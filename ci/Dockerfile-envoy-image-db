@@ -1,0 +1,53 @@
+# This script is executed by universe/envoy/build_container.sh
+# Forked from Dockerfile-envoy-image with the databricks ubuntu as the parent
+
+# Ubuntu image repo to use
+# We can specify 'ubuntu-20.04' as a value to use lightweight 'iknowwhatimdoing' version
+ARG IMAGE_REPO=ubuntu-20.04
+
+# Set Ubuntu image sha256 as an ARG
+# So that we can use the latest one from in universe/envoy/build_container.sh
+# The default was obtain on 09/01/2023
+ARG IMAGE_SHA=sha256:2b42f9d5bd1fc0db6e4339e12aa194cfac49fcd7e66a69cbbae8735a60ed214d
+
+# This is the base image that we will use to build the envoy image
+FROM scratch AS binary
+COPY ci/docker-entrypoint.sh /
+ADD configs/envoyproxy_io_proxy.yaml /etc/envoy/envoy.yaml
+# ARGs for the envoy binary and the suffix
+ARG ENVOY_BINARY=envoy
+ARG ENVOY_BINARY_SUFFIX=_stripped
+ARG TARGETPLATFORM=linux/amd64
+# Add the envoy binary and the su-exec binary
+ADD ${TARGETPLATFORM}/build_${ENVOY_BINARY}_release/su-exec /final-build/
+ADD ${TARGETPLATFORM}/build_${ENVOY_BINARY}_release${ENVOY_BINARY_SUFFIX}/* /final-build/
+
+# STAGE: envoy-base
+FROM registry.dev.databricks.com/universe/${IMAGE_REPO}@${IMAGE_SHA} AS envoy-base
+ENV DEBIAN_FRONTEND=noninteractive
+EXPOSE 10000
+CMD ["envoy", "-c", "/etc/envoy/envoy.yaml"]
+RUN mkdir -p /etc/envoy && adduser --group --system envoy
+ENTRYPOINT ["/docker-entrypoint.sh"]
+ADD VERSION.txt /etc/envoy
+RUN apt-get -qq update \
+    && apt-get -qq upgrade -y \
+    && apt-get -qq install --no-install-recommends -y ca-certificates \
+    && apt-get -qq autoremove -y \
+    && apt-get clean \
+    && rm -rf /tmp/* /var/tmp/* \
+    && rm -rf /var/lib/apt/lists/*
+
+# STAGE: envoy
+FROM envoy-base AS envoy
+COPY --from=binary --chown=0:0 \
+    /etc/envoy/envoy.yaml /etc/envoy/envoy.yaml
+COPY --from=binary --chown=0:0 \
+    /docker-entrypoint.sh /
+COPY --from=binary --chown=0:0 \
+    /final-build/su-exec /usr/local/bin/
+COPY --from=binary --chown=0:0 \
+    "/final-build/${ENVOY_BINARY}" /usr/local/bin/
+
+# Make envoy image as last stage so it is built by default
+FROM envoy
