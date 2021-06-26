@@ -123,20 +123,52 @@ function cp_binary_for_image_build() {
   local BASE_TARGET_DIR="${ENVOY_SRCDIR}${BUILD_ARCH_DIR}"
   local TARGET_DIR=build_"${EXE_NAME}"_"${BINARY_TYPE}"
   local FINAL_DELIVERY_DIR="${ENVOY_DELIVERY_DIR}"/"${EXE_NAME}"
+  mkdir -p "${FINAL_DELIVERY_DIR}"
+
+  # Check if binary already exists
+  if [ -e "${FINAL_DELIVERY_DIR}/envoy" ]; then
+    rm "${FINAL_DELIVERY_DIR}/envoy"
+  fi
+  # Extract & copy binary file from the `release.tar.zst`
+  bazel run "${BAZEL_BUILD_OPTIONS[@]}" \
+        //tools/zstd \
+        -- --stdout \
+           -d "${ENVOY_BUILD_DIR}/bin/release.tar.zst" \
+      | tar xfO - envoy > "${FINAL_DELIVERY_DIR}/envoy"
+  chmod 775 "${FINAL_DELIVERY_DIR}/envoy"
 
   echo "Copying binary for image build..."
   mkdir -p "${BASE_TARGET_DIR}"/"${TARGET_DIR}"
   cp -f "${FINAL_DELIVERY_DIR}"/envoy "${BASE_TARGET_DIR}"/"${TARGET_DIR}"
   if [[ "${COMPILE_TYPE}" == "dbg" || "${COMPILE_TYPE}" == "opt" ]]; then
+    # Check if DWP already exists
+    if [ -e "${FINAL_DELIVERY_DIR}/envoy.dwp" ]; then
+      rm "${FINAL_DELIVERY_DIR}/envoy.dwp"
+    fi
+    # Extract & copy DWP file from the `release.tar.zst`
+    bazel run "${BAZEL_BUILD_OPTIONS[@]}" \
+          //tools/zstd \
+          -- --stdout \
+             -d "${ENVOY_BUILD_DIR}/bin/release.tar.zst" \
+        | tar xfO - dbg/envoy.dwp > "${FINAL_DELIVERY_DIR}/envoy.dwp"
+    chmod 775 "${FINAL_DELIVERY_DIR}/envoy.dwp"
+    # Copy DWP file for image build
     cp -f "${FINAL_DELIVERY_DIR}"/envoy.dwp "${BASE_TARGET_DIR}"/"${TARGET_DIR}"
   fi
 
   # Tools for the tools image. Strip to save size.
-  strip bazel-bin/test/tools/schema_validator/schema_validator_tool \
-    -o "${BASE_TARGET_DIR}"/"${TARGET_DIR}"/schema_validator_tool
+  if [ -e "bazel-bin/test/tools/schema_validator/schema_validator_tool" ]; then
+    strip bazel-bin/test/tools/schema_validator/schema_validator_tool \
+      -o "${BASE_TARGET_DIR}"/"${TARGET_DIR}"/schema_validator_tool
+  fi
 
-  # Copy the su-exec utility binary into the image
-  cp -f bazel-bin/external/com_github_ncopa_suexec/su-exec "${BASE_TARGET_DIR}"/"${TARGET_DIR}"
+  # Extract & copt the su-exec utility binary into the image
+  bazel run "${BAZEL_BUILD_OPTIONS[@]}" \
+        //tools/zstd \
+        -- --stdout \
+           -d "${ENVOY_BUILD_DIR}/bin/release.tar.zst" \
+      | tar xfO - utils/su-exec > "${BASE_TARGET_DIR}/${TARGET_DIR}/su-exec"
+  chmod 775 "${BASE_TARGET_DIR}/${TARGET_DIR}/su-exec"
 
   # Stripped binaries for the debug image.
   mkdir -p "${BASE_TARGET_DIR}"/"${TARGET_DIR}"_stripped
@@ -860,6 +892,9 @@ case $CI_TARGET in
            bazel-bin/test/tools/schema_validator/schema_validator_tool.stripped \
            "${ENVOY_BINARY_DIR}/schema_validator_tool"
         echo "Release files created in ${ENVOY_BINARY_DIR}"
+        # Copy the BUILD files to the binary export directory
+        echo "Copying the BUILD files to local directory..."
+        cp_binary_for_image_build "release" "opt" "envoy"
         ;;
 
     release.server_only.binary)
