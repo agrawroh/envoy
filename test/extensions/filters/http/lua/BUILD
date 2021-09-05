@@ -17,6 +17,7 @@ envoy_extension_cc_test(
     extension_names = ["envoy.filters.http.lua"],
     deps = [
         "//source/common/stream_info:stream_info_lib",
+        "//source/common/network:upstream_server_name_lib",
         "//source/extensions/filters/http/lua:lua_filter_lib",
         "//test/mocks/api:api_mocks",
         "//test/mocks/http:http_mocks",
