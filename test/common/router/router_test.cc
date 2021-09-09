@@ -141,39 +141,70 @@ public:
 
     router_.onDestroy();
   }
+
+  void testAutoSniOptions(absl::optional<envoy::config::core::v3::UpstreamHttpProtocolOptions> dummy_option, Envoy::Http::TestRequestHeaderMapImpl& headers, std::string server_name = "host") {
+    NiceMock<StreamInfo::MockStreamInfo> stream_info;
+    ON_CALL(*cm_.thread_local_cluster_.cluster_.info_, upstreamHttpProtocolOptions())
+        .WillByDefault(ReturnRef(dummy_option));
+    ON_CALL(callbacks_.stream_info_, filterState())
+        .WillByDefault(ReturnRef(stream_info.filterState()));
+    EXPECT_CALL(cm_.thread_local_cluster_.conn_pool_, newStream(_, _))
+        .WillOnce(Return(&cancellable_));
+    stream_info.filterState()->setData(Network::UpstreamServerName::key(),
+                                       std::make_unique<Network::UpstreamServerName>("dummy"),
+                                       StreamInfo::FilterState::StateType::Mutable);
+    expectResponseTimerCreate();
+
+    HttpTestUtility::addDefaultHeaders(headers);
+    router_.decodeHeaders(headers, true);
+    EXPECT_EQ(server_name,
+              stream_info.filterState()
+                  ->getDataReadOnly<Network::UpstreamServerName>(Network::UpstreamServerName::key())
+                  .value());
+    EXPECT_CALL(cancellable_, cancel(_));
+    router_.onDestroy();
+    EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
+    EXPECT_EQ(0U,
+              callbacks_.route_->route_entry_.virtual_cluster_.stats().upstream_rq_total_.value());
+    EXPECT_EQ(0U,
+              callbacks_.route_->route_entry_.virtual_cluster_.stats().upstream_rq_total_.value());
+  }
 };
 
-TEST_F(RouterTest, UpdateServerNameFilterState) {
-  NiceMock<StreamInfo::MockStreamInfo> stream_info;
+TEST_F(RouterTest, UpdateServerNameFilterStateWithoutHeaderOverride) {
+  auto dummy_option = absl::make_optional<envoy::config::core::v3::UpstreamHttpProtocolOptions>();
+  dummy_option.value().set_auto_sni(true);
+
+  auto headers = new Http::TestRequestHeaderMapImpl{};
+  testAutoSniOptions(dummy_option, headers);
+}
+
+TEST_F(RouterTest, UpdateServerNameFilterStateWithHostHeaderOverride) {
   auto dummy_option = absl::make_optional<envoy::config::core::v3::UpstreamHttpProtocolOptions>();
   dummy_option.value().set_auto_sni(true);
   dummy_option.value().set_override_auto_sni_header(":authority");
-  ON_CALL(*cm_.thread_local_cluster_.cluster_.info_, upstreamHttpProtocolOptions())
-      .WillByDefault(ReturnRef(dummy_option));
-  ON_CALL(callbacks_.stream_info_, filterState())
-      .WillByDefault(ReturnRef(stream_info.filterState()));
-  EXPECT_CALL(cm_.thread_local_cluster_.conn_pool_, newStream(_, _))
-      .WillOnce(Return(&cancellable_));
-  stream_info.filterState()->setData(Network::UpstreamServerName::key(),
-                                     std::make_unique<Network::UpstreamServerName>("dummy"),
-                                     StreamInfo::FilterState::StateType::Mutable);
-  expectResponseTimerCreate();
 
-  Http::TestRequestHeaderMapImpl headers;
+  auto headers = new Http::TestRequestHeaderMapImpl{};
+  testAutoSniOptions(dummy_option, headers);
+}
 
-  HttpTestUtility::addDefaultHeaders(headers);
-  router_.decodeHeaders(headers, true);
-  EXPECT_EQ("host",
-            stream_info.filterState()
-                ->getDataReadOnly<Network::UpstreamServerName>(Network::UpstreamServerName::key())
-                .value());
-  EXPECT_CALL(cancellable_, cancel(_));
-  router_.onDestroy();
-  EXPECT_TRUE(verifyHostUpstreamStats(0, 0));
-  EXPECT_EQ(0U,
-            callbacks_.route_->route_entry_.virtual_cluster_.stats().upstream_rq_total_.value());
-  EXPECT_EQ(0U,
-            callbacks_.route_->route_entry_.virtual_cluster_.stats().upstream_rq_total_.value());
+TEST_F(RouterTest, UpdateServerNameFilterStateWithHeaderOverride) {
+  auto dummy_option = absl::make_optional<envoy::config::core::v3::UpstreamHttpProtocolOptions>();
+  dummy_option.value().set_auto_sni(true);
+  dummy_option.value().set_override_auto_sni_header("x-host");
+
+  const auto server_name = "foo.bar";
+  auto headers = new Http::TestRequestHeaderMapImpl{{"x-host", server_name}};
+  testAutoSniOptions(dummy_option, headers, server_name);
+}
+
+TEST_F(RouterTest, UpdateServerNameFilterStateWithEmptyValueHeaderOverride) {
+  auto dummy_option = absl::make_optional<envoy::config::core::v3::UpstreamHttpProtocolOptions>();
+  dummy_option.value().set_auto_sni(true);
+  dummy_option.value().set_override_auto_sni_header("x-host");
+
+  auto headers = new Http::TestRequestHeaderMapImpl{{"x-host", ""}};
+  testAutoSniOptions(dummy_option, headers);
 }
 
 TEST_F(RouterTest, UpdateSubjectAltNamesFilterState) {
@@ -6152,7 +6183,7 @@ TEST_F(RouterTest, NotSetDynamicMaxStreamDurationIfZero) {
         return nullptr;
       }));
 
-  // The timer will not be created.
+  // The timer will not be created.over
   EXPECT_CALL(callbacks_.dispatcher_, createTimer_).Times(0);
 
   Http::TestRequestHeaderMapImpl headers{{"x-envoy-upstream-stream-duration-ms", "0"}};
