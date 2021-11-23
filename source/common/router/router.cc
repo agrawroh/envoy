@@ -189,6 +189,14 @@ TimeoutData FilterUtility::finalTimeout(const RouteEntry& route,
     } else {
       timeout.global_timeout_ = route.timeout();
     }
+  } else {
+    // Only when the request is not a gRPC request and the timeout on the route is not infinite, we
+    // use the defined timeout on the route as the global timeout.
+    // There should be a config check to make sure that `max_stream_duration` is strictly greater
+    // than this timeout or otherwise the behavior of which timer gets fired first is unpredictable.
+    if (route.timeout() > std::chrono::milliseconds(0) && !grpc_request) {
+      timeout.global_timeout_ = route.timeout();
+    }
   }
   timeout.per_try_timeout_ = route.retryPolicy().perTryTimeout();
   timeout.per_try_idle_timeout_ = route.retryPolicy().perTryIdleTimeout();
