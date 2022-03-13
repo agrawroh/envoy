@@ -177,12 +177,10 @@ public:
               envoy::config::route::v3::RouteConfiguration>>(
               server_factory_context_.messageValidationContext().dynamicValidationVisitor(),
               "name");
-          auto subscription = std::make_shared<RdsRouteConfigSubscription>(
-              std::move(config_update), std::move(resource_decoder), config_source,
-              route_config_name_, manager_identifier, server_factory_context_, "test_stat",
-              rds_type_, manager_);
-          auto provider = std::make_shared<RdsRouteConfigProviderImpl>(std::move(subscription),
-                                                                       server_factory_context_);
+          auto subscription = std::make_shared<RdsRouteConfigSubscription>(std::move(config_update), std::move(resource_decoder), config_source, route_config_name_, false, manager_identifier, server_factory_context_, "test_stat", rds_type_, manager_);
+          envoy::config::route::v3::RouteConfiguration route_config;
+          auto provider = std::make_shared<RdsRouteConfigProviderImpl>(
+              route_config, traits_, std::move(subscription), server_factory_context_, manager_);
           return std::make_pair(provider, &provider->subscription().initTarget());
         });
   }

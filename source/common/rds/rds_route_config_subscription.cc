@@ -10,10 +10,10 @@ RdsRouteConfigSubscription::RdsRouteConfigSubscription(
     RouteConfigUpdatePtr&& config_update,
     std::unique_ptr<Envoy::Config::OpaqueResourceDecoder>&& resource_decoder,
     const envoy::config::core::v3::ConfigSource& config_source,
-    const std::string& route_config_name, const uint64_t manager_identifier,
+    const std::string& route_config_name, bool dry_run, const uint64_t manager_identifier,
     Server::Configuration::ServerFactoryContext& factory_context, const std::string& stat_prefix,
     const std::string& rds_type, RouteConfigProviderManager& route_config_provider_manager)
-    : route_config_name_(route_config_name),
+    : route_config_name_(route_config_name), dry_run_(dry_run),
       scope_(factory_context.scope().createScope(stat_prefix + route_config_name_ + ".")),
       factory_context_(factory_context),
       parent_init_target_(
@@ -73,22 +73,40 @@ void RdsRouteConfigSubscription::onConfigUpdate(
         fmt::format("Unexpected {} configuration (expecting {}): {}", rds_type_, route_config_name_,
                     resourceName(route_config_provider_manager_.protoTraits(), route_config)));
   }
-  std::unique_ptr<Init::ManagerImpl> noop_init_manager;
-  std::unique_ptr<Cleanup> resume_rds;
-  if (config_update_info_->onRdsUpdate(route_config, version_info)) {
-    stats_.config_reload_.inc();
-    stats_.config_reload_time_ms_.set(DateUtil::nowToMilliseconds(factory_context_.timeSource()));
-
-    beforeProviderUpdate(noop_init_manager, resume_rds);
-
-    ENVOY_LOG(debug, "rds: loading new configuration: config_name={} hash={}", route_config_name_,
-              config_update_info_->configHash());
-
-    if (route_config_provider_opt_.has_value()) {
-      route_config_provider_opt_.value()->onConfigUpdate();
+  // Check whether RDS needs to run in the dry-run mode or now. We only emit stats when we are
+  // running in the dry-run mode.
+  if (dry_run_) {
+    uint64_t old_hash = config_update_info_->configHash();
+    uint64_t new_hash = getHash(route_config);
+    ENVOY_LOG(
+        debug,
+        "rds: dry-run mode - loading new configuration: config_name={} old_hash={} new_hash={}",
+        route_config_name_, old_hash, new_hash);
+    if (old_hash != new_hash) {
+      stats_.dry_run_config_mismatch_.inc();
+    } else {
+      stats_.dry_run_config_match_.inc();
     }
+    stats_.dry_run_config_fetch_time_ms_.set(
+        DateUtil::nowToMilliseconds(factory_context_.timeSource()));
+  } else {
+    std::unique_ptr<Init::ManagerImpl> noop_init_manager;
+    std::unique_ptr<Cleanup> resume_rds;
+    if (config_update_info_->onRdsUpdate(route_config, version_info)) {
+      stats_.config_reload_.inc();
+      stats_.config_reload_time_ms_.set(DateUtil::nowToMilliseconds(factory_context_.timeSource()));
 
-    afterProviderUpdate();
+      beforeProviderUpdate(noop_init_manager, resume_rds);
+
+      ENVOY_LOG(debug, "rds: loading new configuration: config_name={} hash={}", route_config_name_,
+                config_update_info_->configHash());
+
+      if (route_config_provider_opt_.has_value()) {
+        route_config_provider_opt_.value()->onConfigUpdate();
+      }
+
+      afterProviderUpdate();
+    }
   }
 
   local_init_target_.ready();

@@ -844,6 +844,12 @@ message Rds {
   // associated HTTP connection manager filters) to use different route
   // configurations.
   string route_config_name = 2;
+
+  // The initial route table for the connection manager which would be loaded statically.
+  config.route.v3.RouteConfiguration initial_route_config = 3;
+
+  // Whether to actually propagate the RDS updates or not.
+  bool dry_run = 4;
 }
 
 // This message is used to work around the limitations with 'oneof' and repeated fields.

@@ -226,8 +226,9 @@ void ScopedRdsConfigSubscription::RdsRouteConfigProviderHelper::initRdsConfigPro
     Init::Manager& init_manager) {
   route_provider_ = std::dynamic_pointer_cast<RdsRouteConfigProviderImpl>(
       parent_.route_config_provider_manager_.createRdsRouteConfigProvider(
-          rds, parent_.optional_http_filters_, parent_.factory_context_, parent_.stat_prefix_,
-          init_manager));
+          rds, parent_.optional_http_filters_, parent_.factory_context_,
+          parent_.factory_context_.messageValidationContext().staticValidationVisitor(),
+          parent_.stat_prefix_, init_manager));
 
   rds_update_callback_handle_ = route_provider_->subscription().addUpdateCallback([this]() {
     // Subscribe to RDS update.

@@ -26,7 +26,10 @@ namespace Rds {
  */
 #define ALL_RDS_STATS(COUNTER, GAUGE)                                                              \
   COUNTER(config_reload)                                                                           \
+  COUNTER(dry_run_config_match)                                                                    \
+  COUNTER(dry_run_config_mismatch)                                                                 \
   COUNTER(update_empty)                                                                            \
+  GAUGE(dry_run_config_fetch_time_ms, NeverImport)                                                 \
   GAUGE(config_reload_time_ms, NeverImport)
 
 /**
@@ -47,11 +50,13 @@ public:
       RouteConfigUpdatePtr&& config_update,
       std::unique_ptr<Envoy::Config::OpaqueResourceDecoder>&& resource_decoder,
       const envoy::config::core::v3::ConfigSource& config_source,
-      const std::string& route_config_name, const uint64_t manager_identifier,
+      const std::string& route_config_name, bool dry_run, const uint64_t manager_identifier,
       Server::Configuration::ServerFactoryContext& factory_context, const std::string& stat_prefix,
       const std::string& rds_type, RouteConfigProviderManager& route_config_provider_manager);
 
   ~RdsRouteConfigSubscription() override;
+
+  uint64_t getHash(const Protobuf::Message& rc) const { return MessageUtil::hash(rc); }
 
   absl::optional<RouteConfigProvider*>& routeConfigProvider();
 
@@ -79,6 +84,7 @@ private:
 
 protected:
   const std::string route_config_name_;
+  bool dry_run_;
   // This scope must outlive the subscription_ below as the subscription has derived stats.
   Stats::ScopePtr scope_;
   Envoy::Config::SubscriptionPtr subscription_;

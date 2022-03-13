@@ -3,12 +3,14 @@
 #include <memory>
 #include <string>
 
+#include "envoy/rds/config_traits.h"
 #include "envoy/rds/route_config_provider.h"
 #include "envoy/rds/route_config_update_receiver.h"
 #include "envoy/server/factory_context.h"
 #include "envoy/thread_local/thread_local.h"
 
 #include "source/common/rds/rds_route_config_subscription.h"
+#include "source/common/rds/route_config_provider_manager.h"
 
 namespace Envoy {
 namespace Rds {
@@ -20,8 +22,11 @@ namespace Rds {
 class RdsRouteConfigProviderImpl : public RouteConfigProvider,
                                    Logger::Loggable<Logger::Id::router> {
 public:
-  RdsRouteConfigProviderImpl(RdsRouteConfigSubscriptionSharedPtr&& subscription,
-                             Server::Configuration::ServerFactoryContext& factory_context);
+  RdsRouteConfigProviderImpl(const Protobuf::Message& initial_route_config,
+                             Rds::ConfigTraits& config_traits,
+                             RdsRouteConfigSubscriptionSharedPtr&& subscription,
+                             Server::Configuration::ServerFactoryContext& factory_context,
+                             Rds::RouteConfigProviderManager& route_config_provider_manager);
 
   ~RdsRouteConfigProviderImpl() override;
 

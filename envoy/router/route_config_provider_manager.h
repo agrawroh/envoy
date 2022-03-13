@@ -36,6 +36,7 @@ public:
    * @param rds supplies the proto configuration of an RDS-configured RouteConfigProvider.
    * @param optional_http_filters a set of optional http filter names.
    * @param factory_context is the context to use for the route config provider.
+   * @param validator is a proto validator.
    * @param stat_prefix supplies the stat_prefix to use for the provider stats.
    * @param init_manager the Init::Manager used to coordinate initialization of a the underlying RDS
    * subscription.
@@ -43,7 +44,8 @@ public:
   virtual RouteConfigProviderSharedPtr createRdsRouteConfigProvider(
       const envoy::extensions::filters::network::http_connection_manager::v3::Rds& rds,
       const OptionalHttpFilters& optional_http_filters,
-      Server::Configuration::ServerFactoryContext& factory_context, const std::string& stat_prefix,
+      Server::Configuration::ServerFactoryContext& factory_context,
+      ProtobufMessage::ValidationVisitor& validator, const std::string& stat_prefix,
       Init::Manager& init_manager) PURE;
 
   /**

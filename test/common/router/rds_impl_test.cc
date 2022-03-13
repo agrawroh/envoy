@@ -741,7 +741,8 @@ TEST_F(RdsRouteConfigSubscriptionTest, CreatesNoopInitManager) {
       TestUtility::parseYaml<envoy::extensions::filters::network::http_connection_manager::v3::Rds>(
           rds_config);
   const auto route_config_provider = route_config_provider_manager_->createRdsRouteConfigProvider(
-      rds, OptionalHttpFilters(), server_factory_context_, "stat_prefix", outer_init_manager_);
+      rds, OptionalHttpFilters(), server_factory_context_, validation_visitor_, "stat_prefix",
+      outer_init_manager_);
   RdsRouteConfigSubscription& subscription =
       (dynamic_cast<RdsRouteConfigProviderImpl*>(route_config_provider.get()))->subscription();
   init_watcher_.expectReady(); // The parent_init_target_ will call once.
@@ -770,7 +771,8 @@ public:
     rds_.set_route_config_name("foo_route_config");
     rds_.mutable_config_source()->set_path("foo_path");
     provider_ = route_config_provider_manager_->createRdsRouteConfigProvider(
-        rds_, OptionalHttpFilters(), server_factory_context_, "foo_prefix.", outer_init_manager_);
+        rds_, OptionalHttpFilters(), server_factory_context_, validation_visitor_, "foo_prefix.",
+        outer_init_manager_);
     rds_callbacks_ = server_factory_context_.cluster_manager_.subscription_factory_.callbacks_;
   }
 
@@ -980,7 +982,8 @@ virtual_hosts:
 
   RouteConfigProviderSharedPtr provider2 =
       route_config_provider_manager_->createRdsRouteConfigProvider(
-          rds_, OptionalHttpFilters(), server_factory_context_, "foo_prefix", outer_init_manager_);
+          rds_, OptionalHttpFilters(), server_factory_context_, validation_visitor_, "foo_prefix",
+          outer_init_manager_);
 
   // provider2 should have route config immediately after create
   EXPECT_TRUE(provider2->configInfo().has_value());
@@ -997,7 +1000,8 @@ virtual_hosts:
   rds2.mutable_config_source()->set_path("bar_path");
   RouteConfigProviderSharedPtr provider3 =
       route_config_provider_manager_->createRdsRouteConfigProvider(
-          rds2, OptionalHttpFilters(), server_factory_context_, "foo_prefix", outer_init_manager_);
+          rds2, OptionalHttpFilters(), server_factory_context_, validation_visitor_, "foo_prefix",
+          outer_init_manager_);
   EXPECT_NE(provider3, provider_);
   server_factory_context_.cluster_manager_.subscription_factory_.callbacks_->onConfigUpdate(
       decoded_resources.refvec_, "provider3");
@@ -1040,7 +1044,8 @@ TEST_F(RouteConfigProviderManagerImplTest, SameProviderOnTwoInitManager) {
 
   RouteConfigProviderSharedPtr provider2 =
       route_config_provider_manager_->createRdsRouteConfigProvider(
-          rds_, OptionalHttpFilters(), mock_factory_context2, "foo_prefix", real_init_manager);
+          rds_, OptionalHttpFilters(), mock_factory_context2, validation_visitor_, "foo_prefix",
+          real_init_manager);
 
   EXPECT_FALSE(provider2->configInfo().has_value());
 

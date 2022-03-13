@@ -45,7 +45,7 @@ RouteConfigProviderSharedPtr RouteConfigProviderUtil::create(
     return route_config_provider_manager.createRdsRouteConfigProvider(
         // At the creation of a RDS route config provider, the factory_context's initManager is
         // always valid, though the init manager may go away later when the listener goes away.
-        config.rds(), optional_http_filters, factory_context, stat_prefix, init_manager);
+        config.rds(), optional_http_filters, factory_context, validator, stat_prefix, init_manager);
   case envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager::
       RouteSpecifierCase::kScopedRoutes:
     FALLTHRU; // PANIC
@@ -80,7 +80,7 @@ RdsRouteConfigSubscription::RdsRouteConfigSubscription(
     const uint64_t manager_identifier, Server::Configuration::ServerFactoryContext& factory_context,
     const std::string& stat_prefix, Rds::RouteConfigProviderManager& route_config_provider_manager)
     : Rds::RdsRouteConfigSubscription(std::move(config_update), std::move(resource_decoder),
-                                      rds.config_source(), rds.route_config_name(),
+                                      rds.config_source(), rds.route_config_name(), rds.dry_run(),
                                       manager_identifier, factory_context, stat_prefix + "rds.",
                                       "RDS", route_config_provider_manager),
       config_update_info_(static_cast<RouteConfigUpdateReceiver*>(
@@ -143,10 +143,13 @@ void RdsRouteConfigSubscription::updateOnDemand(const std::string& aliases) {
 }
 
 RdsRouteConfigProviderImpl::RdsRouteConfigProviderImpl(
-    RdsRouteConfigSubscriptionSharedPtr&& subscription,
-    Server::Configuration::ServerFactoryContext& factory_context)
-    : base_(subscription, factory_context), config_update_info_(subscription->routeConfigUpdate()),
-      factory_context_(factory_context) {
+    const envoy::config::route::v3::RouteConfiguration& initial_route_config,
+    Rds::ConfigTraits& config_traits, RdsRouteConfigSubscriptionSharedPtr&& subscription,
+    Server::Configuration::ServerFactoryContext& factory_context,
+    Rds::RouteConfigProviderManager& route_config_provider_manager)
+    : base_(initial_route_config, config_traits, subscription, factory_context,
+            route_config_provider_manager),
+      config_update_info_(subscription->routeConfigUpdate()), factory_context_(factory_context) {
   // The subscription referenced by the 'base_' and by 'this' is the same.
   // In it the provider is already set by the 'base_' so it points to that.
   // Need to set again to point to 'this'.
@@ -233,12 +236,14 @@ RouteConfigProviderManagerImpl::RouteConfigProviderManagerImpl(Server::Admin& ad
 Router::RouteConfigProviderSharedPtr RouteConfigProviderManagerImpl::createRdsRouteConfigProvider(
     const envoy::extensions::filters::network::http_connection_manager::v3::Rds& rds,
     const OptionalHttpFilters& optional_http_filters,
-    Server::Configuration::ServerFactoryContext& factory_context, const std::string& stat_prefix,
+    Server::Configuration::ServerFactoryContext& factory_context,
+    ProtobufMessage::ValidationVisitor& validator, const std::string& stat_prefix,
     Init::Manager& init_manager) {
   auto provider = manager_.addDynamicProvider(
       rds, rds.route_config_name(), init_manager,
-      [&optional_http_filters, &factory_context, &rds, &stat_prefix,
+      [&optional_http_filters, &factory_context, &rds, &stat_prefix, &validator,
        this](uint64_t manager_identifier) {
+        ConfigTraitsImpl config_traits(optional_http_filters, factory_context, validator, true);
         auto config_update = std::make_unique<RouteConfigUpdateReceiverImpl>(
             proto_traits_, factory_context, optional_http_filters);
         auto resource_decoder = std::make_unique<
@@ -247,8 +252,9 @@ Router::RouteConfigProviderSharedPtr RouteConfigProviderManagerImpl::createRdsRo
         auto subscription = std::make_shared<RdsRouteConfigSubscription>(
             std::move(config_update), std::move(resource_decoder), rds, manager_identifier,
             factory_context, stat_prefix, manager_);
-        auto provider =
-            std::make_shared<RdsRouteConfigProviderImpl>(std::move(subscription), factory_context);
+        auto provider = std::make_shared<RdsRouteConfigProviderImpl>(
+            rds.initial_route_config(), config_traits, std::move(subscription), factory_context,
+            manager_);
         return std::make_pair(provider, &provider->subscription().initTarget());
       });
   ASSERT(dynamic_cast<RouteConfigProvider*>(provider.get()));

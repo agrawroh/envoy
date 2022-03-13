@@ -143,8 +143,11 @@ struct UpdateOnDemandCallback {
 class RdsRouteConfigProviderImpl : public RouteConfigProvider,
                                    Logger::Loggable<Logger::Id::router> {
 public:
-  RdsRouteConfigProviderImpl(RdsRouteConfigSubscriptionSharedPtr&& subscription,
-                             Server::Configuration::ServerFactoryContext& factory_context);
+  RdsRouteConfigProviderImpl(
+      const envoy::config::route::v3::RouteConfiguration& initial_route_config,
+      Rds::ConfigTraits& config_traits, RdsRouteConfigSubscriptionSharedPtr&& subscription,
+      Server::Configuration::ServerFactoryContext& factory_context,
+      Rds::RouteConfigProviderManager& route_config_provider_manager);
 
   RdsRouteConfigSubscription& subscription();
 
@@ -197,7 +200,8 @@ public:
   RouteConfigProviderSharedPtr createRdsRouteConfigProvider(
       const envoy::extensions::filters::network::http_connection_manager::v3::Rds& rds,
       const OptionalHttpFilters& optional_http_filters,
-      Server::Configuration::ServerFactoryContext& factory_context, const std::string& stat_prefix,
+      Server::Configuration::ServerFactoryContext& factory_context,
+      ProtobufMessage::ValidationVisitor& validator, const std::string& stat_prefix,
       Init::Manager& init_manager) override;
 
   RouteConfigProviderPtr
