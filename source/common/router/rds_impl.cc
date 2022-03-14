@@ -74,7 +74,8 @@ RdsRouteConfigSubscription::RdsRouteConfigSubscription(
     Envoy::Router::RouteConfigProviderManagerImpl& route_config_provider_manager)
     : Envoy::Config::SubscriptionBase<envoy::config::route::v3::RouteConfiguration>(
           factory_context.messageValidationContext().dynamicValidationVisitor(), "name"),
-      route_config_name_(rds.route_config_name()),
+      route_config_name_(rds.route_config_name()), initial_route_config_hash_(0L),
+      dry_run_(rds.dry_run()),
       scope_(factory_context.scope().createScope(stat_prefix + "rds." + route_config_name_ + ".")),
       factory_context_(factory_context),
       parent_init_target_(fmt::format("RdsRouteConfigSubscription init {}", route_config_name_),
@@ -90,6 +91,9 @@ RdsRouteConfigSubscription::RdsRouteConfigSubscription(
       route_config_provider_manager_(route_config_provider_manager),
       manager_identifier_(manager_identifier), optional_http_filters_(optional_http_filters) {
   const auto resource_name = getResourceName();
+  if (rds.has_initial_route_config()) {
+    initial_route_config_hash_ = getHash(rds.initial_route_config());
+  }
   subscription_ =
       factory_context.clusterManager().subscriptionFactory().subscriptionFromConfigSource(
           rds.config_source(), Grpc::Common::typeUrl(resource_name), *scope_, *this,
@@ -122,36 +126,62 @@ void RdsRouteConfigSubscription::onConfigUpdate(
     throw EnvoyException(fmt::format("Unexpected RDS configuration (expecting {}): {}",
                                      route_config_name_, route_config.name()));
   }
-  std::unique_ptr<Init::ManagerImpl> noop_init_manager;
-  std::unique_ptr<Cleanup> resume_rds;
-  if (config_update_info_->onRdsUpdate(route_config, version_info)) {
-    stats_.config_reload_.inc();
-    stats_.config_reload_time_ms_.set(DateUtil::nowToMilliseconds(factory_context_.timeSource()));
-    if (config_update_info_->protobufConfiguration().has_vhds() &&
-        config_update_info_->vhdsConfigurationChanged()) {
-      ENVOY_LOG(
-          debug,
-          "rds: vhds configuration present/changed, (re)starting vhds: config_name={} hash={}",
-          route_config_name_, config_update_info_->configHash());
-      maybeCreateInitManager(version_info, noop_init_manager, resume_rds);
-      vhds_subscription_ = std::make_unique<VhdsSubscription>(
-          config_update_info_, factory_context_, stat_prefix_, route_config_provider_opt_);
-      vhds_subscription_->registerInitTargetWithInitManager(
-          noop_init_manager == nullptr ? local_init_manager_ : *noop_init_manager);
+  // Check whether RDS needs to run in the dry-run mode or now. We only emit stats when we are
+  // running in the dry-run mode.
+  if (dry_run_) {
+    // `initial_route_config_hash_` would be 0 if there is no initial config defined in the RDS.
+    uint64_t old_hash = initial_route_config_hash_;
+    if (old_hash == 0) {
+      // If there is no initial config provided then we just look at the initial config received
+      // from the RDS itself. NOTE: If there is nothing received from the RDS then this would be 0.
+      old_hash = config_update_info_->configHash();
     }
-
-    ENVOY_LOG(debug, "rds: loading new configuration: config_name={} hash={}", route_config_name_,
-              config_update_info_->configHash());
-
-    if (route_config_provider_opt_.has_value()) {
-      route_config_provider_opt_.value()->onConfigUpdate();
+    // Compute the new hash from the routes we just received in this RDS update.
+    uint64_t new_hash = getHash(route_config);
+    ENVOY_LOG(
+        debug,
+        "rds: (dry-run mode) loading new configuration: config_name={} old_hash={} new_hash={}",
+        route_config_name_, old_hash, new_hash);
+    // Compare the two hashes to determine whether we received the same config or different.
+    if (old_hash != new_hash) {
+      stats_.dry_run_config_mismatch_.inc();
+    } else {
+      stats_.dry_run_config_match_.inc();
     }
-    // RDS update removed VHDS configuration
-    if (!config_update_info_->protobufConfiguration().has_vhds()) {
-      vhds_subscription_.release();
-    }
+    stats_.dry_run_config_fetch_time_ms_.set(
+        DateUtil::nowToMilliseconds(factory_context_.timeSource()));
+  } else {
+    std::unique_ptr<Init::ManagerImpl> noop_init_manager;
+    std::unique_ptr<Cleanup> resume_rds;
+    if (config_update_info_->onRdsUpdate(route_config, version_info)) {
+      stats_.config_reload_.inc();
+      stats_.config_reload_time_ms_.set(DateUtil::nowToMilliseconds(factory_context_.timeSource()));
+      if (config_update_info_->protobufConfiguration().has_vhds() &&
+          config_update_info_->vhdsConfigurationChanged()) {
+        ENVOY_LOG(
+            debug,
+            "rds: vhds configuration present/changed, (re)starting vhds: config_name={} hash={}",
+            route_config_name_, config_update_info_->configHash());
+        maybeCreateInitManager(version_info, noop_init_manager, resume_rds);
+        vhds_subscription_ = std::make_unique<VhdsSubscription>(
+            config_update_info_, factory_context_, stat_prefix_, route_config_provider_opt_);
+        vhds_subscription_->registerInitTargetWithInitManager(
+            noop_init_manager == nullptr ? local_init_manager_ : *noop_init_manager);
+      }
 
-    update_callback_manager_.runCallbacks();
+      ENVOY_LOG(debug, "rds: loading new configuration: config_name={} hash={}", route_config_name_,
+                config_update_info_->configHash());
+
+      if (route_config_provider_opt_.has_value()) {
+        route_config_provider_opt_.value()->onConfigUpdate();
+      }
+      // RDS update removed VHDS configuration
+      if (!config_update_info_->protobufConfiguration().has_vhds()) {
+        vhds_subscription_.release();
+      }
+
+      update_callback_manager_.runCallbacks();
+    }
   }
 
   local_init_target_.ready();
@@ -224,6 +254,7 @@ bool RdsRouteConfigSubscription::validateUpdateSize(int num_resources) {
 }
 
 RdsRouteConfigProviderImpl::RdsRouteConfigProviderImpl(
+    const envoy::extensions::filters::network::http_connection_manager::v3::Rds& rds,
     RdsRouteConfigSubscriptionSharedPtr&& subscription,
     Server::Configuration::ServerFactoryContext& factory_context,
     const OptionalHttpFilters& optional_http_filters)
@@ -232,11 +263,18 @@ RdsRouteConfigProviderImpl::RdsRouteConfigProviderImpl(
       validator_(factory_context.messageValidationContext().dynamicValidationVisitor()),
       tls_(factory_context.threadLocal()), optional_http_filters_(optional_http_filters) {
   ConfigConstSharedPtr initial_config;
-  if (config_update_info_->configInfo().has_value()) {
+  if (rds.has_initial_route_config()) {
+    uint64_t config_hash = getHash(rds.initial_route_config());
+    ENVOY_LOG(debug, "rds: loading initial config with hash={}", config_hash);
+    initial_config = std::make_shared<ConfigImpl>(
+        rds.initial_route_config(), optional_http_filters_, factory_context_, validator_, false);
+  } else if (config_update_info_->configInfo().has_value()) {
+    ENVOY_LOG(debug, "rds: loading initial config from rds");
     initial_config =
         std::make_shared<ConfigImpl>(config_update_info_->protobufConfiguration(),
                                      optional_http_filters_, factory_context_, validator_, false);
   } else {
+    ENVOY_LOG(debug, "rds: no initial config loaded");
     initial_config = std::make_shared<NullConfigImpl>();
   }
   tls_.set([initial_config](Event::Dispatcher&) {
@@ -339,7 +377,7 @@ Router::RouteConfigProviderSharedPtr RouteConfigProviderManagerImpl::createRdsRo
         rds, manager_identifier, factory_context, stat_prefix, optional_http_filters, *this));
     init_manager.add(subscription->parent_init_target_);
     RdsRouteConfigProviderImplSharedPtr new_provider{new RdsRouteConfigProviderImpl(
-        std::move(subscription), factory_context, optional_http_filters)};
+        rds, std::move(subscription), factory_context, optional_http_filters)};
     dynamic_route_config_providers_.insert(
         {manager_identifier, std::weak_ptr<RdsRouteConfigProviderImpl>(new_provider)});
     return new_provider;

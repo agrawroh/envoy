@@ -96,7 +96,10 @@ private:
  */
 #define ALL_RDS_STATS(COUNTER, GAUGE)                                                              \
   COUNTER(config_reload)                                                                           \
+  COUNTER(dry_run_config_match)                                                                    \
+  COUNTER(dry_run_config_mismatch)                                                                 \
   COUNTER(update_empty)                                                                            \
+  GAUGE(dry_run_config_fetch_time_ms, NeverImport)                                                 \
   GAUGE(config_reload_time_ms, NeverImport)
 
 /**
@@ -120,6 +123,7 @@ public:
 
   absl::optional<RouteConfigProvider*>& routeConfigProvider() { return route_config_provider_opt_; }
   RouteConfigUpdatePtr& routeConfigUpdate() { return config_update_info_; }
+  uint64_t getHash(const Protobuf::Message& rc) const { return MessageUtil::hash(rc); }
   void updateOnDemand(const std::string& aliases);
   void maybeCreateInitManager(const std::string& version_info,
                               std::unique_ptr<Init::ManagerImpl>& init_manager,
@@ -149,6 +153,8 @@ private:
   bool validateUpdateSize(int num_resources);
 
   const std::string route_config_name_;
+  uint64_t initial_route_config_hash_;
+  bool dry_run_;
   // This scope must outlive the subscription_ below as the subscription has derived stats.
   Stats::ScopePtr scope_;
   Envoy::Config::SubscriptionPtr subscription_;
@@ -198,6 +204,7 @@ public:
 
   // Router::RouteConfigProvider
   Router::ConfigConstSharedPtr config() override;
+  uint64_t getHash(const Protobuf::Message& rc) const { return MessageUtil::hash(rc); }
   absl::optional<ConfigInfo> configInfo() const override {
     return config_update_info_->configInfo();
   }
@@ -213,9 +220,11 @@ private:
     ConfigConstSharedPtr config_;
   };
 
-  RdsRouteConfigProviderImpl(RdsRouteConfigSubscriptionSharedPtr&& subscription,
-                             Server::Configuration::ServerFactoryContext& factory_context,
-                             const OptionalHttpFilters& optional_http_filters);
+  RdsRouteConfigProviderImpl(
+      const envoy::extensions::filters::network::http_connection_manager::v3::Rds& rds,
+      RdsRouteConfigSubscriptionSharedPtr&& subscription,
+      Server::Configuration::ServerFactoryContext& factory_context,
+      const OptionalHttpFilters& optional_http_filters);
 
   RdsRouteConfigSubscriptionSharedPtr subscription_;
   RouteConfigUpdatePtr& config_update_info_;
