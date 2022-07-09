@@ -129,7 +129,9 @@ private:
 };
 
 class DynamicMetadataMapWrapper;
+class ListenerDynamicMetadataMapWrapper;
 class StreamInfoWrapper;
+class ListenerStreamInfoWrapper;
 
 /**
  * Iterator over a dynamic metadata map.
@@ -145,6 +147,23 @@ public:
 
 private:
   DynamicMetadataMapWrapper& parent_;
+  Protobuf::Map<std::string, ProtobufWkt::Struct>::const_iterator current_;
+};
+
+/**
+ * Iterator over a listener's dynamic metadata map.
+ */
+class ListenerDynamicMetadataMapIterator
+    : public Filters::Common::Lua::BaseLuaObject<ListenerDynamicMetadataMapIterator> {
+public:
+  ListenerDynamicMetadataMapIterator(ListenerDynamicMetadataMapWrapper& parent);
+
+  static ExportedFunctions exportedFunctions() { return {}; }
+
+  DECLARE_LUA_CLOSURE(ListenerDynamicMetadataMapIterator, luaListenerDynamicMetadataPairsIterator);
+
+private:
+  ListenerDynamicMetadataMapWrapper& parent_;
   Protobuf::Map<std::string, ProtobufWkt::Struct>::const_iterator current_;
 };
 
@@ -196,6 +215,48 @@ private:
   Filters::Common::Lua::LuaDeathRef<DynamicMetadataMapIterator> iterator_;
 
   friend class DynamicMetadataMapIterator;
+};
+
+/**
+ * Lua wrapper for a listener-level dynamic metadata.
+ */
+class ListenerDynamicMetadataMapWrapper
+    : public Filters::Common::Lua::BaseLuaObject<ListenerDynamicMetadataMapWrapper> {
+public:
+  ListenerDynamicMetadataMapWrapper(ListenerStreamInfoWrapper& parent) : parent_{parent} {}
+
+  static ExportedFunctions exportedFunctions() {
+    return {{"get", static_luaListenerDynamicMetadataGet},
+            {"__pairs", static_luaListenerDynamicMetadataPairs}};
+  }
+
+private:
+  /**
+   * Get a metadata value from the map.
+   * @param 1 (string): filter name.
+   * @return value if found or nil.
+   */
+  DECLARE_LUA_FUNCTION(ListenerDynamicMetadataMapWrapper, luaListenerDynamicMetadataGet);
+
+  /**
+   * Implementation of the __pairs meta method so a dynamic metadata wrapper can be iterated over
+   * using pairs().
+   */
+  DECLARE_LUA_FUNCTION(ListenerDynamicMetadataMapWrapper, luaListenerDynamicMetadataPairs);
+
+  // Envoy::Lua::BaseLuaObject
+  void onMarkDead() override {
+    // Iterators do not survive yields.
+    iterator_.reset();
+  }
+
+  // To get reference to parent's (StreamInfoWrapper) stream info member.
+  const StreamInfo::StreamInfo& streamInfo();
+
+  ListenerStreamInfoWrapper& parent_;
+  Filters::Common::Lua::LuaDeathRef<ListenerDynamicMetadataMapIterator> iterator_;
+
+  friend class ListenerDynamicMetadataMapIterator;
 };
 
 /**
@@ -263,6 +324,35 @@ private:
       downstream_ssl_connection_;
 
   friend class DynamicMetadataMapWrapper;
+};
+
+/**
+ * Lua wrapper for a connection stream info.
+ */
+class ListenerStreamInfoWrapper
+    : public Filters::Common::Lua::BaseLuaObject<ListenerStreamInfoWrapper> {
+public:
+  ListenerStreamInfoWrapper(const StreamInfo::StreamInfo& listener_stream_info)
+      : listener_stream_info_{listener_stream_info} {}
+  static ExportedFunctions exportedFunctions() {
+    return {{"dynamicMetadata", static_luaListenerDynamicMetadata}};
+  }
+
+private:
+  /**
+   * Get reference to stream info dynamic metadata object.
+   * @return ListenerDynamicMetadataMapWrapper representation of StreamInfo dynamic metadata.
+   */
+  DECLARE_LUA_FUNCTION(ListenerStreamInfoWrapper, luaListenerDynamicMetadata);
+
+  // Envoy::Lua::BaseLuaObject
+  void onMarkDead() override { listener_dynamic_metadata_wrapper_.reset(); }
+
+  const StreamInfo::StreamInfo& listener_stream_info_;
+  Filters::Common::Lua::LuaDeathRef<ListenerDynamicMetadataMapWrapper>
+      listener_dynamic_metadata_wrapper_;
+
+  friend class ListenerDynamicMetadataMapWrapper;
 };
 
 /**
