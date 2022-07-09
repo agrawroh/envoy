@@ -181,6 +181,7 @@ public:
             {"respond", static_luaRespond},
             {"streamInfo", static_luaStreamInfo},
             {"connection", static_luaConnection},
+            {"listenerStreamInfo", static_luaListenerStreamInfo},
             {"importPublicKey", static_luaImportPublicKey},
             {"verifySignature", static_luaVerifySignature},
             {"base64Escape", static_luaBase64Escape},
@@ -250,6 +251,11 @@ private:
    * @return a handle to the network connection.
    */
   DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaConnection);
+
+  /**
+   * @return a handle to the network connection's stream info.
+   */
+  DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaListenerStreamInfo);
 
   /**
    * Log a message to the Envoy log.
@@ -331,6 +337,7 @@ private:
     trailers_wrapper_.reset();
     metadata_wrapper_.reset();
     stream_info_wrapper_.reset();
+    listener_stream_info_wrapper_.reset();
     connection_wrapper_.reset();
     public_key_wrapper_.reset();
   }
@@ -357,6 +364,7 @@ private:
   Filters::Common::Lua::LuaDeathRef<HeaderMapWrapper> trailers_wrapper_;
   Filters::Common::Lua::LuaDeathRef<Filters::Common::Lua::MetadataMapWrapper> metadata_wrapper_;
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> stream_info_wrapper_;
+  Filters::Common::Lua::LuaDeathRef<ListenerStreamInfoWrapper> listener_stream_info_wrapper_;
   Filters::Common::Lua::LuaDeathRef<Filters::Common::Lua::ConnectionWrapper> connection_wrapper_;
   Filters::Common::Lua::LuaDeathRef<PublicKeyWrapper> public_key_wrapper_;
   State state_{State::Running};

@@ -200,6 +200,9 @@ PerLuaCodeSetup::PerLuaCodeSetup(const std::string& lua_code, ThreadLocal::SlotA
   lua_state_.registerType<StreamInfoWrapper>();
   lua_state_.registerType<DynamicMetadataMapWrapper>();
   lua_state_.registerType<DynamicMetadataMapIterator>();
+  lua_state_.registerType<ListenerStreamInfoWrapper>();
+  lua_state_.registerType<ListenerDynamicMetadataMapWrapper>();
+  lua_state_.registerType<ListenerDynamicMetadataMapIterator>();
   lua_state_.registerType<StreamHandleWrapper>();
   lua_state_.registerType<PublicKeyWrapper>();
 
@@ -617,6 +620,17 @@ int StreamHandleWrapper::luaStreamInfo(lua_State* state) {
     stream_info_wrapper_.pushStack();
   } else {
     stream_info_wrapper_.reset(StreamInfoWrapper::create(state, callbacks_.streamInfo()), true);
+  }
+  return 1;
+}
+
+int StreamHandleWrapper::luaListenerStreamInfo(lua_State* state) {
+  ASSERT(state_ == State::Running);
+  if (listener_stream_info_wrapper_.get() != nullptr) {
+    listener_stream_info_wrapper_.pushStack();
+  } else {
+    listener_stream_info_wrapper_.reset(
+        ListenerStreamInfoWrapper::create(state, callbacks_.connection()->streamInfo()), true);
   }
   return 1;
 }
