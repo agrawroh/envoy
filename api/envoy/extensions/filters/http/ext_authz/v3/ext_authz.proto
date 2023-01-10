@@ -69,6 +69,16 @@ message ExtAuthz {
   // HTTP 5xx error.
   bool failure_mode_allow_header_add = 19;
 
+  //  This changes the filter's behaviour on errors:
+  //
+  //  1. When set to true, the filter would retain the status code received from the upstream and
+  //  would also propagate the response body and headers back to the client (if available) for
+  //  further debugging.
+  //
+  //  2. When set to false, the filter would return a 403 or `status_on_error` (if set) and would
+  //  not propagate any response body or headers back to the client. This is the default behavior.
+  bool allow_debugging_failures = 20;
+
   // Enables filter to buffer the client request body and send it within the authorization request.
   // A ``x-envoy-auth-partial-body: false|true`` metadata header will be added to the authorization
   // request message indicating if the body data is partial.
