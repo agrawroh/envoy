@@ -39,7 +39,8 @@ namespace ExtAuthz {
   COUNTER(denied)                                                                                  \
   COUNTER(error)                                                                                   \
   COUNTER(disabled)                                                                                \
-  COUNTER(failure_mode_allowed)
+  COUNTER(failure_mode_allowed)                                                                    \
+  COUNTER(failure_debugging_allowed)
 
 /**
  * Wrapper struct for ext_authz filter stats. @see stats_macros.h
@@ -61,6 +62,7 @@ public:
       : allow_partial_message_(config.with_request_body().allow_partial_message()),
         failure_mode_allow_(config.failure_mode_allow()),
         failure_mode_allow_header_add_(config.failure_mode_allow_header_add()),
+        failure_debugging_allowed_(config.allow_debugging_failures()),
         clear_route_cache_(config.clear_route_cache()),
         max_request_bytes_(config.with_request_body().max_request_bytes()),
 
@@ -105,7 +107,9 @@ public:
         ext_authz_denied_(pool_.add(createPoolStatName(config.stat_prefix(), "denied"))),
         ext_authz_error_(pool_.add(createPoolStatName(config.stat_prefix(), "error"))),
         ext_authz_failure_mode_allowed_(
-            pool_.add(createPoolStatName(config.stat_prefix(), "failure_mode_allowed"))) {
+            pool_.add(createPoolStatName(config.stat_prefix(), "failure_mode_allowed"))),
+        ext_authz_failure_debugging_allowed_(
+            pool_.add(createPoolStatName(config.stat_prefix(), "failure_debugging_allowed"))) {
     auto bootstrap = factory_context.bootstrap();
     auto labels_key_it =
         bootstrap.node().metadata().fields().find(config.bootstrap_metadata_labels_key());
@@ -146,6 +150,8 @@ public:
   bool failureModeAllow() const { return failure_mode_allow_; }
 
   bool failureModeAllowHeaderAdd() const { return failure_mode_allow_header_add_; }
+
+  bool failureDebuggingAllowed() const { return failure_debugging_allowed_; }
 
   bool clearRouteCache() const { return clear_route_cache_; }
 
@@ -232,6 +238,7 @@ private:
   const bool allow_partial_message_;
   const bool failure_mode_allow_;
   const bool failure_mode_allow_header_add_;
+  const bool failure_debugging_allowed_;
   const bool clear_route_cache_;
   const uint32_t max_request_bytes_;
   const bool pack_as_bytes_;
@@ -270,6 +277,7 @@ public:
   const Stats::StatName ext_authz_denied_;
   const Stats::StatName ext_authz_error_;
   const Stats::StatName ext_authz_failure_mode_allowed_;
+  const Stats::StatName ext_authz_failure_debugging_allowed_;
 };
 
 using FilterConfigSharedPtr = std::shared_ptr<FilterConfig>;
