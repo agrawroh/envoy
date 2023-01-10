@@ -43,7 +43,8 @@ namespace ExtAuthz {
   COUNTER(failure_mode_allowed)                                                                    \
   COUNTER(invalid)                                                                                 \
   COUNTER(ignored_dynamic_metadata)                                                                \
-  COUNTER(filter_state_name_collision)
+  COUNTER(filter_state_name_collision)                                                             \
+  COUNTER(failure_debugging_allowed)
 
 /**
  * Wrapper struct for ext_authz filter stats. @see stats_macros.h
@@ -109,6 +110,8 @@ public:
   bool failureModeAllow() const { return failure_mode_allow_; }
 
   bool failureModeAllowHeaderAdd() const { return failure_mode_allow_header_add_; }
+
+  bool failureDebuggingAllowed() const { return failure_debugging_allowed_; }
 
   bool clearRouteCache() const { return clear_route_cache_; }
 
@@ -221,6 +224,7 @@ private:
   const bool allow_partial_message_;
   const bool failure_mode_allow_;
   const bool failure_mode_allow_header_add_;
+  const bool failure_debugging_allowed_;
   const bool clear_route_cache_;
   const uint32_t max_request_bytes_;
   const bool pack_as_bytes_;
@@ -266,6 +270,7 @@ public:
   const Stats::StatName ext_authz_error_;
   const Stats::StatName ext_authz_invalid_;
   const Stats::StatName ext_authz_failure_mode_allowed_;
+  const Stats::StatName ext_authz_failure_debugging_allowed_;
 };
 
 using FilterConfigSharedPtr = std::shared_ptr<FilterConfig>;
