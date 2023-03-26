@@ -24,6 +24,7 @@ public:
   virtual void onNewMessage(MySQLSession::State) PURE;
   virtual void onServerGreeting(ServerGreeting&) PURE;
   virtual void onClientLogin(ClientLogin&) PURE;
+  virtual void onSslState() PURE;
   virtual void onClientLoginResponse(ClientLoginResponse&) PURE;
   virtual void onClientSwitchResponse(ClientSwitchResponse&) PURE;
   virtual void onMoreClientLoginResponse(ClientLoginResponse&) PURE;

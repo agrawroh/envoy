@@ -85,6 +85,7 @@ public:
   void onNewMessage(MySQLSession::State state) override;
   void onServerGreeting(ServerGreeting&) override{};
   void onClientLogin(ClientLogin& message) override;
+  void onSslState() override;
   void onClientLoginResponse(ClientLoginResponse& message) override;
   void onClientSwitchResponse(ClientSwitchResponse&) override{};
   void onMoreClientLoginResponse(ClientLoginResponse& message) override;

@@ -4,6 +4,7 @@
 
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/assert.h"
+#include "source/common/common/hex.h"
 #include "source/common/common/logger.h"
 #include "source/extensions/filters/network/well_known_names.h"
 
@@ -26,16 +27,24 @@ void MySQLFilter::initializeReadFilterCallbacks(Network::ReadFilterCallbacks& ca
 }
 
 Network::FilterStatus MySQLFilter::onData(Buffer::Instance& data, bool) {
+  //read_callbacks_->connection().readDisable(true);
+  ENVOY_LOG(info, "mysql_proxy: onData() = {}", data.length());
+  ENVOY_LOG(trace, "mysql_proxy: onData() buffer = {}",
+            Hex::encode(static_cast<uint8_t*>(data.linearize(data.length())), data.length()));
   // Safety measure just to make sure that if we have a decoding error we keep going and lose stats.
   // This can be removed once we are more confident of this code.
   if (sniffing_) {
     read_buffer_.add(data);
     doDecode(read_buffer_);
   }
+  //read_callbacks_->connection().readDisable(false);
   return Network::FilterStatus::Continue;
 }
 
 Network::FilterStatus MySQLFilter::onWrite(Buffer::Instance& data, bool) {
+  ENVOY_LOG(info, "mysql_proxy: onWrite() = {}", data.length());
+  ENVOY_LOG(trace, "mysql_proxy: onWrite() buffer = {}",
+            Hex::encode(static_cast<uint8_t*>(data.linearize(data.length())), data.length()));
   // Safety measure just to make sure that if we have a decoding error we keep going and lose stats.
   // This can be removed once we are more confident of this code.
   if (sniffing_) {
@@ -46,6 +55,9 @@ Network::FilterStatus MySQLFilter::onWrite(Buffer::Instance& data, bool) {
 }
 
 void MySQLFilter::doDecode(Buffer::Instance& buffer) {
+  ENVOY_LOG(info, "mysql_proxy: doDecode() = {}", buffer.length());
+  ENVOY_LOG(trace, "mysql_proxy: doDecode() buffer = {}",
+            Hex::encode(static_cast<uint8_t*>(buffer.linearize(buffer.length())), buffer.length()));
   // Clear dynamic metadata.
   envoy::config::core::v3::Metadata& dynamic_metadata =
       read_callbacks_->connection().streamInfo().dynamicMetadata();
@@ -83,6 +95,38 @@ void MySQLFilter::onNewMessage(MySQLSession::State state) {
 void MySQLFilter::onClientLogin(ClientLogin& client_login) {
   if (client_login.isSSLRequest()) {
     config_->stats_.upgraded_to_ssl_.inc();
+    // author[agrawroh]: Switch protocols -> SSL
+    if (!read_callbacks_->connection().startSecureTransport()) {
+      ENVOY_CONN_LOG(
+          info, "mysql_proxy: cannot enable downstream secure transport. Check configuration.",
+          read_callbacks_->connection());
+      read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
+    } else {
+      // Unsubscribe the callback.
+      ENVOY_CONN_LOG(trace, "mysql_proxy: onClientLogin()", read_callbacks_->connection());
+      // read_callbacks_->injectReadDataToFilterChain(data, false);
+      ENVOY_CONN_LOG(trace, "mysql_proxy: enabled SSL termination.",
+                     read_callbacks_->connection());
+      // Switch to TLS has been completed.
+      // Signal to the decoder to stop processing the current message (SSLRequest).
+      // Because Envoy terminates SSL, the message was consumed and should not be
+      // passed to other filters in the chain.
+    }
+  }
+}
+
+void MySQLFilter::onSslState() {
+  // Try to switch upstream connection to use a secure channel.
+  ENVOY_CONN_LOG(trace, "mysql_proxy: switching protocols.", read_callbacks_->connection());
+  if (read_callbacks_->startUpstreamSecureTransport()) {
+    ENVOY_CONN_LOG(trace, "mysql_proxy: onSslState()", read_callbacks_->connection());
+    ENVOY_CONN_LOG(trace, "mysql_proxy: upstream SSL enabled.", read_callbacks_->connection());
+  } else {
+    ENVOY_CONN_LOG(info,
+                   "mysql_proxy: cannot enable upstream secure transport. Check "
+                   "configuration. Terminating.",
+                   read_callbacks_->connection());
+    read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
   }
 }
 
@@ -130,6 +174,7 @@ void MySQLFilter::onCommand(Command& command) {
 
 Network::FilterStatus MySQLFilter::onNewConnection() {
   config_->stats_.sessions_.inc();
+  // read_callbacks_->connection().readDisable(true);
   return Network::FilterStatus::Continue;
 }
 

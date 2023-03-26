@@ -28,6 +28,7 @@ envoy_cc_library(
         "//envoy/stats:stats_interface",
         "//envoy/stats:stats_macros",
         "//source/common/network:filter_lib",
+        "//source/common/common:hex_lib",
         "//source/extensions/filters/network:well_known_names",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
     ],
@@ -100,6 +101,7 @@ envoy_cc_library(
     hdrs = ["mysql_decoder_impl.h"],
     deps = [
         ":decoder_interface",
+        "//source/common/common:hex_lib",
     ],
 )
 

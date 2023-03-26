@@ -1,0 +1,38 @@
+# This script is executed by universe/envoy/build_container.sh
+# Forked from Dockerfile-envoy-image with the databricks ubuntu as the parent
+
+# Ubuntu image repo to use
+# We can specify 'ubuntu-18.04' as a value to use lightweight 'iknowwhatimdoing' version
+ARG IMAGE_REPO=db-ubuntu-18.04
+
+# Set Ubuntu image sha256 as an ARG
+# So that we can use the latest one from in universe/envoy/build_container.sh
+# The default was obtain on 02/08/2021
+ARG IMAGE_SHA=sha256:d91a3b36f547aa1db80d9d576e19d177206c3a94791ac51c26d40d246a96fd2b
+
+FROM registry.dev.databricks.com/universe/${IMAGE_REPO}@${IMAGE_SHA}
+ARG TARGETPLATFORM=linux/amd64
+
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && apt-get install -y ca-certificates \
+    && apt-get autoremove -y \
+    && apt-get clean \
+    && rm -rf /tmp/* /var/tmp/* \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /etc/envoy
+
+ARG ENVOY_BINARY=envoy
+ARG ENVOY_BINARY_SUFFIX=_stripped
+ADD ${TARGETPLATFORM}/build_${ENVOY_BINARY}_release${ENVOY_BINARY_SUFFIX}/* /usr/local/bin/
+ADD configs/envoyproxy_io_proxy.yaml /etc/envoy/envoy.yaml
+
+ADD ${TARGETPLATFORM}/build_${ENVOY_BINARY}_release/su-exec /usr/local/bin/
+RUN chown root:root /usr/local/bin/su-exec && adduser --group --system envoy
+
+EXPOSE 10000
+
+COPY ci/docker-entrypoint.sh /
+ENTRYPOINT ["/docker-entrypoint.sh"]
+CMD ["envoy", "-c", "/etc/envoy/envoy.yaml", "--service-cluster", "apiproxy", "--service-node", "apiproxy", "--log-level", "trace"]

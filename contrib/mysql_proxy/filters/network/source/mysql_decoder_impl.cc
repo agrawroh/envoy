@@ -1,7 +1,7 @@
 #include "contrib/mysql_proxy/filters/network/source/mysql_decoder_impl.h"
 
 #include "source/common/common/logger.h"
-
+#include "source/common/common/hex.h"
 #include "contrib/mysql_proxy/filters/network/source/mysql_codec.h"
 #include "contrib/mysql_proxy/filters/network/source/mysql_codec_clogin_resp.h"
 #include "contrib/mysql_proxy/filters/network/source/mysql_utils.h"
@@ -13,6 +13,8 @@ namespace MySQLProxy {
 
 void DecoderImpl::parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t len) {
   ENVOY_LOG(trace, "mysql_proxy: parsing message, seq {}, len {}", seq, len);
+  ENVOY_LOG(trace, "mysql_proxy: buffer value: {}",
+      Hex::encode(static_cast<uint8_t*>(message.linearize(message.length())), message.length()));
   // Run the MySQL state machine
   switch (session_.getState()) {
   case MySQLSession::State::Init: {
@@ -39,6 +41,7 @@ void DecoderImpl::parseMessage(Buffer::Instance& message, uint8_t seq, uint32_t 
   }
   case MySQLSession::State::SslPt:
     // just consume
+    callbacks_.onSslState();
     message.drain(len);
     break;
   case MySQLSession::State::ChallengeResp41:
@@ -171,10 +174,12 @@ bool DecoderImpl::decode(Buffer::Instance& data) {
   uint8_t seq = 0;
 
   // ignore ssl message
+  /*
   if (session_.getState() == MySQLSession::State::SslPt) {
     data.drain(data.length());
     return true;
   }
+  */
 
   if (BufferHelper::peekHdr(data, len, seq) != DecodeStatus::Success) {
     throw EnvoyException("error parsing mysql packet header");
