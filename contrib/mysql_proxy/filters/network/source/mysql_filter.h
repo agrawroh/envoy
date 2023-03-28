@@ -76,6 +76,7 @@ public:
   Network::FilterStatus onData(Buffer::Instance& data, bool end_stream) override;
   Network::FilterStatus onNewConnection() override;
   void initializeReadFilterCallbacks(Network::ReadFilterCallbacks& callbacks) override;
+  void initializeWriteFilterCallbacks(Network::WriteFilterCallbacks& callbacks) override;
 
   // Network::WriteFilter
   Network::FilterStatus onWrite(Buffer::Instance& data, bool end_stream) override;
@@ -98,10 +99,12 @@ public:
 
 private:
   Network::ReadFilterCallbacks* read_callbacks_{};
+  Network::WriteFilterCallbacks* write_callbacks_{};
   MySQLFilterConfigSharedPtr config_;
   Buffer::OwnedImpl read_buffer_;
   Buffer::OwnedImpl write_buffer_;
   std::unique_ptr<Decoder> decoder_;
+  uint32_t init_{0};
   bool sniffing_{true};
 };
 
