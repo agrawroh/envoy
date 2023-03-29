@@ -17,6 +17,7 @@
 
 #include "source/common/access_log/access_log_impl.h"
 #include "source/common/common/assert.h"
+#include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/empty_string.h"
 #include "source/common/common/enum_to_int.h"
 #include "source/common/common/fmt.h"
@@ -645,11 +646,82 @@ void Filter::onConnectTimeout() {
 Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
   ENVOY_CONN_LOG(trace, "downstream connection received {} bytes, end_stream={}",
                  read_callbacks_->connection(), data.length(), end_stream);
-  getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(data.length());
-  if (upstream_) {
-    getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(data.length());
-    upstream_->encodeData(data, end_stream);
+
+  // ROHIT: Manual Processing
+  ENVOY_LOG(info, "ROHIT: onData() = {}", data.length());
+  if (data.length() == 335) {
+    // ROHIT: Drain Data
+    ENVOY_LOG(info, "ROHIT: Draining Data.");
+    data.drain(data.length());
+
+    // ROHIT: Disable Reads
+    ENVOY_LOG(info, "ROHIT: Disabling Reads.");
+    read_callbacks_->connection().readDisable(true);
+
+    Buffer::OwnedImpl out_buffer_0{};
+    // 20 00 00 01 8d ae ff 19 00 00 00 01 ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+    const uint8_t buff_val_0[36]{32, 0, 0, 1, 141, 174, 255, 25, 0, 0, 0, 1, 255, 0, 0, 0, 0, 0,
+                                 0,  0, 0, 0, 0,   0,   0,   0,  0, 0, 0, 0, 0,   0, 0, 0, 0, 0};
+    out_buffer_0.add(buff_val_0, 36);
+
+    getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(36);
+    ENVOY_LOG(info, "ROHIT: Sending 36 Bytes.");
+    if (upstream_) {
+      getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(36);
+      upstream_->encodeData(out_buffer_0, end_stream);
+    }
+
+    // Buffer::OwnedImpl out_buffer_1{};
+    // e2 00 00 01 8d a6 ff 19 00 00 00 01 ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 72 6f 6f 74 00 20 f3 e8 37 af d3 18 ba d7 56 94 33 e5 86 42 10 05 e2 b2 3d fe c9 42 fb 95 dc d7 82 da 64 3f b6 c7 6d 79 73 71 6c 00 63 61 63 68 69 6e 67 5f 73 68 61 32 5f 70 61 73 73 77 6f 72 64 00 7f 03 5f 6f 73 09 6d 61 63 6f 73 31 33 2e 30 09 5f 70 6c 61 74 66 6f 72 6d 05 61 72 6d 36 34 0f 5f 63 6c 69 65 6e 74 5f 76 65 72 73 69 6f 6e 06 38 2e 30 2e 33 32 0c 5f 63 6c 69 65 6e 74 5f 6e 61 6d 65 08 6c 69 62 6d 79 73 71 6c 04 5f 70 69 64 05 32 38 37 34 32 07 6f 73 5f 75 73 65 72 0d 72 6f 68 69 74 2e 61 67 72 61 77 61 6c 0c 70 72 6f 67 72 61 6d 5f 6e 61 6d 65 05 6d 79 73 71 6c
+    // const uint8_t buff_val_1[230]{226, 0, 0, 1, 141, 166, 255, 25, 0, 0, 0, 1, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 114, 111, 111, 116, 0, 32, 243, 232, 55, 175, 211, 24, 186, 215, 86, 148, 51, 229, 134, 66, 16, 5, 226, 178, 61, 254, 201, 66, 251, 149, 220, 215, 130, 218, 100, 63, 182, 199, 109, 121, 115, 113, 108, 0, 99, 97, 99, 104, 105, 110, 103, 95, 115, 104, 97, 50, 95, 112, 97, 115, 115, 119, 111, 114, 100, 0, 127, 3, 95, 111, 115, 9, 109, 97, 99, 111, 115, 49, 51, 46, 48, 9, 95, 112, 108, 97, 116, 102, 111, 114, 109, 5, 97, 114, 109, 54, 52, 15, 95, 99, 108, 105, 101, 110, 116, 95, 118, 101, 114, 115, 105, 111, 110, 6, 56, 46, 48, 46, 51, 50, 12, 95, 99, 108, 105, 101, 110, 116, 95, 110, 97, 109, 101, 8, 108, 105, 98, 109, 121, 115, 113, 108, 4, 95, 112, 105, 100, 5, 50, 56, 55, 52, 50, 7, 111, 115, 95, 117, 115, 101, 114, 13, 114, 111, 104, 105, 116, 46, 97, 103, 114, 97, 119, 97, 108, 12, 112, 114, 111, 103, 114, 97, 109, 95, 110, 97, 109, 101, 5, 109, 121, 115, 113, 108};
+    // out_buffer_1.add(buff_val_1, 230);
+
+    // 16 03 01 01 26 01 00 01 22 03 03 7e 22 94 97 72 be cb de 19 f0 7e 9d 30 15 1f c6 48 ba f3 3d 38 05 56 88 73 6f 7a aa c1 6e 00 86 20 9b 94 1e a9 9c 6a 47 68 4f 36 8f a5 75 a5 31 f5 f1 5c 8b 7f b6 00 26 d6 3e 47 15 26 65 59 64 24 00 48 13 02 13 03 13 01 c0 2b c0 2c c0 2f c0 23 c0 27 c0 30 c0 24 c0 28 00 9e 00 a2 00 67 00 40 00 a3 00 6b 00 6a 00 9f c0 13 c0 09 c0 14 c0 0a 00 32 00 33 00 38 00 39 00 35 00 84 00 41 00 9c 00 9d 00 3c 00 3d 00 2f 00 ff 01 00 00 91 00 0b 00 04 03 00 01 02 00 0a 00 0c 00 0a 00 1d 00 17 00 1e 00 19 00 18 00 23 00 00 00 16 00 00 00 17 00 00 00 0d 00 30 00 2e 04 03 05 03 06 03 08 07 08 08 08 09 08 0a 08 0b 08 04 08 05 08 06 04 01 05 01 06 01 03 03 02 03 03 01 02 01 03 02 02 02 04 02 05 02 06 02 00 2b 00 05 04 03 04 03 03 00 2d 00 02 01 01 00 33 00 26 00 24 00 1d 00 20 b6 c1 be b1 7a 6e 56 a1 60 73 bb ad 7e 07 aa a9 64 60 fc 22 3e 68 3e d8 bc f1 50 ad 41 5e 7b 4b
+    // const uint8_t buff_val_1[299]{22, 3, 1, 1, 38, 1, 0, 1, 34, 3, 3, 126, 34, 148, 151, 114, 190, 203, 222, 25, 240, 126, 157, 48, 21, 31, 198, 72, 186, 243, 61, 56, 5, 86, 136, 115, 111, 122, 170, 193, 110, 0, 134, 32, 155, 148, 30, 169, 156, 106, 71, 104, 79, 54, 143, 165, 117, 165, 49, 245, 241, 92, 139, 127, 182, 0, 38, 214, 62, 71, 21, 38, 101, 89, 100, 36, 0, 72, 19, 2, 19, 3, 19, 1, 192, 43, 192, 44, 192, 47, 192, 35, 192, 39, 192, 48, 192, 36, 192, 40, 0, 158, 0, 162, 0, 103, 0, 64, 0, 163, 0, 107, 0, 106, 0, 159, 192, 19, 192, 9, 192, 20, 192, 10, 0, 50, 0, 51, 0, 56, 0, 57, 0, 53, 0, 132, 0, 65, 0, 156, 0, 157, 0, 60, 0, 61, 0, 47, 0, 255, 1, 0, 0, 145, 0, 11, 0, 4, 3, 0, 1, 2, 0, 10, 0, 12, 0, 10, 0, 29, 0, 23, 0, 30, 0, 25, 0, 24, 0, 35, 0, 0, 0, 22, 0, 0, 0, 23, 0, 0, 0, 13, 0, 48, 0, 46, 4, 3, 5, 3, 6, 3, 8, 7, 8, 8, 8, 9, 8, 10, 8, 11, 8, 4, 8, 5, 8, 6, 4, 1, 5, 1, 6, 1, 3, 3, 2, 3, 3, 1, 2, 1, 3, 2, 2, 2, 4, 2, 5, 2, 6, 2, 0, 43, 0, 5, 4, 3, 4, 3, 3, 0, 45, 0, 2, 1, 1, 0, 51, 0, 38, 0, 36, 0, 29, 0, 32, 182, 193, 190, 177, 122, 110, 86, 161, 96, 115, 187, 173, 126, 7, 170, 169, 100, 96, 252, 34, 62, 104, 62, 216, 188, 241, 80, 173, 65, 94, 123, 75};
+    // out_buffer_1.add(buff_val_1, 299);
+
+    //getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(299);
+
+    if (upstream_) {
+      //getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(299);
+      upstream_->addBytesSentCallback([upstream_callbacks = upstream_callbacks_, read_callbacks = read_callbacks_, this](uint64_t) -> bool {
+        ENVOY_LOG(info, "ROHIT: ****************** Complete Sent *********************************");
+        if (init_) {
+          ENVOY_LOG(info, "ROHIT: Switching -> SSL.");
+          if (read_callbacks->startUpstreamSecureTransport()) {
+            ENVOY_CONN_LOG(trace, "ROHIT: onSslState()", read_callbacks->connection());
+            ENVOY_CONN_LOG(trace, "ROHIT: upstream SSL enabled.", read_callbacks->connection());
+            ENVOY_LOG(info, "ROHIT: Sending 230 Bytes.");
+            Buffer::OwnedImpl out_buffer_1{};
+            // e20000028daeff1900000001ff0000000000000000000000000000000000000000000000726f6f740020fff5d0df9049082440d970924423cc6ecc2f061aa56032307c50106813e92bbd6d7973716c0063616368696e675f736861325f70617373776f7264007f035f6f73096d61636f7331332e30095f706c6174666f726d0561726d36340f5f636c69656e745f76657273696f6e06382e302e33320c5f636c69656e745f6e616d65086c69626d7973716c045f706964053431393730076f735f757365720d726f6869742e6167726177616c0c70726f6772616d5f6e616d65056d7973716c
+            //const uint8_t buff_val_1[230]{226, 0, 0, 1, 141, 166, 255, 25, 0, 0, 0, 1, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 114, 111, 111, 116, 0, 32, 243, 232, 55, 175, 211, 24, 186, 215, 86, 148, 51, 229, 134, 66, 16, 5, 226, 178, 61, 254, 201, 66, 251, 149, 220, 215, 130, 218, 100, 63, 182, 199, 109, 121, 115, 113, 108, 0, 99, 97, 99, 104, 105, 110, 103, 95, 115, 104, 97, 50, 95, 112, 97, 115, 115, 119, 111, 114, 100, 0, 127, 3, 95, 111, 115, 9, 109, 97, 99, 111, 115, 49, 51, 46, 48, 9, 95, 112, 108, 97, 116, 102, 111, 114, 109, 5, 97, 114, 109, 54, 52, 15, 95, 99, 108, 105, 101, 110, 116, 95, 118, 101, 114, 115, 105, 111, 110, 6, 56, 46, 48, 46, 51, 50, 12, 95, 99, 108, 105, 101, 110, 116, 95, 110, 97, 109, 101, 8, 108, 105, 98, 109, 121, 115, 113, 108, 4, 95, 112, 105, 100, 5, 50, 56, 55, 52, 50, 7, 111, 115, 95, 117, 115, 101, 114, 13, 114, 111, 104, 105, 116, 46, 97, 103, 114, 97, 119, 97, 108, 12, 112, 114, 111, 103, 114, 97, 109, 95, 110, 97, 109, 101, 5, 109, 121, 115, 113, 108};
+            //out_buffer_1.add(buff_val_1, 230);
+            const uint8_t buff_val_1[230]{226, 0, 0, 2, 141, 174, 255, 25, 0, 0, 0, 1, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 114, 111, 111, 116, 0, 32, 255, 245, 208, 223, 144, 73, 8, 36, 64, 217, 112, 146, 68, 35, 204, 110, 204, 47, 6, 26, 165, 96, 50, 48, 124, 80, 16, 104, 19, 233, 43, 189, 109, 121, 115, 113, 108, 0, 99, 97, 99, 104, 105, 110, 103, 95, 115, 104, 97, 50, 95, 112, 97, 115, 115, 119, 111, 114, 100, 0, 127, 3, 95, 111, 115, 9, 109, 97, 99, 111, 115, 49, 51, 46, 48, 9, 95, 112, 108, 97, 116, 102, 111, 114, 109, 5, 97, 114, 109, 54, 52, 15, 95, 99, 108, 105, 101, 110, 116, 95, 118, 101, 114, 115, 105, 111, 110, 6, 56, 46, 48, 46, 51, 50, 12, 95, 99, 108, 105, 101, 110, 116, 95, 110, 97, 109, 101, 8, 108, 105, 98, 109, 121, 115, 113, 108, 4, 95, 112, 105, 100, 5, 52, 49, 57, 55, 48, 7, 111, 115, 95, 117, 115, 101, 114, 13, 114, 111, 104, 105, 116, 46, 97, 103, 114, 97, 119, 97, 108, 12, 112, 114, 111, 103, 114, 97, 109, 95, 110, 97, 109, 101, 5, 109, 121, 115, 113, 108};
+            out_buffer_1.add(buff_val_1, 230);
+            this->upstream_->encodeData(out_buffer_1, false);
+            ENVOY_LOG(info, "ROHIT: Enabling Reads.");
+            read_callbacks_->connection().readDisable(false);
+          } else {
+            ENVOY_CONN_LOG(info,
+                           "ROHIT: cannot enable upstream secure transport. Check "
+                           "configuration. Terminating.",
+                           read_callbacks->connection());
+            read_callbacks->connection().close(Network::ConnectionCloseType::NoFlush);
+          }
+          // DO NOT REPEAT THIS
+          init_ = false;
+        }
+        return true;
+      });
+    }
+  } else {
+    getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(data.length());
+    if (upstream_) {
+      getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(data.length());
+      upstream_->encodeData(data, end_stream);
+    }
   }
+
   // The upstream should consume all of the data.
   // Before there is an upstream the connection should be readDisabled. If the upstream is
   // destroyed, there should be no further reads as well.
@@ -727,6 +799,7 @@ void Filter::onUpstreamData(Buffer::Instance& data, bool end_stream) {
 }
 
 void Filter::onUpstreamEvent(Network::ConnectionEvent event) {
+  ENVOY_LOG(debug, "TCP:onUpstreamEvent(), event: {}", static_cast<int>(event));
   if (event == Network::ConnectionEvent::ConnectedZeroRtt) {
     return;
   }

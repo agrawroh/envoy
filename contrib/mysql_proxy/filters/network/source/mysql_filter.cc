@@ -40,10 +40,6 @@ Network::FilterStatus MySQLFilter::onData(Buffer::Instance& data, bool) {
     init_ = 1;
     data.drain(data.length());
     read_callbacks_->connection().readDisable(true);
-  } else if (init_ == 2) {
-    init_ = 3;
-    //data.drain(data.length());
-    onSslState();
   }
 
   return Network::FilterStatus::Continue;
@@ -66,9 +62,8 @@ Network::FilterStatus MySQLFilter::onWrite(Buffer::Instance& data, bool) {
             Hex::encode(static_cast<uint8_t*>(data.linearize(data.length())), data.length()));
 
   if (init_ == 1) {
-    data.drain(data.length());
-
     init_ = 2;
+    data.drain(data.length());
 
     Buffer::OwnedImpl out_buffer_{};
     // 20 00 00 01 8d ae ff 19 00 00 00 01 ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
@@ -79,7 +74,17 @@ Network::FilterStatus MySQLFilter::onWrite(Buffer::Instance& data, bool) {
     out_buffer_.add(buff_val_0, 36);
     out_buffer_.add(buff_val_1, 299);
     read_callbacks_->injectReadDataToFilterChain(out_buffer_, false);
+
+    return Network::FilterStatus::StopIteration;
   }
+
+  /*
+  else if (init_ == 2) {
+    init_ = 3;
+    //data.drain(data.length());
+    onSslState();
+  }
+  */
 
   return Network::FilterStatus::Continue;
 
