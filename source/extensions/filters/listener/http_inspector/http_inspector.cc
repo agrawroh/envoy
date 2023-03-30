@@ -60,6 +60,7 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
 
 Network::FilterStatus Filter::onAccept(Network::ListenerFilterCallbacks& cb) {
   ENVOY_LOG(trace, "inspector: new connection accepted");
+  cb_ = &cb;
 
   Network::ConnectionSocket& socket = cb.socket();
   Buffer::OwnedImpl out_buffer_{};
@@ -68,20 +69,45 @@ Network::FilterStatus Filter::onAccept(Network::ListenerFilterCallbacks& cb) {
   out_buffer_.add(buff_val, 78);
   socket.ioHandle().write(out_buffer_);
 
+  // Peek first
+  auto buffer_ = std::make_unique<uint8_t[]>(36);
+  auto peek_buf_ = buffer_.get();
+  int retry = 0;
+  do {
+    auto result = socket.ioHandle().recv(peek_buf_, 36, MSG_PEEK);
+    if (retry == 25 && (!result.ok() || result.return_value_ != 36)) {
+      ENVOY_LOG(trace, "inspector: failed to drain mysql short handshake packet");
+      socket.ioHandle().close();
+    } else if (result.ok() && result.return_value_ == 36) {
+      ENVOY_LOG(trace, "inspector: peek data = {}", Envoy::Hex::encode(peek_buf_, 36));
+      break;
+    }
+
+    retry++;
+    absl::SleepFor(absl::Milliseconds(10));
+  } while (true);
+
+  // Now actually read
   Buffer::OwnedImpl in_buffer_{};
   auto result = socket.ioHandle().read(in_buffer_, 36);
-  if (!result.ok() || result.return_value_ != 36) {
-    ENVOY_LOG(trace, "inspector: failed to drain mysql short handshake packet");
-    socket.ioHandle().close();
+  if (result.ok()) {
+    auto hex_string = Envoy::Hex::encode(static_cast<uint8_t*>(in_buffer_.linearize(in_buffer_.length())), in_buffer_.length());
+    ENVOY_LOG(trace, "inspector: buffer data = {}", hex_string);
+
+    // ROHIT: Insert the logic to inspect the 36 bytes. If SSL is not requested then we simply close
+    // the connection or otherwise if SSL is requested then we continue.
+
+    const std::string metadata_key = "tidb-listener";
+    ProtobufWkt::Value metadata_value;
+    metadata_value.set_string_value(hex_string);
+    ProtobufWkt::Struct metadata((*cb_->dynamicMetadata().mutable_filter_metadata())[metadata_key]);
+    metadata.mutable_fields()->insert({"short_handshake", metadata_value});
+    cb_->setDynamicMetadata(metadata_key, metadata);
+
+    // Clean up the buffer as we already consumed these 36 bytes of data, and we don't want to send
+    // this to the next filter.
+    in_buffer_.drain(36);
   }
-  ENVOY_LOG(trace, "inspector: buffer data = {}", Envoy::Hex::encode(static_cast<uint8_t*>(in_buffer_.linearize(in_buffer_.length())), in_buffer_.length()));
-
-  // ROHIT: Insert the logic to inspect the 36 bytes. If SSL is not requested then we simply close
-  // the connection or otherwise if SSL is requested then we continue.
-
-  // Clean up the buffer as we already consumed these 36 bytes of data, and we don't want to send
-  // this to the next filter.
-  in_buffer_.drain(36);
 
   /*
   const absl::string_view transport_protocol = socket.detectedTransportProtocol();
@@ -92,7 +118,6 @@ Network::FilterStatus Filter::onAccept(Network::ListenerFilterCallbacks& cb) {
   }
   */
 
-  cb_ = &cb;
   return Network::FilterStatus::StopIteration;
 }
 
