@@ -17,10 +17,12 @@
 #include "envoy/upstream/upstream.h"
 
 #include "source/common/access_log/access_log_impl.h"
+#include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/assert.h"
 #include "source/common/common/empty_string.h"
 #include "source/common/common/enum_to_int.h"
 #include "source/common/common/fmt.h"
+#include "source/common/common/hex.h"
 #include "source/common/common/macros.h"
 #include "source/common/common/utility.h"
 #include "source/common/config/metadata.h"
@@ -696,14 +698,83 @@ void Filter::onConnectTimeout() {
   upstream_callbacks_->onEvent(Network::ConnectionEvent::LocalClose);
 }
 
+std::string extract_username(const char* buffer, std::size_t start_position) {
+  std::string result;
+  const char* position = buffer + start_position;
+  while (*position != '\0') {
+    result += *position;
+    ++position;
+  }
+  return result;
+}
+
+std::string extract_instance(const std::string& username) {
+  std::size_t at_pos = username.find('@');
+  if (at_pos == std::string::npos) {
+    // '@' symbol not found
+    return "";
+  }
+  return username.substr(at_pos + 1);
+}
+
 Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
   ENVOY_CONN_LOG(trace, "downstream connection received {} bytes, end_stream={}",
                  read_callbacks_->connection(), data.length(), end_stream);
-  getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(data.length());
-  if (upstream_) {
-    getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(data.length());
-    upstream_->encodeData(data, end_stream);
+
+  // ROHIT: Manual Processing
+  ENVOY_LOG(info, "ROHIT: onData() = {}", data.length()); // 230
+  if (read_init_) {
+    // Here we can inspect the 230 bytes of data before draining it and then connect to the
+    // appropriate upstream
+
+    // username starts at 37th byte
+    auto username = extract_username(static_cast<const char*>(data.linearize(data.length())), 36);
+    ENVOY_LOG(info, "ROHIT: username = {}", username);
+
+    // Set the tcp_proxy cluster to the same value as SNI. The data is mutable to allow
+    // other filters to change it.
+    auto backend_cluster = extract_instance(username);
+    read_callbacks_->connection().streamInfo().filterState()->setData(
+        PerConnectionCluster::key(),
+        std::make_unique<PerConnectionCluster>(backend_cluster),
+        StreamInfo::FilterState::StateType::Mutable, StreamInfo::FilterState::LifeSpan::Connection);
+
+    // ROHIT: Drain the data as we don't need it anymore.
+    ENVOY_LOG(info, "ROHIT: Draining Data.");
+    data.drain(data.length());
+
+    // =================================== UPSTREAM CONNECTION =====================================
+    if (config_->maxDownstreamConnectionDuration()) {
+      connection_duration_timer_ = read_callbacks_->connection().dispatcher().createTimer(
+          [this]() -> void { onMaxDownstreamConnectionDuration(); });
+      connection_duration_timer_->enableTimer(config_->maxDownstreamConnectionDuration().value());
+    }
+
+    if (config_->accessLogFlushInterval().has_value()) {
+      access_log_flush_timer_ = read_callbacks_->connection().dispatcher().createTimer(
+          [this]() -> void { onAccessLogFlushInterval(); });
+      resetAccessLogFlushTimer();
+    }
+
+    // Set UUID for the connection. This is used for logging and tracing.
+    getStreamInfo().setStreamIdProvider(
+        std::make_shared<StreamInfo::StreamIdProviderImpl>(config_->randomGenerator().uuid()));
+
+    ASSERT(upstream_ == nullptr);
+    route_ = pickRoute();
+    // We can return the status from here if things fail.
+    establishUpstreamConnection();
+    // =================================== UPSTREAM CONNECTION =====================================
+
+    read_init_ = false;
+  } else {
+    getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(data.length());
+    if (upstream_) {
+      getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(data.length());
+      upstream_->encodeData(data, end_stream);
+    }
   }
+
   // The upstream should consume all of the data.
   // Before there is an upstream the connection should be readDisabled. If the upstream is
   // destroyed, there should be no further reads as well.
@@ -713,25 +784,9 @@ Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
 }
 
 Network::FilterStatus Filter::onNewConnection() {
-  if (config_->maxDownstreamConnectionDuration()) {
-    connection_duration_timer_ = read_callbacks_->connection().dispatcher().createTimer(
-        [this]() -> void { onMaxDownstreamConnectionDuration(); });
-    connection_duration_timer_->enableTimer(config_->maxDownstreamConnectionDuration().value());
-  }
-
-  if (config_->accessLogFlushInterval().has_value()) {
-    access_log_flush_timer_ = read_callbacks_->connection().dispatcher().createTimer(
-        [this]() -> void { onAccessLogFlushInterval(); });
-    resetAccessLogFlushTimer();
-  }
-
-  // Set UUID for the connection. This is used for logging and tracing.
-  getStreamInfo().setStreamIdProvider(
-      std::make_shared<StreamInfo::StreamIdProviderImpl>(config_->randomGenerator().uuid()));
-
-  ASSERT(upstream_ == nullptr);
-  route_ = pickRoute();
-  return establishUpstreamConnection();
+  ENVOY_CONN_LOG(trace, "tcp_proxy: onNewConnection() called", read_callbacks_->connection());
+  read_callbacks_->connection().readDisable(false);
+  return Network::FilterStatus::StopIteration;
 }
 
 bool Filter::startUpstreamSecureTransport() {
@@ -781,14 +836,89 @@ void Filter::onDownstreamEvent(Network::ConnectionEvent event) {
 void Filter::onUpstreamData(Buffer::Instance& data, bool end_stream) {
   ENVOY_CONN_LOG(trace, "upstream connection received {} bytes, end_stream={}",
                  read_callbacks_->connection(), data.length(), end_stream);
-  getStreamInfo().getUpstreamBytesMeter()->addWireBytesReceived(data.length());
-  getStreamInfo().getDownstreamBytesMeter()->addWireBytesSent(data.length());
-  read_callbacks_->connection().write(data, end_stream);
+
+  // data.length() == 78
+  if (write_init_) {
+    // ROHIT: Drain Data
+    ENVOY_LOG(info, "ROHIT: Draining Data.");
+    data.drain(data.length());
+
+    // ROHIT: Disable Reads
+    ENVOY_LOG(info, "ROHIT: Disabling Reads.");
+    read_callbacks_->connection().readDisable(true);
+
+    // Create Short Handshake Buffer
+    Buffer::OwnedImpl out_buffer_0{};
+
+    // Extract Metadata
+    const auto& request_metadata = getStreamInfo().dynamicMetadata().filter_metadata();
+    const auto filter_it = request_metadata.find("tidb-listener");
+    ENVOY_LOG(info, "ROHIT: Metadata = TIDB Listener.");
+    if (filter_it != request_metadata.end()) {
+      const auto& fields = filter_it->second.fields();
+      const auto it = fields.find("short_handshake");
+      ENVOY_LOG(info, "ROHIT: Metadata = Short Handshake.");
+      if (it != fields.end()) {
+        ENVOY_LOG(info, "ROHIT: Metadata Value = {}", it->second.string_value());
+        std::vector<uint8_t> data = Hex::decode(it->second.string_value());
+        // 20 00 00 01 8d ae ff 19 00 00 00 01 ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+        // const uint8_t buff_val_0[36]{32, 0, 0, 1, 141, 174, 255, 25, 0, 0, 0, 1, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        out_buffer_0.add(data.data(), data.size());
+      }
+    }
+
+    getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(out_buffer_0.length());
+    if (upstream_) {
+      getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(out_buffer_0.length());
+      upstream_->encodeData(out_buffer_0, end_stream);
+    }
+
+    //getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(299);
+    if (upstream_) {
+      //getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(299);
+      upstream_->addBytesSentCallback([upstream_callbacks = upstream_callbacks_, read_callbacks = read_callbacks_, this](uint64_t) -> bool {
+        ENVOY_LOG(info, "ROHIT: ****************** Complete Sent *********************************");
+        if (init_) {
+          ENVOY_LOG(info, "ROHIT: Switching -> SSL.");
+          if (read_callbacks->startUpstreamSecureTransport()) {
+            ENVOY_CONN_LOG(trace, "ROHIT: onSslState()", read_callbacks->connection());
+            ENVOY_CONN_LOG(trace, "ROHIT: upstream SSL enabled.", read_callbacks->connection());
+            ENVOY_LOG(info, "ROHIT: Sending 230 Bytes.");
+            Buffer::OwnedImpl out_buffer_1{};
+            // e20000028daeff1900000001ff0000000000000000000000000000000000000000000000726f6f740020fff5d0df9049082440d970924423cc6ecc2f061aa56032307c50106813e92bbd6d7973716c0063616368696e675f736861325f70617373776f7264007f035f6f73096d61636f7331332e30095f706c6174666f726d0561726d36340f5f636c69656e745f76657273696f6e06382e302e33320c5f636c69656e745f6e616d65086c69626d7973716c045f706964053431393730076f735f757365720d726f6869742e6167726177616c0c70726f6772616d5f6e616d65056d7973716c
+            //const uint8_t buff_val_1[230]{226, 0, 0, 1, 141, 166, 255, 25, 0, 0, 0, 1, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 114, 111, 111, 116, 0, 32, 243, 232, 55, 175, 211, 24, 186, 215, 86, 148, 51, 229, 134, 66, 16, 5, 226, 178, 61, 254, 201, 66, 251, 149, 220, 215, 130, 218, 100, 63, 182, 199, 109, 121, 115, 113, 108, 0, 99, 97, 99, 104, 105, 110, 103, 95, 115, 104, 97, 50, 95, 112, 97, 115, 115, 119, 111, 114, 100, 0, 127, 3, 95, 111, 115, 9, 109, 97, 99, 111, 115, 49, 51, 46, 48, 9, 95, 112, 108, 97, 116, 102, 111, 114, 109, 5, 97, 114, 109, 54, 52, 15, 95, 99, 108, 105, 101, 110, 116, 95, 118, 101, 114, 115, 105, 111, 110, 6, 56, 46, 48, 46, 51, 50, 12, 95, 99, 108, 105, 101, 110, 116, 95, 110, 97, 109, 101, 8, 108, 105, 98, 109, 121, 115, 113, 108, 4, 95, 112, 105, 100, 5, 50, 56, 55, 52, 50, 7, 111, 115, 95, 117, 115, 101, 114, 13, 114, 111, 104, 105, 116, 46, 97, 103, 114, 97, 119, 97, 108, 12, 112, 114, 111, 103, 114, 97, 109, 95, 110, 97, 109, 101, 5, 109, 121, 115, 113, 108};
+            //out_buffer_1.add(buff_val_1, 230);
+            const uint8_t buff_val_1[230]{226, 0, 0, 2, 141, 174, 255, 25, 0, 0, 0, 1, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 114, 111, 111, 116, 0, 32, 255, 245, 208, 223, 144, 73, 8, 36, 64, 217, 112, 146, 68, 35, 204, 110, 204, 47, 6, 26, 165, 96, 50, 48, 124, 80, 16, 104, 19, 233, 43, 189, 109, 121, 115, 113, 108, 0, 99, 97, 99, 104, 105, 110, 103, 95, 115, 104, 97, 50, 95, 112, 97, 115, 115, 119, 111, 114, 100, 0, 127, 3, 95, 111, 115, 9, 109, 97, 99, 111, 115, 49, 51, 46, 48, 9, 95, 112, 108, 97, 116, 102, 111, 114, 109, 5, 97, 114, 109, 54, 52, 15, 95, 99, 108, 105, 101, 110, 116, 95, 118, 101, 114, 115, 105, 111, 110, 6, 56, 46, 48, 46, 51, 50, 12, 95, 99, 108, 105, 101, 110, 116, 95, 110, 97, 109, 101, 8, 108, 105, 98, 109, 121, 115, 113, 108, 4, 95, 112, 105, 100, 5, 52, 49, 57, 55, 48, 7, 111, 115, 95, 117, 115, 101, 114, 13, 114, 111, 104, 105, 116, 46, 97, 103, 114, 97, 119, 97, 108, 12, 112, 114, 111, 103, 114, 97, 109, 95, 110, 97, 109, 101, 5, 109, 121, 115, 113, 108};
+            out_buffer_1.add(buff_val_1, 230);
+            this->upstream_->encodeData(out_buffer_1, false);
+            ENVOY_LOG(info, "ROHIT: Enabling Reads.");
+            read_callbacks_->connection().readDisable(false);
+          } else {
+            ENVOY_CONN_LOG(info,
+                           "ROHIT: cannot enable upstream secure transport. Check "
+                           "configuration. Terminating.",
+                           read_callbacks->connection());
+            read_callbacks->connection().close(Network::ConnectionCloseType::NoFlush);
+          }
+          // DO NOT REPEAT THIS
+          init_ = false;
+        }
+        return true;
+      });
+    }
+    write_init_ = false;
+  } else {
+    getStreamInfo().getUpstreamBytesMeter()->addWireBytesReceived(data.length());
+    getStreamInfo().getDownstreamBytesMeter()->addWireBytesSent(data.length());
+    read_callbacks_->connection().write(data, end_stream);
+  }
+
   ASSERT(0 == data.length());
   resetIdleTimer(); // TODO(ggreenway) PERF: do we need to reset timer on both send and receive?
 }
 
 void Filter::onUpstreamEvent(Network::ConnectionEvent event) {
+  ENVOY_LOG(debug, "TCP:onUpstreamEvent(), event: {}", static_cast<int>(event));
   if (event == Network::ConnectionEvent::ConnectedZeroRtt) {
     return;
   }
@@ -825,7 +955,7 @@ void Filter::onUpstreamConnection() {
   connecting_ = false;
   // Re-enable downstream reads now that the upstream connection is established
   // so we have a place to send downstream data to.
-  read_callbacks_->connection().readDisable(false);
+  // read_callbacks_->connection().readDisable(false);
 
   read_callbacks_->upstreamHost()->outlierDetector().putResult(
       Upstream::Outlier::Result::LocalOriginConnectSuccessFinal);
