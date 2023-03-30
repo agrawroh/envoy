@@ -649,7 +649,107 @@ Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
 
   // ROHIT: Manual Processing
   ENVOY_LOG(info, "ROHIT: onData() = {}", data.length());
-  if (data.length() == 335) {
+  if (data.length() == 230) {
+    // ROHIT: Drain Data
+    ENVOY_LOG(info, "ROHIT: Draining Data.");
+    data.drain(data.length());
+
+    // Here we can inspect the 230 bytes of data before draining it and then connect to the
+    // appropriate upstream
+
+    /*
+    // Set the tcp_proxy cluster to the same value as SNI. The data is mutable to allow
+    // other filters to change it.
+    read_callbacks_->connection().streamInfo().filterState()->setData(
+        TcpProxy::PerConnectionCluster::key(),
+        std::make_unique<TcpProxy::PerConnectionCluster>(sni),
+        StreamInfo::FilterState::StateType::Mutable, StreamInfo::FilterState::LifeSpan::Connection);
+    */
+
+    // =================================== UPSTREAM CONNECTION =====================================
+    if (config_->maxDownstreamConnectionDuration()) {
+      connection_duration_timer_ = read_callbacks_->connection().dispatcher().createTimer(
+          [this]() -> void { onMaxDownstreamConnectionDuration(); });
+      connection_duration_timer_->enableTimer(config_->maxDownstreamConnectionDuration().value());
+    }
+
+    if (config_->accessLogFlushInterval().has_value()) {
+      access_log_flush_timer_ = read_callbacks_->connection().dispatcher().createTimer(
+          [this]() -> void { onAccessLogFlushInterval(); });
+      resetAccessLogFlushTimer();
+    }
+
+    // Set UUID for the connection. This is used for logging and tracing.
+    getStreamInfo().setStreamIdProvider(
+        std::make_shared<StreamInfo::StreamIdProviderImpl>(config_->randomGenerator().uuid()));
+
+    ASSERT(upstream_ == nullptr);
+    route_ = pickRoute();
+    // We can return the status from here if things fail.
+    establishUpstreamConnection();
+    // =================================== UPSTREAM CONNECTION =====================================
+  } else {
+    getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(data.length());
+    if (upstream_) {
+      getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(data.length());
+      upstream_->encodeData(data, end_stream);
+    }
+  }
+
+  // The upstream should consume all of the data.
+  // Before there is an upstream the connection should be readDisabled. If the upstream is
+  // destroyed, there should be no further reads as well.
+  ASSERT(0 == data.length());
+  resetIdleTimer(); // TODO(ggreenway) PERF: do we need to reset timer on both send and receive?
+  return Network::FilterStatus::StopIteration;
+}
+
+Network::FilterStatus Filter::onNewConnection() {
+  ENVOY_CONN_LOG(trace, "tcp_proxy: onNewConnection() called", read_callbacks_->connection());
+  read_callbacks_->connection().readDisable(false);
+  return Network::FilterStatus::StopIteration;
+}
+
+bool Filter::startUpstreamSecureTransport() { return upstream_->startUpstreamSecureTransport(); }
+
+void Filter::onDownstreamEvent(Network::ConnectionEvent event) {
+  if (event == Network::ConnectionEvent::LocalClose ||
+      event == Network::ConnectionEvent::RemoteClose) {
+    downstream_closed_ = true;
+    // Cancel the potential odcds callback.
+    cluster_discovery_handle_ = nullptr;
+  }
+
+  ENVOY_CONN_LOG(trace, "on downstream event {}, has upstream = {}", read_callbacks_->connection(),
+                 static_cast<int>(event), upstream_ != nullptr);
+
+  if (upstream_) {
+    Tcp::ConnectionPool::ConnectionDataPtr conn_data(upstream_->onDownstreamEvent(event));
+    if (conn_data != nullptr &&
+        conn_data->connection().state() != Network::Connection::State::Closed) {
+      config_->drainManager().add(config_->sharedConfig(), std::move(conn_data),
+                                  std::move(upstream_callbacks_), std::move(idle_timer_),
+                                  read_callbacks_->upstreamHost());
+    }
+    if (event == Network::ConnectionEvent::LocalClose ||
+        event == Network::ConnectionEvent::RemoteClose) {
+      upstream_.reset();
+      disableIdleTimer();
+    }
+  }
+  if (generic_conn_pool_) {
+    if (event == Network::ConnectionEvent::LocalClose ||
+        event == Network::ConnectionEvent::RemoteClose) {
+      // Cancel the conn pool request and close any excess pending requests.
+      generic_conn_pool_.reset();
+    }
+  }
+}
+
+void Filter::onUpstreamData(Buffer::Instance& data, bool end_stream) {
+  ENVOY_CONN_LOG(trace, "upstream connection received {} bytes, end_stream={}",
+                 read_callbacks_->connection(), data.length(), end_stream);
+  if (data.length() == 78) {
     // ROHIT: Drain Data
     ENVOY_LOG(info, "ROHIT: Draining Data.");
     data.drain(data.length());
@@ -715,85 +815,11 @@ Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
       });
     }
   } else {
-    getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(data.length());
-    if (upstream_) {
-      getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(data.length());
-      upstream_->encodeData(data, end_stream);
-    }
+    getStreamInfo().getUpstreamBytesMeter()->addWireBytesReceived(data.length());
+    getStreamInfo().getDownstreamBytesMeter()->addWireBytesSent(data.length());
+    read_callbacks_->connection().write(data, end_stream);
   }
 
-  // The upstream should consume all of the data.
-  // Before there is an upstream the connection should be readDisabled. If the upstream is
-  // destroyed, there should be no further reads as well.
-  ASSERT(0 == data.length());
-  resetIdleTimer(); // TODO(ggreenway) PERF: do we need to reset timer on both send and receive?
-  return Network::FilterStatus::StopIteration;
-}
-
-Network::FilterStatus Filter::onNewConnection() {
-  if (config_->maxDownstreamConnectionDuration()) {
-    connection_duration_timer_ = read_callbacks_->connection().dispatcher().createTimer(
-        [this]() -> void { onMaxDownstreamConnectionDuration(); });
-    connection_duration_timer_->enableTimer(config_->maxDownstreamConnectionDuration().value());
-  }
-
-  if (config_->accessLogFlushInterval().has_value()) {
-    access_log_flush_timer_ = read_callbacks_->connection().dispatcher().createTimer(
-        [this]() -> void { onAccessLogFlushInterval(); });
-    resetAccessLogFlushTimer();
-  }
-
-  // Set UUID for the connection. This is used for logging and tracing.
-  getStreamInfo().setStreamIdProvider(
-      std::make_shared<StreamInfo::StreamIdProviderImpl>(config_->randomGenerator().uuid()));
-
-  ASSERT(upstream_ == nullptr);
-  route_ = pickRoute();
-  return establishUpstreamConnection();
-}
-
-bool Filter::startUpstreamSecureTransport() { return upstream_->startUpstreamSecureTransport(); }
-
-void Filter::onDownstreamEvent(Network::ConnectionEvent event) {
-  if (event == Network::ConnectionEvent::LocalClose ||
-      event == Network::ConnectionEvent::RemoteClose) {
-    downstream_closed_ = true;
-    // Cancel the potential odcds callback.
-    cluster_discovery_handle_ = nullptr;
-  }
-
-  ENVOY_CONN_LOG(trace, "on downstream event {}, has upstream = {}", read_callbacks_->connection(),
-                 static_cast<int>(event), upstream_ != nullptr);
-
-  if (upstream_) {
-    Tcp::ConnectionPool::ConnectionDataPtr conn_data(upstream_->onDownstreamEvent(event));
-    if (conn_data != nullptr &&
-        conn_data->connection().state() != Network::Connection::State::Closed) {
-      config_->drainManager().add(config_->sharedConfig(), std::move(conn_data),
-                                  std::move(upstream_callbacks_), std::move(idle_timer_),
-                                  read_callbacks_->upstreamHost());
-    }
-    if (event == Network::ConnectionEvent::LocalClose ||
-        event == Network::ConnectionEvent::RemoteClose) {
-      upstream_.reset();
-      disableIdleTimer();
-    }
-  }
-  if (generic_conn_pool_) {
-    if (event == Network::ConnectionEvent::LocalClose ||
-        event == Network::ConnectionEvent::RemoteClose) {
-      // Cancel the conn pool request and close any excess pending requests.
-      generic_conn_pool_.reset();
-    }
-  }
-}
-
-void Filter::onUpstreamData(Buffer::Instance& data, bool end_stream) {
-  ENVOY_CONN_LOG(trace, "upstream connection received {} bytes, end_stream={}",
-                 read_callbacks_->connection(), data.length(), end_stream);
-  getStreamInfo().getUpstreamBytesMeter()->addWireBytesReceived(data.length());
-  getStreamInfo().getDownstreamBytesMeter()->addWireBytesSent(data.length());
-  read_callbacks_->connection().write(data, end_stream);
   ASSERT(0 == data.length());
   resetIdleTimer(); // TODO(ggreenway) PERF: do we need to reset timer on both send and receive?
 }
@@ -835,7 +861,7 @@ void Filter::onUpstreamConnection() {
   connecting_ = false;
   // Re-enable downstream reads now that the upstream connection is established
   // so we have a place to send downstream data to.
-  read_callbacks_->connection().readDisable(false);
+  // read_callbacks_->connection().readDisable(false);
 
   read_callbacks_->upstreamHost()->outlierDetector().putResult(
       Upstream::Outlier::Result::LocalOriginConnectSuccessFinal);
