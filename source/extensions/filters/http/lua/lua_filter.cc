@@ -205,6 +205,7 @@ PerLuaCodeSetup::PerLuaCodeSetup(const std::string& lua_code, ThreadLocal::SlotA
   lua_state_.registerType<ListenerDynamicMetadataMapIterator>();
   lua_state_.registerType<StreamHandleWrapper>();
   lua_state_.registerType<PublicKeyWrapper>();
+  lua_state_.registerType<PrivateKeyWrapper>();
 
   const Filters::Common::Lua::InitializerList initializers(
       // EnvoyTimestampResolution "enum".
@@ -713,6 +714,32 @@ int StreamHandleWrapper::luaVerifySignature(lua_State* state) {
     lua_pushnil(state);
   } else {
     lua_pushlstring(state, output.error_message_.data(), output.error_message_.size());
+  }
+  return 2;
+}
+
+int StreamHandleWrapper::luaDecryptText(lua_State* state) {
+  // Step 1: Get the key pointer.
+  auto key = luaL_checkstring(state, 2);
+  auto ptr = private_key_storage_.find(key);
+  if (ptr == private_key_storage_.end()) {
+    luaL_error(state, "invalid private key");
+    return 0;
+  }
+
+  // Step 2: Get encrypted text from args.
+  const char* cipher_text = luaL_checkstring(state, 3);
+  int cipher_text_len = luaL_checknumber(state, 4);
+  const std::vector<uint8_t> cipher_text_vec(cipher_text, cipher_text + cipher_text_len);
+
+  // Step 3: Decrypt cipher text.
+  auto& crypto_util = Envoy::Common::Crypto::UtilitySingleton::get();
+  auto output = crypto_util.decrypt(*ptr->second, cipher_text_vec);
+  lua_pushboolean(state, output.result_);
+  if (output.result_) {
+    lua_pushlstring(state, output.data_.data(), output.data_length_);
+  } else {
+    lua_pushlstring(state, output.data_.data(), output.data_length_);
   }
   return 2;
 }

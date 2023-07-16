@@ -185,6 +185,7 @@ public:
             {"importPublicKey", static_luaImportPublicKey},
             {"importPrivateKey", static_luaImportPrivateKey},
             {"verifySignature", static_luaVerifySignature},
+            {"decryptText", static_luaDecryptText},
             {"base64Escape", static_luaBase64Escape},
             {"timestamp", static_luaTimestamp},
             {"timestampString", static_luaTimestampString}};
@@ -281,6 +282,12 @@ private:
    * the second element stores the error message
    */
   DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaVerifySignature);
+
+  /**
+   * Decrypt cipher text.
+   * TODO(agrawroh)
+   */
+  DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaDecryptText);
 
   /**
    * Import public key.

@@ -29,24 +29,19 @@ struct VerificationOutput {
 
 struct DecryptionOutput {
   /**
-   * Decryption result. If result_ is true, error_message_ is empty.
+   * Decryption result.
    */
   bool result_;
 
   /**
-   * Error message when decryption failed.
+   * Error message when decryption failed, plaintext when successful.
    */
-  std::string error_message_;
+  std::string data_;
 
   /**
-   * Cleartext string when decryption succeed.
+   * Length of the data.
    */
-  std::string clear_text_;
-
-  /**
-   * Cleartext bytes when decryption succeed.
-   */
-  size_t length_;
+  size_t data_length_;
 };
 
 class Utility {
