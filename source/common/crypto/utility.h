@@ -27,6 +27,28 @@ struct VerificationOutput {
   std::string error_message_;
 };
 
+struct DecryptionOutput {
+  /**
+   * Decryption result. If result_ is true, error_message_ is empty.
+   */
+  bool result_;
+
+  /**
+   * Error message when decryption failed.
+   */
+  std::string error_message_;
+
+  /**
+   * Cleartext string when decryption succeed.
+   */
+  std::string clear_text_;
+
+  /**
+   * Cleartext bytes when decryption succeed.
+   */
+  size_t length_;
+};
+
 class Utility {
 public:
   virtual ~Utility() = default;
@@ -59,6 +81,15 @@ public:
   virtual const VerificationOutput verifySignature(absl::string_view hash, CryptoObject& key,
                                                    const std::vector<uint8_t>& signature,
                                                    const std::vector<uint8_t>& text) PURE;
+
+  /**
+   * Decrypt cipher text.
+   * @param key pointer to EVP_PKEY private key
+   * @param cipher_text cipher text
+   * @return If the result_ is true, the error_message_ is empty; otherwise, the error_message
+   */
+  virtual const DecryptionOutput decrypt(CryptoObject& key,
+                                         const std::vector<uint8_t>& cipher_text) PURE;
 
   /**
    * Import public key.

@@ -35,6 +35,84 @@ std::vector<uint8_t> UtilityImpl::getSha256Hmac(const std::vector<uint8_t>& key,
   return hmac;
 }
 
+const DecryptionOutput UtilityImpl::decrypt(CryptoObject& key,
+                                            const std::vector<uint8_t>& cipher_text) {
+  // Step 1: get private key
+  auto pkey_wrapper = Common::Crypto::Access::getTyped<Common::Crypto::PrivateKeyObject>(key);
+  EVP_PKEY* pkey = pkey_wrapper->getEVP_PKEY();
+  if (pkey == nullptr) {
+    return {false, "Failed to get private key for decryption.", "", 0};
+  }
+
+  // Step 2: initialize EVP_PKEY_CTX
+  EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+  if (!ctx) {
+    return {false, "Failed to create context for decryption.", "", 0};
+  }
+
+  int ok = EVP_PKEY_decrypt_init(ctx);
+  if (!ok) {
+    EVP_PKEY_CTX_free(ctx);
+    return {false, "Failed to initialize private key for decryption.", "", 0};
+  }
+
+  // Step 3: decrypt cipher text
+  size_t plaintext_size;
+  ok = EVP_PKEY_decrypt(ctx, nullptr, &plaintext_size, cipher_text.data(), cipher_text.size());
+  if (!ok) {
+    EVP_PKEY_CTX_free(ctx);
+    return {false, "Failed to get plaintext size.", "", 0};
+  }
+
+  std::vector<uint8_t> plaintext(plaintext_size);
+  ok = EVP_PKEY_decrypt(ctx, plaintext.data(), &plaintext_size, cipher_text.data(), cipher_text.size());
+
+  // Step 4: check result
+  std::string p_text(plaintext.begin(), plaintext.end());
+  std::cout << "[ROHIT]: " << p_text << "\n";
+  EVP_PKEY_CTX_free(ctx);
+  if (ok == 1) {
+    return {true, "", p_text, p_text.size()};
+  }
+
+  return {false, "", "", 0};
+}
+
+/*
+const DecryptionOutput UtilityImpl::decrypt(CryptoObject& key,
+                                            const std::vector<uint8_t>& cipher_text) {
+  bssl::ScopedEVP_PKEY_CTX ctx;
+
+  // Step 1: get private key
+  auto pkey_wrapper = Common::Crypto::Access::getTyped<Common::Crypto::PrivateKeyObject>(key);
+  EVP_PKEY* pkey = pkey_wrapper->getEVP_PKEY();
+  if (pkey == nullptr) {
+    return {false, "Failed to get private key for decryption.", "", 0};
+  }
+
+  // Step 2: initialize EVP_PKEY_CTX
+  int ok = EVP_PKEY_decrypt_init(ctx.get());
+  if (!ok) {
+    return {false, "Failed to initialize private key for decryption.", "", 0};
+  }
+
+  // Step 3: decrypt cipher text
+  std::vector<uint8_t> plaintext;
+  size_t plaintext_size;
+  ok = EVP_PKEY_decrypt(ctx.get(), &plaintext, &plaintext_size, cipher_text.data(),
+                        cipher_text.size());
+
+  // Step 5: check result
+  std::string p_text(plaintext.begin(), plaintext.end());
+  std::cout << "[ROHIT]: " << p_text << "\n";
+  if (ok == 1) {
+    return {true, "", p_text, p_text.size()};
+  }
+
+  return {false, "", "", 0};
+}
+*/
+
 const VerificationOutput UtilityImpl::verifySignature(absl::string_view hash, CryptoObject& key,
                                                       const std::vector<uint8_t>& signature,
                                                       const std::vector<uint8_t>& text) {

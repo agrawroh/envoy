@@ -18,6 +18,8 @@ public:
   const VerificationOutput verifySignature(absl::string_view hash, CryptoObject& key,
                                            const std::vector<uint8_t>& signature,
                                            const std::vector<uint8_t>& text) override;
+  const DecryptionOutput decrypt(CryptoObject& key,
+                                 const std::vector<uint8_t>& cipher_text) override;
   CryptoObjectPtr importPublicKey(const std::vector<uint8_t>& key) override;
   CryptoObjectPtr importPrivateKey(const std::vector<uint8_t>& key) override;
 
