@@ -77,6 +77,12 @@ CryptoObjectPtr UtilityImpl::importPublicKey(const std::vector<uint8_t>& key) {
   return std::make_unique<PublicKeyObject>(EVP_parse_public_key(&cbs));
 }
 
+CryptoObjectPtr UtilityImpl::importPrivateKey(const std::vector<uint8_t>& key) {
+  CBS cbs({key.data(), key.size()});
+
+  return std::make_unique<PrivateKeyObject>(EVP_parse_private_key(&cbs));
+}
+
 const EVP_MD* UtilityImpl::getHashFunction(absl::string_view name) {
   const std::string hash = absl::AsciiStrToLower(name);
 

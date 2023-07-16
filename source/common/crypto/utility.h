@@ -66,6 +66,13 @@ public:
    * @return pointer to EVP_PKEY public key
    */
   virtual CryptoObjectPtr importPublicKey(const std::vector<uint8_t>& key) PURE;
+
+  /**
+   * Import private key.
+   * @param key key string
+   * @return pointer to EVP_PKEY private key
+   */
+  virtual CryptoObjectPtr importPrivateKey(const std::vector<uint8_t>& key) PURE;
 };
 
 using UtilitySingleton = InjectableSingleton<Utility>;

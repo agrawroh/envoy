@@ -744,6 +744,33 @@ int StreamHandleWrapper::luaImportPublicKey(lua_State* state) {
   return 1;
 }
 
+int StreamHandleWrapper::luaImportPrivateKey(lua_State* state) {
+  // Get byte array and the length.
+  const char* str = luaL_checkstring(state, 2);
+  int n = luaL_checknumber(state, 3);
+  std::vector<uint8_t> key(str, str + n);
+  if (private_key_wrapper_.get() != nullptr) {
+    private_key_wrapper_.pushStack();
+  } else {
+    auto& crypto_util = Envoy::Common::Crypto::UtilitySingleton::get();
+    Envoy::Common::Crypto::CryptoObjectPtr crypto_ptr = crypto_util.importPrivateKey(key);
+    auto wrapper = Envoy::Common::Crypto::Access::getTyped<Envoy::Common::Crypto::PrivateKeyObject>(
+        *crypto_ptr);
+    EVP_PKEY* pkey = wrapper->getEVP_PKEY();
+    if (pkey == nullptr) {
+      // TODO(dio): Call luaL_error here instead of failing silently. However, the current behavior
+      // is to return nil (when calling get() to the wrapped object, hence we create a wrapper
+      // initialized by an empty string here) when importing a private key is failed.
+      private_key_wrapper_.reset(PrivateKeyWrapper::create(state, EMPTY_STRING), true);
+    }
+
+    private_key_storage_.insert({std::string(str).substr(0, n), std::move(crypto_ptr)});
+    private_key_wrapper_.reset(PrivateKeyWrapper::create(state, str), true);
+  }
+
+  return 1;
+}
+
 int StreamHandleWrapper::luaBase64Escape(lua_State* state) {
   absl::string_view input = Filters::Common::Lua::getStringViewFromLuaString(state, 2);
   auto output = absl::Base64Escape(input);

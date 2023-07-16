@@ -183,6 +183,7 @@ public:
             {"connection", static_luaConnection},
             {"listenerStreamInfo", static_luaListenerStreamInfo},
             {"importPublicKey", static_luaImportPublicKey},
+            {"importPrivateKey", static_luaImportPrivateKey},
             {"verifySignature", static_luaVerifySignature},
             {"base64Escape", static_luaBase64Escape},
             {"timestamp", static_luaTimestamp},
@@ -290,6 +291,14 @@ private:
   DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaImportPublicKey);
 
   /**
+   * Import private key.
+   * @param 1 (string) keyder string
+   * @param 2 (int)    length of keyder string
+   * @return pointer to private key
+   */
+  DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaImportPrivateKey);
+
+  /**
    * This is the closure/iterator returned by luaBodyChunks() above.
    */
   DECLARE_LUA_CLOSURE(StreamHandleWrapper, luaBodyIterator);
@@ -340,6 +349,7 @@ private:
     listener_stream_info_wrapper_.reset();
     connection_wrapper_.reset();
     public_key_wrapper_.reset();
+    private_key_wrapper_.reset();
   }
 
   // Http::AsyncClient::Callbacks
@@ -367,6 +377,7 @@ private:
   Filters::Common::Lua::LuaDeathRef<ListenerStreamInfoWrapper> listener_stream_info_wrapper_;
   Filters::Common::Lua::LuaDeathRef<Filters::Common::Lua::ConnectionWrapper> connection_wrapper_;
   Filters::Common::Lua::LuaDeathRef<PublicKeyWrapper> public_key_wrapper_;
+  Filters::Common::Lua::LuaDeathRef<PrivateKeyWrapper> private_key_wrapper_;
   State state_{State::Running};
   std::function<void()> yield_callback_;
   Http::AsyncClient::Request* http_request_{};
@@ -374,6 +385,9 @@ private:
 
   // The inserted crypto object pointers will not be removed from this map.
   absl::flat_hash_map<std::string, Envoy::Common::Crypto::CryptoObjectPtr> public_key_storage_;
+
+  // The inserted crypto object pointers will not be removed from this map.
+  absl::flat_hash_map<std::string, Envoy::Common::Crypto::CryptoObjectPtr> private_key_storage_;
 };
 
 /**

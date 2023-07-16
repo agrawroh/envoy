@@ -19,6 +19,7 @@ public:
                                            const std::vector<uint8_t>& signature,
                                            const std::vector<uint8_t>& text) override;
   CryptoObjectPtr importPublicKey(const std::vector<uint8_t>& key) override;
+  CryptoObjectPtr importPrivateKey(const std::vector<uint8_t>& key) override;
 
 private:
   const EVP_MD* getHashFunction(absl::string_view name);
