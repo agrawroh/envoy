@@ -183,7 +183,10 @@ public:
             {"connection", static_luaConnection},
             {"listenerStreamInfo", static_luaListenerStreamInfo},
             {"importPublicKey", static_luaImportPublicKey},
+            {"importPrivateKey", static_luaImportPrivateKey},
             {"verifySignature", static_luaVerifySignature},
+            {"decryptText", static_luaDecryptText},
+            {"encryptText", static_luaEncryptText},
             {"base64Escape", static_luaBase64Escape},
             {"timestamp", static_luaTimestamp},
             {"timestampString", static_luaTimestampString}};
@@ -282,12 +285,42 @@ private:
   DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaVerifySignature);
 
   /**
+   * Decrypts given cipher text using the provided private key.
+   * @param 1 (void*)  pointer to the private key
+   * @param 2 (string) cipher text string
+   * @param 3 (int)    length of the cipher text
+   * @return (bool, string) If the first element is true, the second element contains the plain text
+   * message upon successful decryption of the given cipher text; otherwise, the second element
+   * contains the error message returned by the decryption function.
+   */
+  DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaDecryptText);
+
+  /**
+   * Encrypts given plaintext using the provided public key.
+   * @param 1 (void*)  pointer to the public key
+   * @param 2 (string) plaintext string
+   * @param 3 (int)    length of the plaintext
+   * @return (bool, string) If the first element is true, the second element contains the cipher
+   * text upon successful encryption of the given plaintext message; otherwise, the second element
+   * contains the error message returned by the encryption function.
+   */
+  DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaEncryptText);
+
+  /**
    * Import public key.
    * @param 1 (string) keyder string
    * @param 2 (int)    length of keyder string
    * @return pointer to public key
    */
   DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaImportPublicKey);
+
+  /**
+   * Import private key.
+   * @param 1 (string) keyder string
+   * @param 2 (int)    length of keyder string
+   * @return pointer to private key
+   */
+  DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaImportPrivateKey);
 
   /**
    * This is the closure/iterator returned by luaBodyChunks() above.
@@ -340,6 +373,7 @@ private:
     listener_stream_info_wrapper_.reset();
     connection_wrapper_.reset();
     public_key_wrapper_.reset();
+    private_key_wrapper_.reset();
   }
 
   // Http::AsyncClient::Callbacks
@@ -367,6 +401,7 @@ private:
   Filters::Common::Lua::LuaDeathRef<ListenerStreamInfoWrapper> listener_stream_info_wrapper_;
   Filters::Common::Lua::LuaDeathRef<Filters::Common::Lua::ConnectionWrapper> connection_wrapper_;
   Filters::Common::Lua::LuaDeathRef<PublicKeyWrapper> public_key_wrapper_;
+  Filters::Common::Lua::LuaDeathRef<PrivateKeyWrapper> private_key_wrapper_;
   State state_{State::Running};
   std::function<void()> yield_callback_;
   Http::AsyncClient::Request* http_request_{};
@@ -374,6 +409,9 @@ private:
 
   // The inserted crypto object pointers will not be removed from this map.
   absl::flat_hash_map<std::string, Envoy::Common::Crypto::CryptoObjectPtr> public_key_storage_;
+
+  // The inserted crypto object pointers will not be removed from this map.
+  absl::flat_hash_map<std::string, Envoy::Common::Crypto::CryptoObjectPtr> private_key_storage_;
 };
 
 /**
