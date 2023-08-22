@@ -786,7 +786,7 @@ void ConnectionManagerImpl::RdsRouteConfigUpdateRequester::requestSrdsUpdate(
               if (scope_exist) {
                 parent_.refreshCachedRoute();
               }
-              (*cb)(scope_exist && parent_.hasCachedRoute());
+              (*cb)(scope_exist&& parent_.hasCachedRoute());
             }
           });
   scoped_route_config_provider_->onDemandRdsUpdate(std::move(scope_key), thread_local_dispatcher,
@@ -2039,6 +2039,14 @@ void ConnectionManagerImpl::ActiveStream::setRoute(Router::RouteConstSharedPtr r
     auto* cluster = connection_manager_.cluster_manager_.getThreadLocalCluster(
         route->routeEntry()->clusterName());
     cached_cluster_info_ = (nullptr == cluster) ? nullptr : cluster->info();
+
+    // Set the route name in the filter manager's stream info.
+    const auto* direct_response = route->directResponseEntry();
+    if (direct_response != nullptr) {
+      filter_manager_.streamInfo().setRouteName(std::string(direct_response->routeName()));
+    } else {
+      filter_manager_.streamInfo().setRouteName(std::string(route->routeEntry()->routeName()));
+    }
   }
 
   // Update route and cluster info in the filter manager's stream info.
