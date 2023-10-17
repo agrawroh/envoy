@@ -739,6 +739,25 @@ int StreamHandleWrapper::luaDecryptText(lua_State* state) {
   return 2;
 }
 
+int StreamHandleWrapper::luaDecryptSymmetric(lua_State* state) {
+  // Step 1: Get symmetric key string from args.
+  const char* key = luaL_checkstring(state, 2);
+  int key_len = luaL_checknumber(state, 3);
+  const std::vector<uint8_t> key_vec(key, key + key_len);
+
+  // Step 2: Get ciphertext string text from args.
+  const char* ciphertext = luaL_checkstring(state, 4);
+  int ciphertext_len = luaL_checknumber(state, 5);
+  const std::vector<uint8_t> ciphertext_vec(ciphertext, ciphertext + ciphertext_len);
+
+  // Step 3: Decrypt ciphertext using symmetric key.
+  auto& crypto_util = Envoy::Common::Crypto::UtilitySingleton::get();
+  auto output = crypto_util.decryptSymmetric(key_vec, ciphertext_vec);
+  lua_pushboolean(state, output.result_);
+  lua_pushlstring(state, output.data_.data(), output.data_.size());
+  return 2;
+}
+
 int StreamHandleWrapper::luaEncryptText(lua_State* state) {
   // Step 1: Get the public key pointer.
   auto key = luaL_checkstring(state, 2);
@@ -756,6 +775,25 @@ int StreamHandleWrapper::luaEncryptText(lua_State* state) {
   // Step 3: Encrypt plaintext using public key.
   auto& crypto_util = Envoy::Common::Crypto::UtilitySingleton::get();
   auto output = crypto_util.encrypt(*ptr->second, plaintext_vec);
+  lua_pushboolean(state, output.result_);
+  lua_pushlstring(state, output.data_.data(), output.data_.size());
+  return 2;
+}
+
+int StreamHandleWrapper::luaEncryptSymmetric(lua_State* state) {
+  // Step 1: Get symmetric key string from args.
+  const char* key = luaL_checkstring(state, 2);
+  int key_len = luaL_checknumber(state, 3);
+  const std::vector<uint8_t> key_vec(key, key + key_len);
+
+  // Step 2: Get plaintext string text from args.
+  const char* plaintext = luaL_checkstring(state, 4);
+  int plaintext_len = luaL_checknumber(state, 5);
+  const std::vector<uint8_t> plaintext_vec(plaintext, plaintext + plaintext_len);
+
+  // Step 3: Encrypt plaintext using symmetric key.
+  auto& crypto_util = Envoy::Common::Crypto::UtilitySingleton::get();
+  auto output = crypto_util.encryptSymmetric(key_vec, plaintext_vec);
   lua_pushboolean(state, output.result_);
   lua_pushlstring(state, output.data_.data(), output.data_.size());
   return 2;

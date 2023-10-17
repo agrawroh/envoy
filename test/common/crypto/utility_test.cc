@@ -25,6 +25,37 @@ TEST(UtilityTest, TestSha256DigestWithEmptyBuffer) {
             Hex::encode(digest));
 }
 
+TEST(UtilityTest, TestEncryptSymmetric) {
+  // Initialize your symmetric encryption key
+  const std::string inputKey = "MX3qLUsX9NUvxBIzot20Gxrd+G8j6Y24BzvNpn/XHhQ=";
+  const std::vector<uint8_t> key(inputKey.begin(), inputKey.end());
+  const std::string inputText = "Hello, World!";
+  const std::vector<uint8_t> plaintext(inputText.begin(), inputText.end());
+
+  // Encrypt the plaintext using the key
+  auto result = UtilitySingleton::get().encryptSymmetric(key, plaintext);
+
+  // Perform assertions
+  EXPECT_TRUE(result.result_);
+  EXPECT_EQ("\x83.\xD3>\xF4_\xC6\x8F\xAFl\xB5,\x89P\xAE\xE1", result.data_);
+}
+
+TEST(UtilityTest, TestDecryptSymmetric) {
+  // Initialize your symmetric encryption key
+  const std::string inputKey = "MX3qLUsX9NUvxBIzot20Gxrd+G8j6Y24BzvNpn/XHhQ=";
+  const std::vector<uint8_t> key(inputKey.begin(), inputKey.end());
+  // Initialize your ciphertext
+  const std::string inputCipher = "\x83.\xD3>\xF4_\xC6\x8F\xAFl\xB5,\x89P\xAE\xE1";
+  const std::vector<uint8_t> ciphertext(inputCipher.begin(), inputCipher.end());
+
+  // Decrypt the ciphertext using the key
+  const auto result = UtilitySingleton::get().decryptSymmetric(key, ciphertext);
+
+  // Perform assertions
+  EXPECT_TRUE(result.result_);
+  EXPECT_EQ("Hello, World!", result.data_);
+}
+
 TEST(UtilityTest, TestSha256DigestGrowingBuffer) {
   // Adding multiple slices to the buffer
   Buffer::OwnedImpl buffer("slice 1");

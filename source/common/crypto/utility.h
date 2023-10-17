@@ -63,6 +63,24 @@ public:
                                              absl::string_view message) PURE;
 
   /**
+   * Encrypt plaintext using the provided symmetric key.
+   * @param key the symmetric key.
+   * @param plaintext the plaintext message.
+   * @return the encrypted message.
+   */
+  virtual const EncryptionDecryptionOutput
+  encryptSymmetric(const std::vector<uint8_t>& key, const std::vector<uint8_t>& plaintext) PURE;
+
+  /**
+   * Decrypt cipher text using the provided symmetric key.
+   * @param key the symmetric key.
+   * @param ciphertext the cipher text.
+   * @return the decrypted message.
+   */
+  virtual const EncryptionDecryptionOutput
+  decryptSymmetric(const std::vector<uint8_t>& key, const std::vector<uint8_t>& ciphertext) PURE;
+
+  /**
    * Verify cryptographic signatures.
    * @param hash hash function(including SHA1, SHA224, SHA256, SHA384, SHA512)
    * @param key pointer to EVP_PKEY public key

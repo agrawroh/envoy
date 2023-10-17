@@ -187,6 +187,8 @@ public:
             {"verifySignature", static_luaVerifySignature},
             {"decryptText", static_luaDecryptText},
             {"encryptText", static_luaEncryptText},
+            {"decryptSymmetric", static_luaDecryptSymmetric},
+            {"encryptSymmetric", static_luaEncryptSymmetric},
             {"base64Escape", static_luaBase64Escape},
             {"timestamp", static_luaTimestamp},
             {"timestampString", static_luaTimestampString}};
@@ -296,6 +298,18 @@ private:
   DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaDecryptText);
 
   /**
+   * Decrypts given cipher text using the provided symmetric key.
+   * @param 2 (string) symmetric key string
+   * @param 3 (int)    length of the symmetric key
+   * @param 4 (string) cipher text string
+   * @param 5 (int)    length of the cipher text
+   * @return (bool, string) If the first element is true, the second element contains the plain text
+   * message upon successful decryption of the given cipher text; otherwise, the second element
+   * contains the error message returned by the decryption function.
+   */
+  DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaDecryptSymmetric);
+
+  /**
    * Encrypts given plaintext using the provided public key.
    * @param 1 (void*)  pointer to the public key
    * @param 2 (string) plaintext string
@@ -305,6 +319,18 @@ private:
    * contains the error message returned by the encryption function.
    */
   DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaEncryptText);
+
+  /**
+   * Encrypts given plaintext using the provided symmetric key.
+   * @param 2 (string) symmetric key string
+   * @param 3 (int)    length of the symmetric key
+   * @param 4 (string) plaintext string
+   * @param 5 (int)    length of the plaintext
+   * @return (bool, string) If the first element is true, the second element contains the cipher
+   * text upon successful encryption of the given plaintext message; otherwise, the second element
+   * contains the error message returned by the encryption function.
+   */
+  DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaEncryptSymmetric);
 
   /**
    * Import public key.

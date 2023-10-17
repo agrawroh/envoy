@@ -17,6 +17,90 @@ struct EVP_PKEY_CTX_deleter {
 
 using EVP_PKEY_CTX_ptr = std::unique_ptr<EVP_PKEY_CTX, EVP_PKEY_CTX_deleter>;
 
+struct EVP_CIPHER_CTX_deleter {
+  void operator()(EVP_CIPHER_CTX* ctx) const { EVP_CIPHER_CTX_free(ctx); }
+};
+
+using EVP_CIPHER_CTX_ptr = std::unique_ptr<EVP_CIPHER_CTX, EVP_CIPHER_CTX_deleter>;
+
+const EncryptionDecryptionOutput
+UtilityImpl::encryptSymmetric(const std::vector<uint8_t>& key,
+                              const std::vector<uint8_t>& plaintext) {
+  std::vector<uint8_t> ciphertext;
+
+  // Step 1: Initialize the cipher context
+  EVP_CIPHER_CTX_ptr ctx(EVP_CIPHER_CTX_new());
+  if (!ctx) {
+    return {false, "failed to initialize cipher context for encryption"};
+  }
+
+  // Step 2: Initialize the encryption operation
+  if (EVP_EncryptInit_ex(ctx.get(), EVP_aes_256_cbc(), nullptr, key.data(), nullptr) != 1) {
+    return {false, "failed to initialize encryption operation"};
+  }
+
+  // Set up the data buffer
+  int out_len;
+  ciphertext.resize(plaintext.size() + EVP_CIPHER_block_size(EVP_aes_256_cbc()));
+
+  // Step 3: Perform the encryption
+  if (EVP_EncryptUpdate(ctx.get(), ciphertext.data(), &out_len, plaintext.data(),
+                        plaintext.size()) != 1) {
+    return {false, "failed to encrypt plaintext"};
+  }
+
+  // Finalize the encryption
+  int final_len;
+  if (EVP_EncryptFinal_ex(ctx.get(), ciphertext.data() + out_len, &final_len) != 1) {
+    return {false, "failed to finalize the encryption operation"};
+  }
+
+  // Set the actual size of the ciphertext
+  ciphertext.resize(out_len + final_len);
+  std::string p_text(ciphertext.begin(), ciphertext.end());
+
+  return {true, p_text};
+}
+
+const EncryptionDecryptionOutput
+UtilityImpl::decryptSymmetric(const std::vector<uint8_t>& key,
+                              const std::vector<uint8_t>& ciphertext) {
+  std::vector<uint8_t> plaintext;
+
+  // Step 1: Initialize the cipher context
+  EVP_CIPHER_CTX_ptr ctx(EVP_CIPHER_CTX_new());
+  if (!ctx) {
+    return {false, "failed to initialize cipher context for decryption"};
+  }
+
+  // Step 2: Initialize the decryption operation
+  if (EVP_DecryptInit_ex(ctx.get(), EVP_aes_256_cbc(), nullptr, key.data(), nullptr) != 1) {
+    return {false, "failed to initialize decryption operation"};
+  }
+
+  // Set up the data buffer
+  int out_len;
+  plaintext.resize(ciphertext.size());
+
+  // Step 3: Perform the decryption
+  if (EVP_DecryptUpdate(ctx.get(), plaintext.data(), &out_len, ciphertext.data(),
+                        ciphertext.size()) != 1) {
+    return {false, "failed to decrypt ciphertext"};
+  }
+
+  // Finalize the decryption
+  int final_len;
+  if (EVP_DecryptFinal_ex(ctx.get(), plaintext.data() + out_len, &final_len) != 1) {
+    return {false, "failed to finalize the decryption operation"};
+  }
+
+  // Set the actual size of the plaintext
+  plaintext.resize(out_len + final_len);
+  std::string p_text(plaintext.begin(), plaintext.end());
+
+  return {true, p_text};
+}
+
 std::vector<uint8_t> UtilityImpl::getSha256Digest(const Buffer::Instance& buffer) {
   std::vector<uint8_t> digest(SHA256_DIGEST_LENGTH);
   bssl::ScopedEVP_MD_CTX ctx;

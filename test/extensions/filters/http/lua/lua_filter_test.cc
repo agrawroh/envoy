@@ -2544,6 +2544,36 @@ TEST_F(LuaHttpFilterTest, EncryptTextSuccess) {
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
 }
 
+TEST_F(LuaHttpFilterTest, SymmetricEncryptionSuccess) {
+  const std::string SCRIPT{R"EOF(
+    function envoy_on_request(request_handle)
+      symmetric_key = "MX3qLUsX9NUvxBIzot20Gxrd+G8j6Y24BzvNpn/XHhQ="
+      data = "Hello, World!"
+      enc_ok, enc_out = request_handle:encryptSymmetric(symmetric_key, string.len(symmetric_key), data, string.len(data))
+      if enc_ok then
+        request_handle:logTrace("encryption successful!")
+        dec_ok, dec_out = request_handle:decryptSymmetric(symmetric_key, string.len(symmetric_key), enc_out, string.len(enc_out))
+        if dec_ok then
+          request_handle:logTrace("decryption successful! Result: "..dec_out)
+        else
+          request_handle:logTrace("decryption failed! error: "..dec_out)
+        end
+      else
+        request_handle:logTrace("encryption failed! error: "..enc_out)
+      end
+    end
+  )EOF"};
+
+  InSequence s;
+  setup(SCRIPT);
+
+  Http::TestRequestHeaderMapImpl request_headers{{":path", "/"}};
+  EXPECT_CALL(*filter_, scriptLog(spdlog::level::trace, StrEq("encryption successful!")));
+  EXPECT_CALL(*filter_, scriptLog(spdlog::level::trace,
+                                  StrEq("decryption successful! Result: Hello, World!")));
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, true));
+}
+
 TEST_F(LuaHttpFilterTest, ImportKeys) {
   const std::string SCRIPT{R"EOF(
     -- this function converts hex to string
