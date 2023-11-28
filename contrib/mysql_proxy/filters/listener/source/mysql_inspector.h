@@ -18,9 +18,10 @@ namespace ListenerFilters {
 namespace MySQLInspector {
 
 /**
- * All stats for the http inspector. @see stats_macros.h
+ * All stats for the MySQL inspector.
+ * @see stats_macros.h
  */
-#define ALL_HTTP_INSPECTOR_STATS(COUNTER)                                                          \
+#define ALL_MYSQL_INSPECTOR_STATS(COUNTER)                                                         \
   COUNTER(read_error)                                                                              \
   COUNTER(http10_found)                                                                            \
   COUNTER(http11_found)                                                                            \
@@ -28,10 +29,11 @@ namespace MySQLInspector {
   COUNTER(http_not_found)
 
 /**
- * Definition of all stats for the Http inspector. @see stats_macros.h
+ * Definition of all stats for the MySQL inspector.
+ * @see stats_macros.h
  */
-struct HttpInspectorStats {
-  ALL_HTTP_INSPECTOR_STATS(GENERATE_COUNTER_STRUCT)
+struct MySQLInspectorStats {
+  ALL_MYSQL_INSPECTOR_STATS(GENERATE_COUNTER_STRUCT)
 };
 
 enum class ParseState {
@@ -44,24 +46,24 @@ enum class ParseState {
 };
 
 /**
- * Global configuration for http inspector.
+ * Global configuration for MySQL inspector.
  */
 class Config {
 public:
   Config(Stats::Scope& scope);
 
-  const HttpInspectorStats& stats() const { return stats_; }
+  const MySQLInspectorStats& stats() const { return stats_; }
 
   static constexpr uint32_t MAX_INSPECT_SIZE = 8192;
 
 private:
-  HttpInspectorStats stats_;
+  MySQLInspectorStats stats_;
 };
 
 using ConfigSharedPtr = std::shared_ptr<Config>;
 
 /**
- * Http inspector listener filter.
+ * MySQL inspector listener filter.
  */
 class Filter : public Network::ListenerFilter, Logger::Loggable<Logger::Id::filter> {
 public:
@@ -69,16 +71,13 @@ public:
 
   // Network::ListenerFilter
   Network::FilterStatus onAccept(Network::ListenerFilterCallbacks& cb) override;
-  Network::FilterStatus onData(Network::ListenerFilterBuffer& buffer) override;
+  Network::FilterStatus onData(Network::ListenerFilterBuffer&) override {
+    return Network::FilterStatus::Continue;
+  }
 
   size_t maxReadBytes() const override { return Config::MAX_INSPECT_SIZE; }
 
 private:
-  static const absl::string_view HTTP2_CONNECTION_PREFACE;
-
-  void done(bool success);
-  ParseState parseHttpHeader(absl::string_view data);
-
   const absl::flat_hash_set<std::string>& httpProtocols() const;
   const absl::flat_hash_set<std::string>& http1xMethods() const;
 

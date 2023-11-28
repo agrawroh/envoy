@@ -526,6 +526,10 @@ protected:
   Event::TimerPtr connection_duration_timer_;
   Event::TimerPtr access_log_flush_timer_;
 
+  bool init_{true};
+  bool read_init_{true};
+  bool write_init_{true};
+
   // A pointer to the on demand cluster lookup when lookup is in flight.
   Upstream::ClusterDiscoveryCallbackHandlePtr cluster_discovery_handle_;
 

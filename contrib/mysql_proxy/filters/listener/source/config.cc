@@ -3,7 +3,7 @@
 #include "envoy/registry/registry.h"
 #include "envoy/server/filter_config.h"
 
-#include "source/extensions/filters/listener/http_inspector/http_inspector.h"
+#include "contrib/mysql_proxy/filters/listener/source/mysql_inspector.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -20,7 +20,7 @@ public:
       const Protobuf::Message&,
       const Network::ListenerFilterMatcherSharedPtr& listener_filter_matcher,
       Server::Configuration::ListenerFactoryContext& context) override {
-    ConfigSharedPtr config(std::make_shared<Config>(context.scope()));
+    MySQLInspector::ConfigSharedPtr config(std::make_shared<Config>(context.scope()));
     return
         [listener_filter_matcher, config](Network::ListenerFilterManager& filter_manager) -> void {
           filter_manager.addAcceptFilter(listener_filter_matcher, std::make_unique<Filter>(config));

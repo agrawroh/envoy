@@ -7,14 +7,14 @@ load(
 
 licenses(["notice"])  # Apache 2
 
-# HTTP inspector filter for sniffing HTTP protocol and setting HTTP version to a FilterChain.
+# MySQL inspector filter for sniffing MySQL protocol
 
 envoy_extension_package()
 
 envoy_cc_library(
-    name = "http_inspector_lib",
-    srcs = ["http_inspector.cc"],
-    hdrs = ["http_inspector.h"],
+    name = "mysql_inspector_lib",
+    srcs = ["mysql_inspector.cc"],
+    hdrs = ["mysql_inspector.h"],
     external_deps = ["http_parser"],
     deps = [
         "//envoy/event:dispatcher_interface",
@@ -34,9 +34,10 @@ envoy_cc_extension(
     name = "config",
     srcs = ["config.cc"],
     deps = [
-        ":http_inspector_lib",
-        "//envoy/registry",
+        ":mysql_inspector_lib",
         "//envoy/server:filter_config_interface",
+        "//source/extensions/filters/network:well_known_names",
+        "//source/extensions/filters/network/common:factory_base_lib",
         "@envoy_api//envoy/extensions/filters/listener/http_inspector/v3:pkg_cc_proto",
     ],
 )

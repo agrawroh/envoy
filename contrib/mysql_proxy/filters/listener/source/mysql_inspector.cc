@@ -1,19 +1,13 @@
-#include "source/extensions/filters/listener/http_inspector/http_inspector.h"
+#include "contrib/mysql_proxy/filters/listener/source/mysql_inspector.h"
 
 #include "envoy/event/dispatcher.h"
 #include "envoy/network/listen_socket.h"
 #include "envoy/stats/scope.h"
 
-#include "source/common/api/os_sys_calls_impl.h"
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/assert.h"
-#include "source/common/common/macros.h"
 #include "source/common/common/hex.h"
-#include "source/common/http/headers.h"
 #include "source/common/http/utility.h"
-
-#include "absl/strings/match.h"
-#include "absl/strings/str_split.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -21,9 +15,7 @@ namespace ListenerFilters {
 namespace MySQLInspector {
 
 Config::Config(Stats::Scope& scope)
-    : stats_{ALL_HTTP_INSPECTOR_STATS(POOL_COUNTER_PREFIX(scope, "http_inspector."))} {}
-
-const absl::string_view Filter::HTTP2_CONNECTION_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    : stats_{ALL_MYSQL_INSPECTOR_STATS(POOL_COUNTER_PREFIX(scope, "mysql_inspector."))} {}
 
 Filter::Filter(const ConfigSharedPtr config) : config_(config) {
   http_parser_init(&parser_, HTTP_REQUEST);
@@ -33,118 +25,80 @@ http_parser_settings Filter::settings_{
     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
 };
 
-Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
-  auto raw_slice = buffer.rawSlice();
-  auto buf = reinterpret_cast<const uint8_t*>(raw_slice.mem_);
-  ENVOY_LOG(trace, "inspector: onData() buffer = {}", Envoy::Hex::encode(buf, raw_slice.len_));
-  return Network::FilterStatus::Continue;
-
-  /*
-  auto raw_slice = buffer.rawSlice();
-  const char* buf = static_cast<const char*>(raw_slice.mem_);
-  const auto parse_state = parseHttpHeader(absl::string_view(buf, raw_slice.len_));
-  switch (parse_state) {
-  case ParseState::Error:
-    // Invalid HTTP preface found, then just continue for next filter.
-    done(false);
-    return Network::FilterStatus::Continue;
-  case ParseState::Done:
-    done(true);
-    return Network::FilterStatus::Continue;
-  case ParseState::Continue:
-    return Network::FilterStatus::StopIteration;
-  }
-  PANIC_DUE_TO_CORRUPT_ENUM
-  */
-}
-
 Network::FilterStatus Filter::onAccept(Network::ListenerFilterCallbacks& cb) {
   ENVOY_LOG(trace, "inspector: new connection accepted");
   cb_ = &cb;
 
-  Network::ConnectionSocket& socket = cb.socket();
-  Buffer::OwnedImpl out_buffer_{};
-  // 4a 00 00 00 0a 38 2e 30 2e 33 32 00 d8 01 00 00 75 71 73 14 58 07 30 40 00 ff ff ff 02 00 ff df 15 00 00 00 00 00 00 00 00 00 00 28 41 38 4f 57 45 21 0e 22 15 77 38 00 63 61 63 68 69 6e 67 5f 73 68 61 32 5f 70 61 73 73 77 6f 72 64 00
-  const uint8_t buff_val[78]{74, 0, 0, 0, 10, 56, 46, 48, 46, 51, 50, 0, 216, 1, 0, 0, 117, 113, 115, 20, 88, 7, 48, 64, 0, 255, 255, 255, 2, 0, 255, 223, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 65, 56, 79, 87, 69, 33, 14, 34, 21, 119, 56, 0, 99, 97, 99, 104, 105, 110, 103, 95, 115, 104, 97, 50, 95, 112, 97, 115, 115, 119, 111, 114, 100, 0};
-  out_buffer_.add(buff_val, 78);
-  socket.ioHandle().write(out_buffer_);
+  // Responsibilities:
+  // 1. Send Server Greeting Packet
+  // 2. Check Whether Client Wants SSL
+  // 3. Close Connection if SSL is not requested or if SSL is requested then stop iteration
+  // 4. onData() would be called again, and we can write the first 36 bytes of the packet to the
+  // filter metadata namespace
+  // 5. Record Metrics
 
-  // Peek first
-  auto buffer_ = std::make_unique<uint8_t[]>(36);
-  auto peek_buf_ = buffer_.get();
+  // ################################ Send Server Greeting Packet ##################################
+  Network::ConnectionSocket& socket = cb.socket();
+  Buffer::OwnedImpl write_buffer{};
+  const uint8_t server_greeting[78]{74, 0, 0, 0, 10, 56, 46, 48, 46, 51, 50, 0, 216, 1, 0, 0, 117, 113, 115, 20, 88, 7, 48, 64, 0, 255, 255, 255, 2, 0, 255, 223, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 65, 56, 79, 87, 69, 33, 14, 34, 21, 119, 56, 0, 99, 97, 99, 104, 105, 110, 103, 95, 115, 104, 97, 50, 95, 112, 97, 115, 115, 119, 111, 114, 100, 0};
+
+  // Write directly to the socket's buffer
+  write_buffer.add(server_greeting, 78);
+  socket.ioHandle().write(write_buffer);
+
+  // ############################## Receive Client Handshake Packet ################################
+  constexpr int kExpectedSize = 36;
+  std::vector<uint8_t> buffer(kExpectedSize);
+
+  int totalReceived = 0;
   int retry = 0;
-  do {
-    auto result = socket.ioHandle().recv(peek_buf_, 36, MSG_PEEK);
-    if (retry == 25 && (!result.ok() || result.return_value_ != 36)) {
-      ENVOY_LOG(trace, "inspector: failed to drain mysql short handshake packet");
-      socket.ioHandle().close();
-    } else if (result.ok() && result.return_value_ == 36) {
-      ENVOY_LOG(trace, "inspector: peek data = {}", Envoy::Hex::encode(peek_buf_, 36));
+
+  while (totalReceived < kExpectedSize && retry < 100) {
+    auto result = socket.ioHandle().recv(buffer.data() + totalReceived, kExpectedSize - totalReceived, MSG_PEEK);
+
+    if (!result.ok() || result.return_value_ <= 0) {
+      absl::SleepFor(absl::Milliseconds(10));
+      retry++;
+      continue;
+    }
+
+    totalReceived += result.return_value_;
+
+    if (totalReceived == kExpectedSize) {
+      std::string hex_string = Envoy::Hex::encode(buffer.data(), kExpectedSize);
+      ENVOY_LOG(trace, "inspector: buffer data = {}", hex_string);
       break;
     }
-
-    retry++;
-    absl::SleepFor(absl::Milliseconds(10));
-  } while (true);
-
-  // Now actually read
-  Buffer::OwnedImpl in_buffer_{};
-  auto result = socket.ioHandle().read(in_buffer_, 36);
-  if (result.ok()) {
-    auto hex_string = Envoy::Hex::encode(static_cast<uint8_t*>(in_buffer_.linearize(in_buffer_.length())), in_buffer_.length());
-    ENVOY_LOG(trace, "inspector: buffer data = {}", hex_string);
-
-    // ROHIT: Insert the logic to inspect the 36 bytes. If SSL is not requested then we simply close
-    // the connection or otherwise if SSL is requested then we continue.
-
-    const std::string metadata_key = "tidb-listener";
-    ProtobufWkt::Value metadata_value;
-    metadata_value.set_string_value(hex_string);
-    ProtobufWkt::Struct metadata((*cb_->dynamicMetadata().mutable_filter_metadata())[metadata_key]);
-    metadata.mutable_fields()->insert({"short_handshake", metadata_value});
-    cb_->setDynamicMetadata(metadata_key, metadata);
-
-    // Clean up the buffer as we already consumed these 36 bytes of data, and we don't want to send
-    // this to the next filter.
-    in_buffer_.drain(36);
   }
 
-  /*
-  const absl::string_view transport_protocol = socket.detectedTransportProtocol();
-  if (!transport_protocol.empty() && transport_protocol != "raw_buffer") {
-    ENVOY_LOG(trace, "http inspector: cannot inspect http protocol with transport socket {}",
-              transport_protocol);
-    return Network::FilterStatus::Continue;
-  }
-  */
+  // Verify the data
+  if (totalReceived == kExpectedSize) {
+    // Perform the read without MSG_PEEK to actually consume the data
+    Buffer::OwnedImpl in_buffer{};
+    auto read_result = socket.ioHandle().read(in_buffer, kExpectedSize);
 
-  return Network::FilterStatus::StopIteration;
-}
+    if (read_result.ok()) {
+      auto hex_string = Envoy::Hex::encode(static_cast<uint8_t*>(in_buffer.linearize(kExpectedSize)), kExpectedSize);
 
-void Filter::done(bool success) {
-  ENVOY_LOG(trace, "http inspector: done: {}", success);
+      // Your inspection logic here...
 
-  if (success) {
-    absl::string_view protocol;
-    if (protocol_ == Http::Headers::get().ProtocolStrings.Http10String) {
-      config_->stats().http10_found_.inc();
-      protocol = Http::Utility::AlpnNames::get().Http10;
-    } else if (protocol_ == Http::Headers::get().ProtocolStrings.Http11String) {
-      config_->stats().http11_found_.inc();
-      protocol = Http::Utility::AlpnNames::get().Http11;
-    } else {
-      ASSERT(protocol_ == "HTTP/2");
-      config_->stats().http2_found_.inc();
-      // h2 HTTP/2 over TLS, h2c HTTP/2 over TCP
-      // TODO(yxue): use detected protocol from http inspector and support h2c token in HCM
-      protocol = Http::Utility::AlpnNames::get().Http2c;
+      const std::string metadata_key = "mysql_inspector";
+      ProtobufWkt::Value metadata_value;
+      metadata_value.set_string_value(hex_string);
+      ProtobufWkt::Struct& metadata = (*cb_->dynamicMetadata().mutable_filter_metadata())[metadata_key];
+      metadata.mutable_fields()->insert({"short_handshake", metadata_value});
+      cb_->setDynamicMetadata(metadata_key, metadata);
     }
-    ENVOY_LOG(debug, "http inspector: set application protocol to {}", protocol);
 
-    cb_->socket().setRequestedApplicationProtocols({protocol});
+    // Ensure the consumed data doesn't go to the next filter
+    // (assuming in_buffer is not used elsewhere)
+    in_buffer.drain(kExpectedSize);
   } else {
-    config_->stats().http_not_found_.inc();
+    ENVOY_LOG(trace, "inspector: failed to drain mysql short handshake packet");
+    socket.ioHandle().close();
   }
+
+  return Network::FilterStatus::Continue;
 }
 
 } // namespace MySQLInspector

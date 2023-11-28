@@ -69,15 +69,14 @@ public:
 
   // Network::ListenerFilter
   Network::FilterStatus onAccept(Network::ListenerFilterCallbacks& cb) override;
-  Network::FilterStatus onData(Network::ListenerFilterBuffer& buffer) override;
+  Network::FilterStatus onData(Network::ListenerFilterBuffer&) override {
+    return Network::FilterStatus::Continue;
+  }
 
   size_t maxReadBytes() const override { return Config::MAX_INSPECT_SIZE; }
 
 private:
-  static const absl::string_view HTTP2_CONNECTION_PREFACE;
-
-  void done(bool success);
-  ParseState parseHttpHeader(absl::string_view data);
+  //void done(bool success);
 
   const absl::flat_hash_set<std::string>& httpProtocols() const;
   const absl::flat_hash_set<std::string>& http1xMethods() const;

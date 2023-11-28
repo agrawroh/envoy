@@ -24,6 +24,12 @@ CONTRIB_EXTENSIONS = {
     "envoy.filters.network.golang":                             "//contrib/golang/filters/network/source:config",
 
     #
+    # Listener filters
+    #
+
+    "envoy.filters.listener.mysql_inspector":                   "//contrib/mysql_proxy/filters/listener/source:config",
+
+    #
     # Sip proxy
     #
 

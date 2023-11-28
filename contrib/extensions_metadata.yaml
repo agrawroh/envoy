@@ -48,6 +48,10 @@ envoy.filters.network.rocketmq_proxy:
   - envoy.filters.network
   security_posture: requires_trusted_downstream_and_upstream
   status: alpha
+envoy.filters.listener.mysql_inspector:
+  categories:
+    - envoy.filters.listener
+  status: alpha
 envoy.filters.network.mysql_proxy:
   categories:
   - envoy.filters.network
