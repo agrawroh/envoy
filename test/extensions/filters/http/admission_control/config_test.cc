@@ -33,8 +33,8 @@ public:
   std::shared_ptr<AdmissionControlFilterConfig> makeConfig(const std::string& yaml) {
     AdmissionControlProto proto;
     TestUtility::loadFromYamlAndValidate(yaml, proto);
-    auto tls =
-        ThreadLocal::TypedSlot<ThreadLocalControllerImpl>::makeUnique(context_.threadLocal());
+    auto tls = ThreadLocal::TypedSlot<ThreadLocalControllerImpl>::makeUnique(
+        context_.server_factory_context_.threadLocal());
     auto evaluator = std::make_unique<SuccessCriteriaEvaluator>(proto.success_criteria());
     return std::make_shared<AdmissionControlFilterConfig>(proto, runtime_, random_, scope_,
                                                           std::move(tls), std::move(evaluator));
@@ -77,7 +77,7 @@ success_criteria:
   EXPECT_THROW_WITH_MESSAGE(
       admission_control_filter_factory
           .createFilterFactoryFromProtoTyped(proto, "whatever", dual_info_,
-                                             factory_context.getServerFactoryContext())
+                                             factory_context.serverFactoryContext())
           .status()
           .IgnoreError(),
       EnvoyException, "Success rate threshold cannot be less than 1.0%.");
@@ -108,7 +108,7 @@ success_criteria:
   EXPECT_THROW_WITH_MESSAGE(
       admission_control_filter_factory
           .createFilterFactoryFromProtoTyped(proto, "whatever", dual_info_,
-                                             factory_context.getServerFactoryContext())
+                                             factory_context.serverFactoryContext())
           .status()
           .IgnoreError(),
       EnvoyException, "Success rate threshold cannot be less than 1.0%.");
