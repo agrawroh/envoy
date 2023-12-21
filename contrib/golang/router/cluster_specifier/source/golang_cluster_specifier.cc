@@ -21,15 +21,9 @@ ClusterConfig::ClusterConfig(const GolangClusterProto& config)
   // loads DSO store a static map and a open handles leak will occur when the filter gets loaded and
   // unloaded.
   // TODO: unload DSO when filter updated.
-  auto res = Envoy::Dso::DsoManager<Dso::ClusterSpecifierDsoImpl>::load(so_id_, so_path_);
-  if (!res) {
-    throw EnvoyException(fmt::format("golang_cluster_specifier_plugin: load library failed: {} {}",
-                                     so_id_, so_path_));
-  }
-
-  dynamic_lib_ = Dso::DsoManager<Dso::ClusterSpecifierDsoImpl>::getDsoByID(so_id_);
+  dynamic_lib_ = Envoy::Dso::DsoManager<Dso::ClusterSpecifierDsoImpl>::load(so_id_, so_path_);
   if (dynamic_lib_ == nullptr) {
-    throw EnvoyException(fmt::format("golang_cluster_specifier_plugin: get library failed: {} {}",
+    throw EnvoyException(fmt::format("golang_cluster_specifier_plugin: load library failed: {} {}",
                                      so_id_, so_path_));
   }
 
@@ -51,9 +45,9 @@ ClusterConfig::ClusterConfig(const GolangClusterProto& config)
 }
 
 RouteConstSharedPtr
-GolangClusterSpecifierPlugin::route(const RouteEntry& parent,
+GolangClusterSpecifierPlugin::route(RouteConstSharedPtr parent,
                                     const Http::RequestHeaderMap& header) const {
-  ASSERT(dynamic_cast<const RouteEntryImplBase*>(&parent) != nullptr);
+  ASSERT(dynamic_cast<const RouteEntryImplBase*>(parent.get()) != nullptr);
   int buffer_len = 256;
   std::string buffer;
   std::string cluster;
@@ -85,7 +79,7 @@ GolangClusterSpecifierPlugin::route(const RouteEntry& parent,
   }
 
   return std::make_shared<RouteEntryImplBase::DynamicRouteEntry>(
-      dynamic_cast<const RouteEntryImplBase*>(&parent), cluster);
+      dynamic_cast<const RouteEntryImplBase*>(parent.get()), parent, cluster);
 }
 
 void GolangClusterSpecifierPlugin::log(absl::string_view& msg) const {

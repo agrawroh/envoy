@@ -51,9 +51,9 @@ struct HttpClientStats {
  */
 class Client : public Logger::Loggable<Logger::Id::http> {
 public:
-  Client(ApiListener& api_listener, Event::ProvisionalDispatcher& dispatcher, Stats::Scope& scope,
-         Random::RandomGenerator& random)
-      : api_listener_(api_listener), dispatcher_(dispatcher),
+  Client(ApiListenerPtr&& api_listener, Event::ProvisionalDispatcher& dispatcher,
+         Stats::Scope& scope, Random::RandomGenerator& random)
+      : api_listener_(std::move(api_listener)), dispatcher_(dispatcher),
         stats_(
             HttpClientStats{ALL_HTTP_CLIENT_STATS(POOL_COUNTER_PREFIX(scope, "http.client."),
                                                   POOL_HISTOGRAM_PREFIX(scope, "http.client."))}),
@@ -126,6 +126,8 @@ public:
   const std::string& getCancelDetails() {
     CONSTRUCT_ON_FIRST_USE(std::string, "client_cancelled_stream");
   }
+
+  void shutdownApiListener() { api_listener_.reset(); }
 
 private:
   class DirectStream;
@@ -235,6 +237,12 @@ private:
     // Stream
     void addCallbacks(StreamCallbacks& callbacks) override { addCallbacksHelper(callbacks); }
     void removeCallbacks(StreamCallbacks& callbacks) override { removeCallbacksHelper(callbacks); }
+    CodecEventCallbacks*
+    registerCodecEventCallbacks(CodecEventCallbacks* codec_callbacks) override {
+      std::swap(codec_callbacks, codec_callbacks_);
+      return codec_callbacks;
+    }
+
     void resetStream(StreamResetReason) override;
     Network::ConnectionInfoProvider& connectionInfoProvider() override {
       return parent_.address_provider_;
@@ -274,13 +282,42 @@ private:
     // Latches latency info from stream info before it goes away.
     void saveFinalStreamIntel();
 
+    // Various signals to propagate to the adapter.
+    enum class AdapterSignal { EncodeComplete, Error, Cancel };
+
+    // Used to notify adapter of stream's completion.
+    void notifyAdapter(AdapterSignal signal) {
+      if (codec_callbacks_) {
+        switch (signal) {
+        case AdapterSignal::EncodeComplete:
+          codec_callbacks_->onCodecEncodeComplete();
+          break;
+        case AdapterSignal::Error:
+          FALLTHRU;
+        case AdapterSignal::Cancel:
+          codec_callbacks_->onCodecLowLevelReset();
+        }
+        registerCodecEventCallbacks(nullptr);
+      }
+    }
+
+    OptRef<RequestDecoder> requestDecoder() {
+      if (!request_decoder_) {
+        return {};
+      }
+      return request_decoder_->get();
+    }
+
     const envoy_stream_t stream_handle_;
 
     // Used to issue outgoing HTTP stream operations.
-    RequestDecoder* request_decoder_;
+    RequestDecoderHandlePtr request_decoder_;
     // Used to receive incoming HTTP stream operations.
     DirectStreamCallbacksPtr callbacks_;
     Client& parent_;
+    // Used to communicate with the HTTP Connection Manager that
+    // it can destroy the active stream.
+    CodecEventCallbacks* codec_callbacks_{nullptr};
     // Response details used by the connection manager.
     absl::string_view response_details_;
     // Tracks read disable calls. Different buffers can call read disable, and
@@ -340,7 +377,7 @@ private:
   void removeStream(envoy_stream_t stream_handle);
   void setDestinationCluster(RequestHeaderMap& headers);
 
-  ApiListener& api_listener_;
+  ApiListenerPtr api_listener_;
   Event::ProvisionalDispatcher& dispatcher_;
   Event::SchedulableCallbackPtr scheduled_callback_;
   HttpClientStats stats_;

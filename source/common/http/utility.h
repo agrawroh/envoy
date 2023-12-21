@@ -127,10 +127,22 @@ initializeAndValidateOptions(const envoy::config::core::v3::Http3ProtocolOptions
 namespace Http {
 namespace Utility {
 
+enum UrlComponents {
+  UcSchema = 0,
+  UcHost = 1,
+  UcPort = 2,
+  UcPath = 3,
+  UcQuery = 4,
+  UcFragment = 5,
+  UcUserinfo = 6,
+  UcMax = 7
+};
+
 /**
  * Given a fully qualified URL, splits the string_view provided into scheme,
  * host and path with query parameters components.
  */
+
 class Url {
 public:
   bool initialize(absl::string_view absolute_url, bool is_connect_request);
@@ -145,10 +157,14 @@ public:
   /** Returns the fully qualified URL as a string. */
   std::string toString() const;
 
+  bool containsFragment();
+  bool containsUserinfo();
+
 private:
   absl::string_view scheme_;
   absl::string_view host_and_port_;
   absl::string_view path_and_query_params_;
+  uint8_t component_bitmap_;
 };
 
 class PercentEncoding {
@@ -243,37 +259,6 @@ void updateAuthority(RequestHeaderMap& headers, absl::string_view hostname, bool
 std::string createSslRedirectPath(const RequestHeaderMap& headers);
 
 /**
- * Parse a URL into query parameters.
- * @param url supplies the url to parse.
- * @return QueryParams the parsed parameters, if any.
- */
-QueryParams parseQueryString(absl::string_view url);
-
-/**
- * Parse a URL into query parameters.
- * @param url supplies the url to parse.
- * @return QueryParams the parsed and percent-decoded parameters, if any.
- */
-QueryParams parseAndDecodeQueryString(absl::string_view url);
-
-/**
- * Parse a a request body into query parameters.
- * @param body supplies the body to parse.
- * @return QueryParams the parsed parameters, if any.
- */
-QueryParams parseFromBody(absl::string_view body);
-
-/**
- * Parse query parameters from a URL or body.
- * @param data supplies the data to parse.
- * @param start supplies the offset within the data.
- * @param decode_params supplies the flag whether to percent-decode the parsed parameters (both name
- *        and value). Set to false to keep the parameters encoded.
- * @return QueryParams the parsed parameters, if any.
- */
-QueryParams parseParameters(absl::string_view data, size_t start, bool decode_params);
-
-/**
  * Finds the start of the query string in a path
  * @param path supplies a HeaderString& to search for the query string
  * @return absl::string_view starting at the beginning of the query string,
@@ -288,20 +273,6 @@ absl::string_view findQueryStringStart(const HeaderString& path);
  * @return std::string the path without query string.
  */
 std::string stripQueryString(const HeaderString& path);
-
-/**
- * Replace the query string portion of a given path with a new one.
- *
- * e.g. replaceQueryString("/foo?key=1", {key:2}) -> "/foo?key=2"
- *      replaceQueryString("/bar", {hello:there}) -> "/bar?hello=there"
- *
- * @param path the original path that may or may not contain an existing query string
- * @param params the new params whose string representation should be formatted onto
- *               the `path` above
- * @return std::string the new path whose query string has been replaced by `params` and whose path
- *         portion from `path` remains unchanged.
- */
-std::string replaceQueryString(const HeaderString& path, const QueryParams& params);
 
 /**
  * Parse a particular value out of a cookie
@@ -348,7 +319,7 @@ std::string parseSetCookieValue(const HeaderMap& headers, const std::string& key
  */
 std::string makeSetCookieValue(const std::string& key, const std::string& value,
                                const std::string& path, const std::chrono::seconds max_age,
-                               bool httponly);
+                               bool httponly, const Http::CookieAttributeRefVector attributes);
 
 /**
  * Get the response status from the response headers.
@@ -527,11 +498,6 @@ std::string localPathFromFilePath(const absl::string_view& file_path);
 RequestMessagePtr prepareHeaders(const envoy::config::core::v3::HttpUri& http_uri);
 
 /**
- * Serialize query-params into a string.
- */
-std::string queryParamsToString(const QueryParams& query_params);
-
-/**
  * Returns string representation of StreamResetReason.
  */
 const std::string resetReasonToString(const Http::StreamResetReason reset_reason);
@@ -643,15 +609,19 @@ getMergedPerFilterConfig(const Http::StreamFilterCallbacks* callbacks,
 
   absl::optional<ConfigType> merged;
 
-  callbacks->traversePerFilterConfig(
-      [&reduce, &merged](const Router::RouteSpecificFilterConfig& cfg) {
-        const ConfigType* typed_cfg = dynamic_cast<const ConfigType*>(&cfg);
-        if (!merged) {
-          merged.emplace(*typed_cfg);
-        } else {
-          reduce(merged.value(), *typed_cfg);
-        }
-      });
+  callbacks->traversePerFilterConfig([&reduce,
+                                      &merged](const Router::RouteSpecificFilterConfig& cfg) {
+    const ConfigType* typed_cfg = dynamic_cast<const ConfigType*>(&cfg);
+    if (typed_cfg == nullptr) {
+      ENVOY_LOG_MISC(debug, "Failed to retrieve the correct type of route specific filter config");
+      return;
+    }
+    if (!merged) {
+      merged.emplace(*typed_cfg);
+    } else {
+      reduce(merged.value(), *typed_cfg);
+    }
+  });
 
   return merged;
 }
@@ -701,6 +671,13 @@ convertCoreToRouteRetryPolicy(const envoy::config::core::v3::RetryPolicy& retry_
 bool isSafeRequest(const Http::RequestHeaderMap& request_headers);
 
 /**
+ * @param value: the value of the referer header field
+ * @return true if the given value conforms to RFC specifications
+ * https://www.rfc-editor.org/rfc/rfc7231#section-5.5.2
+ */
+bool isValidRefererValue(absl::string_view value);
+
+/**
  * Return the GatewayTimeout HTTP code to indicate the request is full received.
  */
 Http::Code maybeRequestTimeoutCode(bool remote_decode_complete);
@@ -721,6 +698,25 @@ struct RedirectConfig {
   const bool https_redirect_;
   const bool strip_query_;
 };
+
+/**
+ * Validates the provided scheme is valid (either http or https)
+ * @param scheme the scheme to validate
+ * @return bool true if the scheme is valid.
+ */
+bool schemeIsValid(const absl::string_view scheme);
+
+/**
+ * @param scheme the scheme to validate
+ * @return bool true if the scheme is http.
+ */
+bool schemeIsHttp(const absl::string_view scheme);
+
+/**
+ * @param scheme the scheme to validate
+ * @return bool true if the scheme is https.
+ */
+bool schemeIsHttps(const absl::string_view scheme);
 
 /*
  * Compute new path based on RedirectConfig.

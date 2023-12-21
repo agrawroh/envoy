@@ -1,12 +1,13 @@
-FROM python:3.11.2-slim-bullseye@sha256:9ab472fc54e9ed1064c97ff26baa16f3aad8009c03e9adf63d408f39ad3dc983 as python-base
+FROM python:3.11.5-slim-bookworm@sha256:edaf703dce209d774af3ff768fc92b1e3b60261e7602126276f9ceb0e3a96874 as python-base
 RUN rm -f /etc/apt/apt.conf.d/docker-clean \
     && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' | tee /etc/apt/apt.conf.d/keep-cache
+ARG PYTHON_REQUIREMENTS_FILE=aiohttp/requirements.txt
+ADD "$PYTHON_REQUIREMENTS_FILE" /tmp/requirements.txt
 
 
 FROM python-base as python-grpc-client
 WORKDIR /client
-COPY requirements.txt /client/requirements.txt
-RUN pip install --require-hashes -qr /client/requirements.txt
+RUN pip install --require-hashes -qr /tmp/requirements.txt
 # Copy the sources, including the stubs
 COPY --chmod=777 client.py /client/grpc-kv-client.py
 COPY kv /client/kv
@@ -15,12 +16,12 @@ CMD tail -f /dev/null
 
 FROM python-base as aiohttp-service
 ENV DEBIAN_FRONTEND=noninteractive
-ADD requirements.txt /tmp/requirements.txt
+ADD "$PYTHON_REQUIREMENTS_FILE" /tmp/requirements.txt
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    pip3 install -qr /tmp/requirements.txt \
+    pip3 install --require-hashes -qr /tmp/requirements.txt \
     && apt-get -qq update \
-    && apt-get -qq install -y --no-install-recommends netcat \
+    && apt-get -qq install -y --no-install-recommends netcat-traditional \
     && mkdir /code
 HEALTHCHECK \
     --interval=1s \

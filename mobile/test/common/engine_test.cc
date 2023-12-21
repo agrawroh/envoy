@@ -2,7 +2,6 @@
 #include "gtest/gtest.h"
 #include "library/cc/engine_builder.h"
 #include "library/common/engine.h"
-#include "library/common/engine_handle.h"
 #include "library/common/main_interface.h"
 
 namespace Envoy {
@@ -18,10 +17,10 @@ struct TestEngineHandle {
     Platform::EngineBuilder builder;
     auto bootstrap = builder.generateBootstrap();
     std::string yaml = Envoy::MessageUtil::getYamlStringFromMessage(*bootstrap);
-    run_engine(handle_, yaml.c_str(), level.c_str(), "");
+    run_engine(handle_, yaml.c_str(), level.c_str());
   }
 
-  void terminate() { terminate_engine(handle_, /* release */ false); }
+  envoy_status_t terminate() { return terminate_engine(handle_, /* release */ false); }
 
   ~TestEngineHandle() { terminate_engine(handle_, /* release */ true); }
 };
@@ -53,10 +52,10 @@ TEST_F(EngineTest, EarlyExit) {
 
   engine_ = std::make_unique<TestEngineHandle>(callbacks, level);
   envoy_engine_t handle = engine_->handle_;
-  ASSERT_TRUE(test_context.on_engine_running.WaitForNotificationWithTimeout(absl::Seconds(3)));
+  ASSERT_TRUE(test_context.on_engine_running.WaitForNotificationWithTimeout(absl::Seconds(10)));
 
-  engine_->terminate();
-  ASSERT_TRUE(test_context.on_exit.WaitForNotificationWithTimeout(absl::Seconds(3)));
+  ASSERT_EQ(engine_->terminate(), ENVOY_SUCCESS);
+  ASSERT_TRUE(test_context.on_exit.WaitForNotificationWithTimeout(absl::Seconds(10)));
 
   start_stream(handle, 0, {}, false);
 
@@ -76,24 +75,18 @@ TEST_F(EngineTest, AccessEngineAfterInitialization) {
 
   engine_ = std::make_unique<TestEngineHandle>(callbacks, level);
   envoy_engine_t handle = engine_->handle_;
-  ASSERT_TRUE(test_context.on_engine_running.WaitForNotificationWithTimeout(absl::Seconds(3)));
+  ASSERT_TRUE(test_context.on_engine_running.WaitForNotificationWithTimeout(absl::Seconds(10)));
 
   absl::Notification getClusterManagerInvoked;
-  // Scheduling on the dispatcher should work, the engine is running.
-  EXPECT_EQ(ENVOY_SUCCESS, EngineHandle::runOnEngineDispatcher(
-                               handle, [&getClusterManagerInvoked](Envoy::Engine& engine) {
-                                 engine.getClusterManager();
-                                 getClusterManagerInvoked.Notify();
-                               }));
-
-  // Validate that we actually invoked the function.
-  EXPECT_TRUE(getClusterManagerInvoked.WaitForNotificationWithTimeout(absl::Seconds(1)));
+  envoy_data stats_data;
+  // Running engine functions should work because the engine is running
+  EXPECT_EQ(ENVOY_SUCCESS, dump_stats(handle, &stats_data));
+  release_envoy_data(stats_data);
 
   engine_->terminate();
 
   // Now that the engine has been shut down, we no longer expect scheduling to work.
-  EXPECT_EQ(ENVOY_FAILURE, EngineHandle::runOnEngineDispatcher(
-                               handle, [](Envoy::Engine& engine) { engine.getClusterManager(); }));
+  EXPECT_EQ(ENVOY_FAILURE, dump_stats(handle, &stats_data));
 
   engine_.reset();
 }

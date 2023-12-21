@@ -15,6 +15,7 @@
 #include "test/mocks/http/mocks.h"
 #include "test/mocks/http/stream_decoder.h"
 #include "test/mocks/network/mocks.h"
+#include "test/test_common/test_runtime.h"
 #include "test/test_common/test_time.h"
 #include "test/test_common/utility.h"
 
@@ -73,9 +74,10 @@ public:
                       quic::StreamSendingState state, bool, absl::optional<quic::EncryptionLevel>) {
               return quic::QuicConsumedData{write_length, state != quic::NO_FIN};
             }));
-    EXPECT_CALL(writer_, WritePacket(_, _, _, _, _))
+    EXPECT_CALL(writer_, WritePacket(_, _, _, _, _, _))
         .WillRepeatedly(Invoke([](const char*, size_t buf_len, const quic::QuicIpAddress&,
-                                  const quic::QuicSocketAddress&, quic::PerPacketOptions*) {
+                                  const quic::QuicSocketAddress&, quic::PerPacketOptions*,
+                                  const quic::QuicPacketWriterParams&) {
           return quic::WriteResult{quic::WRITE_STATUS_OK, static_cast<int>(buf_len)};
         }));
   }
@@ -117,8 +119,6 @@ public:
 
 #ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
   void setUpCapsuleProtocol(bool close_send_stream, bool close_recv_stream) {
-    quic_stream_->useCapsuleProtocol();
-
     // Decodes a CONNECT-UDP request.
     EXPECT_CALL(stream_decoder_, decodeHeaders_(_, _))
         .WillOnce(Invoke([](const Http::RequestHeaderMapSharedPtr& headers, bool) {
@@ -265,6 +265,7 @@ TEST_F(EnvoyQuicServerStreamTest, GetRequestAndResponse) {
   spdy_headers[":authority"] = host_;
   spdy_headers[":method"] = "GET";
   spdy_headers[":path"] = "/";
+  spdy_headers[":scheme"] = "https";
   spdy_headers.AppendValueOrAddHeader("cookie", "a=b");
   spdy_headers.AppendValueOrAddHeader("cookie", "c=d");
   std::string payload = spdyHeaderToHttp3StreamPayload(spdy_headers);
@@ -275,6 +276,21 @@ TEST_F(EnvoyQuicServerStreamTest, GetRequestAndResponse) {
 }
 
 TEST_F(EnvoyQuicServerStreamTest, PostRequestAndResponse) {
+  EXPECT_EQ(absl::nullopt, quic_stream_->http1StreamEncoderOptions());
+  receiveRequest(request_body_, true, request_body_.size() * 2);
+  quic_stream_->encodeHeaders(response_headers_, /*end_stream=*/false);
+
+  std::string response(18 * 1024, 'a');
+  Buffer::OwnedImpl buffer(response);
+  quic_stream_->encodeData(buffer, false);
+  quic_stream_->encodeTrailers(response_trailers_);
+}
+
+TEST_F(EnvoyQuicServerStreamTest, PostRequestAndResponseWithMemSliceReleasor) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{"envoy.reloadable_features.quiche_use_mem_slice_releasor_api", "true"}});
+
   EXPECT_EQ(absl::nullopt, quic_stream_->http1StreamEncoderOptions());
   receiveRequest(request_body_, true, request_body_.size() * 2);
   quic_stream_->encodeHeaders(response_headers_, /*end_stream=*/false);
@@ -543,6 +559,22 @@ TEST_F(EnvoyQuicServerStreamTest, ReadDisableUponTrailers) {
 
   EXPECT_TRUE(quic_stream_->IsDoneReading());
   EXPECT_CALL(stream_callbacks_, onResetStream(_, _));
+}
+
+TEST_F(EnvoyQuicServerStreamTest, ReadDisableUponMalformedTrailers) {
+  size_t payload_offset = receiveRequest(request_body_, false, request_body_.length() * 2);
+  EXPECT_FALSE(quic_stream_->HasBytesToRead());
+  EXPECT_CALL(stream_decoder_, decodeTrailers_(_)).Times(0);
+
+  // Invalid uppercase key
+  spdy_trailers_["KEY1"] = "value1";
+  std::string payload = spdyHeaderToHttp3StreamPayload(spdy_trailers_);
+  quic::QuicStreamFrame frame(stream_id_, true, payload_offset, payload);
+
+  EXPECT_CALL(quic_session_, MaybeSendRstStreamFrame(_, _, _));
+  EXPECT_CALL(stream_callbacks_, onResetStream(_, _));
+  quic_stream_->OnStreamFrame(frame);
+  EXPECT_TRUE(quic_stream_->IsDoneReading());
 }
 
 // Tests that the stream with a send buffer whose high limit is 16k and low
@@ -829,7 +861,7 @@ TEST_F(EnvoyQuicServerStreamTest, StatsGathererLogsOnStreamDestruction) {
   EXPECT_GT(quic_stream_->statsGatherer()->bytesOutstanding(), 0);
   // Close the stream; incoming acks will no longer invoke the stats gatherer but
   // the stats gatherer should log on stream close despite not receiving final downstream ack.
-  EXPECT_CALL(*mock_logger, log(_, _, _, _));
+  EXPECT_CALL(*mock_logger, log(_, _));
   quic_stream_->resetStream(Http::StreamResetReason::LocalRefusedStreamReset);
 }
 
@@ -863,6 +895,37 @@ TEST_F(EnvoyQuicServerStreamTest, DecodeHttp3Datagram) {
   quic_session_.OnMessageReceived(datagram_fragment_);
 }
 #endif
+
+TEST_F(EnvoyQuicServerStreamTest, RegularHeaderBeforePseudoHeader) {
+  spdy::Http2HeaderBlock spdy_headers;
+  spdy_headers["foo"] = "bar";
+  spdy_headers[":authority"] = host_;
+  spdy_headers[":method"] = "GET";
+  spdy_headers[":path"] = "/";
+  spdy_headers[":scheme"] = "https";
+  std::string payload = spdyHeaderToHttp3StreamPayload(spdy_headers);
+  quic::QuicStreamFrame frame(stream_id_, true, 0, payload);
+  EXPECT_CALL(stream_callbacks_, onResetStream(Http::StreamResetReason::ProtocolError, _));
+  EXPECT_CALL(quic_session_, MaybeSendStopSendingFrame(_, _));
+  EXPECT_CALL(quic_session_, MaybeSendRstStreamFrame(_, _, _));
+  quic_stream_->OnStreamFrame(frame);
+}
+
+TEST_F(EnvoyQuicServerStreamTest, DuplicatedPathHeader) {
+  quic::QuicHeaderList header_list;
+  header_list.OnHeaderBlockStart();
+  header_list.OnHeader(":authority", "www.google.com:4433");
+  header_list.OnHeader(":method", "GET");
+  header_list.OnHeader(":scheme", "https");
+  header_list.OnHeader(":path", "/");
+  header_list.OnHeader(":path", "/");
+  header_list.OnHeaderBlockEnd(0, 0);
+
+  EXPECT_CALL(stream_callbacks_, onResetStream(Http::StreamResetReason::ProtocolError, _));
+  EXPECT_CALL(quic_session_, MaybeSendStopSendingFrame(_, _));
+  EXPECT_CALL(quic_session_, MaybeSendRstStreamFrame(_, _, _));
+  quic_stream_->OnStreamHeaderList(true, 0, header_list);
+}
 
 } // namespace Quic
 } // namespace Envoy

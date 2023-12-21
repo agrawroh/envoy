@@ -45,10 +45,17 @@ public:
   virtual bool connect() PURE;
 
   /**
-   * Close the client. It abortively closes the connection discarding any unsent data.
+   * Close the client. It closes the connection based on close type.
    * The underlying connection will be defer deleted when a Close event is received.
+   * Abrt/NoFlush will abortively closes the connection discarding any unsent data.
+   * @param type the connection close type.
    */
-  virtual void close() PURE;
+  virtual void close(Network::ConnectionCloseType type) PURE;
+
+  /**
+   * @return the detected close type from socket.
+   */
+  virtual Network::DetectedCloseType detectedCloseType() const PURE;
 
   /**
    * Write data through the client.
@@ -80,6 +87,11 @@ public:
    * @return if the client connects to a peer host.
    */
   virtual bool connected() PURE;
+
+  /**
+   * @return the streamInfo of the current connection if there is any.
+   */
+  virtual OptRef<StreamInfo::StreamInfo> getStreamInfo() PURE;
 };
 
 using AsyncTcpClientPtr = std::unique_ptr<AsyncTcpClient>;

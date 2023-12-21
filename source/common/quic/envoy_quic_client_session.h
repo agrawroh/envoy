@@ -26,8 +26,7 @@ public:
   EnvoyQuicClientSession(
       const quic::QuicConfig& config, const quic::ParsedQuicVersionVector& supported_versions,
       std::unique_ptr<EnvoyQuicClientConnection> connection, const quic::QuicServerId& server_id,
-      std::shared_ptr<quic::QuicCryptoClientConfig> crypto_config,
-      quic::QuicClientPushPromiseIndex* push_promise_index, Event::Dispatcher& dispatcher,
+      std::shared_ptr<quic::QuicCryptoClientConfig> crypto_config, Event::Dispatcher& dispatcher,
       uint32_t send_buffer_limit,
       EnvoyQuicCryptoClientStreamFactoryInterface& crypto_stream_factory,
       QuicStatNames& quic_stat_names, OptRef<Http::HttpServerPropertiesCache> rtt_cache,
@@ -65,9 +64,11 @@ public:
                                    std::unique_ptr<quic::QuicEncrypter> encrypter) override;
 
   quic::HttpDatagramSupport LocalHttpDatagramSupport() override {
-    // TODO(https://github.com/envoyproxy/envoy/issues/23564): Http3 Datagram support should be
-    // turned on by returning quic::HttpDatagramSupport::kRfc once the CONNECT-UDP support work is
-    // completed.
+#ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
+    if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.enable_connect_udp_support")) {
+      return quic::HttpDatagramSupport::kRfc;
+    }
+#endif
     return quic::HttpDatagramSupport::kNone;
   }
 

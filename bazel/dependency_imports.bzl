@@ -15,16 +15,16 @@ load("@emsdk//:emscripten_deps.bzl", "emscripten_deps")
 load("@com_github_aignas_rules_shellcheck//:deps.bzl", "shellcheck_dependencies")
 load("@aspect_bazel_lib//lib:repositories.bzl", "register_jq_toolchains", "register_yq_toolchains")
 load("@com_google_cel_cpp//bazel:deps.bzl", "parser_deps")
+load("@com_github_chrusty_protoc_gen_jsonschema//:deps.bzl", protoc_gen_jsonschema_go_dependencies = "go_dependencies")
 
 # go version for rules_go
-GO_VERSION = "1.18"
+GO_VERSION = "1.20"
 
-JQ_VERSION = "1.6"
+JQ_VERSION = "1.7"
 YQ_VERSION = "4.24.4"
 
 def envoy_dependency_imports(go_version = GO_VERSION, jq_version = JQ_VERSION, yq_version = YQ_VERSION):
-    # TODO: allow building of tools for easier onboarding
-    rules_foreign_cc_dependencies(register_default_tools = False, register_built_tools = False)
+    rules_foreign_cc_dependencies()
     go_rules_dependencies()
     go_register_toolchains(go_version)
     envoy_download_go_sdks(go_version)
@@ -57,7 +57,7 @@ def envoy_dependency_imports(go_version = GO_VERSION, jq_version = JQ_VERSION, y
         oss_fuzz = True,
         honggfuzz = False,
     )
-    emscripten_deps()
+    emscripten_deps(emscripten_version = "3.1.7")
     register_jq_toolchains(version = jq_version)
     register_yq_toolchains(version = yq_version)
     parser_deps()
@@ -125,7 +125,7 @@ def envoy_dependency_imports(go_version = GO_VERSION, jq_version = JQ_VERSION, y
         # source = "https://github.com/bufbuild/protoc-gen-validate/blob/v0.6.1/dependencies.bzl#L60-L65"
     )
     go_repository(
-        name = "com_github_lyft_protoc_gen_star",
+        name = "com_github_lyft_protoc_gen_star_v2",
         importpath = "github.com/lyft/protoc-gen-star/v2",
         sum = "h1:keaAo8hRuAT0O3DfJ/wM3rufbAjGeJ1lAtWZHDjKGB0=",
         version = "v2.0.1",
@@ -146,6 +146,8 @@ def envoy_dependency_imports(go_version = GO_VERSION, jq_version = JQ_VERSION, y
         # use_category = ["api"],
         # source = "https://github.com/bufbuild/protoc-gen-validate/blob/v0.6.1/dependencies.bzl#L23-L28"
     )
+
+    protoc_gen_jsonschema_go_dependencies()
 
 def envoy_download_go_sdks(go_version):
     go_download_sdk(

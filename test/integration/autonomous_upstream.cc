@@ -24,6 +24,7 @@ const char AutonomousStream::RESET_AFTER_REQUEST[] = "reset_after_request";
 const char AutonomousStream::CLOSE_AFTER_RESPONSE[] = "close_after_response";
 const char AutonomousStream::NO_TRAILERS[] = "no_trailers";
 const char AutonomousStream::NO_END_STREAM[] = "no_end_stream";
+const char AutonomousStream::RESPOND_AFTER_REQUEST_HEADERS[] = "respond_after_request_headers";
 
 AutonomousStream::AutonomousStream(FakeHttpConnection& parent, Http::ResponseEncoder& encoder,
                                    AutonomousUpstream& upstream, bool allow_incomplete_streams)
@@ -36,10 +37,20 @@ AutonomousStream::~AutonomousStream() {
   }
 }
 
+void AutonomousStream::decodeHeaders(Http::RequestHeaderMapSharedPtr&& headers, bool end_stream) {
+  bool send_response = !headers->get(Http::LowerCaseString(RESPOND_AFTER_REQUEST_HEADERS)).empty();
+  FakeStream::decodeHeaders(std::move(headers), end_stream);
+
+  if (send_response) {
+    absl::MutexLock lock(&lock_);
+    sendResponse();
+  }
+}
+
 // By default, automatically send a response when the request is complete.
 void AutonomousStream::setEndStream(bool end_stream) {
   FakeStream::setEndStream(end_stream);
-  if (end_stream) {
+  if (end_stream && headers_->get(Http::LowerCaseString(RESPOND_AFTER_REQUEST_HEADERS)).empty()) {
     sendResponse();
   }
 }
@@ -99,9 +110,11 @@ void AutonomousStream::sendResponse() {
 AutonomousHttpConnection::AutonomousHttpConnection(AutonomousUpstream& autonomous_upstream,
                                                    SharedConnectionWrapper& shared_connection,
                                                    Http::CodecType type,
+                                                   uint32_t max_request_headers_kb,
+                                                   uint32_t max_request_headers_count,
                                                    AutonomousUpstream& upstream)
     : FakeHttpConnection(autonomous_upstream, shared_connection, type, upstream.timeSystem(),
-                         Http::DEFAULT_MAX_REQUEST_HEADERS_KB, Http::DEFAULT_MAX_HEADERS_COUNT,
+                         max_request_headers_kb, max_request_headers_count,
                          envoy::config::core::v3::HttpProtocolOptions::ALLOW),
       upstream_(upstream) {}
 
@@ -120,10 +133,11 @@ AutonomousUpstream::~AutonomousUpstream() {
 }
 
 bool AutonomousUpstream::createNetworkFilterChain(Network::Connection& connection,
-                                                  const std::vector<Network::FilterFactoryCb>&) {
+                                                  const Filter::NetworkFilterFactoriesList&) {
   shared_connections_.emplace_back(new SharedConnectionWrapper(connection));
-  AutonomousHttpConnectionPtr http_connection(
-      new AutonomousHttpConnection(*this, *shared_connections_.back(), http_type_, *this));
+  AutonomousHttpConnectionPtr http_connection(new AutonomousHttpConnection(
+      *this, *shared_connections_.back(), http_type_, config().max_request_headers_kb_,
+      config().max_request_headers_count_, *this));
   http_connection->initialize();
   http_connections_.push_back(std::move(http_connection));
   return true;
@@ -133,6 +147,10 @@ bool AutonomousUpstream::createListenerFilterChain(Network::ListenerFilterManage
 
 void AutonomousUpstream::createUdpListenerFilterChain(Network::UdpListenerFilterManager&,
                                                       Network::UdpReadFilterCallbacks&) {}
+
+bool AutonomousUpstream::createQuicListenerFilterChain(Network::QuicListenerFilterManager&) {
+  return true;
+}
 
 void AutonomousUpstream::setLastRequestHeaders(const Http::HeaderMap& headers) {
   Thread::LockGuard lock(headers_lock_);

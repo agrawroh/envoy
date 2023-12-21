@@ -38,6 +38,16 @@ TEST(HeaderMutationFilterTest, HeaderMutationFilterTest) {
           key: "flag-header-4"
           value: "flag-header-4-value"
         append_action: "OVERWRITE_IF_EXISTS_OR_ADD"
+    - append:
+        header:
+          key: "flag-header-5"
+          value: "flag-header-5-value"
+        append_action: "OVERWRITE_IF_EXISTS"
+    - append:
+        header:
+          key: "flag-header-6"
+          value: "flag-header-6-value"
+        append_action: "OVERWRITE_IF_EXISTS"
     response_mutations:
     - remove: "flag-header"
     - append:
@@ -60,6 +70,16 @@ TEST(HeaderMutationFilterTest, HeaderMutationFilterTest) {
           key: "flag-header-4"
           value: "flag-header-4-value"
         append_action: "OVERWRITE_IF_EXISTS_OR_ADD"
+    - append:
+        header:
+          key: "flag-header-5"
+          value: "flag-header-5-value"
+        append_action: "OVERWRITE_IF_EXISTS"
+    - append:
+        header:
+          key: "flag-header-6"
+          value: "flag-header-6-value"
+        append_action: "OVERWRITE_IF_EXISTS"
   )EOF";
 
   const std::string config_yaml = R"EOF(
@@ -105,6 +125,7 @@ TEST(HeaderMutationFilterTest, HeaderMutationFilterTest) {
           {"flag-header-2", "flag-header-2-value-old"},
           {"flag-header-3", "flag-header-3-value-old"},
           {"flag-header-4", "flag-header-4-value-old"},
+          {"flag-header-6", "flag-header-6-value-old"},
           {":method", "GET"},
           {":path", "/"},
           {":scheme", "http"},
@@ -122,6 +143,10 @@ TEST(HeaderMutationFilterTest, HeaderMutationFilterTest) {
       // 'flag-header-4' is overwritten.
       EXPECT_EQ(1, headers.get(Envoy::Http::LowerCaseString("flag-header-4")).size());
       EXPECT_EQ("flag-header-4-value", headers.get_("flag-header-4"));
+      // 'flag-header-5' was not present, so will not be present after mutation.
+      EXPECT_FALSE(headers.has("flag-header-5"));
+      // 'flag-header-6' was present and should be overwritten.
+      EXPECT_EQ("flag-header-6-value", headers.get_("flag-header-6"));
     }
 
     // Case where the decodeHeaders() is not called and the encodeHeaders() is called.
@@ -132,13 +157,14 @@ TEST(HeaderMutationFilterTest, HeaderMutationFilterTest) {
           {"flag-header-2", "flag-header-2-value-old"},
           {"flag-header-3", "flag-header-3-value-old"},
           {"flag-header-4", "flag-header-4-value-old"},
+          {"flag-header-6", "flag-header-6-value-old"},
           {":status", "200"},
       };
 
-      const Http::RequestHeaderMap* request_headers_pointer =
+      Http::RequestHeaderMap* request_headers_pointer =
           Http::StaticEmptyHeaders::get().request_headers.get();
-      EXPECT_CALL(encoder_callbacks.stream_info_, getRequestHeaders())
-          .WillOnce(testing::Return(request_headers_pointer));
+      EXPECT_CALL(encoder_callbacks, requestHeaders())
+          .WillOnce(testing::Return(makeOptRefFromPtr(request_headers_pointer)));
 
       EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter.encodeHeaders(headers, true));
 
@@ -152,6 +178,10 @@ TEST(HeaderMutationFilterTest, HeaderMutationFilterTest) {
       // 'flag-header-4' is overwritten.
       EXPECT_EQ(1, headers.get(Envoy::Http::LowerCaseString("flag-header-4")).size());
       EXPECT_EQ("flag-header-4-value", headers.get_("flag-header-4"));
+      // 'flag-header-5' was not present, so will not be present after mutation.
+      EXPECT_FALSE(headers.has("flag-header-5"));
+      // 'flag-header-6' was present and should be overwritten.
+      EXPECT_EQ("flag-header-6-value", headers.get_("flag-header-6"));
     }
 
     // Case where the request headers map is nullptr.
@@ -162,11 +192,12 @@ TEST(HeaderMutationFilterTest, HeaderMutationFilterTest) {
           {"flag-header-2", "flag-header-2-value-old"},
           {"flag-header-3", "flag-header-3-value-old"},
           {"flag-header-4", "flag-header-4-value-old"},
+          {"flag-header-6", "flag-header-6-value-old"},
           {":status", "200"},
       };
 
-      EXPECT_CALL(encoder_callbacks.stream_info_, getRequestHeaders())
-          .WillOnce(testing::Return(nullptr));
+      EXPECT_CALL(encoder_callbacks, requestHeaders())
+          .WillOnce(testing::Return(Http::RequestHeaderMapOptRef{}));
 
       EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter.encodeHeaders(headers, true));
 
@@ -180,6 +211,10 @@ TEST(HeaderMutationFilterTest, HeaderMutationFilterTest) {
       // 'flag-header-4' is overwritten.
       EXPECT_EQ(1, headers.get(Envoy::Http::LowerCaseString("flag-header-4")).size());
       EXPECT_EQ("flag-header-4-value", headers.get_("flag-header-4"));
+      // 'flag-header-5' was not present, so will not be present after mutation.
+      EXPECT_FALSE(headers.has("flag-header-5"));
+      // 'flag-header-6' was present and should be overwritten.
+      EXPECT_EQ("flag-header-6-value", headers.get_("flag-header-6"));
     }
   }
 
@@ -197,6 +232,7 @@ TEST(HeaderMutationFilterTest, HeaderMutationFilterTest) {
         {"flag-header-2", "flag-header-2-value-old"},
         {"flag-header-3", "flag-header-3-value-old"},
         {"flag-header-4", "flag-header-4-value-old"},
+        {"flag-header-6", "flag-header-6-value-old"},
         {":status", "200"},
     };
 
@@ -216,6 +252,10 @@ TEST(HeaderMutationFilterTest, HeaderMutationFilterTest) {
     // 'flag-header-4' is overwritten.
     EXPECT_EQ(1, headers.get(Envoy::Http::LowerCaseString("flag-header-4")).size());
     EXPECT_EQ("flag-header-4-value", headers.get_("flag-header-4"));
+    // 'flag-header-5' was not present, so will not be present after mutation.
+    EXPECT_FALSE(headers.has("flag-header-5"));
+    // 'flag-header-6' was present and should be overwritten.
+    EXPECT_EQ("flag-header-6-value", headers.get_("flag-header-6"));
   }
 
   {
