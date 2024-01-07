@@ -4,6 +4,8 @@
 !/ci
 !/configs/google-vrp
 !/configs/*yaml
+!/linux/amd64/build_envoy-contrib_fastbuild
+!/linux/amd64/build_envoy-contrib_fastbuild_stripped
 !/linux/amd64/build_envoy_release
 !/linux/amd64/build_envoy_release_stripped
 !/linux/amd64/build_envoy_debug

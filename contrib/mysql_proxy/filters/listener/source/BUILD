@@ -23,8 +23,8 @@ envoy_cc_library(
         "//envoy/network:listen_socket_interface",
         "//source/common/api:os_sys_calls_lib",
         "//source/common/buffer:buffer_lib",
-        "//source/common/common:minimal_logger_lib",
         "//source/common/common:hex_lib",
+        "//source/common/common:minimal_logger_lib",
         "//source/common/http:headers_lib",
         "//source/common/http:utility_lib",
     ],
@@ -38,6 +38,6 @@ envoy_cc_extension(
         "//envoy/server:filter_config_interface",
         "//source/extensions/filters/network:well_known_names",
         "//source/extensions/filters/network/common:factory_base_lib",
-        "@envoy_api//envoy/extensions/filters/listener/http_inspector/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/filters/listener/mysql_inspector/v3:pkg_cc_proto",
     ],
 )
