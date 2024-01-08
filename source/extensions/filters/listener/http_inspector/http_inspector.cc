@@ -91,7 +91,8 @@ Network::FilterStatus Filter::onAccept(Network::ListenerFilterCallbacks& cb) {
       const std::string metadata_key = "tidb-listener";
       ProtobufWkt::Value metadata_value;
       metadata_value.set_string_value(hex_string);
-      ProtobufWkt::Struct& metadata = (*cb_->dynamicMetadata().mutable_filter_metadata())[metadata_key];
+
+      ProtobufWkt::Struct metadata((*cb_->dynamicMetadata().mutable_filter_metadata())[metadata_key]);
       metadata.mutable_fields()->insert({"short_handshake", metadata_value});
       cb_->setDynamicMetadata(metadata_key, metadata);
     }

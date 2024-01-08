@@ -834,7 +834,7 @@ void Filter::onUpstreamData(Buffer::Instance& data, bool end_stream) {
 
     // Extract Metadata
     const auto& request_metadata = getStreamInfo().dynamicMetadata().filter_metadata();
-    const auto filter_it = request_metadata.find("tidb-listener");
+    const auto filter_it = request_metadata.find("mysql-inspector");
     ENVOY_LOG(info, "ROHIT: Metadata = TIDB Listener.");
     if (filter_it != request_metadata.end()) {
       const auto& fields = filter_it->second.fields();
@@ -852,7 +852,8 @@ void Filter::onUpstreamData(Buffer::Instance& data, bool end_stream) {
     getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(out_buffer_0.length());
     if (upstream_) {
       getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(out_buffer_0.length());
-      upstream_->encodeData(out_buffer_0, end_stream);
+      // end_stream = false [We do not want to end stream]
+      upstream_->encodeData(out_buffer_0, false);
     }
 
     //getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(299);
