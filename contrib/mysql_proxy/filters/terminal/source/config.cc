@@ -10,25 +10,26 @@ namespace Extensions {
 namespace NetworkFilters {
 namespace MySQLConnectProxy {
 
-Network::FilterFactoryCb ConfigFactory::createFilterFactoryFromProtoTyped(
-    const envoy::extensions::filters::network::mysql_connect_proxy::v3::MySQLConnectProxy& proto_config,
-    Server::Configuration::FactoryContext& context) {
-  ASSERT(!proto_config.stat_prefix().empty());
+Network::FilterFactoryCb MySQLConnectProxyConfigFactory::createFilterFactoryFromProtoTyped(
+        const envoy::extensions::filters::network::mysql_connect_proxy::v3::MySQLConnectProxy& proto_config,
+        Server::Configuration::FactoryContext& context) {
+    ASSERT(!proto_config.stat_prefix().empty());
 
-  Envoy::MySQLConnectProxy::ConfigSharedPtr filter_config(
-      std::make_shared<Envoy::MySQLConnectProxy::Config>(proto_config, context));
-  return [filter_config, &context](Network::FilterManager& filter_manager) -> void {
-    filter_manager.addReadFilter(
-        std::make_shared<Envoy::MySQLConnectProxy::Filter>(filter_config, context.clusterManager()));
-  };
+    Envoy::MySQLConnectProxy::ConfigSharedPtr filter_config(
+            std::make_shared<Envoy::MySQLConnectProxy::Config>(proto_config, context));
+    return [filter_config, &context](Network::FilterManager& filter_manager) -> void {
+        filter_manager.addReadFilter(
+                std::make_shared<Envoy::MySQLConnectProxy::Filter>(filter_config, context.clusterManager()));
+    };
 }
 
 /**
- * Static registration for the MySQL proxy filter. @see RegisterFactory.
- */
-LEGACY_REGISTER_FACTORY(ConfigFactory, Server::Configuration::NamedNetworkFilterConfigFactory, "envoy.filters.network.mysql_connect_proxy");
+* Static registration for the MySQL Connect Proxy filter. @see RegisterFactory.
+*/
+LEGACY_REGISTER_FACTORY(MySQLConnectProxyConfigFactory, Server::Configuration::NamedNetworkFilterConfigFactory,
+                        "envoy.mysql_connect_proxy");
 
-} // namespace MySQLConnectProxy
+} // namespace TcpProxy
 } // namespace NetworkFilters
 } // namespace Extensions
 } // namespace Envoy

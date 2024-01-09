@@ -14,10 +14,10 @@ namespace MySQLConnectProxy {
 /**
  * Config registration for the MySQL proxy filter. @see NamedNetworkFilterConfigFactory.
  */
-class ConfigFactory
+class MySQLConnectProxyConfigFactory
     : public Common::FactoryBase<envoy::extensions::filters::network::mysql_connect_proxy::v3::MySQLConnectProxy> {
 public:
-  ConfigFactory() : FactoryBase(NetworkFilterNames::get().MySQLConnectProxy, true) {}
+    MySQLConnectProxyConfigFactory() : FactoryBase(NetworkFilterNames::get().MySQLConnectProxy, true) {}
 
 private:
   Network::FilterFactoryCb createFilterFactoryFromProtoTyped(
