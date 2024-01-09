@@ -35,6 +35,8 @@ public:
   const std::string MongoProxy = "envoy.filters.network.mongo_proxy";
   // MySQL proxy filter
   const std::string MySQLProxy = "envoy.filters.network.mysql_proxy";
+  // MySQL Connect proxy filter
+  const std::string MySQLConnectProxy = "envoy.filters.network.mysql_connect_proxy";
   // Postgres proxy filter
   const std::string PostgresProxy = "envoy.filters.network.postgres_proxy";
   // Rate limit filter

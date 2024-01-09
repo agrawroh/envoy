@@ -26,6 +26,7 @@ CONTRIB_EXTENSIONS = {
     # Listener filters
     #
     "envoy.filters.listener.mysql_inspector": "//contrib/mysql_proxy/filters/listener/source:config",
+    "envoy.filters.network.mysql_connect_proxy": "//contrib/mysql_proxy/filters/terminal/source:config",
 
     #
     # Sip proxy
