@@ -19,8 +19,8 @@ ARG ENVOY_BINARY=envoy
 ARG ENVOY_BINARY_SUFFIX=_stripped
 ARG TARGETPLATFORM=linux/amd64
 # Add the envoy binary and the su-exec binary
-ADD ${TARGETPLATFORM}/build_${ENVOY_BINARY}_release/su-exec /final-build/
-ADD ${TARGETPLATFORM}/build_${ENVOY_BINARY}_release${ENVOY_BINARY_SUFFIX}/* /final-build/
+ADD ${TARGETPLATFORM}/build_${ENVOY_BINARY}-contrib_fastbuild/su-exec /final-build/
+ADD ${TARGETPLATFORM}/build_${ENVOY_BINARY}-contrib_fastbuild${ENVOY_BINARY_SUFFIX}/* /final-build/
 
 # STAGE: envoy-base
 FROM registry.dev.databricks.com/universe/${IMAGE_REPO}@${IMAGE_SHA} AS envoy-base
