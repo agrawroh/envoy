@@ -56,7 +56,6 @@ RUNTIME_GUARD(envoy_reloadable_features_http1_connection_close_header_in_redirec
 RUNTIME_GUARD(envoy_reloadable_features_http1_use_balsa_parser);
 RUNTIME_GUARD(envoy_reloadable_features_http2_decode_metadata_with_quiche);
 RUNTIME_GUARD(envoy_reloadable_features_http2_discard_host_header);
-RUNTIME_GUARD(envoy_reloadable_features_http2_use_oghttp2);
 RUNTIME_GUARD(envoy_reloadable_features_http2_validate_authority_with_quiche);
 RUNTIME_GUARD(envoy_reloadable_features_http_allow_partial_urls_in_referer);
 RUNTIME_GUARD(envoy_reloadable_features_http_filter_avoid_reentrant_local_reply);
@@ -102,6 +101,8 @@ RUNTIME_GUARD(envoy_restart_features_udp_read_normalize_addresses);
 // Begin false flags. These should come with a TODO to flip true.
 // Sentinel and test flag.
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_test_feature_false);
+// Turn off `oghttp2` by default until it stabilizes.
+FALSE_RUNTIME_GUARD(envoy_reloadable_features_http2_use_oghttp2);
 // TODO(paul-r-gall) Make this enabled by default after additional soak time.
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_streaming_shadow);
 // TODO(adisuissa) reset to true to enable unified mux by default
