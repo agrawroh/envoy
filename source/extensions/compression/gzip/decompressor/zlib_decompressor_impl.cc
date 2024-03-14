@@ -39,6 +39,39 @@ void ZlibDecompressorImpl::init(int64_t window_bits) {
   initialized_ = true;
 }
 
+void ZlibDecompressorImpl::decompress(const Buffer::Instance& input_buffer, Buffer::Instance& output_buffer) {
+    size_t srcPos = 0;
+    for (const Buffer::RawSlice& input_slice : input_buffer.getRawSlices()) {
+        if (input_slice.len_ > 0) {
+            const uint8_t* data = static_cast<uint8_t*>(input_slice.mem_);
+            uint8_t ctrl = data[srcPos++];
+
+            if (ctrl < (1 << 5)) { // Literal run
+                size_t length = ctrl + 1;
+                output_buffer.add(&data[srcPos], length);
+                srcPos += length;
+            } else { // Back-reference
+                size_t length = ctrl >> 5;
+                size_t offset = (ctrl & 0x1F) << 8;
+                if (length == 7) {
+                    length += data[srcPos++];
+                }
+                offset |= data[srcPos++];
+                if (offset == 0) {
+                    break; // End of data
+                }
+                offset = output_buffer.length() - offset;
+                uint8_t* output_data = static_cast<uint8_t*>(output_buffer.linearize(length + 2));
+                for (size_t i = 0; i < length + 2; ++i) {
+                    output_data[i] = output_data[offset++];
+                }
+                //output_buffer.commit(length + 2);
+            }
+        }
+    }
+}
+
+/*
 void ZlibDecompressorImpl::decompress(const Buffer::Instance& input_buffer,
                                       Buffer::Instance& output_buffer) {
   uint64_t limit = max_inflate_ratio_ * input_buffer.length();
@@ -68,6 +101,7 @@ void ZlibDecompressorImpl::decompress(const Buffer::Instance& input_buffer,
   // will pollute output upon the next call to decompress().
   updateOutput(output_buffer);
 }
+*/
 
 bool ZlibDecompressorImpl::inflateNext() {
   const int result = inflate(zstream_ptr_.get(), Z_NO_FLUSH);
