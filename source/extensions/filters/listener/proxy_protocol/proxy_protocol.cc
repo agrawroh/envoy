@@ -569,9 +569,7 @@ bool Filter::parseTlvs(const uint8_t* buf, size_t len) {
       }
       // Always populate untyped metadata for backwards compatibility.
       ProtobufWkt::Value metadata_value;
-      // Sanitize any non utf8 characters.
-      auto sanitised_tlv_value = MessageUtil::sanitizeUtf8String(tlv_value);
-      metadata_value.set_string_value(sanitised_tlv_value.data(), sanitised_tlv_value.size());
+      metadata_value.set_string_value(tlv_value.data(), tlv_value.size());
       ProtobufWkt::Struct metadata(
           (*cb_->dynamicMetadata().mutable_filter_metadata())[metadata_key]);
       metadata.mutable_fields()->insert({key_value_pair->key(), metadata_value});
