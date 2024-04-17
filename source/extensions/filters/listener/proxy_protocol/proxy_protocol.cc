@@ -534,9 +534,7 @@ bool Filter::parseTlvs(const uint8_t* buf, size_t len) {
     auto key_value_pair = config_->isTlvTypeNeeded(tlv_type);
     if (nullptr != key_value_pair) {
       ProtobufWkt::Value metadata_value;
-      // Sanitize any non utf8 characters.
-      auto sanitised_tlv_value = MessageUtil::sanitizeUtf8String(tlv_value);
-      metadata_value.set_string_value(sanitised_tlv_value.data(), sanitised_tlv_value.size());
+      metadata_value.set_string_value(tlv_value.data(), tlv_value.size());
 
       std::string metadata_key = key_value_pair->metadata_namespace().empty()
                                      ? "envoy.filters.listener.proxy_protocol"
