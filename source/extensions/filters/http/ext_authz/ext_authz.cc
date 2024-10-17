@@ -859,16 +859,16 @@ void Filter::onComplete(Filters::Common::ExtAuthz::ResponsePtr&& response) {
              &callbacks = *decoder_callbacks_](Http::HeaderMap& response_headers) -> void {
               ENVOY_STREAM_LOG(
                   trace, "ext_authz filter added header(s) to the local response:", callbacks);
-              // Firstly, remove all headers requested by the ext_authz filter, to ensure that they
-              // will override existing headers.
-              for (const auto& header : headers) {
-                response_headers.remove(header.first);
+              // Firstly, remove all headers requested by the ext_authz filter, to ensure that they will
+              // override existing headers.
+              for (const auto& [key, _] : headers) {
+                response_headers.remove(Http::LowerCaseString(key));
               }
-              // Then set all the requested headers, allowing the same header to be set multiple
+              // Then set all of the requested headers, allowing the same header to be set multiple
               // times, e.g. `Set-Cookie`.
-              for (const auto& header : headers) {
-                ENVOY_STREAM_LOG(trace, " '{}':'{}'", callbacks, header.first.get(), header.second);
-                response_headers.addCopy(header.first, header.second);
+              for (const auto& [key, value] : headers) {
+                ENVOY_STREAM_LOG(trace, " '{}':'{}'", callbacks, key, value);
+                response_headers.addCopy(Http::LowerCaseString(key), value);
               }
             },
             absl::nullopt, Filters::Common::ExtAuthz::ResponseCodeDetails::get().AuthzError);
