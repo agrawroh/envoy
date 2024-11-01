@@ -16,11 +16,11 @@ COPY ci/docker-entrypoint.sh /
 ADD configs/envoyproxy_io_proxy.yaml /etc/envoy/envoy.yaml
 # ARGs for the envoy binary and the suffix
 ARG ENVOY_BINARY=envoy
-ARG ENVOY_BINARY_SUFFIX=_stripped
 ARG TARGETPLATFORM=linux/amd64
 # Add the envoy binary and the su-exec binary
-ADD ${TARGETPLATFORM}/build_${ENVOY_BINARY}_release/su-exec /final-build/
-ADD ${TARGETPLATFORM}/build_${ENVOY_BINARY}_release${ENVOY_BINARY_SUFFIX}/* /final-build/
+# "build-output" is the directory where release.tar.zst is extracted. This is done in the universe/envoy/build_container.sh
+ADD build-output/${ENVOY_BINARY} /final-build/
+ADD build-output/utils/su-exec /final-build/
 
 # STAGE: envoy-base
 FROM registry.dev.databricks.com/universe/${IMAGE_REPO}@${IMAGE_SHA} AS envoy-base
@@ -40,6 +40,8 @@ RUN apt-get -qq update \
 
 # STAGE: envoy
 FROM envoy-base AS envoy
+ARG ENVOY_BINARY
+RUN echo "ENVOY_BINARY: ${ENVOY_BINARY}"
 COPY --from=binary --chown=0:0 \
     /etc/envoy/envoy.yaml /etc/envoy/envoy.yaml
 COPY --from=binary --chown=0:0 \
@@ -47,7 +49,7 @@ COPY --from=binary --chown=0:0 \
 COPY --from=binary --chown=0:0 \
     /final-build/su-exec /usr/local/bin/
 COPY --from=binary --chown=0:0 \
-    "/final-build/${ENVOY_BINARY}" /usr/local/bin/
+    "/final-build/${ENVOY_BINARY}" /usr/local/bin/envoy
 
 # Make envoy image as last stage so it is built by default
 FROM envoy
