@@ -63,6 +63,8 @@ public:
   const std::string NetworkExternalProcessor = "envoy.filters.network.ext_proc";
   // Network match delegate filter
   const std::string NetworkMatchDelegate = "envoy.filters.network.match_delegate";
+  // Databricks sql proxy filter
+  const std::string DatabricksSqlProxy = "envoy.filters.network.databricks_sql_proxy";
 };
 
 using NetworkFilterNames = ConstSingleton<NetworkFilterNameValues>;

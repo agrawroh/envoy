@@ -1,0 +1,109 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.network.databricks_sql_proxy.v3;
+
+import "envoy/config/core/v3/grpc_service.proto";
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/wrappers.proto";
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.network.databricks_sql_proxy.v3";
+option java_outer_classname = "DatabricksSqlProxyProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/contrib/envoy/extensions/filters/network/databricks_sql_proxy/v3;databricks_sql_proxyv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// MySQL protocol specific routing configuration
+message MySQLRoutingConfig {
+  // Regex pattern to extract username and instance from MySQL login request
+  string username_pattern = 1 [(validate.rules).string = {min_len: 1}];
+
+  // List of regex patterns for allowed hostnames. If a hostname doesn't match any pattern in this list, the connection
+  // will be rejected. If this list is empty, all hostnames will be allowed.
+  repeated string allowed_hostname_patterns = 2;
+}
+
+// Postgres protocol specific routing configuration
+message PostgresRoutingConfig {
+  // Send upstream IP address to downstream client via Postgres ParameterStatus message.
+  bool send_parameter_status_upstream_ip = 1;
+
+  // Read upstream IP address from Postgres ParameterStatus message.
+  bool read_parameter_status_upstream_ip = 2;
+
+  // Store cancellation key from Postgres BackendKeyData message in the sidecar.
+  bool store_cancellation_key = 3;
+
+  // Should the filter randomize and replace the cancellation key (PID and secret) with 
+  // 64-bit integer in the Postgres BackendKeyData message.
+  bool randomize_cancellation_key = 4;
+}
+
+// [#protodoc-title: Databricks SQL Proxy Filter]
+// A filter that proxies Postgres or MySQL traffic to Databricks SQL.
+// [#next-free-field: 10]
+message DatabricksSqlProxy {
+  enum Protocol {
+    UNDEFINED_PROTOCOL = 0;
+    POSTGRES = 1;
+    MYSQL = 2;
+  }
+
+  // Where to get the destination cluster name from.
+  //
+  // SIDECAR_SERVICE: Use the target cluster name returned from the sidecar service gRPC call.
+  // SNI: Use the SNI from the client hello.
+  // DFP: Use the provided cluster name for Dynamic Forward Proxy.
+  enum DestinationClusterSource {
+    UNDEFINED_DESTINATION_CLUSTER_SOURCE = 0;
+    SIDECAR_SERVICE = 1;
+    SNI = 2;
+    DYNAMIC_FORWARD_PROXY = 3;
+  }
+
+  // The human readable prefix to use when emitting :ref:`statistics
+  // <config_network_filters_postgres_proxy_stats>`.
+  string stat_prefix = 1 [(validate.rules).string = {min_len: 1}];
+
+  // Protocol of the application.
+  Protocol protocol = 2 [(validate.rules).enum = {defined_only: true not_in: 0}];
+
+  // The external authorization gRPC service configuration.
+  // The default timeout is set to 200ms by this filter.
+  config.core.v3.GrpcService ext_authz_service = 3;
+
+  // Specifies if the peer certificate is sent to the external service.
+  //
+  // When this field is true, Envoy will include the peer X.509 certificate, if available, in the
+  // :ref:`certificate<envoy_v3_api_field_service.auth.v3.AttributeContext.Peer.certificate>`.
+  bool include_peer_certificate = 4;
+
+  // Specifies if the filter should setup TLS with upstream.
+  // By default (true), the filter will always setup TLS with upstream.
+  google.protobuf.BoolValue enable_upstream_tls = 5 [(validate.rules).message = {required: true}];
+
+  DestinationClusterSource destination_cluster_source = 6
+      [(validate.rules).enum = {defined_only: true not_in: 0}];
+
+  // Protocol-specific routing configuration
+  oneof protocol_config {
+    MySQLRoutingConfig mysql_config = 7;
+
+    PostgresRoutingConfig postgres_config = 8;
+  }
+
+  // The timeout for handling handshake message and figuring out upstream cluster.
+  // If we cannot figure out the upstream cluster within this timeout, we will close the connection.
+  // Once we figure the upstream cluster, we will start tcp_proxy connection and
+  // the timeout for the actual connection is controlled by tcp_proxy.
+  // Default timeout value is 15 seconds.
+  google.protobuf.Duration handshake_timeout = 9;
+
+  // The list of keys to propagate to the ext_authz filter by reading it from the incoming request. Filter state should
+  // already be present with the keys in the incoming request. Type of the metadata should be ``envoy.hashable_string``
+  // or otherwise it would not get extracted and propagated.
+  repeated string filter_state_propagation_keys_to_ext_authz = 10;
+}

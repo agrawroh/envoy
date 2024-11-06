@@ -29,7 +29,9 @@ CONTRIB_V3_ALLOW_LIST = [
     # Extensions moved from core to contrib.
     'envoy.extensions.filters.http.dynamo.v3',
     'envoy.extensions.filters.http.squash.v3',
+    'envoy.extensions.filters.listener.databricks_sql_inspector.v3',
     'envoy.extensions.filters.network.client_ssl_auth.v3',
+    'envoy.extensions.filters.network.databricks_sql_proxy.v3',
     'envoy.extensions.filters.network.generic_proxy.action.v3',
     'envoy.extensions.filters.network.generic_proxy.codecs.dubbo.v3',
     'envoy.extensions.filters.network.generic_proxy.codecs.http1.v3',

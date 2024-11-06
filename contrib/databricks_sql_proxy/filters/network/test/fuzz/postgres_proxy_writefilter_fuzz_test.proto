@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.network.test.fuzz.postgres_proxy_writefilter;
+
+import "validate/validate.proto";
+import "google/protobuf/empty.proto";
+
+message OnWrite {
+  bytes data = 1;
+  bool end_stream = 2;
+}
+
+message DatabricksSqlProxyPostgresTestCase {
+  repeated OnWrite on_writes = 1;
+}

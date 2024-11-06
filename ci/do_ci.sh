@@ -642,15 +642,19 @@ case $CI_TARGET in
         ;;
 
     fuzz)
+        # [Databricks]: Need to change the tags to fuzz_target because this the the correct one. Remove new line from the targets.
+        # Set up fuzz iterations to 600 to ensure that the fuzzers have enough time to find issues.
+        FUZZ_ITERATIONS="${FUZZ_ITERATIONS:-600}"
         setup_clang_toolchain
-        FUZZ_TEST_TARGETS=("$(bazel query "${BAZEL_GLOBAL_OPTIONS[@]}" "attr('tags','fuzzer',${TEST_TARGETS[*]})")")
+        FUZZ_TEST_TARGETS=($(bazel query "${BAZEL_GLOBAL_OPTIONS[@]}" "attr('tags','fuzz_target',${TEST_TARGETS[*]})" | tr '\n' ' '))
         echo "bazel ASAN libFuzzer build with fuzz tests ${FUZZ_TEST_TARGETS[*]}"
-        echo "Building envoy fuzzers and executing 100 fuzz iterations..."
+        echo "Building envoy fuzzers and executing ${FUZZ_ITERATIONS} fuzz iterations..."
+        # [Databricks]: Update iteration to 600 since we start from empty corpus
         bazel_with_collection \
             test "${BAZEL_BUILD_OPTIONS[@]}" \
             --config=asan-fuzzer \
             "${FUZZ_TEST_TARGETS[@]}" \
-            --test_arg="-runs=10"
+            --test_arg="-runs=${FUZZ_ITERATIONS}"
         ;;
 
     gcc)
