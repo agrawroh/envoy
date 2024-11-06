@@ -65,6 +65,8 @@ public:
   const std::string NetworkMatchDelegate = "envoy.filters.network.match_delegate";
   // Reverse tunnel filter
   const std::string ReverseTunnel = "envoy.filters.network.reverse_tunnel";
+  // Databricks sql proxy filter
+  const std::string DatabricksSqlProxy = "envoy.filters.network.databricks_sql_proxy";
 };
 
 using NetworkFilterNames = ConstSingleton<NetworkFilterNameValues>;
