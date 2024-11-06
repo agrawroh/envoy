@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.listener.databricks_sql_inspector.v3;
+
+import "google/protobuf/wrappers.proto";
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.listener.databricks_sql_inspector.v3";
+option java_outer_classname = "DatabricksSqlInspectorProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/contrib/envoy/extensions/filters/listener/databricks_sql_inspector/v3;databricks_sql_inspectorv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// MySQL protocol specific configuration for initial handshake
+message MySQLConfig {
+  // Server version string to advertise (e.g., "8.0.0-databricks-proxy")
+  string server_version = 1 [(validate.rules).string = {min_len: 1}];
+
+  // Authentication plugin name (e.g., "mysql_native_password")
+  string auth_plugin_name = 2 [(validate.rules).string = {min_len: 1}];
+
+  // Character set ID (defaults to utf8_general_ci if not specified)
+  uint32 character_set_id = 3;
+
+  // Whether to require TLS from the client
+  string server_capabilities = 4 [(validate.rules).string = {min_len: 1}];
+
+  // Whether to require TLS from the client
+  string extended_server_capabilities = 5 [(validate.rules).string = {min_len: 1}];
+
+  // Whether to require TLS from the client
+  google.protobuf.BoolValue require_tls = 6 [(validate.rules).message = {required: true}];
+}
+
+// Postgres protocol specific configuration for initial handshake
+message PostgresConfig {
+  // Reserved
+}
+
+// [#protodoc-title: Databricks SQL Inspector Filter]
+// Detect whether the application protocol is Postgres or MySQL.
+// [#extension: envoy.filters.listener.databricks_sql_inspector]
+message DatabricksSqlInspector {
+  enum Protocol {
+    UNSPECIFIED = 0;
+    POSTGRES = 1;
+    MYSQL = 2;
+  }
+
+  // The human readable prefix to use when emitting statistics
+  string stat_prefix = 1 [(validate.rules).string = {min_len: 1}];
+
+  // Protocol of the application.
+  // Must be set to value other than UNSPECIFIED.
+  Protocol protocol = 2 [(validate.rules).enum = {not_in: 0}];
+
+  // Protocol-specific configuration
+  oneof protocol_config {
+    MySQLConfig mysql_config = 3;
+
+    PostgresConfig postgres_config = 4;
+  }
+}

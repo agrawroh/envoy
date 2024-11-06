@@ -21,10 +21,19 @@ CONTRIB_EXTENSIONS = {
     "envoy.filters.http.alpn":                                  "//contrib/istio/filters/http/alpn/source:config_lib",
 
     #
+    # Listener filters
+    #
+
+    # Databricks custom listener filter to handle postgres and mysql protocol.
+    # This must be used with the corresponding network filter.
+    "envoy.filters.listener.databricks_sql_inspector":          "//contrib/databricks_sql_proxy/filters/listener/source:config",
+
+    #
     # Network filters
     #
 
     "envoy.filters.network.client_ssl_auth":                    "//contrib/client_ssl_auth/filters/network/source:config",
+    "envoy.filters.network.databricks_sql_proxy":               "//contrib/databricks_sql_proxy/filters/network/source:config",
     "envoy.filters.network.kafka_broker":                       "//contrib/kafka/filters/network/source/broker:config_lib",
     "envoy.filters.network.kafka_mesh":                         "//contrib/kafka/filters/network/source/mesh:config_lib",
     "envoy.filters.network.mysql_proxy":                        "//contrib/mysql_proxy/filters/network/source:config",

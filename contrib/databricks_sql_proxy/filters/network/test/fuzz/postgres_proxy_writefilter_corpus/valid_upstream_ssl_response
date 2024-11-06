@@ -1,0 +1,4 @@
+on_write {
+  data = "\x53"
+  end_stream = false
+}

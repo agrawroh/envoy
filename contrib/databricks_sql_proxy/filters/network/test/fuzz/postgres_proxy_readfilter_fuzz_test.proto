@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.network.test.fuzz.postgres_proxy_readfilter;
+
+import "contrib/envoy/extensions/filters/network/databricks_sql_proxy/v3/databricks_sql_proxy.proto";
+import "validate/validate.proto";
+import "google/protobuf/empty.proto";
+
+message OnData {
+  bytes data = 1;
+  bool end_stream = 2;
+  // optional: to set the default authorization check result for this and the following onData()
+  Result result = 3;
+}
+
+message Action {
+  oneof action_selector {
+    option (validate.required) = true;
+    // Call onNewConnection().
+    google.protobuf.Empty on_new_connection = 1;
+    // Call onData().
+    OnData on_data = 2;
+  }
+}
+
+message Result {
+  oneof result_selector {
+    option (validate.required) = true;
+    // Authorization check status
+    google.protobuf.Empty check_status_error = 1;
+    google.protobuf.Empty check_status_denied = 2;
+    google.protobuf.Empty check_status_ok = 3;
+  }
+}
+
+message DatabricksSqlProxyPostgresTestCase {
+  repeated Action actions = 1;
+  envoy.extensions.filters.network.databricks_sql_proxy.v3.DatabricksSqlProxy
+      .DestinationClusterSource destination_cluster_source = 2;
+}
