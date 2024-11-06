@@ -417,6 +417,8 @@ public:
    * return value is cwnd(in packets) times the connection's MSS.
    */
   virtual absl::optional<uint64_t> congestionWindowInBytes() const PURE;
+
+  virtual void setTransportSocketDataChunkSendLimit(uint64_t data_chunk_size) PURE;
 };
 
 using ConnectionPtr = std::unique_ptr<Connection>;

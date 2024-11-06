@@ -74,6 +74,8 @@ public:
   void closeSocket(Network::ConnectionEvent event) override;
   Network::IoResult doRead(Buffer::Instance& buffer) override;
   void onConnected() override;
+  // This should be no-op for this transport socket.
+  void setTlsDataChunkSendLimit(uint64_t _) override {}
 
   // TsiHandshakerCallbacks
   void onNextDone(NextResultPtr&& result) override;

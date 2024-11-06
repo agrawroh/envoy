@@ -115,6 +115,15 @@ public:
   const StreamInfo::StreamInfo& streamInfo() const override { return stream_info_; }
   absl::string_view transportFailureReason() const override;
   bool startSecureTransport() override { return transport_socket_->startSecureTransport(); }
+  void setTransportSocketDataChunkSendLimit(uint64_t data_chunk_size) override {
+    const auto* socket_ptr = transport_socket_.get();
+    const char* socket_type = typeid(*socket_ptr).name();
+    ENVOY_CONN_LOG(info,
+                   "connectionImpl setTransportSocketDataChunkSendLimit to {} for "
+                   "transport_socket_:{} type: {}",
+                   *this, data_chunk_size, fmt::ptr(socket_ptr), socket_type);
+    transport_socket_->setTlsDataChunkSendLimit(data_chunk_size);
+  }
   absl::optional<std::chrono::milliseconds> lastRoundTripTime() const override;
   void configureInitialCongestionWindow(uint64_t bandwidth_bits_per_sec,
                                         std::chrono::microseconds rtt) override;

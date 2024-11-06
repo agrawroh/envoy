@@ -130,7 +130,8 @@ RuntimeFilter::RuntimeFilter(const envoy::config::accesslog::v3::RuntimeFilter& 
                              Runtime::Loader& runtime, Random::RandomGenerator& random)
     : runtime_(runtime), random_(random), runtime_key_(config.runtime_key()),
       percent_(config.percent_sampled()),
-      use_independent_randomness_(config.use_independent_randomness()) {}
+      use_independent_randomness_(config.use_independent_randomness()),
+      emit_metadata_(config.emit_metadata()), metadata_key_suffix_(config.metadata_key_suffix()) {}
 
 bool RuntimeFilter::evaluate(const Formatter::Context&,
                              const StreamInfo::StreamInfo& stream_info) const {
@@ -151,9 +152,31 @@ bool RuntimeFilter::evaluate(const Formatter::Context&,
     }
   }
 
-  return runtime_.snapshot().featureEnabled(
-      runtime_key_, percent_.numerator(), random_value,
-      ProtobufPercentHelper::fractionalPercentDenominatorToInt(percent_.denominator()));
+  const uint64_t denominator =
+      ProtobufPercentHelper::fractionalPercentDenominatorToInt(percent_.denominator());
+
+  bool sampled = runtime_.snapshot().featureEnabled(runtime_key_, percent_.numerator(),
+                                                    random_value, denominator);
+
+  // Store the sampling decision and fraction information in dynamic metadata if configured.
+  if (emit_metadata_) {
+    auto& mutable_info = const_cast<StreamInfo::StreamInfo&>(stream_info);
+    Protobuf::Struct sampling_metadata;
+    auto* sampling_fields = sampling_metadata.mutable_fields();
+
+    // Store the basic sampling decision
+    (*sampling_fields)[SamplingDecisionKey].set_bool_value(sampled);
+    (*sampling_fields)[RuntimeKeyFieldName].set_string_value(runtime_key_);
+
+    // Store the fraction information
+    const uint64_t numerator = runtime_.snapshot().getInteger(runtime_key_, percent_.numerator());
+    (*sampling_fields)[NumeratorKey].set_number_value(numerator);
+    (*sampling_fields)[DenominatorKey].set_number_value(denominator);
+
+    mutable_info.setDynamicMetadata(getMetadataKey(), sampling_metadata);
+  }
+
+  return sampled;
 }
 
 OperatorFilter::OperatorFilter(

@@ -66,6 +66,11 @@ public:
   Ssl::ConnectionInfoConstSharedPtr ssl() const override;
   bool startSecureTransport() override { return false; }
   void configureInitialCongestionWindow(uint64_t, std::chrono::microseconds) override {}
+  void setTlsDataChunkSendLimit(uint64_t data_chunk_size) override {
+    data_chunk_send_limit_ = data_chunk_size;
+    ENVOY_CONN_LOG(info, "ssl_socket setTlsDataChunkSendLimit to {} *this:{}",
+                   callbacks_->connection(), data_chunk_send_limit_, fmt::ptr(this));
+  }
   // Ssl::PrivateKeyConnectionCallbacks
   void onPrivateKeyMethodComplete() override;
   // Ssl::HandshakeCallbacks
@@ -104,7 +109,7 @@ private:
   ContextImplSharedPtr ctx_;
   uint64_t bytes_to_retry_{};
   std::string failure_reason_;
-
+  uint64_t data_chunk_send_limit_{16384};
   SslHandshakerImplSharedPtr info_;
 };
 
@@ -125,6 +130,8 @@ public:
   Ssl::ConnectionInfoConstSharedPtr ssl() const override { return nullptr; }
   bool startSecureTransport() override { return false; }
   void configureInitialCongestionWindow(uint64_t, std::chrono::microseconds) override {}
+  // This should be no-op for this transport socket.
+  void setTlsDataChunkSendLimit(uint64_t) override {}
 };
 
 // This SslSocket will be used when SSL secret is not fetched from SDS server.
