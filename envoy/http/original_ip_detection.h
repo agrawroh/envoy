@@ -74,12 +74,12 @@ public:
   ~OriginalIPDetectionFactory() override = default;
 
   /**
-   * Creates a particular extension implementation or return an error status.
+   * Creates a particular extension implementation.
    *
    * @param config supplies the configuration for the original IP detection extension.
    * @return OriginalIPDetectionSharedPtr the extension instance.
    */
-  virtual absl::StatusOr<OriginalIPDetectionSharedPtr>
+  virtual OriginalIPDetectionSharedPtr
   createExtension(const Protobuf::Message& config,
                   Server::Configuration::FactoryContext& context) PURE;
 
