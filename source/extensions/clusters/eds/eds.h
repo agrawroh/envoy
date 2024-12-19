@@ -106,6 +106,7 @@ private:
 
   Config::SubscriptionPtr subscription_;
   const LocalInfo::LocalInfo& local_info_;
+  const envoy::config::cluster::v3::Cluster& cluster_config_;
   std::vector<LocalityWeightsMap> locality_weights_map_;
   Event::TimerPtr assignment_timeout_;
   InitializePhase initialize_phase_;

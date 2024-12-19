@@ -31,6 +31,7 @@ EdsClusterImpl::EdsClusterImpl(const envoy::config::cluster::v3::Cluster& cluste
       Envoy::Config::SubscriptionBase<envoy::config::endpoint::v3::ClusterLoadAssignment>(
           cluster_context.messageValidationVisitor(), "cluster_name"),
       local_info_(cluster_context.serverFactoryContext().localInfo()),
+      cluster_config_(cluster),
       eds_resources_cache_(
           Runtime::runtimeFeatureEnabled("envoy.restart_features.use_eds_cache_for_ads")
               ? cluster_context.clusterManager().edsResourcesCache()
@@ -38,8 +39,8 @@ EdsClusterImpl::EdsClusterImpl(const envoy::config::cluster::v3::Cluster& cluste
   Event::Dispatcher& dispatcher = cluster_context.serverFactoryContext().mainThreadDispatcher();
   assignment_timeout_ = dispatcher.createTimer([this]() -> void { onAssignmentTimeout(); });
   const auto& eds_config = cluster.eds_cluster_config().eds_config();
-  if (Config::SubscriptionFactory::isPathBasedConfigSource(
-          eds_config.config_source_specifier_case())) {
+  if (cluster.has_load_assignment() || Config::SubscriptionFactory::isPathBasedConfigSource(
+                                           eds_config.config_source_specifier_case())) {
     initialize_phase_ = InitializePhase::Primary;
   } else {
     initialize_phase_ = InitializePhase::Secondary;
@@ -59,7 +60,24 @@ EdsClusterImpl::~EdsClusterImpl() {
   }
 }
 
-void EdsClusterImpl::startPreInit() { subscription_->start({edsServiceName()}); }
+void EdsClusterImpl::startPreInit() {
+  if (cluster_config_.has_load_assignment()) {
+    ProtobufTypes::MessagePtr msg = std::make_unique<envoy::config::endpoint::v3::ClusterLoadAssignment>(
+        cluster_config_.load_assignment());
+
+    Config::DecodedResourceImpl decoded_resource(std::move(msg), "", std::vector<std::string>(), "");
+    std::vector<Config::DecodedResourceRef> resources = {decoded_resource};
+
+    auto status = onConfigUpdate(resources, "");
+    if (!status.ok()) {
+      ENVOY_LOG(warn, "EDS initial config rejected: {}", status.ToString());
+    }
+    onPreInitComplete();
+  }
+
+  // Continue with regular EDS initialization
+  subscription_->start({edsServiceName()});
+}
 
 void EdsClusterImpl::BatchUpdateHelper::batchUpdate(PrioritySet::HostUpdateCb& host_update_cb) {
   absl::flat_hash_set<std::string> all_new_hosts;
