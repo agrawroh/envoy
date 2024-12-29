@@ -21,9 +21,36 @@
 #include "source/common/upstream/cluster_factory_impl.h"
 #include "source/common/upstream/upstream_impl.h"
 #include "source/extensions/clusters/eds/leds.h"
+#include "source/extensions/common/dynamic_forward_proxy/dns_cache.h"
+#include "source/extensions/common/dynamic_forward_proxy/dns_cache_impl.h"
 
 namespace Envoy {
 namespace Upstream {
+
+struct DnsResolutionContext {
+  bool resolution_complete = false;
+  Network::Address::InstanceConstSharedPtr dns_address;
+};
+
+class DnsCacheCallbacks
+    : public Extensions::Common::DynamicForwardProxy::DnsCache::LoadDnsCacheEntryCallbacks {
+public:
+  DnsCacheCallbacks(Network::Address::InstanceConstSharedPtr& addr, bool& complete)
+      : dns_address_(addr), resolution_complete_(complete) {}
+
+  // Implement the pure virtual method
+  void onLoadDnsCacheComplete(
+      const Extensions::Common::DynamicForwardProxy::DnsHostInfoSharedPtr& host_info) override {
+    if (host_info && host_info->address()) {
+      dns_address_ = host_info->address();
+    }
+    resolution_complete_ = true;
+  }
+
+private:
+  Network::Address::InstanceConstSharedPtr& dns_address_;
+  bool& resolution_complete_;
+};
 
 /**
  * Cluster implementation that reads host information from the Endpoint Discovery Service.
@@ -106,6 +133,8 @@ private:
 
   Config::SubscriptionPtr subscription_;
   const LocalInfo::LocalInfo& local_info_;
+  Server::Configuration::ServerFactoryContext& factory_context_;
+  ProtobufMessage::ValidationVisitor& validation_visitor_;
   const envoy::config::cluster::v3::Cluster& cluster_config_;
   std::vector<LocalityWeightsMap> locality_weights_map_;
   Event::TimerPtr assignment_timeout_;
@@ -125,6 +154,10 @@ private:
   // An optional cache for the EDS resources.
   // Upon a (warming) timeout, a cached resource will be used.
   Config::EdsResourcesCacheOptRef eds_resources_cache_;
+
+  // DNS Cache
+  Extensions::Common::DynamicForwardProxy::DnsCacheManagerSharedPtr dns_cache_manager_;
+  Extensions::Common::DynamicForwardProxy::DnsCacheSharedPtr dns_cache_;
 
   // Tracks whether a cached resource is used as the current EDS resource.
   bool using_cached_resource_{false};

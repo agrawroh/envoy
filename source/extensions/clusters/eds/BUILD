@@ -36,9 +36,12 @@ envoy_cc_extension(
         "//source/common/protobuf:utility_lib",
         "//source/common/upstream:cluster_factory_lib",
         "//source/common/upstream:upstream_includes",
+        "//source/extensions/common/dynamic_forward_proxy:dns_cache_interface",
+        "//source/extensions/common/dynamic_forward_proxy:dns_cache_manager_impl",
         "@envoy_api//envoy/config/cluster/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/endpoint/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/common/dynamic_forward_proxy/v3:pkg_cc_proto",
         "@envoy_api//envoy/service/discovery/v3:pkg_cc_proto",
     ],
 )

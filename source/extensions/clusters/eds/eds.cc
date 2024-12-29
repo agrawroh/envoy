@@ -3,6 +3,7 @@
 #include "envoy/common/exception.h"
 #include "envoy/config/cluster/v3/cluster.pb.h"
 #include "envoy/config/core/v3/config_source.pb.h"
+#include "envoy/extensions/common/dynamic_forward_proxy/v3/dns_cache.pb.h"
 #include "envoy/service/discovery/v3/discovery.pb.h"
 
 #include "source/common/common/assert.h"
@@ -10,6 +11,9 @@
 #include "source/common/config/api_version.h"
 #include "source/common/config/decoded_resource_impl.h"
 #include "source/common/grpc/common.h"
+#include "source/extensions/common/dynamic_forward_proxy/dns_cache.h"
+#include "source/extensions/common/dynamic_forward_proxy/dns_cache_impl.h"
+#include "source/extensions/common/dynamic_forward_proxy/dns_cache_manager_impl.h"
 
 namespace Envoy {
 namespace Upstream {
@@ -31,7 +35,8 @@ EdsClusterImpl::EdsClusterImpl(const envoy::config::cluster::v3::Cluster& cluste
       Envoy::Config::SubscriptionBase<envoy::config::endpoint::v3::ClusterLoadAssignment>(
           cluster_context.messageValidationVisitor(), "cluster_name"),
       local_info_(cluster_context.serverFactoryContext().localInfo()),
-      cluster_config_(cluster),
+      factory_context_(cluster_context.serverFactoryContext()),
+      validation_visitor_(cluster_context.messageValidationVisitor()), cluster_config_(cluster),
       eds_resources_cache_(
           Runtime::runtimeFeatureEnabled("envoy.restart_features.use_eds_cache_for_ads")
               ? cluster_context.clusterManager().edsResourcesCache()
@@ -51,6 +56,22 @@ EdsClusterImpl::EdsClusterImpl(const envoy::config::cluster::v3::Cluster& cluste
           eds_config, Grpc::Common::typeUrl(resource_name), info_->statsScope(), *this,
           resource_decoder_, {}),
       Config::SubscriptionPtr);
+
+  // Initialize DNS cache manager and cache
+  Extensions::Common::DynamicForwardProxy::DnsCacheManagerFactoryImpl cache_manager_factory(
+      factory_context_, validation_visitor_);
+  dns_cache_manager_ = cache_manager_factory.get();
+
+  envoy::extensions::common::dynamic_forward_proxy::v3::DnsCacheConfig dns_cache_config;
+  dns_cache_config.set_name("eds");
+  dns_cache_config.set_max_hosts(8);
+
+  auto cache_or_error = dns_cache_manager_->getCache(dns_cache_config);
+  if (!cache_or_error.ok()) {
+    ENVOY_LOG(warn, "eds: failed to create DNS cache");
+  } else {
+    dns_cache_ = cache_or_error.value();
+  }
 }
 
 EdsClusterImpl::~EdsClusterImpl() {
@@ -62,10 +83,12 @@ EdsClusterImpl::~EdsClusterImpl() {
 
 void EdsClusterImpl::startPreInit() {
   if (cluster_config_.has_load_assignment()) {
-    ProtobufTypes::MessagePtr msg = std::make_unique<envoy::config::endpoint::v3::ClusterLoadAssignment>(
-        cluster_config_.load_assignment());
+    ProtobufTypes::MessagePtr msg =
+        std::make_unique<envoy::config::endpoint::v3::ClusterLoadAssignment>(
+            cluster_config_.load_assignment());
 
-    Config::DecodedResourceImpl decoded_resource(std::move(msg), "", std::vector<std::string>(), "");
+    Config::DecodedResourceImpl decoded_resource(std::move(msg), "", std::vector<std::string>(),
+                                                 "");
     std::vector<Config::DecodedResourceRef> resources = {decoded_resource};
 
     auto status = onConfigUpdate(resources, "");
@@ -171,9 +194,76 @@ void EdsClusterImpl::BatchUpdateHelper::updateLocalityEndpoints(
     const envoy::config::endpoint::v3::LbEndpoint& lb_endpoint,
     const envoy::config::endpoint::v3::LocalityLbEndpoints& locality_lb_endpoint,
     PriorityStateManager& priority_state_manager, absl::flat_hash_set<std::string>& all_new_hosts) {
-  const auto address =
-      THROW_OR_RETURN_VALUE(parent_.resolveProtoAddress(lb_endpoint.endpoint().address()),
-                            const Network::Address::InstanceConstSharedPtr);
+  const auto& endpoint_address = lb_endpoint.endpoint().address();
+  Network::Address::InstanceConstSharedPtr address;
+
+  // First check if it's an IP address
+  if (endpoint_address.has_socket_address()) {
+    const auto& socket = endpoint_address.socket_address();
+    address =
+        Network::Utility::parseInternetAddressNoThrow(socket.address(), socket.port_value(), false);
+
+    // If it's not an IP address, check if it's a hostname and resolve it
+    if (!address && parent_.dns_cache_) {
+      ENVOY_LOG(debug, "eds: starting DNS resolution for '{}:{}'", socket.address(),
+                socket.port_value());
+
+      auto context = std::make_shared<DnsResolutionContext>();
+      auto callbacks =
+          std::make_unique<DnsCacheCallbacks>(context->dns_address, context->resolution_complete);
+
+      // Start DNS resolution using stored cache
+      auto result = parent_.dns_cache_->loadDnsCacheEntry(socket.address(), socket.port_value(),
+                                                          false, *callbacks);
+      ENVOY_LOG(debug, "eds: DNS cache lookup status: {}", static_cast<int>(result.status_));
+
+      if (result.status_ ==
+              Extensions::Common::DynamicForwardProxy::DnsCache::LoadDnsCacheEntryStatus::InCache &&
+          result.host_info_.has_value()) {
+        ENVOY_LOG(debug, "eds: using cached DNS result for '{}'", socket.address());
+        address = (*result.host_info_)->address();
+      } else if (result.status_ == Extensions::Common::DynamicForwardProxy::DnsCache::
+                                       LoadDnsCacheEntryStatus::Loading) {
+        // Create a timer for the timeout (5s) and wait for the resolution to complete
+        Event::TimerPtr resolution_timer =
+            parent_.factory_context_.mainThreadDispatcher().createTimer(
+                [&context]() { context->resolution_complete = true; });
+        resolution_timer->enableTimer(std::chrono::milliseconds(5000));
+
+        // Wait for either resolution complete or timeout
+        ENVOY_LOG(debug, "eds: waiting for DNS resolution callback for '{}'", socket.address());
+        while (!context->resolution_complete) {
+          parent_.factory_context_.mainThreadDispatcher().run(Event::Dispatcher::RunType::NonBlock);
+        }
+
+        // Cancel the timer if resolution completed before timeout
+        resolution_timer->disableTimer();
+
+        // Check if we have a valid address (timeout case will have null address)
+        if (context->dns_address) {
+          ENVOY_LOG(debug, "eds: DNS resolution complete for '{}'", socket.address());
+          address = context->dns_address;
+        } else {
+          ENVOY_LOG(warn, "eds: DNS resolution timed out for '{}'", socket.address());
+        }
+      }
+
+      if (!address) {
+        ENVOY_LOG(warn, "eds: DNS resolution failed for '{}'", socket.address());
+        return;
+      }
+      ENVOY_LOG(debug, "eds: resolved address for '{}:{}' to '{}'", socket.address(),
+                socket.port_value(), address->asString());
+    }
+  }
+
+  // Log final address state
+  if (!address) {
+    ENVOY_LOG(warn, "eds: failed to resolve address for endpoint with hostname '{}'",
+              lb_endpoint.endpoint().hostname());
+    return;
+  }
+
   std::vector<Network::Address::InstanceConstSharedPtr> address_list;
   if (!lb_endpoint.endpoint().additional_addresses().empty()) {
     address_list.push_back(address);
@@ -182,9 +272,9 @@ void EdsClusterImpl::BatchUpdateHelper::updateLocalityEndpoints(
           returnOrThrow(parent_.resolveProtoAddress(additional_address.address()));
       address_list.emplace_back(address);
     }
-    for (const Network::Address::InstanceConstSharedPtr& address : address_list) {
+    for (const Network::Address::InstanceConstSharedPtr& addr : address_list) {
       // All addresses must by IP addresses.
-      if (!address->ip()) {
+      if (!addr->ip()) {
         throwEnvoyExceptionOrPanic("additional_addresses must be IP addresses.");
       }
     }
