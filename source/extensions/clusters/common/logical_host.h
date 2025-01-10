@@ -147,6 +147,8 @@ public:
   void setLastHcPassTime(MonotonicTime) override {}
   void priority(uint32_t) override {}
   void setLbPolicyData(HostLbPolicyDataPtr) override {}
+  const absl::string_view getHostId() const override { return absl::string_view(); }
+  void setHostId(const absl::string_view) override{};
 
 private:
   const Network::Address::InstanceConstSharedPtr address_;
