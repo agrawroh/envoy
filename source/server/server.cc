@@ -636,6 +636,11 @@ absl::Status InstanceBase::initializeOrThrow(Network::Address::InstanceConstShar
     auto config = Config::Utility::translateAnyToFactoryConfig(
         bootstrap_extension.typed_config(), messageValidationContext().staticValidationVisitor(),
         factory);
+    ENVOY_LOG(trace, "creating bootstrap extension from factory: {}", factory.name());
+    if (factory.name() == "envoy.bootstrap.reverse_connection") {
+      ENVOY_LOG(debug, "Reverse connections need to be enabled");
+      enable_reverse_connections_ = true;
+    }
     bootstrap_extensions_.push_back(
         factory.createBootstrapExtension(*config, serverFactoryContext()));
   }
@@ -762,11 +767,15 @@ absl::Status InstanceBase::initializeOrThrow(Network::Address::InstanceConstShar
   // cluster_manager_factory_ is available.
   RETURN_IF_NOT_OK(config_.initialize(bootstrap_, *this, *cluster_manager_factory_));
 
+<<<<<<< HEAD
   // Create the xDS-Manager and pass the cluster manager that was created above.
   ASSERT(config_.clusterManager());
   xds_manager_ =
       std::make_unique<Config::XdsManagerImpl>(*config_.clusterManager(), validation_context_);
+  listener_manager_->setClusterManagerForWorkers(config_.clusterManager());
 
+=======
+>>>>>>> a40c034a8d... Pass cluster manager while creating tls registry
   // Instruct the listener manager to create the LDS provider if needed. This must be done later
   // because various items do not yet exist when the listener manager is created.
   if (bootstrap_.dynamic_resources().has_lds_config() ||
@@ -803,6 +812,16 @@ absl::Status InstanceBase::initializeOrThrow(Network::Address::InstanceConstShar
   // Now that we are initialized, notify the bootstrap extensions.
   for (auto&& bootstrap_extension : bootstrap_extensions_) {
     bootstrap_extension->onServerInitialized();
+  }
+
+  if (enable_reverse_connections_) {
+    std::shared_ptr<Network::RevConnRegistry> reverse_conn_registry =
+        singleton_manager_.getTyped<Network::RevConnRegistry>("reverse_conn_registry_singleton");
+    if (reverse_conn_registry == nullptr) {
+      throw EnvoyException(
+          "Cannot enable reverse connections. Reverse connection registry not found");
+    }
+    listener_manager_->enableReverseConnections(*reverse_conn_registry);
   }
 
   // GuardDog (deadlock detection) object and thread setup before workers are

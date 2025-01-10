@@ -33,6 +33,9 @@
 #include "absl/functional/any_invocable.h"
 
 namespace Envoy {
+namespace Upstream {
+class ClusterManager;
+}
 namespace Event {
 
 /**
@@ -286,6 +289,17 @@ public:
    * Shutdown the dispatcher by clear dispatcher thread deletable.
    */
   virtual void shutdown() PURE;
+
+  /**
+   * Provides filters access to connection handler to save outgoing connections as
+   * incoming connections for reverse tunnels
+   */
+  virtual void setConnectionHandler(Network::ConnectionHandler* connection_handler) PURE;
+
+  /**
+   * @return the Connection Handler.
+   */
+  virtual Network::ConnectionHandler* connectionHandler() PURE;
 };
 
 using DispatcherPtr = std::unique_ptr<Dispatcher>;
