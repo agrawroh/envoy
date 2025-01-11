@@ -199,7 +199,7 @@ Http::FilterHeadersStatus ReverseConnFilter::getReverseConnectionInfo() {
   if (!send_all_rc_info) {
     std::string response = fmt::format("{{\"available_connections\":{}}}", num_sockets);
     try {
-      Json::Factory::loadFromString(response);
+      auto ret = Json::Factory::loadFromString(response);
     } catch (EnvoyException& e) {
       decoder_callbacks_->sendLocalReply(Http::Code::InternalServerError,
                                          "failed to form valid json response", nullptr,

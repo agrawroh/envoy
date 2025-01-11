@@ -37,9 +37,10 @@ void ReverseConnExtension::onServerInitialized() {
       ThreadLocal::TypedSlot<Bootstrap::ReverseConnection::RCThreadLocalRegistry>::makeUnique(
           server_context_.threadLocal());
   Stats::Scope& scope = server_context_.scope();
-  global_tls_registry_->tls_slot_->set([this, &scope](Event::Dispatcher& dispatcher) {
+  Upstream::ClusterManager& cluster_manager = server_context_.clusterManager();
+  global_tls_registry_->tls_slot_->set([this, &scope, &cluster_manager](Event::Dispatcher& dispatcher) {
     return std::make_shared<Bootstrap::ReverseConnection::RCThreadLocalRegistry>(dispatcher, scope,
-                                                                                 stat_prefix_);
+                                                                                 stat_prefix_, cluster_manager);
   });
 }
 

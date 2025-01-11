@@ -28,7 +28,7 @@ public:
   virtual Event::Dispatcher& dispatcher() const PURE;
 
   // Returns the global cluster manager.
-  virtual  Upstream::ClusterManager& clusterManager() const PURE;;
+  virtual  Upstream::ClusterManager& clusterManager() const PURE;
 
   /**
    * Sets the stats scope for logging initiated reverse connections with the local

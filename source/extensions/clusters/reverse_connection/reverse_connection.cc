@@ -78,12 +78,27 @@ HostSharedPtr RevConCluster::checkAndCreateHost(const absl::string_view host_id)
   // saying found malformed IPv4 address.
   Network::Address::InstanceConstSharedPtr host_ip_port(
       std::make_shared<Network::Address::Ipv4Instance>("0.0.0.0", 0, nullptr));
-  HostSharedPtr host(std::make_shared<HostImpl>(
-      info(), absl::StrCat(info()->name(), static_cast<std::string>(host_id)),
-      std::move(host_ip_port), nullptr /* metadata */, nullptr, 1 /* initial_weight */,
+  absl::Status host_creation_status;
+  auto host_result = HostImpl::create(
+      info(),
+      absl::StrCat(info()->name(), static_cast<std::string>(host_id)),
+      std::move(host_ip_port),
+      nullptr /* metadata */,
+      nullptr /* locality_metadata */,
+      1 /* initial_weight */,
       envoy::config::core::v3::Locality().default_instance(),
       envoy::config::endpoint::v3::Endpoint::HealthCheckConfig().default_instance(),
-      0 /* priority */, envoy::config::core::v3::UNKNOWN, time_source_));
+      0 /* priority */,
+      envoy::config::core::v3::UNKNOWN,
+      time_source_,
+      {} /* empty address_list */);
+
+  if (!host_result.ok()) {
+      ENVOY_LOG(error, "Failed to create host: {}", host_result.status().message());
+      return nullptr;
+  }
+
+  HostSharedPtr host(std::move(host_result.value()));
   host->setHostId(host_id);
   ENVOY_LOG(trace, "Created a host {} for {}.", *host, host_id);
 

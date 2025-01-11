@@ -107,7 +107,6 @@ envoy_cc_library(
         "connection_impl.h",
         "reversed_connection_impl.h",
     ],
-    external_deps = ["abseil_optional"],
     deps = [
         ":address_lib",
         ":connection_base_lib",

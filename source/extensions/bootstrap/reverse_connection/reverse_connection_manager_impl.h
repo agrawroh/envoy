@@ -26,7 +26,7 @@ using RCInitiatorPtr = std::unique_ptr<ReverseConnectionInitiator>;
 class ReverseConnectionManagerImpl : Logger::Loggable<Logger::Id::main>,
                                      public Envoy::Network::ReverseConnectionManager {
 public:
-  ReverseConnectionManagerImpl(Event::Dispatcher& dispatcher);
+  ReverseConnectionManagerImpl(Event::Dispatcher& dispatcher, Upstream::ClusterManager& cluster_manager);
 
   // Constuct the RCManager scope from the base scope and stat prefix and store it in
   // reverse_conn_manager_scope_.
@@ -34,6 +34,8 @@ public:
 
   // Returns a reference to the parent dispatcher of the current thread.
   Event::Dispatcher& dispatcher() const override;
+
+  Upstream::ClusterManager& clusterManager() const override;
 
   /**
    * Checks whether an existing ReverseConnectionInitiator is present for the given listener.
@@ -113,6 +115,10 @@ private:
    * ReverseConnectionInitiator to initiate more reverse connections if a socket closes.
    */
   absl::flat_hash_map<uint64_t, RCInitiatorPtr> available_rc_initiators_;
+
+  // The cluster manager to get the thread local cluster. This is required
+  // to initiate reverse connections.
+  Upstream::ClusterManager& cluster_manager_;
 
   Stats::ScopeSharedPtr stats_root_scope_;
 };

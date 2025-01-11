@@ -9,10 +9,10 @@ namespace Bootstrap {
 namespace ReverseConnection {
 
 RCThreadLocalRegistry::RCThreadLocalRegistry(Event::Dispatcher& dispatcher, Stats::Scope& scope,
-                                             std::string stat_prefix) {
+                                             std::string stat_prefix, Upstream::ClusterManager& cluster_manager) {
   ENVOY_LOG_MISC(debug, "RCThreadLocalRegistry: creating RCManager and RCHandler for worker: {}",
                  dispatcher.name());
-  rc_manager_ = std::make_shared<ReverseConnectionManagerImpl>(dispatcher);
+  rc_manager_ = std::make_shared<ReverseConnectionManagerImpl>(dispatcher, cluster_manager);
   rc_handler_ = std::make_shared<ReverseConnectionHandlerImpl>(&dispatcher);
   // Pass a root scope, i.e., "reverse_connection" so that RCManager and RCHandler stats are
   // organized under the same scope.

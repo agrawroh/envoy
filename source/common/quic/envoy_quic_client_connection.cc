@@ -15,13 +15,13 @@ namespace Quic {
 // Used to defer deleting connection socket to avoid deleting IoHandle in a read loop.
 class DeferredDeletableSocket : public Event::DeferredDeletable {
 public:
-  explicit DeferredDeletableSocket(std::unique_ptr<Network::ConnectionSocket> socket)
+  explicit DeferredDeletableSocket(std::shared_ptr<Network::ConnectionSocket> socket)
       : socket_(std::move(socket)) {}
 
   void deleteIsPending() override { socket_->close(); }
 
 private:
-  std::unique_ptr<Network::ConnectionSocket> socket_;
+  std::shared_ptr<Network::ConnectionSocket> socket_;
 };
 
 EnvoyQuicClientConnection::EnvoyQuicClientConnection(

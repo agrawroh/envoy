@@ -16,7 +16,7 @@ class RCThreadLocalRegistry : public ThreadLocal::ThreadLocalObject,
                               public Logger::Loggable<Logger::Id::main> {
 public:
   RCThreadLocalRegistry(Event::Dispatcher& dispatcher, Stats::Scope& scope,
-                        std::string stat_prefix);
+                        std::string stat_prefix, Upstream::ClusterManager& cluster_manager);
   ~RCThreadLocalRegistry() = default;
 
   Network::ReverseConnectionManager& getRCManager() override;

@@ -121,9 +121,7 @@ bool ReverseConnectionInitiator::maintainConnCount() {
     addStatshandlerForCluster(remote_cluster_id);
 
     // Retrieve the resolved hosts for a cluster and update the corresponding maps.
-    const auto thread_local_cluster =
-        parent_rc_manager_.dispatcher().getClusterManager()->getThreadLocalCluster(
-            remote_cluster_id);
+    const auto thread_local_cluster = parent_rc_manager_.clusterManager().getThreadLocalCluster(remote_cluster_id);
 
     // The thread_local_cluster will be nullptr during any LDS or CDS update.
     // In these cases, we should wait for the next iteration.
@@ -212,9 +210,7 @@ bool ReverseConnectionInitiator::initiateOneReverseConnection(const std::string&
   // request for reverse connection initiation through it.
   Upstream::Host::CreateConnectionData conn_data;
   try {
-    const auto thread_local_cluster =
-        parent_rc_manager_.dispatcher().getClusterManager()->getThreadLocalCluster(
-            remote_cluster_id);
+    const auto thread_local_cluster = parent_rc_manager_.clusterManager().getThreadLocalCluster(remote_cluster_id);
     if (thread_local_cluster != nullptr) {
       ReverseConnectionLoadBalancerContext lb_context(host);
       conn_data = thread_local_cluster->tcpConn(&lb_context);
