@@ -600,16 +600,12 @@ ListenerImpl::buildInternalListener(const envoy::config::listener::v3::Listener&
 
 absl::Status ListenerImpl::buildReverseConnectionListener(
     const envoy::config::listener::v3::Listener& config) {
+  if (!config.has_reverse_connection_listener_config()) {
+    return absl::OkStatus();
+  }
 
   ENVOY_LOG(debug, "Listener: {}; Reverse conn metadata : {}", config.name(),
             config.reverse_connection_listener_config().DebugString());
-
-  if (!config.has_reverse_connection_listener_config()) {
-    return absl::InvalidArgumentError(
-        fmt::format("error adding listener named '{}': reverse connection listener config is "
-                    "missing",
-                    config.name()));
-  }
 
   // Reverse connection listener should not bind to port.
   bind_to_port_ = false;
