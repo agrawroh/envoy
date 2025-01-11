@@ -94,7 +94,7 @@ protected:
 };
 
 class UpstreamDownstreamIntegrationTest
-    : public testing::TestWithParam<std::tuple<HttpProtocolTestParams, bool>>,
+    : public testing::TestWithParam<std::tuple<HttpProtocolTestParams, bool, bool>>,
       public HttpIntegrationTest {
 public:
   UpstreamDownstreamIntegrationTest()
@@ -107,17 +107,23 @@ public:
     config_helper_.addRuntimeOverride(
         "envoy.reloadable_features.enable_universal_header_validator",
         std::get<0>(GetParam()).use_universal_header_validator ? "true" : "false");
+    const bool avoid_reentrant_filter_local_reply = std::get<2>(GetParam());
+    config_helper_.addRuntimeOverride(
+        "envoy_reloadable_features_http_filter_avoid_reentrant_local_reply",
+        avoid_reentrant_filter_local_reply ? "true" : "false");
   }
   static std::string testParamsToString(
-      const ::testing::TestParamInfo<std::tuple<HttpProtocolTestParams, bool>>& params) {
+      const ::testing::TestParamInfo<std::tuple<HttpProtocolTestParams, bool, bool>>& params) {
     return fmt::format(
-        "{}_{}",
+        "{}_{}_{}",
         HttpProtocolIntegrationTest::protocolTestParamsToString(
             ::testing::TestParamInfo<HttpProtocolTestParams>(std::get<0>(params.param), 0)),
-        std::get<1>(params.param) ? "DownstreamFilter" : "UpstreamFilter");
+        std::get<1>(params.param) ? "DownstreamFilter" : "UpstreamFilter",
+        std::get<2>(params.param) ? "AvoidReentrantFilterLocalReply"
+                                  : "AllowReentrantFilterLocalReply");
   }
 
-  static std::vector<std::tuple<HttpProtocolTestParams, bool>>
+  static std::vector<std::tuple<HttpProtocolTestParams, bool, bool>>
   getDefaultTestParams(const std::vector<Http::CodecType>& downstream_protocols =
                            {
                                Http::CodecType::HTTP1,
@@ -129,15 +135,19 @@ public:
                            Http::CodecType::HTTP2,
                            Http::CodecType::HTTP3,
                        }) {
-    std::vector<std::tuple<HttpProtocolTestParams, bool>> ret;
+    std::vector<std::tuple<HttpProtocolTestParams, bool, bool>> ret;
     std::vector<HttpProtocolTestParams> protocol_defaults =
         HttpProtocolIntegrationTest::getProtocolTestParams(downstream_protocols,
                                                            upstream_protocols);
     const std::vector<bool> testing_downstream_filter_values{true, false};
+    const std::vector<bool> avoid_reentrant_filter_local_reply_values{true, false};
 
     for (auto& param : protocol_defaults) {
       for (bool testing_downstream_filter : testing_downstream_filter_values) {
-        ret.push_back(std::make_tuple(param, testing_downstream_filter));
+        for (bool avoid_reentrant_filter_local_reply : avoid_reentrant_filter_local_reply_values) {
+          ret.push_back(std::make_tuple(param, testing_downstream_filter,
+                                        avoid_reentrant_filter_local_reply));
+        }
       }
     }
     return ret;

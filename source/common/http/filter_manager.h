@@ -1182,7 +1182,9 @@ public:
         stream_info_(protocol, time_source, connection.connectionInfoProviderSharedPtr(),
                      StreamInfo::FilterState::LifeSpan::FilterChain,
                      std::move(parent_filter_state)),
-        local_reply_(local_reply), filter_chain_factory_(filter_chain_factory),
+        local_reply_(local_reply),
+        avoid_reentrant_filter_invocation_during_local_reply_(Runtime::runtimeFeatureEnabled("envoy.reloadable_features.http_filter_avoid_reentrant_local_reply")),
+        filter_chain_factory_(filter_chain_factory),
         downstream_filter_load_shed_point_(overload_manager.getLoadShedPoint(
             Server::LoadShedPointName::get().HttpDownstreamFilterCheck)),
         use_filter_manager_state_for_downstream_end_stream_(Runtime::runtimeFeatureEnabled(
@@ -1284,6 +1286,7 @@ private:
 private:
   OverridableRemoteConnectionInfoSetterStreamInfo stream_info_;
   const LocalReply::LocalReply& local_reply_;
+  const bool avoid_reentrant_filter_invocation_during_local_reply_;
   const FilterChainFactory& filter_chain_factory_;
   Utility::PreparedLocalReplyPtr prepared_local_reply_{nullptr};
   Server::LoadShedPoint* downstream_filter_load_shed_point_{nullptr};
