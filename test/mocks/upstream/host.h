@@ -117,6 +117,8 @@ public:
               (const));
   MOCK_METHOD(void, setLbPolicyData, (HostLbPolicyDataPtr lb_policy_data));
   MOCK_METHOD(OptRef<HostLbPolicyData>, lbPolicyData, (), (const));
+  MOCK_METHOD(const absl::string_view, getHostId, (), (const));
+  MOCK_METHOD(void, setHostId, (const absl::string_view host_id));
 
   std::string hostname_;
   Network::Address::InstanceConstSharedPtr address_;
@@ -233,6 +235,8 @@ public:
               (const Network::Address::InstanceConstSharedPtr& dest_address,
                const envoy::config::core::v3::Metadata* metadata),
               (const));
+  MOCK_METHOD(const absl::string_view, getHostId, (), (const));
+  MOCK_METHOD(void, setHostId, (const absl::string_view host_id));
 
   testing::NiceMock<MockClusterInfo> cluster_;
   Network::UpstreamTransportSocketFactoryPtr socket_factory_;

@@ -1283,6 +1283,10 @@ TEST_P(FilterIntegrationTest, EncoderResetFilterAndContinue) {
 }
 
 TEST_P(FilterIntegrationTest, LocalReplyViaFilterChainDoesNotConcurrentlyInvokeFilter) {
+  if (!Runtime::runtimeFeatureEnabled(
+          "envoy.reloadable_features.http_filter_avoid_reentrant_local_reply")) {
+    return;
+  }
   prependFilter(R"EOF(
   name: assert-non-reentrant-filter
   )EOF");

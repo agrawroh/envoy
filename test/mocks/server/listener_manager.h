@@ -31,6 +31,7 @@ public:
   MOCK_METHOD(void, endListenerUpdate, (ListenerManager::FailureStates &&));
   MOCK_METHOD(ApiListenerOptRef, apiListener, ());
   MOCK_METHOD(bool, isWorkerStarted, ());
+  MOCK_METHOD(void, enableReverseConnections, (Network::RevConnRegistry& reverse_conn_registry));
 };
 } // namespace Server
 } // namespace Envoy
