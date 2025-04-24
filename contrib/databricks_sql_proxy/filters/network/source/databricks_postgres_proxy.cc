@@ -456,15 +456,18 @@ Network::FilterStatus PostgresProxy::handleUpstreamData(Buffer::Instance& data, 
 
     write_callbacks_->injectWriteDataToFilterChain(data_to_forward_, end_stream);
 
-    // If we processed backend key data message and need to store the cancellation key, store it.
-    if (config_->protoConfig().postgres_config().store_cancellation_key() &&
-        upstream_handshake_state_ == UpstreamHandshakeState::ProcessedBackendKeyData) {
-      ENVOY_CONN_LOG(debug, "databricks_sql_proxy: Storing cancellation key in sidecar.",
-                     read_callbacks_->connection());
-      parent_.storeMetadataInSidecar();
+    if (upstream_handshake_state_ == UpstreamHandshakeState::ProcessedBackendKeyData) {
+      // If we processed backend key data message and need to store the cancellation key, store it.
+      if (config_->protoConfig().postgres_config().store_cancellation_key()) {
+        ENVOY_CONN_LOG(debug, "databricks_sql_proxy: Storing cancellation key in sidecar.",
+                       read_callbacks_->connection());
+        parent_.storeMetadataInSidecar();
+      }
+      // Only increment successful login stats if we have processed backend key data message.
+      // When we see backend key data, it means that the authentication is successful.
+      // We will switch to forward mode.
+      config_->stats().successful_login_.inc();
     }
-
-    config_->stats().successful_login_.inc();
   }
 
   return Network::FilterStatus::Continue;

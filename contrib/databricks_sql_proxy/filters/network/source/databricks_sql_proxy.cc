@@ -457,14 +457,16 @@ void Filter::pollForUpstreamConnected() {
                      static_cast<int>(handshake_state_)));
 
   // If read is enabled, it means that TcpProxy established the upstream connection.
-  if (read_callbacks_->connection().state() == Network::Connection::State::Open && read_callbacks_->connection().readEnabled()) {
+  if (read_callbacks_->connection().state() == Network::Connection::State::Open &&
+      read_callbacks_->connection().readEnabled()) {
     // Disable the timer task since we do not need it anymore.
     upstream_connect_check_timer_->disableTimer();
     sql_proxy_->onUpstreamConnected();
     // Set the handshake state to UpstreamConnected and call onUpstreamConnected on the sql_proxy.
     setHandshakeState(HandshakeState::UpstreamConnected);
   } else {
-    if (read_callbacks_->connection().state() == Network::Connection::State::Open && shouldPollForUpstreamConnected()) {
+    if (read_callbacks_->connection().state() == Network::Connection::State::Open &&
+        shouldPollForUpstreamConnected()) {
       // Enable timer to try again.
       upstream_connect_check_timer_->enableTimer(std::chrono::milliseconds(1));
     } else {

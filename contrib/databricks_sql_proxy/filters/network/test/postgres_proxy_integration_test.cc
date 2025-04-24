@@ -395,22 +395,23 @@ void DatabricksSqlProxyPostgresIntegrationTest::runEndToEndTest(
   fake_postgres_upstream_connection->clearData();
 
   const std::string_view ip = "1.2.3.4";
-  Buffer::OwnedImpl upstream_data;
-  // If we need to read upstream_ip parameter status message then inject it.
-  if (postgres_config.read_parameter_status_upstream_ip()) {
-    size_t parameter_status_message_len =
-        sizeof(uint32_t) + CommonConstants::PARAMETER_STATUS_UPSTREAM_IP_KEY.size() +
-        1 /* null-terminator */ + ip.size() + 1 /* null-terminator */;
-    Buffer::OwnedImpl parameter_status_message;
-    parameter_status_message.writeByte(PostgresConstants::PARAMETER_STATUS_MESSAGE_TYPE);
-    parameter_status_message.writeBEInt<int32_t>(parameter_status_message_len);
-    parameter_status_message.add(CommonConstants::PARAMETER_STATUS_UPSTREAM_IP_KEY);
-    parameter_status_message.writeByte(0); // null-terminator
-    parameter_status_message.add(ip);
-    parameter_status_message.writeByte(0); // null-terminator
+  size_t parameter_status_message_len =
+      sizeof(uint32_t) + CommonConstants::PARAMETER_STATUS_UPSTREAM_IP_KEY.size() +
+      1 /* null-terminator */ + ip.size() + 1 /* null-terminator */;
+  Buffer::OwnedImpl parameter_status_message;
+  parameter_status_message.writeByte(PostgresConstants::PARAMETER_STATUS_MESSAGE_TYPE);
+  parameter_status_message.writeBEInt<int32_t>(parameter_status_message_len);
+  parameter_status_message.add(CommonConstants::PARAMETER_STATUS_UPSTREAM_IP_KEY);
+  parameter_status_message.writeByte(0); // null-terminator
+  parameter_status_message.add(ip);
+  parameter_status_message.writeByte(0); // null-terminator
 
-    upstream_data.add(parameter_status_message);
-  }
+  // Send one parameter status message separately.
+  ASSERT_TRUE(fake_postgres_upstream_connection->write(parameter_status_message.toString()));
+
+  Buffer::OwnedImpl upstream_data;
+  // Add it to the combined data.
+  upstream_data.add(parameter_status_message);
   // Upstream always sends the backend key data message.
   Buffer::OwnedImpl backend_key_data_message;
   backend_key_data_message.writeByte(PostgresConstants::BACKEND_KEY_DATA_MESSAGE_TYPE);
@@ -527,10 +528,10 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, EndToEndTLSSidecarService) {
                   "termination_detail=- "
                   "response_code_details=- "
                   "response_flags=- "
-                  "DOWNSTREAM_WIRE_BYTES_SENT=39 "
+                  "DOWNSTREAM_WIRE_BYTES_SENT=64 "
                   "DOWNSTREAM_WIRE_BYTES_RECEIVED=59 "
                   "UPSTREAM_WIRE_BYTES_SENT=59 "
-                  "UPSTREAM_WIRE_BYTES_RECEIVED=39"
+                  "UPSTREAM_WIRE_BYTES_RECEIVED=64"
                   "\r?.*",
                   DatabricksSqlProxyProto::Protocol_Name(DatabricksSqlProxyProto::POSTGRES),
                   static_cast<int>(HandshakeState::UpstreamConnected),
@@ -554,10 +555,10 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, EndToEndTLSSni) {
                   "termination_detail=- "
                   "response_code_details=- "
                   "response_flags=- "
-                  "DOWNSTREAM_WIRE_BYTES_SENT=14 "
+                  "DOWNSTREAM_WIRE_BYTES_SENT=64 "
                   "DOWNSTREAM_WIRE_BYTES_RECEIVED=59 "
                   "UPSTREAM_WIRE_BYTES_SENT=59 "
-                  "UPSTREAM_WIRE_BYTES_RECEIVED=14"
+                  "UPSTREAM_WIRE_BYTES_RECEIVED=64"
                   "\r?.*",
                   DatabricksSqlProxyProto::Protocol_Name(DatabricksSqlProxyProto::POSTGRES),
                   static_cast<int>(HandshakeState::UpstreamConnected),
@@ -1104,10 +1105,10 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTestNoUpstreamSSL, EndToEndNoUpstrea
                   "termination_detail=- "
                   "response_code_details=- "
                   "response_flags=- "
-                  "DOWNSTREAM_WIRE_BYTES_SENT=13 "
+                  "DOWNSTREAM_WIRE_BYTES_SENT=63 "
                   "DOWNSTREAM_WIRE_BYTES_RECEIVED=51 "
                   "UPSTREAM_WIRE_BYTES_SENT=51 "
-                  "UPSTREAM_WIRE_BYTES_RECEIVED=13"
+                  "UPSTREAM_WIRE_BYTES_RECEIVED=63"
                   "\r?.*",
                   DatabricksSqlProxyProto::Protocol_Name(DatabricksSqlProxyProto::POSTGRES),
                   static_cast<int>(HandshakeState::UpstreamConnected),

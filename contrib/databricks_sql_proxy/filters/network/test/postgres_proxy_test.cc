@@ -248,6 +248,10 @@ TEST_F(PostgresProxyTest, FullEndToEndWithSidecarService) {
   parameter_status_message.add(ip);
   parameter_status_message.writeByte(0); // null-terminator
 
+  // Send the parameter status message to the filter.
+  EXPECT_EQ(Envoy::Network::FilterStatus::Continue,
+            filter_->onWrite(parameter_status_message, false /*end_stream*/));
+
   const int32_t process_id = 1111;
   const int32_t secret_key = 9876;
   Buffer::OwnedImpl backend_key_data_message;
@@ -298,6 +302,9 @@ TEST_F(PostgresProxyTest, FullEndToEndWithSidecarService) {
   // For the test, we don't care about the data.
   EXPECT_EQ(Envoy::Network::FilterStatus::Continue,
             filter_->onWrite(ssl_response, false /*end_stream*/));
+
+  EXPECT_EQ(0, config_->stats().errors_.value());
+  EXPECT_EQ(1, config_->stats().successful_login_.value());
 }
 
 // Test that when destination_cluster_source is set to SNI, the SNI is used as the upstream cluster
@@ -351,6 +358,8 @@ TEST_F(PostgresProxyTest, SniAsDestinationClusterSource) {
   // Should not have any active ext_authz call.
   EXPECT_EQ(0, config->stats().active_ext_authz_call_.value());
   EXPECT_EQ(0, config->stats().errors_.value());
+  // We have not finished authentication yet. successful_login should be 0.
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
 }
 
 // Test that if there is not enough data to process the first start-up message,
@@ -395,6 +404,7 @@ TEST_F(PostgresProxyTest, NotEnoughData) {
 
   // Code should proceed to a point where we call ext_authz.
   EXPECT_EQ(1, config_->stats().active_ext_authz_call_.value());
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
   // onData should drain the buffer because the message is processed.
   EXPECT_EQ(0, postgres_startup_message.length());
 }
@@ -414,6 +424,7 @@ TEST_F(PostgresProxyTest, ShorterThanExpectedMessage) {
 
   EXPECT_EQ(1UL, config_->stats().invalid_message_length_.value());
   EXPECT_EQ(1UL, config_->stats().errors_.value());
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
 }
 
 // Test that if the start-up message length is larger than expected, the connection should be
@@ -430,6 +441,7 @@ TEST_F(PostgresProxyTest, LargerThanExpectedMessage) {
 
   EXPECT_EQ(1UL, config_->stats().invalid_message_length_.value());
   EXPECT_EQ(1UL, config_->stats().errors_.value());
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
 }
 
 // Test that if the protocol version is incorrect, the connection should be closed.
@@ -458,6 +470,7 @@ TEST_F(PostgresProxyTest, IncorrectProtocolVersion) {
 
   EXPECT_EQ(1UL, config_->stats().invalid_protocol_version_.value());
   EXPECT_EQ(1UL, config_->stats().errors_.value());
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
 }
 
 // Test that if the upstream return some data before the postgres SSL request is sent, the
@@ -509,6 +522,7 @@ TEST_F(PostgresProxyTest, HandleUpstreamDataInitState) {
   EXPECT_EQ(Envoy::Network::FilterStatus::StopIteration, filter_->onWrite(upstream_message, false));
   EXPECT_EQ(1, config_->stats().protocol_violation_.value());
   EXPECT_EQ(2, config_->stats().errors_.value());
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
 }
 
 // Test multiple scenarios that the upstream can return invalid data.
@@ -586,6 +600,7 @@ TEST_F(PostgresProxyTest, HandleUpstreamDataSentSslRequestUpstreamState) {
             "Failed to start secure transport with upstream.");
   EXPECT_EQ(1UL, config_->stats().failed_upstream_ssl_handshake_.value());
   EXPECT_EQ(3UL, config_->stats().errors_.value());
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
 }
 
 void PostgresProxyTest::runExtAuthzFailureTest(
@@ -631,6 +646,7 @@ void PostgresProxyTest::runExtAuthzFailureTest(
 
   EXPECT_EQ(1, config_->stats().ext_authz_failed_.value());
   EXPECT_EQ(1, config_->stats().errors_.value());
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
 }
 
 TEST_F(PostgresProxyTest, ExtAuthzError) {
@@ -670,6 +686,7 @@ TEST_F(PostgresProxyTest, DownstreamNotSsl) {
 
   EXPECT_EQ(1, config_->stats().downstream_not_support_ssl_.value());
   EXPECT_EQ(1, config_->stats().errors_.value());
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
 }
 
 // Test that if the downstream connection does not have SNI, we error out.
