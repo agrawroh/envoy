@@ -383,7 +383,7 @@ Network::FilterStatus PostgresProxy::handleUpstreamData(Buffer::Instance& data, 
   // cancellation message we should flush all buffered data to downstream by calling
   // Network::FilterStatus::Continue.
   if (end_stream && upstream_handshake_state_ < UpstreamHandshakeState::ProcessedBackendKeyData) {
-    ENVOY_CONN_LOG(info,
+    ENVOY_CONN_LOG(debug,
                    "databricks_sql_proxy: Upstream is closing TCP connection end_stream: {}. Flush "
                    "all buffered data to downstream. data.length: {}",
                    read_callbacks_->connection(), end_stream, data.length());
@@ -507,7 +507,7 @@ Network::FilterStatus PostgresProxy::handleUpstreamSslResponse(Buffer::Instance&
                    read_callbacks_->connection());
 
     if (read_callbacks_->startUpstreamSecureTransport()) {
-      ENVOY_CONN_LOG(info, "databricks_sql_proxy: Upstream connection is now secure.",
+      ENVOY_CONN_LOG(debug, "databricks_sql_proxy: Upstream connection is now secure.",
                      read_callbacks_->connection());
 
       sendPostgresStartupMessageToUpstream();

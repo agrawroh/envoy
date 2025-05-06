@@ -397,7 +397,7 @@ void Filter::onEvent(Network::ConnectionEvent event) {
 }
 
 void Filter::setUpstreamSni(std::string& sni) {
-  ENVOY_CONN_LOG(info, "databricks_sql_proxy: SNI {}", read_callbacks_->connection(), sni);
+  ENVOY_CONN_LOG(debug, "databricks_sql_proxy: SNI {}", read_callbacks_->connection(), sni);
 
   // Override upstream SNI with downstream SNI to keep the original target hostname.
   read_callbacks_->connection().streamInfo().filterState()->setData(
