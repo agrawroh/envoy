@@ -472,8 +472,12 @@ envoy_cc_library(
 
 envoy_cc_library(
     name = "server_lib",
-    srcs = ["instance_impl.cc"],
-    hdrs = ["instance_impl.h"],
+    srcs = [
+        "instance_impl.cc",
+    ],
+    hdrs = [
+        "instance_impl.h",
+    ],
     deps = [
         ":guarddog_lib",
         ":server_base_lib",
@@ -482,6 +486,7 @@ envoy_cc_library(
         "//source/common/upstream:prod_cluster_info_factory_lib",
         "//source/server:null_overload_manager_lib",
         "//source/server:overload_manager_lib",
+        "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
     ],
 )
 

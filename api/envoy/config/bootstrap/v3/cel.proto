@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package envoy.config.bootstrap.v3;
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.config.bootstrap.v3";
+option java_outer_classname = "CelProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3;bootstrapv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: CEL Configuration]
+// This proto is used to configure CEL (Common Expression Language) evaluator in Envoy. This configuration controls
+// which of the additional CEL language features and extensions should be available for use in CEL expressions
+// throughout Envoy's configuration.
+message CelExtensionOptions {
+  // Controls whether string extension functions are available in CEL expressions.
+  // When enabled, provides functions like:
+  // * lowerAscii(): Convert ASCII characters to lowercase
+  // * upperAscii(): Convert ASCII characters to uppercase
+  // * replace(): Replace occurrences of a substring
+  // * trim(): Remove leading and trailing whitespace
+  // * startsWith()/endsWith(): String prefix/suffix testing
+  // * matches(): Regular expression matching
+  //
+  // .. warning::
+  //   These functions can be computationally expensive with large strings. Only enable if
+  //   needed and ensure proper input validation.
+  //
+  // **Default**: false
+  bool enable_string_extensions = 1;
+  
+  // Controls whether string concatenation operations are allowed in CEL expressions.
+  // When enabled, allows:
+  // * String concatenation operator (+): "hello" + " world"
+  // * format() function: format("Hello %s", name)
+  //
+  // .. warning::
+  //   String concatenation can lead to excessive memory usage when concatenating large
+  //   strings or in loops. Only enable if required.
+  //
+  // **Default**: false
+  bool enable_string_concat = 2;
+  
+  // Controls whether list concatenation operations are allowed in CEL expressions.
+  // When enabled, allows:
+  // * List concatenation operator (+): [1, 2] + [3, 4]
+  // * append(): Append elements to a list
+  // * flatten(): Flatten nested lists
+  //
+  // .. warning::
+  //   String concatenation can lead to excessive memory usage when concatenating large
+  //   strings or in loops. Only enable if required.
+  //
+  // **Default**: false
+  bool enable_list_concat = 3;
+}

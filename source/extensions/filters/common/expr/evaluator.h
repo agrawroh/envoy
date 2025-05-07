@@ -1,5 +1,6 @@
 #pragma once
 
+#include "envoy/server/factory_context.h"
 #include "envoy/stream_info/stream_info.h"
 
 #include "source/common/http/headers.h"
@@ -90,6 +91,12 @@ using BuilderInstanceSharedPtr = std::shared_ptr<BuilderInstance>;
 // for intermediate evaluation results.
 // Throws an exception if fails to construct an expression builder.
 BuilderPtr createBuilder(Protobuf::Arena* arena);
+
+// Creates an expression builder with a specified ServerFactoryContext (primarily for testing).
+// The optional arena is used to enable constant folding for intermediate evaluation results.
+// Throws an exception if fails to construct an expression builder.
+BuilderPtr createBuilder(Protobuf::Arena* arena,
+                         Server::Configuration::ServerFactoryContext* server_factory_context);
 
 // Gets the singleton expression builder. Must be called on the main thread.
 BuilderInstanceSharedPtr getBuilder(Server::Configuration::CommonFactoryContext& context);

@@ -3,7 +3,14 @@
 #include "envoy/common/exception.h"
 #include "envoy/singleton/manager.h"
 
+#include "source/common/config/metadata.h"
+#include "source/common/http/utility.h"
 #include "source/common/runtime/runtime_features.h"
+#include "source/common/singleton/const_singleton.h"
+#include "source/common/singleton/manager_impl.h"
+#include "source/extensions/filters/common/expr/cel_options_provider.h"
+#include "source/extensions/filters/common/expr/context.h"
+#include "source/server/instance_impl.h"
 
 #include "extensions/regex_functions.h"
 
@@ -103,9 +110,17 @@ ActivationPtr createActivation(const LocalInfo::LocalInfo* local_info,
 
 BuilderPtr createBuilder(Protobuf::Arena* arena) {
   ASSERT_IS_MAIN_OR_TEST_THREAD();
+
+  // Use the default approach with null context - will try the getInProgressUnsafe method
+  return createBuilder(arena, nullptr);
+}
+
+BuilderPtr createBuilder(Protobuf::Arena* arena,
+                         Server::Configuration::ServerFactoryContext* server_factory_context) {
+  ASSERT_IS_MAIN_OR_TEST_THREAD();
   google::api::expr::runtime::InterpreterOptions options;
 
-  // Security-oriented defaults
+  // Set security-oriented defaults
   options.enable_comprehension = false;
   options.enable_regex = true;
   options.regex_max_program_size = 100;
@@ -114,15 +129,34 @@ BuilderPtr createBuilder(Protobuf::Arena* arena) {
   options.enable_string_concat = false;
   options.enable_list_concat = false;
 
-  // Performance-oriented defaults
-  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.enable_cel_regex_precompilation")) {
-    options.enable_regex_precompilation = true;
+  // Apply CEL options from bootstrap if available through context
+  const envoy::config::bootstrap::v3::CelExtensionOptions* cel_options = nullptr;
+
+  if (server_factory_context != nullptr) {
+    // First try to get options directly from bootstrap
+    if (server_factory_context->bootstrap().has_cel_extension_options()) {
+      cel_options = &server_factory_context->bootstrap().cel_extension_options();
+    } else {
+      // Try to get options from the singleton provider if available
+      const auto& singleton_manager = server_factory_context->singletonManager();
+      if (singleton_manager.contains("cel_options_provider")) {
+        auto& provider = singleton_manager.getTyped<CelOptionsProvider>("cel_options_provider");
+        cel_options = &provider.options();
+      }
+    }
   }
 
-  // Enable constant folding (performance optimization)
-  if (arena != nullptr) {
-    options.constant_folding = true;
-    options.constant_arena = arena;
+  // Apply options if found
+  if (cel_options != nullptr) {
+    if (cel_options->enable_string_extensions()) {
+      options.enable_string_conversion = true;
+    }
+    if (cel_options->enable_string_concat()) {
+      options.enable_string_concat = true;
+    }
+    if (cel_options->enable_list_concat()) {
+      options.enable_list_concat = true;
+    }
   }
 
   auto builder = google::api::expr::runtime::CreateCelExpressionBuilder(options);
