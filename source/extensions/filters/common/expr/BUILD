@@ -14,11 +14,14 @@ envoy_cc_library(
     hdrs = ["evaluator.h"],
     tags = ["skip_on_windows"],
     deps = [
+        ":cel_options_provider",
         ":context_lib",
         "//envoy/singleton:manager_interface",
         "//source/common/http:utility_lib",
         "//source/common/protobuf",
         "//source/common/runtime:runtime_features_lib",
+        "//source/common/singleton:manager_impl_lib",
+        "//source/server:server_lib",
         "@com_github_cncf_xds//xds/type/v3:pkg_cc_proto",
         "@com_google_cel_cpp//eval/public:activation",
         "@com_google_cel_cpp//eval/public:builtin_func_registrar",
@@ -26,6 +29,7 @@ envoy_cc_library(
         "@com_google_cel_cpp//eval/public:cel_expression",
         "@com_google_cel_cpp//eval/public:cel_value",
         "@com_google_cel_cpp//extensions:regex_functions",
+        "@com_google_cel_cpp//extensions:strings",
     ],
 )
 
@@ -66,5 +70,15 @@ envoy_cc_library(
         "@com_google_cel_cpp//eval/public:cel_value",
         "@com_google_cel_cpp//eval/public/structs:cel_proto_wrapper",
         "@com_google_cel_cpp//tools:flatbuffers_backed_impl",
+    ],
+)
+
+envoy_cc_library(
+    name = "cel_options_provider",
+    hdrs = ["cel_options_provider.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//envoy/singleton:instance_interface",
+        "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
     ],
 )

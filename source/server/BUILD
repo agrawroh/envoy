@@ -435,16 +435,23 @@ envoy_cc_library(
 
 envoy_cc_library(
     name = "server_lib",
-    srcs = ["instance_impl.cc"],
-    hdrs = ["instance_impl.h"],
+    srcs = [
+        "instance_impl.cc",
+    ],
+    hdrs = [
+        "instance_impl.h",
+    ],
     deps = [
         ":guarddog_lib",
         ":server_base_lib",
         "//source/common/memory:heap_shrinker_lib",
+        "//source/common/thread_local:thread_local_lib",
         "//source/common/upstream:health_discovery_service_lib",
         "//source/common/upstream:prod_cluster_info_factory_lib",
+        "//source/extensions/filters/common/expr:cel_options_provider",
         "//source/server:null_overload_manager_lib",
         "//source/server:overload_manager_lib",
+        "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
     ],
 )
 

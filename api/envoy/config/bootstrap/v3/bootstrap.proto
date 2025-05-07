@@ -3,6 +3,7 @@ syntax = "proto3";
 package envoy.config.bootstrap.v3;
 
 import "envoy/config/accesslog/v3/accesslog.proto";
+import "envoy/config/bootstrap/v3/cel.proto";
 import "envoy/config/cluster/v3/cluster.proto";
 import "envoy/config/core/v3/address.proto";
 import "envoy/config/core/v3/base.proto";
@@ -41,7 +42,7 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 // <config_overview_bootstrap>` for more detail.
 
 // Bootstrap :ref:`configuration overview <config_overview_bootstrap>`.
-// [#next-free-field: 42]
+// [#next-free-field: 43]
 message Bootstrap {
   option (udpa.annotations.versioning).previous_message_type =
       "envoy.config.bootstrap.v2.Bootstrap";
@@ -169,7 +170,7 @@ message Bootstrap {
   //
   // The node context parameters act as a base layer dictionary for the context
   // parameters (i.e. more specific resource specific context parameters will
-  // override). Field names will be prefixed with “udpa.node.” when included in
+  // override). Field names will be prefixed with "udpa.node." when included in
   // context parameters.
   //
   // For example, if node_context_params is ``["user_agent_name", "metadata"]``,
@@ -250,7 +251,7 @@ message Bootstrap {
       [deprecated = true, (envoy.annotations.deprecated_at_minor_version) = "3.0"];
 
   // Configuration for the runtime configuration provider. If not
-  // specified, a “null” provider will be used which will result in all defaults
+  // specified, a "null" provider will be used which will result in all defaults
   // being used.
   LayeredRuntime layered_runtime = 17;
 
@@ -413,6 +414,11 @@ message Bootstrap {
   // Optional configuration for memory allocation manager.
   // Memory releasing is only supported for `tcmalloc allocator <https://github.com/google/tcmalloc>`_.
   MemoryAllocatorManager memory_allocator_manager = 41;
+
+  // Optional configuration options for CEL (Common Expression Language) extension.
+  // This could be used to optionally enable the features that are disabled by default for security and performance
+  // reasons.
+  CelExtensionOptions cel_extension_options = 42;
 }
 
 // Administration interface :ref:`operations documentation
@@ -426,14 +432,14 @@ message Admin {
   repeated accesslog.v3.AccessLog access_log = 5;
 
   // The path to write the access log for the administration server. If no
-  // access log is desired specify ‘/dev/null’. This is only required if
+  // access log is desired specify 'dev/null'. This is only required if
   // :ref:`address <envoy_v3_api_field_config.bootstrap.v3.Admin.address>` is set.
   // Deprecated in favor of ``access_log`` which offers more options.
   string access_log_path = 1
       [deprecated = true, (envoy.annotations.deprecated_at_minor_version) = "3.0"];
 
   // The cpu profiler output path for the administration server. If no profile
-  // path is specified, the default is ‘/var/log/envoy/envoy.prof’.
+  // path is specified, the default is 'var/log/envoy/envoy.prof'.
   string profile_path = 2;
 
   // The TCP address that the administration server will listen on.
