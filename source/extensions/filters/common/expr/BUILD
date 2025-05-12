@@ -75,6 +75,7 @@ envoy_cc_library(
 envoy_cc_library(
     name = "cel_options_provider",
     hdrs = ["cel_options_provider.h"],
+    visibility = ["//visibility:public"],
     deps = [
         "//envoy/singleton:instance_interface",
         "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",

@@ -90,6 +90,26 @@ public:
 
 private:
   std::unique_ptr<Memory::HeapShrinker> heap_shrinker_;
+  
+  // Member variables referenced in the constructor initialization list
+  const Options& options_;
+  Api::Api& api_;
+  Http::Context& http_context_;
+  Grpc::Context& grpc_context_;
+  Router::Context& router_context_;
+  ProcessContextOptRef process_context_;
+  ProtobufMessage::ValidationContext& validation_context_;
+  LocalInfo::LocalInfo local_info_;
+  AccessLog::AccessLogManager& access_log_manager_;
+  ServerLifecycleNotifier& lifecycle_notifier_;
+  ThreadLocal::Instance& thread_local_;
+  Filesystem::Instance& file_system_;
+  Random::RandomGenerator& random_generator_;
+  const envoy::config::bootstrap::v3::Bootstrap& bootstrap_;
+  Stats::StoreRoot& stats_;
+  Ssl::ContextManager& ssl_context_manager_;
+  std::unique_ptr<Singleton::Manager> singleton_manager_;
+  Thread::ThreadFactory& thread_factory_;
 };
 
 } // namespace Server

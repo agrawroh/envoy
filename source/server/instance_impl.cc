@@ -10,7 +10,7 @@
 #include "source/common/stats/stats_matcher_impl.h"
 #include "source/common/thread_local/thread_local_impl.h"
 #include "source/server/configuration_impl.h"
-#include "source/server/guard_dog_impl.h"
+
 #include "source/server/overload_manager_impl.h"
 #include "source/server/server.h"
 #include "source/server/worker_impl.h"
@@ -42,12 +42,20 @@ InstanceImpl::InstanceImpl(const Options& options, Network::Address::InstanceCon
   initialize(options, component_factory, bootstrap, ssl_context_manager);
 }
 
+// Static method to get the current instance
+InstanceImpl* InstanceImpl::getInProgressUnsafe() {
+  // This is a placeholder implementation that will need to be updated with 
+  // proper initialization tracking. For now, returning nullptr is safer
+  // than dereferencing an uninitialized pointer.
+  return nullptr;
+}
+
 void InstanceImpl::initialize(const Options& options, ComponentFactory& component_factory,
                             const envoy::config::bootstrap::v3::Bootstrap& bootstrap,
                             Ssl::ContextManager& ssl_context_manager) {
   if (bootstrap.has_cel_extension_options()) {
     auto& provider = singleton_manager_->getTyped<Extensions::Filters::Common::Expr::CelOptionsProvider>(
-        Extensions::Filters::Common::Expr::CelOptionsProvider::name, [this]() {
+        Extensions::Filters::Common::Expr::CelOptionsProvider::name, []() {
           return std::make_shared<Extensions::Filters::Common::Expr::CelOptionsProvider>();
         });
     provider.setOptions(bootstrap.cel_extension_options());
@@ -71,7 +79,8 @@ std::unique_ptr<OverloadManager> InstanceImpl::createNullOverloadManager() {
 
 std::unique_ptr<Server::GuardDog> InstanceImpl::maybeCreateGuardDog(absl::string_view name) {
   return std::make_unique<Server::GuardDogImpl>(*stats().rootScope(),
-                                                config().mainThreadWatchdogConfig(), api(), name);
+                                                bootstrap().watchdog().main_thread_watchdog(),
+                                                api(), name);
 }
 
 std::unique_ptr<HdsDelegateApi>
