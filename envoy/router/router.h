@@ -101,6 +101,18 @@ public:
   virtual const std::string& responseBody() const PURE;
 
   /**
+   * Returns a formatted response body based on the request and stream info.
+   * @param stream_info Stream info instance to use in the formatting.
+   * @return std::string the formatted response body, or an empty string if no body format is
+   * specified. This will be used instead of the static body if available.
+   */
+  virtual absl::optional<std::string>
+  formatResponseBody(const StreamInfo::StreamInfo& stream_info) const {
+    UNREFERENCED_PARAMETER(stream_info);
+    return {};
+  }
+
+  /**
    * Do potentially destructive header transforms on Path header prior to redirection. For
    * example prefix rewriting for redirects etc. This should only be called ONCE
    * immediately prior to redirecting.

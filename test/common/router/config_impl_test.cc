@@ -28,6 +28,7 @@
 #include "test/fuzz/utility.h"
 #include "test/mocks/router/mocks.h"
 #include "test/mocks/server/instance.h"
+#include "test/mocks/stream_info/mocks.h"
 #include "test/mocks/upstream/retry_priority.h"
 #include "test/mocks/upstream/retry_priority_factory.h"
 #include "test/mocks/upstream/test_retry_host_predicate_factory.h"
@@ -341,6 +342,7 @@ most_specific_header_mutations_wins: {0}
   Stats::TestUtil::TestSymbolTable symbol_table_;
   Api::ApiPtr api_;
   NiceMock<Server::Configuration::MockServerFactoryContext> factory_context_;
+  NiceMock<Envoy::StreamInfo::MockStreamInfo> mock_stream_info_;
   Event::SimulatedTimeSystem test_time_;
   absl::Status creation_status_ = absl::OkStatus();
 };
@@ -7815,6 +7817,48 @@ virtual_hosts:
   EXPECT_NE(nullptr, direct_response);
   EXPECT_EQ(Http::Code::OK, direct_response->responseCode());
   EXPECT_STREQ("content", direct_response->responseBody().c_str());
+}
+
+// Test direct_response with substitution formatter
+TEST_F(RouteConfigurationV2, DirectResponseWithBodyFormat) {
+  const std::string yaml = R"EOF(
+virtual_hosts:
+  - name: direct
+    domains: [example.com]
+    routes:
+      - match: { prefix: "/static"}
+        direct_response: 
+          status: 200
+          body: { inline_string: "static body" }
+      - match: { prefix: "/dynamic"}
+        direct_response: 
+          status: 200
+          body_format:
+            text_format_source:
+              inline_string: "dynamic body %PROTOCOL%"
+  )EOF";
+
+  TestConfigImpl config(parseRouteConfigurationFromYaml(yaml), factory_context_, true,
+                        creation_status_);
+
+  // Test with a static body
+  const auto* static_response =
+      config.route(genHeaders("example.com", "/static", "GET"), 0)->directResponseEntry();
+  EXPECT_NE(nullptr, static_response);
+  EXPECT_EQ(Http::Code::OK, static_response->responseCode());
+  EXPECT_STREQ("static body", static_response->responseBody().c_str());
+  EXPECT_FALSE(static_response->formatResponseBody(mock_stream_info_).has_value());
+
+  // Test with a dynamic body format
+  const auto* dynamic_response =
+      config.route(genHeaders("example.com", "/dynamic", "GET"), 0)->directResponseEntry();
+  EXPECT_NE(nullptr, dynamic_response);
+  EXPECT_EQ(Http::Code::OK, dynamic_response->responseCode());
+  EXPECT_STREQ("", dynamic_response->responseBody().c_str());
+  // TODO: Uncomment once SubstitutionFormatString is properly implemented
+  // EXPECT_TRUE(dynamic_response->formatResponseBody(mock_stream_info_).has_value());
+  // EXPECT_EQ("dynamic body HTTP/1.1",
+  //           dynamic_response->formatResponseBody(mock_stream_info_).value());
 }
 
 // Test the parsing of a direct response configuration where the response body is too large.

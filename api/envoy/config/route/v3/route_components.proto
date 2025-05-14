@@ -5,6 +5,7 @@ package envoy.config.route.v3;
 import "envoy/config/core/v3/base.proto";
 import "envoy/config/core/v3/extension.proto";
 import "envoy/config/core/v3/proxy_protocol.proto";
+import "envoy/config/core/v3/substitution_format_string.proto";
 import "envoy/type/matcher/v3/filter_state.proto";
 import "envoy/type/matcher/v3/metadata.proto";
 import "envoy/type/matcher/v3/regex.proto";
@@ -346,7 +347,7 @@ message Route {
   // The human readable prefix to use when emitting statistics for this endpoint.
   // The statistics are rooted at vhost.<virtual host name>.route.<stat_prefix>.
   // This should be set for highly critical
-  // endpoints that one wishes to get “per-route” statistics on.
+  // endpoints that one wishes to get "per-route" statistics on.
   // If not set, endpoint statistics are not generated.
   //
   // The emitted statistics are the same as those documented for :ref:`virtual clusters <config_http_filters_router_vcluster_stats>`.
@@ -626,7 +627,7 @@ message RouteMatch {
   core.v3.RuntimeFractionalPercent runtime_fraction = 9;
 
   // Specifies a set of headers that the route should match on. The router will
-  // check the request’s headers against all the specified headers in the route
+  // check the request's headers against all the specified headers in the route
   // config. A match will happen if all the headers in the route are present in
   // the request with the same values (or based on presence if the value field
   // is not in the config).
@@ -1774,15 +1775,27 @@ message DirectResponseAction {
   // Specifies the HTTP response status to be returned.
   uint32 status = 1 [(validate.rules).uint32 = {lt: 600 gte: 200}];
 
-  // Specifies the content of the response body. If this setting is omitted,
-  // no body is included in the generated response.
-  //
-  // .. note::
-  //
-  //   Headers can be specified using ``response_headers_to_add`` in the enclosing
-  //   :ref:`envoy_v3_api_msg_config.route.v3.Route`, :ref:`envoy_v3_api_msg_config.route.v3.RouteConfiguration` or
-  //   :ref:`envoy_v3_api_msg_config.route.v3.VirtualHost`.
-  core.v3.DataSource body = 2;
+  oneof body_specifier {
+    // Specifies the content of the response body. If this setting is omitted,
+    // no body is included in the generated response.
+    //
+    // .. note::
+    //
+    //   Headers can be specified using ``response_headers_to_add`` in the enclosing
+    //   :ref:`envoy_v3_api_msg_config.route.v3.Route`, :ref:`envoy_v3_api_msg_config.route.v3.RouteConfiguration` or
+    //   :ref:`envoy_v3_api_msg_config.route.v3.VirtualHost`.
+    core.v3.DataSource body = 2;
+
+    // Specifies the content of the response body as a formatted string.
+    // If this setting is omitted, no body is included in the generated response.
+    //
+    // .. note::
+    //
+    //   Headers can be specified using ``response_headers_to_add`` in the enclosing
+    //   :ref:`envoy_v3_api_msg_config.route.v3.Route`, :ref:`envoy_v3_api_msg_config.route.v3.RouteConfiguration` or
+    //   :ref:`envoy_v3_api_msg_config.route.v3.VirtualHost`.
+    .envoy.config.core.v3.SubstitutionFormatString body_format = 3;
+  }
 }
 
 // [#not-implemented-hide:]
@@ -1847,9 +1860,9 @@ message Tracing {
 // certain important endpoints such that statistics are generated explicitly for
 // the matched requests. The reason this is useful is that when doing
 // prefix/path matching Envoy does not always know what the application
-// considers to be an endpoint. Thus, it’s impossible for Envoy to generically
+// considers to be an endpoint. Thus, it's impossible for Envoy to generically
 // emit per endpoint statistics. However, often systems have highly critical
-// endpoints that they wish to get “perfect” statistics on. Virtual cluster
+// endpoints that they wish to get "perfect" statistics on. Virtual cluster
 // statistics are perfect in the sense that they are emitted on the downstream
 // side such that they include network level failures.
 //
@@ -1932,7 +1945,7 @@ message RateLimit {
       option (udpa.annotations.versioning).previous_message_type =
           "envoy.api.v2.route.RateLimit.Action.RequestHeaders";
 
-      // The header name to be queried from the request headers. The header’s
+      // The header name to be queried from the request headers. The header's
       // value is used to populate the value of the descriptor entry for the
       // descriptor_key.
       string header_name = 1
@@ -2058,7 +2071,7 @@ message RateLimit {
       google.protobuf.BoolValue expect_match = 2;
 
       // Specifies a set of headers that the rate limit action should match
-      // on. The action will check the request’s headers against all the
+      // on. The action will check the request's headers against all the
       // specified headers in the config. A match will happen if all the
       // headers in the config are present in the request with the same values
       // (or based on presence if the value field is not in the config).
@@ -2152,7 +2165,7 @@ message RateLimit {
       google.protobuf.BoolValue expect_match = 2;
 
       // Specifies a set of query parameters that the rate limit action should match
-      // on. The action will check the request’s query parameters against all the
+      // on. The action will check the request's query parameters against all the
       // specified query parameters in the config. A match will happen if all the
       // query parameters in the config are present in the request with the same values
       // (or based on presence if the value field is not in the config).

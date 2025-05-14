@@ -482,7 +482,16 @@ Http::FilterHeadersStatus Filter::decodeHeaders(Http::RequestHeaderMap& headers,
     stats_.rq_direct_response_.inc();
     direct_response->rewritePathHeader(headers, !config_->suppress_envoy_headers_);
     callbacks_->sendLocalReply(
-        direct_response->responseCode(), direct_response->responseBody(),
+        direct_response->responseCode(),
+        [direct_response, &stream_info = callbacks_->streamInfo()]() -> std::string {
+          // Check if we have a formatted body first
+          auto formatted_body = direct_response->formatResponseBody(stream_info);
+          if (formatted_body.has_value()) {
+            return formatted_body.value();
+          }
+          // Fall back to static body
+          return direct_response->responseBody();
+        }(),
         [this, direct_response,
          &request_headers = headers](Http::ResponseHeaderMap& response_headers) -> void {
           std::string new_uri;

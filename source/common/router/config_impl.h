@@ -813,6 +813,14 @@ public:
                                                      : EMPTY_STRING;
   }
 
+  absl::optional<std::string>
+  formatResponseBody(const StreamInfo::StreamInfo& stream_info) const override {
+    if (direct_response_body_format_ != nullptr) {
+      return direct_response_body_format_->formatWithContext({}, stream_info);
+    }
+    return {};
+  }
+
   // Router::Route
   const DirectResponseEntry* directResponseEntry() const override;
   const RouteEntry* routeEntry() const override;
@@ -1241,11 +1249,14 @@ private:
 
   const DecoratorConstPtr decorator_;
   const RouteTracingConstPtr route_tracing_;
-  Envoy::Config::DataSource::DataSourceProviderPtr direct_response_body_provider_;
+  std::unique_ptr<Envoy::Config::DataSource::DataSourceProvider> direct_response_body_provider_;
   std::unique_ptr<PerFilterConfigs> per_filter_configs_;
   const std::string route_name_;
   TimeSource& time_source_;
   EarlyDataPolicyPtr early_data_policy_;
+  Formatter::FormatterPtr direct_response_body_format_;
+  // Default delay_close_timeout to use on the HCM.
+  std::chrono::milliseconds default_delay_close_timeout_{0};
 
   // Keep small members (bools and enums) at the end of class, to reduce alignment overhead.
   uint32_t retry_shadow_buffer_limit_{std::numeric_limits<uint32_t>::max()};
