@@ -241,6 +241,15 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "socket_interface_lib_envoy_extension",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":socket_interface_lib",
+    ],
+    alwayslink = LEGACY_ALWAYSLINK,
+)
+
+envoy_cc_library(
     name = "default_socket_interface_lib",
     srcs = [
         "io_socket_handle_base_impl.cc",

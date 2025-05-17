@@ -33,4 +33,22 @@ envoy_cc_library(
         "//source/common/network:socket_lib",
         "@com_google_protobuf//:protobuf",
     ],
+)
+
+# Add the extension library target with proper visibility
+envoy_cc_library(
+    name = "ktls_socket_interface_lib_envoy_extension",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":ktls_socket_interface_lib",
+        "//envoy/registry:registry",
+        "//source/common/api:os_sys_calls_lib",
+        "//source/common/common:assert_lib",
+        "//source/common/network:address_lib",
+        "//source/common/network:socket_interface_lib",
+        "//source/common/network:socket_lib",
+        "@com_google_protobuf//:protobuf",
+        "@envoy_api//envoy/extensions/network/socket_interface/v3:pkg_cc_proto",
+    ],
+    alwayslink = 1,
 ) 

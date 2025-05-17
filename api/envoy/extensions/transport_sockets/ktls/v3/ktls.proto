@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package envoy.extensions.transport_sockets.ktls.v3;
+
+import "envoy/config/core/v3/socket_option.proto";
+import "google/protobuf/any.proto";
+import "udpa/annotations/status.proto";
+import "udpa/annotations/versioning.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.transport_sockets.ktls.v3";
+option java_outer_classname = "KTlsProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/ktls/v3;ktlsv3";
+
+// [#protodoc-title: kTLS Transport Socket Configuration]
+// [#availability: experimental]
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// Configuration for kTLS transport socket. This wraps another transport socket
+// and enables the use of kernel TLS for hardware offloading.
+message KtlsTransportSocket {
+  option (udpa.annotations.versioning).previous_message_type = "envoy.config.transport_socket.ktls.v2.KtlsTransportSocket";
+
+  // The name of the underlying transport socket being wrapped.
+  message TlsSocketConfig {
+    // The name of the transport socket being wrapped.
+    string name = 1;
+
+    // The typed configuration of the transport socket being wrapped.
+    google.protobuf.Any typed_config = 2;
+  }
+
+  // The underlying transport socket configuration.
+  TlsSocketConfig tls_socket_config = 1;
+
+  // Enable TX zerocopy (if supported by the platform).
+  // This may reduce CPU usage but can increase memory use.
+  bool enable_tx_zerocopy = 2;
+
+  // Enable RX no padding (if supported by the platform).
+  // This is for TLSv1.3 and might reduce CPU usage.
+  bool enable_rx_no_pad = 3;
+
+  // Additional socket options specific to kTLS.
+  // [#not-implemented-hide:]
+  repeated envoy.config.core.v3.SocketOption additional_options = 4;
+} 

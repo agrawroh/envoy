@@ -1,179 +1,120 @@
 #include "source/extensions/transport_sockets/ktls/config.h"
 
-#include "envoy/extensions/transport_sockets/v3/ktls.pb.h"
-#include "envoy/extensions/transport_sockets/v3/ktls.pb.validate.h"
+#include "envoy/extensions/transport_sockets/ktls/v3/ktls.pb.h"
+#include "envoy/extensions/transport_sockets/ktls/v3/ktls.pb.validate.h"
 #include "envoy/registry/registry.h"
 
 #include "source/common/config/utility.h"
 #include "source/common/protobuf/utility.h"
-#include "source/extensions/transport_sockets/ktls/ktls_ssl_info_impl.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace TransportSockets {
-namespace KTls {
+namespace Ktls {
 
-namespace {
-
-// Factory that creates a kTLS transport socket wrapped around another transport socket
-class KTlsTransportSocketFactory : public Network::TransportSocketFactory {
+// Downstream kTLS transport socket factory implementation
+class KtlsDownstreamTransportSocketFactory : public TransportSockets::DownstreamPassthroughFactory {
 public:
-  KTlsTransportSocketFactory(Network::TransportSocketFactoryPtr&& transport_socket_factory,
-                            const envoy::extensions::transport_sockets::v3::KTlsOptions& options)
-      : transport_socket_factory_(std::move(transport_socket_factory)),
-        options_(options) {}
+  KtlsDownstreamTransportSocketFactory(Network::DownstreamTransportSocketFactoryPtr&& transport_socket_factory,
+                                     bool enable_tx_zerocopy,
+                                     bool enable_rx_no_pad)
+      : DownstreamPassthroughFactory(std::move(transport_socket_factory)),
+        enable_tx_zerocopy_(enable_tx_zerocopy),
+        enable_rx_no_pad_(enable_rx_no_pad) {}
 
-  // Creates a transport socket wrapped in a kTLS transport socket
-  Network::TransportSocketPtr createTransportSocket(
-      Network::TransportSocketOptionsConstSharedPtr options) const override {
-    // Create the underlying transport socket
-    Network::TransportSocketPtr transport_socket = transport_socket_factory_->createTransportSocket(options);
-    
-    // Only continue if the underlying socket implements secure transport
-    if (!transport_socket_factory_->implementsSecureTransport()) {
-      return transport_socket;
+  Network::TransportSocketPtr createTransportSocket(Network::TransportSocketOptionsConstSharedPtr options,
+                                                   const Network::Address::InstanceConstSharedPtr& local_address,
+                                                   const Network::Address::InstanceConstSharedPtr& remote_address) const override {
+    auto inner_socket = transport_socket_factory_->createTransportSocket(options, local_address, remote_address);
+    if (inner_socket == nullptr) {
+      return nullptr;
     }
-    
-    // Check if kTLS is explicitly disabled
-    if (options_.has_enable_ktls() && !options_.enable_ktls()) {
-      return transport_socket;
-    }
-    
-    // Create the kTLS transport socket
-    // We'll need access to the SSL session after the handshake completes
-    // For now, we return the original transport socket, and we'll upgrade
-    // to kTLS after the handshake completes in the connection handlers
-    
-    // Ideally, we would have a way to get the SSL connection info with direct
-    // access to the OpenSSL SSL* object, which we need for kTLS configuration
-    
-    // For prototype purposes, wrap with a kTLS transport socket
-    Ssl::ConnectionInfoConstSharedPtr ssl_info = transport_socket->ssl();
-    if (ssl_info == nullptr) {
-      // Not a TLS socket, can't use kTLS
-      return transport_socket;
-    }
-    
-    // In a real implementation, we would:
-    // 1. Register a handshake completion callback with the TLS transport socket
-    // 2. When the handshake completes, extract SSL session information
-    // 3. Create a KTlsTransportSocket that takes over from the TLS socket
-    
-    // For now, just return the original socket
-    return transport_socket;
-  }
-
-  bool implementsSecureTransport() const override {
-    return transport_socket_factory_->implementsSecureTransport();
-  }
-
-  bool supportsAlpn() const override { return transport_socket_factory_->supportsAlpn(); }
-
-private:
-  Network::TransportSocketFactoryPtr transport_socket_factory_;
-  envoy::extensions::transport_sockets::v3::KTlsOptions options_;
-};
-
-// Factory that creates upstream kTLS transport sockets
-class KTlsUpstreamTransportSocketFactory : public KTlsTransportSocketFactory,
-                                          public Network::UpstreamTransportSocketFactory {
-public:
-  KTlsUpstreamTransportSocketFactory(Network::UpstreamTransportSocketFactoryPtr&& transport_socket_factory,
-                                    const envoy::extensions::transport_sockets::v3::KTlsOptions& options)
-      : KTlsTransportSocketFactory(std::move(transport_socket_factory), options),
-        upstream_factory_(std::move(transport_socket_factory)) {}
-
-  void hashKey(std::vector<uint8_t>& key, Network::TransportSocketOptionsConstSharedPtr options) const override {
-    upstream_factory_->hashKey(key, options);
+    return std::make_unique<KtlsTransportSocket>(std::move(inner_socket), 
+                                               enable_tx_zerocopy_, enable_rx_no_pad_);
   }
 
 private:
-  Network::UpstreamTransportSocketFactoryPtr upstream_factory_;
+  bool enable_tx_zerocopy_;
+  bool enable_rx_no_pad_;
 };
 
-// Factory that creates downstream kTLS transport sockets
-class KTlsDownstreamTransportSocketFactory : public KTlsTransportSocketFactory,
-                                            public Network::DownstreamTransportSocketFactory {
-public:
-  KTlsDownstreamTransportSocketFactory(Network::DownstreamTransportSocketFactoryPtr&& transport_socket_factory,
-                                      const envoy::extensions::transport_sockets::v3::KTlsOptions& options)
-      : KTlsTransportSocketFactory(std::move(transport_socket_factory), options),
-        downstream_factory_(std::move(transport_socket_factory)) {}
+// Helper functions to create the inner TLS transport socket factory
+Network::TransportSocketFactoryPtr createInnerFactory(
+    const envoy::extensions::transport_sockets::ktls::v3::KtlsTransportSocket& config,
+    Server::Configuration::TransportSocketFactoryContext& context) {
+  auto& inner_config = config.tls_socket_config();
 
-  std::vector<std::string> alpnProtocols() const override {
-    return downstream_factory_->alpnProtocols();
-  }
+  // Find inner transport socket factory, which should be TLS
+  auto& config_factory = Config::Utility::getAndCheckFactory<
+      Server::Configuration::UpstreamTransportSocketConfigFactory>(inner_config.name());
 
-private:
-  Network::DownstreamTransportSocketFactoryPtr downstream_factory_;
-};
-
-} // namespace
-
-ProtobufTypes::MessagePtr KTlsTransportSocketConfigFactory::createEmptyConfigProto() {
-  return std::make_unique<envoy::extensions::transport_sockets::v3::KTls>();
+  // For client sockets, no server_names are passed
+  return config_factory.createTransportSocketFactory(inner_config.typed_config(), context);
 }
 
-absl::StatusOr<Network::UpstreamTransportSocketFactoryPtr>
-KTlsUpstreamTransportSocketConfigFactory::createTransportSocketFactory(
+Network::TransportSocketFactoryPtr createInnerFactory(
+    const envoy::extensions::transport_sockets::ktls::v3::KtlsTransportSocket& config,
+    Server::Configuration::TransportSocketFactoryContext& context,
+    const std::vector<std::string>& server_names) {
+  auto& inner_config = config.tls_socket_config();
+
+  // Find inner transport socket factory, which should be TLS
+  auto& config_factory = Config::Utility::getAndCheckFactory<
+      Server::Configuration::DownstreamTransportSocketConfigFactory>(inner_config.name());
+
+  // For server sockets, pass SNI server_names
+  return config_factory.createTransportSocketFactory(inner_config.typed_config(), context, server_names);
+}
+
+ProtobufTypes::MessagePtr KtlsTransportSocketConfigFactory::createEmptyConfigProto() {
+  return std::make_unique<envoy::extensions::transport_sockets::ktls::v3::KtlsTransportSocket>();
+}
+
+Network::TransportSocketFactoryPtr KtlsClientTransportSocketConfigFactory::createTransportSocketFactory(
     const Protobuf::Message& message,
     Server::Configuration::TransportSocketFactoryContext& context) {
-  const auto& outer_config = MessageUtil::downcastAndValidate<
-      const envoy::extensions::transport_sockets::v3::KTls&>(
-      message, context.messageValidationVisitor());
-  
-  auto& inner_config = outer_config.transport_socket();
-  auto& inner_factory_name = inner_config.name();
-  auto* inner_factory = Registry::FactoryRegistry<
-      Server::Configuration::UpstreamTransportSocketConfigFactory>::getFactory(inner_factory_name);
-  if (inner_factory == nullptr) {
-    return absl::InvalidArgumentError(
-        fmt::format("Unable to find inner transport socket factory with name {}.", inner_factory_name));
+  const auto& outer_config =
+      MessageUtil::downcastAndValidate<const envoy::extensions::transport_sockets::ktls::v3::KtlsTransportSocket&>(
+          message, context.messageValidationVisitor());
+
+  auto inner_factory = createInnerFactory(outer_config, context);
+  if (!inner_factory) {
+    return nullptr;
   }
 
-  auto inner_transport_factory =
-      inner_factory->createTransportSocketFactory(*inner_config.typed_config().get(), context);
-  if (!inner_transport_factory.ok()) {
-    return inner_transport_factory.status();
-  }
-
-  return std::make_unique<KTlsUpstreamTransportSocketFactory>(
-      std::move(*inner_transport_factory), outer_config.options());
+  return std::make_unique<KtlsTransportSocketFactory>(
+      std::move(Network::UpstreamTransportSocketFactoryPtr(
+          dynamic_cast<Network::UpstreamTransportSocketFactory*>(inner_factory.release()))),
+      outer_config.enable_tx_zerocopy(),
+      outer_config.enable_rx_no_pad());
 }
 
-absl::StatusOr<Network::DownstreamTransportSocketFactoryPtr>
-KTlsDownstreamTransportSocketConfigFactory::createTransportSocketFactory(
+Network::TransportSocketFactoryPtr KtlsServerTransportSocketConfigFactory::createTransportSocketFactory(
     const Protobuf::Message& message,
-    Server::Configuration::TransportSocketFactoryContext& context) {
-  const auto& outer_config = MessageUtil::downcastAndValidate<
-      const envoy::extensions::transport_sockets::v3::KTls&>(
-      message, context.messageValidationVisitor());
-  
-  auto& inner_config = outer_config.transport_socket();
-  auto& inner_factory_name = inner_config.name();
-  auto* inner_factory = Registry::FactoryRegistry<
-      Server::Configuration::DownstreamTransportSocketConfigFactory>::getFactory(inner_factory_name);
-  if (inner_factory == nullptr) {
-    return absl::InvalidArgumentError(
-        fmt::format("Unable to find inner transport socket factory with name {}.", inner_factory_name));
+    Server::Configuration::TransportSocketFactoryContext& context,
+    const std::vector<std::string>& server_names) {
+  const auto& outer_config =
+      MessageUtil::downcastAndValidate<const envoy::extensions::transport_sockets::ktls::v3::KtlsTransportSocket&>(
+          message, context.messageValidationVisitor());
+
+  auto inner_factory = createInnerFactory(outer_config, context, server_names);
+  if (!inner_factory) {
+    return nullptr;
   }
 
-  auto inner_transport_factory =
-      inner_factory->createTransportSocketFactory(*inner_config.typed_config().get(), context);
-  if (!inner_transport_factory.ok()) {
-    return inner_transport_factory.status();
-  }
-
-  return std::make_unique<KTlsDownstreamTransportSocketFactory>(
-      std::move(*inner_transport_factory), outer_config.options());
+  return std::make_unique<KtlsDownstreamTransportSocketFactory>(
+      std::move(Network::DownstreamTransportSocketFactoryPtr(
+          dynamic_cast<Network::DownstreamTransportSocketFactory*>(inner_factory.release()))),
+      outer_config.enable_tx_zerocopy(),
+      outer_config.enable_rx_no_pad());
 }
 
-REGISTER_FACTORY(KTlsUpstreamTransportSocketConfigFactory,
-                Server::Configuration::UpstreamTransportSocketConfigFactory);
-REGISTER_FACTORY(KTlsDownstreamTransportSocketConfigFactory,
-                Server::Configuration::DownstreamTransportSocketConfigFactory);
+REGISTER_FACTORY(KtlsClientTransportSocketConfigFactory,
+                 Server::Configuration::UpstreamTransportSocketConfigFactory);
+REGISTER_FACTORY(KtlsServerTransportSocketConfigFactory,
+                 Server::Configuration::DownstreamTransportSocketConfigFactory);
 
-} // namespace KTls
+} // namespace Ktls
 } // namespace TransportSockets
 } // namespace Extensions
 } // namespace Envoy 

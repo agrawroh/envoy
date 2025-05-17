@@ -23,6 +23,21 @@ envoy_cc_extension(
     ],
 )
 
+# Add alias for config_envoy_extension
+envoy_cc_extension(
+    name = "config_envoy_extension",
+    srcs = ["config.cc"],
+    hdrs = ["config.h"],
+    deps = [
+        ":upstream_proxy_protocol",
+        "//envoy/network:transport_socket_interface",
+        "//envoy/registry",
+        "//envoy/server:transport_socket_config_interface",
+        "//source/common/config:utility_lib",
+        "@envoy_api//envoy/extensions/transport_sockets/proxy_protocol/v3:pkg_cc_proto",
+    ],
+)
+
 envoy_cc_library(
     name = "upstream_proxy_protocol",
     srcs = ["proxy_protocol.cc"],

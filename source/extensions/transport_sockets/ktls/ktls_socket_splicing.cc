@@ -1,140 +1,150 @@
 #include "source/extensions/transport_sockets/ktls/ktls_socket_splicing.h"
 
-#include <fcntl.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "source/common/common/assert.h"
+#include "source/common/network/io_socket_error_impl.h"
+
+// Only include Linux-specific headers when compiling on Linux
+#ifdef __linux__
+#include <sys/splice.h>
+#endif
 
 namespace Envoy {
 namespace Extensions {
 namespace TransportSockets {
-namespace KTls {
+namespace Ktls {
 
-bool KTlsSplicer::initialize(os_fd_t source_fd, os_fd_t destination_fd) {
-  // Close existing pipe if already initialized
-  if (pipe_initialized_) {
-    closePipe();
-  }
-
-  source_fd_ = source_fd;
-  destination_fd_ = destination_fd;
-
-  return createPipe();
+KtlsSocketSplicing::KtlsSocketSplicing(Network::IoHandle& source_io_handle, 
+                                   Network::IoHandle& dest_io_handle)
+    : source_io_handle_(source_io_handle), dest_io_handle_(dest_io_handle) {
+  // Initialize the pipe for splicing
+  pipe_initialized_ = initializePipe();
 }
 
-bool KTlsSplicer::createPipe() {
-  // Create a pipe for the splice operation
-  if (pipe(pipe_fds_) != 0) {
-    ENVOY_LOG(error, "Failed to create pipe for splice: {}", strerror(errno));
+KtlsSocketSplicing::~KtlsSocketSplicing() {
+  // Close pipe if it's open
+  if (pipe_initialized_) {
+    if (pipe_fds_[0] >= 0) {
+      ::close(pipe_fds_[0]);
+    }
+    if (pipe_fds_[1] >= 0) {
+      ::close(pipe_fds_[1]);
+    }
+    pipe_initialized_ = false;
+  }
+}
+
+bool KtlsSocketSplicing::initializePipe() {
+  // Create a pipe for splicing
+  if (::pipe(pipe_fds_) < 0) {
+    ENVOY_LOG(error, "Failed to create pipe for kTLS socket splicing: {}", ::strerror(errno));
     return false;
   }
-
-  // Try to increase the pipe capacity for better performance
-  int pipe_size = DEFAULT_PIPE_SIZE;
-  if (fcntl(pipe_fds_[0], F_SETPIPE_SZ, pipe_size) == -1) {
-    // This is not a critical error, so just log it and continue
-    ENVOY_LOG(warn, "Failed to set pipe size: {}", strerror(errno));
+  
+  // Set pipe size for optimal performance
+  // In a real implementation, you would tune this based on throughput requirements
+#ifdef __linux__
+  // F_SETPIPE_SZ is Linux-specific
+  constexpr int pipe_size = 1024 * 1024; // 1MB pipe buffer
+  if (::fcntl(pipe_fds_[0], F_SETPIPE_SZ, pipe_size) < 0 ||
+      ::fcntl(pipe_fds_[1], F_SETPIPE_SZ, pipe_size) < 0) {
+    ENVOY_LOG(warn, "Failed to set pipe size for kTLS socket splicing: {}", ::strerror(errno));
+    // Not fatal, continue
   }
-
+#endif
+  
   // Set the pipe to non-blocking mode
   for (int i = 0; i < 2; ++i) {
-    int flags = fcntl(pipe_fds_[i], F_GETFL);
-    if (flags == -1) {
-      ENVOY_LOG(error, "Failed to get flags for pipe: {}", strerror(errno));
-      closePipe();
+    int flags = ::fcntl(pipe_fds_[i], F_GETFL, 0);
+    if (flags < 0) {
+      ENVOY_LOG(error, "Failed to get pipe flags: {}", ::strerror(errno));
       return false;
     }
-    if (fcntl(pipe_fds_[i], F_SETFL, flags | O_NONBLOCK) == -1) {
-      ENVOY_LOG(error, "Failed to set non-blocking mode for pipe: {}", strerror(errno));
-      closePipe();
+    if (::fcntl(pipe_fds_[i], F_SETFL, flags | O_NONBLOCK) < 0) {
+      ENVOY_LOG(error, "Failed to set pipe to non-blocking: {}", ::strerror(errno));
       return false;
     }
   }
-
-  pipe_initialized_ = true;
+  
   return true;
 }
 
-void KTlsSplicer::closePipe() {
-  if (pipe_fds_[0] >= 0) {
-    close(pipe_fds_[0]);
-    pipe_fds_[0] = -1;
-  }
-  if (pipe_fds_[1] >= 0) {
-    close(pipe_fds_[1]);
-    pipe_fds_[1] = -1;
-  }
-  pipe_initialized_ = false;
-}
-
-ssize_t KTlsSplicer::splice(size_t bytes) {
+Api::IoCallUint64Result KtlsSocketSplicing::splice(uint64_t max_bytes) {
+  // Ensure pipe is initialized
   if (!pipe_initialized_) {
-    ENVOY_LOG(error, "Cannot splice: pipe not initialized");
-    return -1;
+    return {0, Network::IoSocketError::getIoSocketEbadfError()};
   }
   
-  if (source_fd_ < 0 || destination_fd_ < 0) {
-    ENVOY_LOG(error, "Cannot splice: invalid file descriptors");
-    return -1;
-  }
-
-  // Implementation of zero-copy data transfer using splice()
-  // This uses two splice() calls to move data from source FD to destination FD via the pipe
+  // Get file descriptors from IO handles
+  int source_fd = source_io_handle_.fdDoNotUse();
+  int dest_fd = dest_io_handle_.fdDoNotUse();
   
-  // First splice: from source FD to pipe
-  ssize_t nread = ::splice(source_fd_, nullptr, pipe_fds_[1], nullptr, 
-                         bytes == 0 ? DEFAULT_PIPE_SIZE : bytes, SPLICE_FLAGS);
-  if (nread <= 0) {
-    if (nread == 0) {
-      // End of file
-      return 0;
-    }
-    
+  // Validate file descriptors
+  if (source_fd < 0 || dest_fd < 0) {
+    return {0, Network::IoSocketError::getIoSocketEbadfError()};
+  }
+  
+#ifdef __linux__
+  // Linux-specific splice() implementation
+  
+  // Splice flags
+  int splice_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK;
+  
+  // Perform two-stage splice
+  // First, splice from source to pipe
+  ssize_t bytes_in_pipe = ::splice(source_fd, nullptr, pipe_fds_[1], nullptr, 
+                                  max_bytes, splice_flags);
+  if (bytes_in_pipe < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      // No data available right now
-      return 0;
+      return {0, Network::IoSocketError::getIoSocketEagainError()};
     }
-    
-    ENVOY_LOG(error, "First splice failed: {}", strerror(errno));
-    return -1;
+    return {0, Network::IoSocketError::create(errno)};
   }
   
-  // Second splice: from pipe to destination FD
-  ssize_t nwritten = 0;
-  ssize_t remaining = nread;
-  
-  while (remaining > 0) {
-    ssize_t n = ::splice(pipe_fds_[0], nullptr, destination_fd_, nullptr, 
-                       remaining, SPLICE_FLAGS);
-    if (n < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        // Destination not ready, might need to wait
-        // In a real implementation, we would register for write readiness
-        break;
-      }
-      
-      ENVOY_LOG(error, "Second splice failed: {}", strerror(errno));
-      return -1;
-    }
-    
-    nwritten += n;
-    remaining -= n;
-    
-    if (n == 0) {
-      // This shouldn't happen, but just in case
-      break;
-    }
+  if (bytes_in_pipe == 0) {
+    // No data to splice
+    return {0, Api::IoError::none()};
   }
   
-  // If we couldn't write everything, we'd need to buffer the remaining data
-  // This simplified implementation doesn't handle that case properly
-  if (nwritten < nread) {
-    ENVOY_LOG(warn, "Partial splice: {} of {} bytes", nwritten, nread);
+  // Then, splice from pipe to destination
+  ssize_t bytes_out = ::splice(pipe_fds_[0], nullptr, dest_fd, nullptr, 
+                              bytes_in_pipe, splice_flags);
+  if (bytes_out < 0) {
+    // This is a serious error as we now have data in the pipe but couldn't send it
+    ENVOY_LOG(error, "Failed to splice from pipe to destination: {}", ::strerror(errno));
+    return {0, Network::IoSocketError::create(errno)};
   }
   
-  return nwritten;
+  // Return the number of bytes transferred
+  return {static_cast<uint64_t>(bytes_out), nullptr};
+#else
+  // On non-Linux platforms, splice is not available, so return not implemented
+  UNREFERENCED_PARAMETER(max_bytes);
+  return {0, Network::IoSocketError::create(ENOSYS)};
+#endif
 }
 
-} // namespace KTls
+Api::IoCallUint64Result KtlsSocketSplicing::writeFromBuffer(Buffer::Instance& buffer) {
+  // In a real implementation, we would:
+  // 1. Get raw slices from the buffer
+  // 2. Use writev or sendfile to write directly to the destination
+  // For now, we just return a "not implemented" error
+  
+  UNREFERENCED_PARAMETER(buffer);
+  return {0, Network::IoSocketError::create(ENOSYS)};
+}
+
+Api::IoCallUint64Result KtlsSocketSplicing::readToBuffer(Buffer::Instance& buffer, uint64_t max_bytes) {
+  // In a real implementation, we would:
+  // 1. Get a raw slice from the buffer
+  // 2. Use readv to read directly into the buffer
+  // For now, we just return a "not implemented" error
+  
+  UNREFERENCED_PARAMETER(buffer);
+  UNREFERENCED_PARAMETER(max_bytes);
+  return {0, Network::IoSocketError::create(ENOSYS)};
+}
+
+} // namespace Ktls
 } // namespace TransportSockets
 } // namespace Extensions
 } // namespace Envoy 

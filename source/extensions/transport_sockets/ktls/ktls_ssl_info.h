@@ -1,42 +1,49 @@
 #pragma once
 
-#include "source/extensions/transport_sockets/ktls/tls_compat.h"
-
 #include "envoy/ssl/connection.h"
 
-#include "openssl/ssl.h"
+#include "source/extensions/transport_sockets/ktls/tls_compat.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace TransportSockets {
-namespace KTls {
+namespace Ktls {
 
 /**
- * Extension for the SSL ConnectionInfo interface that provides access
- * to the TLS key material needed for kTLS.
+ * Interface for accessing SSL session data needed for kTLS configuration.
  */
-class KTlsInfo {
+class KtlsInfo {
 public:
-  virtual ~KTlsInfo() = default;
+  virtual ~KtlsInfo() = default;
 
   /**
-   * Extract the crypto parameters needed for kTLS from the SSL session.
-   * @param crypto_info The tls12_crypto_info_aes_gcm_128 structure to populate.
-   * @param is_tx True for transmit direction, false for receive direction.
-   * @return True if successful, false otherwise.
+   * @return The TLS version used for the connection (e.g., "TLSv1.2").
    */
-  virtual bool extractCryptoInfo(tls12_crypto_info_aes_gcm_128& crypto_info, bool is_tx) const PURE;
+  virtual absl::string_view tlsVersion() const PURE;
 
   /**
-   * Get access to the raw SSL object.
-   * @return Pointer to the SSL object.
+   * @return The cipher suite used for the connection.
    */
-  virtual SSL* ssl() const PURE;
+  virtual absl::string_view cipherSuite() const PURE;
+
+  /**
+   * Gets the TLS crypto information for transmit direction (TX).
+   * @param crypto_info The structure to fill with crypto parameters.
+   * @return true if the parameters were successfully extracted, false otherwise.
+   */
+  virtual bool getTxCryptoInfo(tls_crypto_info_t& crypto_info) const PURE;
+
+  /**
+   * Gets the TLS crypto information for receive direction (RX).
+   * @param crypto_info The structure to fill with crypto parameters.
+   * @return true if the parameters were successfully extracted, false otherwise.
+   */
+  virtual bool getRxCryptoInfo(tls_crypto_info_t& crypto_info) const PURE;
 };
 
-using KTlsInfoConstSharedPtr = std::shared_ptr<const KTlsInfo>;
+using KtlsInfoConstSharedPtr = std::shared_ptr<const KtlsInfo>;
 
-} // namespace KTls
+} // namespace Ktls
 } // namespace TransportSockets
 } // namespace Extensions
 } // namespace Envoy 
