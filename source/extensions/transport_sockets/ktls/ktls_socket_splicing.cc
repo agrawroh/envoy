@@ -6,6 +6,7 @@
 // Only include Linux-specific headers when compiling on Linux
 #ifdef __linux__
 #include <sys/splice.h>
+#include <sys/uio.h>
 #endif
 
 namespace Envoy {
@@ -124,24 +125,101 @@ Api::IoCallUint64Result KtlsSocketSplicing::splice(uint64_t max_bytes) {
 }
 
 Api::IoCallUint64Result KtlsSocketSplicing::writeFromBuffer(Buffer::Instance& buffer) {
-  // In a real implementation, we would:
-  // 1. Get raw slices from the buffer
-  // 2. Use writev or sendfile to write directly to the destination
-  // For now, we just return a "not implemented" error
+#ifdef __linux__
+  // Get all the buffer fragments
+  const uint64_t num_slices = buffer.getRawSlices(nullptr, 0);
+  if (num_slices == 0) {
+    return {0, Api::IoError::none()}; // Nothing to write
+  }
   
+  // Allocate array for slices
+  Buffer::RawSlice slices[num_slices];
+  buffer.getRawSlices(slices, num_slices);
+  
+  // Create iovec array for writev
+  struct iovec iov[num_slices];
+  uint64_t total_size = 0;
+  
+  for (uint64_t i = 0; i < num_slices; i++) {
+    if (slices[i].len_ == 0) {
+      continue;
+    }
+    iov[i].iov_base = slices[i].mem_;
+    iov[i].iov_len = slices[i].len_;
+    total_size += slices[i].len_;
+  }
+  
+  if (total_size == 0) {
+    return {0, Api::IoError::none()}; // Nothing to write
+  }
+  
+  // Get file descriptor from IO handle
+  int fd = dest_io_handle_.fdDoNotUse();
+  if (fd < 0) {
+    return {0, Network::IoSocketError::getIoSocketEbadfError()};
+  }
+  
+  // Write data in a single syscall using writev
+  ssize_t written = ::writev(fd, iov, num_slices);
+  if (written < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return {0, Network::IoSocketError::getIoSocketEagainError()};
+    }
+    return {0, Network::IoSocketError::create(errno)};
+  }
+  
+  // Return the number of bytes written
+  return {static_cast<uint64_t>(written), nullptr};
+#else
+  // On non-Linux platforms, return not implemented
   UNREFERENCED_PARAMETER(buffer);
   return {0, Network::IoSocketError::create(ENOSYS)};
+#endif
 }
 
 Api::IoCallUint64Result KtlsSocketSplicing::readToBuffer(Buffer::Instance& buffer, uint64_t max_bytes) {
-  // In a real implementation, we would:
-  // 1. Get a raw slice from the buffer
-  // 2. Use readv to read directly into the buffer
-  // For now, we just return a "not implemented" error
+#ifdef __linux__
+  // Reserve space in the buffer
+  Buffer::RawSlice slice;
+  buffer.reserve(max_bytes, &slice, 1);
   
+  if (slice.len_ == 0) {
+    return {0, Network::IoSocketError::getIoSocketEnomemError()};
+  }
+  
+  // Adjust slice length to max_bytes if needed
+  slice.len_ = std::min(slice.len_, max_bytes);
+  
+  // Get file descriptor from IO handle
+  int fd = source_io_handle_.fdDoNotUse();
+  if (fd < 0) {
+    return {0, Network::IoSocketError::getIoSocketEbadfError()};
+  }
+  
+  // Read data directly into buffer's reserved space
+  ssize_t bytes_read = ::read(fd, slice.mem_, slice.len_);
+  
+  if (bytes_read < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return {0, Network::IoSocketError::getIoSocketEagainError()};
+    }
+    return {0, Network::IoSocketError::create(errno)};
+  }
+  
+  // Commit the data to the buffer only if we read something
+  if (bytes_read > 0) {
+    slice.len_ = bytes_read;
+    buffer.commit(&slice, 1);
+  }
+  
+  // Return the number of bytes read
+  return {static_cast<uint64_t>(bytes_read), nullptr};
+#else
+  // On non-Linux platforms, return not implemented
   UNREFERENCED_PARAMETER(buffer);
   UNREFERENCED_PARAMETER(max_bytes);
   return {0, Network::IoSocketError::create(ENOSYS)};
+#endif
 }
 
 } // namespace Ktls

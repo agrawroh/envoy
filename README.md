@@ -100,3 +100,62 @@ Builds for the ppc64le architecture or using aws-lc are not covered by the envoy
 ## Releases
 
 For further details please see our [release process](https://github.com/envoyproxy/envoy/blob/main/RELEASES.md).
+
+# kTLS Support for Envoy
+
+This repository contains a work-in-progress implementation of Kernel TLS (kTLS) support for Envoy. kTLS allows offloading TLS processing to the Linux kernel after the handshake is complete, which can significantly improve performance.
+
+## Overview
+
+Kernel TLS (kTLS) is a feature in Linux that allows applications to offload TLS record processing to the kernel. After a TLS handshake completes in userspace, the TLS session keys can be installed into the kernel, allowing the kernel to handle the encryption and decryption of TLS records. This can provide significant performance benefits by:
+
+1. Reducing CPU usage for TLS encryption/decryption
+2. Enabling zero-copy operations for improved throughput
+3. Taking advantage of hardware acceleration when available
+4. Reducing context switches and memory copies
+
+## Implementation Components
+
+Our implementation includes:
+
+1. **Platform compatibility layer** (`tls_compat.h`): Provides definitions for kTLS-related constants and structures that work across platforms.
+
+2. **SSL Information Interface** (`ktls_ssl_info.h` and implementations): Extracts TLS session keys and parameters needed for kTLS from established SSL sessions.
+
+3. **Socket Splicing** (`ktls_socket_splicing.h` and implementations): Provides zero-copy data transfer capabilities using Linux's `splice()` system call.
+
+4. **Transport Socket** (`ktls_transport_socket.h` and implementations): Main transport socket implementation that enables kTLS and handles data transfer with fallback mechanisms.
+
+5. **Configuration** (`config.h/cc`): Protocol buffer definitions and factory classes for enabling kTLS through Envoy configuration.
+
+## Current Status
+
+The implementation is still work in progress and has several compilation issues to resolve:
+
+1. Interface incompatibilities between the current Envoy transport socket factory APIs and our implementation
+2. Issues with downstream transport socket handling
+3. StatusOr return type handling issues
+
+## Further Work Required
+
+To complete the implementation, we need to:
+
+1. Properly implement the PassthroughFactory for downstream sockets 
+2. Fix the StatusOr return types and conversion in the config classes
+3. Update the socket splicing implementation for better zero-copy performance
+4. Add proper TLS session key extraction from SSL objects
+5. Add comprehensive testing for the implementation
+
+## References
+
+This implementation was informed by:
+
+1. The Linux kernel kTLS implementation: https://github.com/ktls/af_ktls
+2. Oracle's kTLS utilities: https://github.com/oracle/ktls-utils
+3. Envoy's existing TLS transport socket implementations
+
+## Requirements
+
+- Requires a Linux kernel with kTLS support (kernel 4.13+)
+- Supports TLS 1.2 with AES-GCM ciphers initially
+- Uses OpenSSL for TLS handshakes before kernel offload

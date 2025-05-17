@@ -28,13 +28,17 @@ envoy_cc_library(
         "ktls_ssl_info_impl.h",
         "tls_compat.h",
     ],
-    external_deps = ["ssl"],
+    external_deps = [
+        "ssl",
+        "abseil_strings",
+    ],
     deps = [
         "//envoy/ssl:connection_interface",
         "//source/common/common:assert_lib",
+        "//source/common/common:logger_lib",
         "//source/common/network:utility_lib",
         "//source/common/tls:utility_lib",
-        "//source/common/tls:ssl_socket_base",
+        "//source/common/tls:ssl_socket_lib",
     ],
 )
 
@@ -55,11 +59,17 @@ envoy_cc_library(
     name = "ktls_transport_socket_lib",
     srcs = ["ktls_transport_socket.cc"],
     hdrs = ["ktls_transport_socket.h"],
-    external_deps = ["ssl"],
+    external_deps = [
+        "ssl",
+        "abseil_strings",
+    ],
     deps = [
         ":ktls_socket_splicing_lib",
         ":ktls_ssl_info_lib",
         "//envoy/network:transport_socket_interface",
+        "//envoy/ssl:connection_interface",
+        "//envoy/upstream:upstream_interface",
+        "//envoy/upstream:host_description_interface",
         "//source/common/common:assert_lib",
         "//source/common/common:minimal_logger_lib",
         "//source/common/network:transport_socket_options_lib",

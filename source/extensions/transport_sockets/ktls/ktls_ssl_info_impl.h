@@ -1,6 +1,7 @@
 #pragma once
 
 #include "source/extensions/transport_sockets/ktls/ktls_ssl_info.h"
+#include "source/common/common/logger.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -10,7 +11,7 @@ namespace Ktls {
 /**
  * Implementation of KtlsInfo that gets TLS session data from an Ssl::ConnectionInfo.
  */
-class KtlsSslInfoImpl : public KtlsInfo {
+class KtlsSslInfoImpl : public KtlsInfo, public Logger::Loggable<Logger::Id::connection> {
 public:
   KtlsSslInfoImpl(Ssl::ConnectionInfoConstSharedPtr ssl_info);
 
@@ -47,6 +48,8 @@ private:
   std::vector<uint8_t> server_key_;
   std::vector<uint8_t> client_iv_;
   std::vector<uint8_t> server_iv_;
+  std::vector<uint8_t> client_salt_;
+  std::vector<uint8_t> server_salt_;
   std::vector<uint8_t> client_rec_seq_;
   std::vector<uint8_t> server_rec_seq_;
 };

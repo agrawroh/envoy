@@ -60,6 +60,7 @@ bool KtlsSslInfoImpl::getTxCryptoInfo(tls_crypto_info_t& crypto_info) const {
     memcpy(crypto_info.key, client_key_.data(), sizeof(crypto_info.key));
     memcpy(crypto_info.iv, client_iv_.data(), sizeof(crypto_info.iv));
     memcpy(crypto_info.rec_seq, client_rec_seq_.data(), sizeof(crypto_info.rec_seq));
+    memcpy(crypto_info.salt, client_salt_.data(), sizeof(crypto_info.salt));
   } else {
     if (server_key_.size() != sizeof(crypto_info.key) ||
         server_iv_.size() != sizeof(crypto_info.iv) ||
@@ -70,10 +71,8 @@ bool KtlsSslInfoImpl::getTxCryptoInfo(tls_crypto_info_t& crypto_info) const {
     memcpy(crypto_info.key, server_key_.data(), sizeof(crypto_info.key));
     memcpy(crypto_info.iv, server_iv_.data(), sizeof(crypto_info.iv));
     memcpy(crypto_info.rec_seq, server_rec_seq_.data(), sizeof(crypto_info.rec_seq));
+    memcpy(crypto_info.salt, server_salt_.data(), sizeof(crypto_info.salt));
   }
-  
-  // For simplicity, use all zeros for salt (this would normally be extracted from the TLS connection)
-  memset(crypto_info.salt, 0, sizeof(crypto_info.salt));
   
   return true;
 }
@@ -106,6 +105,7 @@ bool KtlsSslInfoImpl::getRxCryptoInfo(tls_crypto_info_t& crypto_info) const {
     memcpy(crypto_info.key, server_key_.data(), sizeof(crypto_info.key));
     memcpy(crypto_info.iv, server_iv_.data(), sizeof(crypto_info.iv));
     memcpy(crypto_info.rec_seq, server_rec_seq_.data(), sizeof(crypto_info.rec_seq));
+    memcpy(crypto_info.salt, server_salt_.data(), sizeof(crypto_info.salt));
   } else {
     if (client_key_.size() != sizeof(crypto_info.key) ||
         client_iv_.size() != sizeof(crypto_info.iv) ||
@@ -116,51 +116,73 @@ bool KtlsSslInfoImpl::getRxCryptoInfo(tls_crypto_info_t& crypto_info) const {
     memcpy(crypto_info.key, client_key_.data(), sizeof(crypto_info.key));
     memcpy(crypto_info.iv, client_iv_.data(), sizeof(crypto_info.iv));
     memcpy(crypto_info.rec_seq, client_rec_seq_.data(), sizeof(crypto_info.rec_seq));
+    memcpy(crypto_info.salt, client_salt_.data(), sizeof(crypto_info.salt));
   }
-  
-  // For simplicity, use all zeros for salt
-  memset(crypto_info.salt, 0, sizeof(crypto_info.salt));
   
   return true;
 }
 
 bool KtlsSslInfoImpl::extractCryptoParams() {
-  // Currently we need to stub this out in our implementation
-  // In a real implementation, we would need to extract the actual key material
-  // from the SSL session
+  // Check if we already extracted params
+  if (params_extracted_) {
+    return true;
+  }
   
-  // In real implementation, this would:
-  // 1. Get the SSL* from ConnectionInfo
-  // 2. Extract the keys, IVs, and record sequences
-  // 3. Determine if we're client or server
+  // We need to check the cipher suite first
+  std::string cipher = std::string(cipherSuite());
+  bool is_aes_gcm = cipher.find("AES128-GCM") != std::string::npos || 
+                    cipher.find("AES-128-GCM") != std::string::npos;
   
-  // For now, just use dummy values to make it compile
-  client_key_.resize(16, 0x01);
-  server_key_.resize(16, 0x02);
-  client_iv_.resize(8, 0x03);
-  server_iv_.resize(8, 0x04);
-  client_rec_seq_.resize(8, 0x05);
-  server_rec_seq_.resize(8, 0x06);
+  if (!is_aes_gcm) {
+    ENVOY_LOG(debug, "Unsupported cipher for kTLS: {}", cipher);
+    return false;
+  }
   
-  // Assume we're the server for now
-  is_client_ = false;
+  // Check TLS version
+  std::string version = std::string(tlsVersion());
+  if (version != "TLSv1.2") {
+    ENVOY_LOG(debug, "Unsupported TLS version for kTLS: {}", version);
+    return false;
+  }
   
-  // Mark as extracted
+  // Try to extract key material
+  if (!extractKeyMaterial()) {
+    ENVOY_LOG(debug, "Failed to extract key material for kTLS");
+    return false;
+  }
+  
   params_extracted_ = true;
-  
   return true;
 }
 
 bool KtlsSslInfoImpl::extractKeyMaterial() {
-  // This would be used to extract key material from the SSL connection
-  // Requires access to the OpenSSL internals
+  // In Envoy, we don't have direct access to the SSL* structure from ConnectionInfo
+  // We would need to enhance the ConnectionInfo interface to expose methods for extracting
+  // key material needed for kTLS.
   
-  // In a full implementation, we would:
-  // 1. Check cipher suite (only AES-GCM supported)
-  // 2. Extract client and server keys, IVs, and record sequence numbers
-  // 3. Set is_client_ based on the SSL connection
+  // For now, simulate this with placeholder values to make it compile
+  // But in a real implementation, we would get the SSL* and extract the real key material
   
-  // For now, just return true
+  // Determine if we're client or server based on ConnectionInfo
+  // In a real implementation, we would determine this from the SSL connection
+  is_client_ = false;
+  
+  // In a real implementation based on ktls-utils, we would:
+  // 1. Extract master secret using SSL_SESSION_get_master_key
+  // 2. Extract client/server random values
+  // 3. Derive the key material using SSL_export_keying_material or similar
+  // 4. Set up proper record sequence numbers based on handshake completion
+  
+  // For now, use placeholder values for development
+  client_key_.resize(16, 0x01);
+  server_key_.resize(16, 0x02);
+  client_iv_.resize(8, 0x03);
+  server_iv_.resize(8, 0x04);
+  client_salt_.resize(4, 0x05);
+  server_salt_.resize(4, 0x06);
+  client_rec_seq_.resize(8, 0);
+  server_rec_seq_.resize(8, 0);
+  
   return true;
 }
 

@@ -9,36 +9,40 @@ namespace TransportSockets {
 namespace Ktls {
 
 /**
- * Config registration for the kTLS transport socket factory.
+ * Config registration for the kTLS transport socket factory for both client and server.
  * @see TransportSocketConfigFactory.
  */
-class KtlsSocketFactory : public virtual Server::Configuration::TransportSocketConfigFactory {
+class KtlsTransportSocketConfigFactory : public virtual Server::Configuration::TransportSocketConfigFactory {
 public:
-  std::string name() const override { return "envoy.transport_sockets.ktls"; }
+  ~KtlsTransportSocketConfigFactory() override = default;
+  
+  /**
+   * @return ProtobufTypes::MessagePtr create empty config proto.
+   */
   ProtobufTypes::MessagePtr createEmptyConfigProto() override;
+  
+  std::string name() const override { return "envoy.transport_sockets.ktls"; }
 };
 
 /**
- * Config registration for the upstream kTLS transport socket factory.
+ * Client kTLS transport socket implementation factory.
  */
-class UpstreamKtlsSocketFactory
-    : public Server::Configuration::UpstreamTransportSocketConfigFactory,
-      public KtlsSocketFactory {
+class KtlsClientTransportSocketConfigFactory : public KtlsTransportSocketConfigFactory,
+                                           public Server::Configuration::UpstreamTransportSocketConfigFactory {
 public:
   absl::StatusOr<Network::UpstreamTransportSocketFactoryPtr> createTransportSocketFactory(
-      const Protobuf::Message& config,
+      const Protobuf::Message& message,
       Server::Configuration::TransportSocketFactoryContext& context) override;
 };
 
 /**
- * Config registration for the downstream kTLS transport socket factory.
+ * Server kTLS transport socket implementation factory.
  */
-class DownstreamKtlsSocketFactory
-    : public Server::Configuration::DownstreamTransportSocketConfigFactory,
-      public KtlsSocketFactory {
+class KtlsServerTransportSocketConfigFactory : public KtlsTransportSocketConfigFactory,
+                                           public Server::Configuration::DownstreamTransportSocketConfigFactory {
 public:
   absl::StatusOr<Network::DownstreamTransportSocketFactoryPtr> createTransportSocketFactory(
-      const Protobuf::Message& config,
+      const Protobuf::Message& message,
       Server::Configuration::TransportSocketFactoryContext& context,
       const std::vector<std::string>& server_names) override;
 };

@@ -60,8 +60,35 @@ Network::IoResult KtlsTransportSocket::doRead(Buffer::Instance& buffer) {
     return PassthroughSocket::doRead(buffer);
   }
   
-  // If kTLS is enabled, we might want to use socket splicing for zero-copy
-  // But for now, we just pass through
+  // If kTLS is enabled and we have socket splicing, use it for zero-copy reads
+  if (socket_splicing_ && enable_rx_no_pad_) {
+    // Get a reasonable read chunk size
+    uint64_t max_bytes = std::min(buffer.highWatermark() - buffer.length(), 
+                                 static_cast<uint64_t>(16384));
+    if (max_bytes == 0) {
+      // No capacity to read into
+      return {Network::PostIoAction::KeepOpen, 0, false};
+    }
+    
+    // Try to read using socket splicing
+    auto result = socket_splicing_->readToBuffer(buffer, max_bytes);
+    
+    if (!result.ok() && result.err_->getErrorCode() == Api::IoError::IoErrorCode::Again) {
+      // EAGAIN, nothing to read
+      return {Network::PostIoAction::KeepOpen, 0, false};
+    } else if (!result.ok()) {
+      // Real error
+      ENVOY_LOG(debug, "kTLS zero-copy read error: {}", result.err_->getErrorDetails());
+      return {Network::PostIoAction::Close, 0, false};
+    }
+    
+    // If we read some data, return it
+    if (result.return_value_ > 0) {
+      return {Network::PostIoAction::KeepOpen, result.return_value_, false};
+    }
+  }
+  
+  // Fall back to standard read path
   return PassthroughSocket::doRead(buffer);
 }
 
@@ -71,8 +98,37 @@ Network::IoResult KtlsTransportSocket::doWrite(Buffer::Instance& buffer, bool en
     return PassthroughSocket::doWrite(buffer, end_stream);
   }
   
-  // If kTLS is enabled, we might use socket splicing for zero-copy
-  // But for now, we just pass through
+  // If kTLS is enabled and we have socket splicing, use it for zero-copy writes
+  if (socket_splicing_ && enable_tx_zerocopy_ && buffer.length() > 0) {
+    // Try to write using socket splicing for zero-copy
+    auto result = socket_splicing_->writeFromBuffer(buffer);
+    
+    if (!result.ok() && result.err_->getErrorCode() == Api::IoError::IoErrorCode::Again) {
+      // EAGAIN, resource temporarily unavailable
+      return {Network::PostIoAction::KeepOpen, 0, false};
+    } else if (!result.ok()) {
+      // Real error
+      ENVOY_LOG(debug, "kTLS zero-copy write error: {}", result.err_->getErrorDetails());
+      return {Network::PostIoAction::Close, 0, false};
+    }
+    
+    // If we wrote some data, drain it from the buffer
+    if (result.return_value_ > 0) {
+      buffer.drain(result.return_value_);
+      
+      // Check if we've written everything (accounting for end_stream)
+      if (buffer.length() == 0) {
+        return {Network::PostIoAction::KeepOpen, result.return_value_, end_stream};
+      }
+    }
+    
+    // If we still have data to write, it will be handled in the next write event
+    if (buffer.length() > 0) {
+      return {Network::PostIoAction::KeepOpen, result.ok() ? result.return_value_ : 0, false};
+    }
+  }
+  
+  // Fall back to standard write path
   return PassthroughSocket::doWrite(buffer, end_stream);
 }
 
@@ -219,14 +275,31 @@ bool KtlsTransportSocket::canEnableKtls() const {
 KtlsTransportSocketFactory::KtlsTransportSocketFactory(
     Network::UpstreamTransportSocketFactoryPtr&& transport_socket_factory,
     bool enable_tx_zerocopy, bool enable_rx_no_pad)
-    : PassthroughFactory(std::move(transport_socket_factory)),
+    : inner_factory_(std::move(transport_socket_factory)),
       enable_tx_zerocopy_(enable_tx_zerocopy),
       enable_rx_no_pad_(enable_rx_no_pad) {}
 
 Network::TransportSocketPtr KtlsTransportSocketFactory::createTransportSocket(
-    Network::TransportSocketOptionsConstSharedPtr options) const {
-  std::shared_ptr<const Upstream::HostDescription> host; // Null host
-  auto inner_socket = transport_socket_factory_->createTransportSocket(options, host);
+    Network::TransportSocketOptionsConstSharedPtr options,
+    std::shared_ptr<const Upstream::HostDescription> host) const {
+  auto inner_socket = inner_factory_->createTransportSocket(options, host);
+  if (inner_socket == nullptr) {
+    return nullptr;
+  }
+  
+  return std::make_unique<KtlsTransportSocket>(std::move(inner_socket), 
+                                             enable_tx_zerocopy_, enable_rx_no_pad_);
+}
+
+DownstreamKtlsTransportSocketFactory::DownstreamKtlsTransportSocketFactory(
+    Network::DownstreamTransportSocketFactoryPtr&& transport_socket_factory,
+    bool enable_tx_zerocopy, bool enable_rx_no_pad)
+    : DownstreamPassthroughFactory(std::move(transport_socket_factory)),
+      enable_tx_zerocopy_(enable_tx_zerocopy),
+      enable_rx_no_pad_(enable_rx_no_pad) {}
+
+Network::TransportSocketPtr DownstreamKtlsTransportSocketFactory::createDownstreamTransportSocket() const {
+  auto inner_socket = transport_socket_factory_->createDownstreamTransportSocket();
   if (inner_socket == nullptr) {
     return nullptr;
   }
