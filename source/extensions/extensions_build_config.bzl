@@ -309,13 +309,16 @@ EXTENSIONS = {
     #
 
     "envoy.transport_sockets.alts":                     "//source/extensions/transport_sockets/alts:config",
-    "envoy.transport_sockets.http_11_proxy":            "//source/extensions/transport_sockets/http_11_proxy:upstream_config",
-    "envoy.transport_sockets.upstream_proxy_protocol":  "//source/extensions/transport_sockets/proxy_protocol:upstream_config",
+    "envoy.transport_sockets.http_11_proxy":            "//source/extensions/transport_sockets/http_11_proxy:config",
+    "envoy.transport_sockets.ktls":                     "//source/extensions/transport_sockets/ktls:config",
+    "envoy.transport_sockets.proxy_protocol":           "//source/extensions/transport_sockets/proxy_protocol:config",
+    "envoy.transport_sockets.quic":                     "//source/extensions/transport_sockets/quic:config",
     "envoy.transport_sockets.raw_buffer":               "//source/extensions/transport_sockets/raw_buffer:config",
-    "envoy.transport_sockets.tap":                      "//source/extensions/transport_sockets/tap:config",
     "envoy.transport_sockets.starttls":                 "//source/extensions/transport_sockets/starttls:config",
+    "envoy.transport_sockets.tap":                      "//source/extensions/transport_sockets/tap:config",
     "envoy.transport_sockets.tcp_stats":                "//source/extensions/transport_sockets/tcp_stats:config",
     "envoy.transport_sockets.tls":                      "//source/extensions/transport_sockets/tls:config",
+    "envoy.transport_sockets.upstream_proxy_protocol":  "//source/extensions/transport_sockets/proxy_protocol:upstream_config",
     "envoy.transport_sockets.internal_upstream":        "//source/extensions/transport_sockets/internal_upstream:config",
 
     #
@@ -559,6 +562,15 @@ EXTENSIONS = {
 
     # Dynamic mocules
     "envoy.filters.http.dynamic_modules":                      "//source/extensions/filters/http/dynamic_modules:factory_registration",
+
+    #
+    # Network
+    #
+
+    #"envoy.network.connection_balance.dlb":             "//source/extensions/network/connection_balance/dlb:config",
+    #"envoy.network.connection_balance.dynamic_connection_balancing": "//source/extensions/network/connection_balance/dynamic_connection_balancing:config",
+    "envoy.network.socket_interface.default_socket_interface": "//source/common/network:socket_interface_lib",
+    "envoy.network.socket_interface.ktls_socket_interface": "//source/common/network/ktls:ktls_socket_interface_lib",
 }
 
 # These can be changed to ["//visibility:public"], for  downstream builds which
