@@ -20,38 +20,66 @@ public:
   absl::string_view cipherSuite() const override;
   bool getTxCryptoInfo(tls_crypto_info_t& crypto_info) const override;
   bool getRxCryptoInfo(tls_crypto_info_t& crypto_info) const override;
+  
+  // Override from KtlsInfo
+  bool extractCryptoParams() const override;
 
 private:
-  /**
-   * Extract crypto parameters for both TX and RX from the SSL connection.
-   * @return true if successful, false otherwise.
-   */
-  bool extractCryptoParams();
-
   /**
    * Extract key material from SSL connection.
    * @return true if successful, false otherwise.
    */
-  bool extractKeyMaterial();
+  bool extractKeyMaterial() const;
 
+  /**
+   * SSL connection information.
+   */
   Ssl::ConnectionInfoConstSharedPtr ssl_info_;
 
-  // Storage for returned cipher suite string
+  /**
+   * Storage for cipher suite string.
+   */
   mutable std::string cipher_suite_storage_;
 
-  // Extracted crypto parameters
-  bool params_extracted_{false};
-  bool is_client_{false};
+  /**
+   * Flag indicating whether we are a client or server.
+   */
+  mutable bool is_client_{false};
 
-  // Crypto key material
-  std::vector<uint8_t> client_key_;
-  std::vector<uint8_t> server_key_;
-  std::vector<uint8_t> client_iv_;
-  std::vector<uint8_t> server_iv_;
-  std::vector<uint8_t> client_salt_;
-  std::vector<uint8_t> server_salt_;
-  std::vector<uint8_t> client_rec_seq_;
-  std::vector<uint8_t> server_rec_seq_;
+  /**
+   * Flag indicating whether crypto parameters have been extracted.
+   */
+  mutable bool params_extracted_{false};
+
+  /**
+   * Client write key (16 bytes for AES-128-GCM).
+   */
+  mutable std::vector<uint8_t> client_write_key_;
+
+  /**
+   * Server write key (16 bytes for AES-128-GCM).
+   */
+  mutable std::vector<uint8_t> server_write_key_;
+
+  /**
+   * Client write IV (12 bytes for AES-128-GCM, includes 4-byte salt and 8-byte nonce).
+   */
+  mutable std::vector<uint8_t> client_write_iv_;
+
+  /**
+   * Server write IV (12 bytes for AES-128-GCM, includes 4-byte salt and 8-byte nonce).
+   */
+  mutable std::vector<uint8_t> server_write_iv_;
+
+  /**
+   * Client write sequence number (8 bytes).
+   */
+  mutable std::vector<uint8_t> client_write_seq_;
+
+  /**
+   * Server write sequence number (8 bytes).
+   */
+  mutable std::vector<uint8_t> server_write_seq_;
 };
 
 using KtlsSslInfoImplConstSharedPtr = std::shared_ptr<const KtlsSslInfoImpl>;

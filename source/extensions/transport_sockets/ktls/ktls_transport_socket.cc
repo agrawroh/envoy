@@ -1,9 +1,25 @@
-#include "source/extensions/transport_sockets/ktls/ktls_transport_socket.h"
+#include <string>
+#include <utility>
+#include <vector>
 
-// Only include Linux-specific headers when compiling on Linux
+// Include system headers only once and in a specific order to avoid conflicts
 #ifdef __linux__
-// Intentionally not defining _GNU_SOURCE as it's already defined by the build system
+// Include Linux-specific headers
+#include <sys/socket.h>
 #include <sys/utsname.h>
+
+// Only use linux/tcp.h for the specific kTLS definitions we need
+// Include it in a namespace to avoid polluting global namespace
+namespace {
+#include <linux/tcp.h>
+}  // namespace
+
+// Include capability support if available
+#if __has_include(<sys/capability.h>)
+#include <sys/capability.h>
+#define HAS_CAPABILITY_SUPPORT 1
+#endif
+
 // More reliable check for splice availability
 #if __has_include(<sys/splice.h>) || defined(splice)
 #include <sys/splice.h>
@@ -18,25 +34,38 @@
 #endif
 #endif
 
-#include <netinet/tcp.h>
+// Include Envoy headers
+#include "envoy/event/dispatcher.h"
+#include "envoy/network/connection.h"
+#include "envoy/network/transport_socket.h"
 
-// Include standard includes
+#include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/assert.h"
 #include "source/common/common/empty_string.h"
 #include "source/common/common/logger.h"
+#include "source/common/common/safe_memcpy.h"
+#include "source/common/common/thread.h"
 #include "source/common/network/io_socket_error_impl.h"
+#include "source/common/network/transport_socket_options_impl.h"
 #include "source/common/tls/connection_info_impl_base.h"
+#include "source/extensions/transport_sockets/ktls/ktls_ssl_info_impl.h"
+#include "source/extensions/transport_sockets/ktls/ktls_transport_socket.h"
+#include "source/extensions/transport_sockets/ktls/tls_compat.h"
 
-// Include OpenSSL headers for direct access to SSL objects
+// Include OpenSSL headers
 #include "openssl/evp.h"
 #include "openssl/ssl.h"
 
-#include "source/extensions/transport_sockets/ktls/ktls_ssl_info_impl.h"
-// Socket splicing headers are already included in the main header file
+// Include SSL socket header using correct path
+#include "source/common/tls/ssl_socket.h"
 
 // Define TLS constants for non-Linux platforms
 #ifndef SOL_TLS
 #define SOL_TLS 282
+#endif
+
+#ifndef SOL_TCP
+#define SOL_TCP 6
 #endif
 
 #ifndef TLS_TX
@@ -53,6 +82,15 @@
 
 #ifndef TLS_RX_EXPECT_NO_PAD
 #define TLS_RX_EXPECT_NO_PAD 4
+#endif
+
+// Define linux/tcp.h constants needed for kTLS
+#ifndef TCP_ULP
+#define TCP_ULP 31
+#endif
+
+#ifndef TCP_INFO
+#define TCP_INFO 11
 #endif
 
 // Define tls_crypto_info_t type if not defined
@@ -595,8 +633,8 @@ void KtlsTransportSocket::processPendingOps() {
 
   // Create temporary copies of our pending operations and reset the originals
   // This prevents recursive calls back into processPendingOps() during doRead/doWrite
-  std::optional<PendingReadOp> pending_read_copy;
-  std::optional<PendingWriteOp> pending_write_copy;
+  absl::optional<PendingReadOp> pending_read_copy;
+  absl::optional<PendingWriteOp> pending_write_copy;
 
   if (pending_read_ && !pending_read_->completed) {
     pending_read_copy = std::move(pending_read_);
@@ -720,6 +758,12 @@ bool KtlsTransportSocket::enableKtls() {
   // Create SSL info wrapper for kTLS
   ktls_info_ = std::make_shared<KtlsSslInfoImpl>(ssl_info);
 
+  // Explicitly extract crypto parameters before using them
+  if (!ktls_info_->extractCryptoParams()) {
+    ENVOY_LOG(debug, "Failed to extract crypto parameters for kTLS");
+    return false;
+  }
+
 #ifdef __linux__
 // Add additional runtime checks to make sure we're actually on Linux
 #ifdef __APPLE__
@@ -764,8 +808,37 @@ bool KtlsTransportSocket::enableKtls() {
     return false;
   }
 
+  // Check TCP socket state before trying to enable kTLS
+  struct {
+    uint8_t tcpi_state;
+    uint8_t tcpi_ca_state;
+    uint8_t pad[2];
+    uint32_t tcpi_retransmits;
+    uint32_t tcpi_probes;
+    uint32_t tcpi_backoff;
+    uint32_t tcpi_options;
+    uint32_t tcpi_snd_wscale : 4, tcpi_rcv_wscale : 4;
+    // Rest of the fields aren't used, so we don't need to define them
+  } tcp_info;
+  socklen_t tcp_info_len = sizeof(tcp_info);
+  if (getsockopt(fd, SOL_TCP, TCP_INFO, &tcp_info, &tcp_info_len) == 0) {
+    ENVOY_LOG(debug, "TCP socket state: {}, congestion state: {}", 
+              tcp_info.tcpi_state, tcp_info.tcpi_ca_state);
+    
+    // TCP_ESTABLISHED is typically state 1, but this may vary across kernel versions
+    if (tcp_info.tcpi_state != 1) { // TCP_ESTABLISHED
+      ENVOY_LOG(debug, "TCP socket not in ESTABLISHED state (state={}), kTLS may fail", 
+                tcp_info.tcpi_state);
+    }
+  } else {
+    int err = errno;
+    ENVOY_LOG(debug, "Failed to get TCP socket info: {} (errno={})", 
+              Envoy::errorDetails(err), err);
+  }
+
   // 1. Enable kTLS ULP on the socket
   const char* tls_ulp = "tls";
+  ENVOY_LOG(debug, "Attempting to set TCP_ULP for kTLS on socket fd={}", fd);
   if (setsockopt(fd, SOL_TCP, TCP_ULP, tls_ulp, strlen(tls_ulp)) < 0) {
     int err = errno;
     ENVOY_LOG(debug, "Failed to set TCP_ULP for kTLS: {} (errno={})", Envoy::errorDetails(err),
@@ -776,13 +849,22 @@ bool KtlsTransportSocket::enableKtls() {
       ENVOY_LOG(debug,
                 "kTLS ULP module not found - kernel may not support kTLS or module not loaded");
     } else if (err == EPERM) {
+#ifdef HAS_CAPABILITY_SUPPORT
       ENVOY_LOG(debug, "Permission denied for kTLS ULP - check CAP_NET_ADMIN capability");
+#else
+      ENVOY_LOG(debug, "Permission denied for kTLS ULP - may need elevated permissions");
+#endif
     } else if (err == ENOPROTOOPT) {
       ENVOY_LOG(debug, "Protocol option TCP_ULP not available - kernel may be too old for kTLS");
+    } else if (err == EEXIST) {
+      ENVOY_LOG(debug, "TCP_ULP already set to 'tls' - may indicate a conflict with another TLS layer");
+    } else if (err == EINVAL) {
+      ENVOY_LOG(debug, "Invalid TCP_ULP value - connection may be in wrong state for kTLS");
     }
 
     return false;
   }
+  ENVOY_LOG(debug, "Successfully set TCP_ULP=tls on fd={}", fd);
 
   // 2. Set up the TLS crypto state for TX (sending)
   tls_crypto_info_t crypto_info;
@@ -790,6 +872,29 @@ bool KtlsTransportSocket::enableKtls() {
     ENVOY_LOG(debug, "Failed to get TX crypto info for kTLS");
     return false;
   }
+
+  ENVOY_LOG(debug, "Attempting to set TLS_TX crypto state on fd={}", fd);
+  ENVOY_LOG(debug, "TX crypto_info: version={}, cipher_type={}", 
+            crypto_info.version, crypto_info.cipher_type);
+            
+  // Debug dump for TX crypto info
+  const uint8_t* tx_key = reinterpret_cast<const uint8_t*>(crypto_info.key);
+  const uint8_t* tx_iv = reinterpret_cast<const uint8_t*>(crypto_info.iv);
+  const uint8_t* tx_salt = reinterpret_cast<const uint8_t*>(crypto_info.salt);
+  const uint8_t* tx_rec_seq = reinterpret_cast<const uint8_t*>(crypto_info.rec_seq);
+  
+  ENVOY_LOG(debug, "TX key size: {}, first 4 bytes: {:02x} {:02x} {:02x} {:02x}",
+            sizeof(crypto_info.key), 
+            tx_key[0], tx_key[1], tx_key[2], tx_key[3]);
+  ENVOY_LOG(debug, "TX IV size: {}, first 4 bytes: {:02x} {:02x} {:02x} {:02x}",
+            sizeof(crypto_info.iv),
+            tx_iv[0], tx_iv[1], tx_iv[2], tx_iv[3]);
+  ENVOY_LOG(debug, "TX salt size: {}, bytes: {:02x} {:02x} {:02x} {:02x}",
+            sizeof(crypto_info.salt),
+            tx_salt[0], tx_salt[1], tx_salt[2], tx_salt[3]);
+  ENVOY_LOG(debug, "TX record seq size: {}, first 4 bytes: {:02x} {:02x} {:02x} {:02x}",
+            sizeof(crypto_info.rec_seq),
+            tx_rec_seq[0], tx_rec_seq[1], tx_rec_seq[2], tx_rec_seq[3]);
 
   if (setsockopt(fd, SOL_TLS, TLS_TX, &crypto_info, sizeof(crypto_info)) < 0) {
     int err = errno;
@@ -801,6 +906,10 @@ bool KtlsTransportSocket::enableKtls() {
       ENVOY_LOG(debug, "Invalid TLS crypto info - cipher/key may not be supported by kernel kTLS");
     } else if (err == ENOPROTOOPT) {
       ENVOY_LOG(debug, "SOL_TLS protocol option not supported - kernel may be too old for kTLS");
+    } else if (err == EBUSY) {
+      ENVOY_LOG(debug, "TLS_TX already set - possible duplicate configuration attempt");
+    } else if (err == EPROTONOSUPPORT) {
+      ENVOY_LOG(debug, "Protocol not supported - possible bad version or cipher type");
     }
 
     return false;
@@ -812,12 +921,48 @@ bool KtlsTransportSocket::enableKtls() {
     return false;
   }
 
+  ENVOY_LOG(debug, "Attempting to set TLS_RX crypto state on fd={}", fd);
+  ENVOY_LOG(debug, "RX crypto_info: version={}, cipher_type={}", 
+            crypto_info.version, crypto_info.cipher_type);
+            
+  // Debug dump for RX crypto info
+  const uint8_t* rx_key = reinterpret_cast<const uint8_t*>(crypto_info.key);
+  const uint8_t* rx_iv = reinterpret_cast<const uint8_t*>(crypto_info.iv);
+  const uint8_t* rx_salt = reinterpret_cast<const uint8_t*>(crypto_info.salt);
+  const uint8_t* rx_rec_seq = reinterpret_cast<const uint8_t*>(crypto_info.rec_seq);
+  
+  ENVOY_LOG(debug, "RX key size: {}, first 4 bytes: {:02x} {:02x} {:02x} {:02x}",
+            sizeof(crypto_info.key), 
+            rx_key[0], rx_key[1], rx_key[2], rx_key[3]);
+  ENVOY_LOG(debug, "RX IV size: {}, first 4 bytes: {:02x} {:02x} {:02x} {:02x}",
+            sizeof(crypto_info.iv),
+            rx_iv[0], rx_iv[1], rx_iv[2], rx_iv[3]);
+  ENVOY_LOG(debug, "RX salt size: {}, bytes: {:02x} {:02x} {:02x} {:02x}",
+            sizeof(crypto_info.salt),
+            rx_salt[0], rx_salt[1], rx_salt[2], rx_salt[3]);
+  ENVOY_LOG(debug, "RX record seq size: {}, first 4 bytes: {:02x} {:02x} {:02x} {:02x}",
+            sizeof(crypto_info.rec_seq),
+            rx_rec_seq[0], rx_rec_seq[1], rx_rec_seq[2], rx_rec_seq[3]);
+
   if (setsockopt(fd, SOL_TLS, TLS_RX, &crypto_info, sizeof(crypto_info)) < 0) {
     int err = errno;
     ENVOY_LOG(debug, "Failed to set TLS_RX crypto info: {} (errno={})", Envoy::errorDetails(err),
               err);
+    
+    // Special handling for common errors
+    if (err == EINVAL) {
+      ENVOY_LOG(debug, "Invalid RX TLS crypto info - cipher/key may not be supported by kernel kTLS");
+    } else if (err == ENOPROTOOPT) {
+      ENVOY_LOG(debug, "SOL_TLS protocol option for RX not supported");
+    } else if (err == EBUSY) {
+      ENVOY_LOG(debug, "TLS_RX already set - possible duplicate configuration attempt");
+    } else if (err == EPROTONOSUPPORT) {
+      ENVOY_LOG(debug, "Protocol not supported for RX - possible bad version or cipher type");
+    }
+    
     return false;
   }
+  ENVOY_LOG(debug, "Successfully set TLS_RX on fd={}", fd);
 
   // 4. Enable TX zerocopy if requested
   if (enable_tx_zerocopy_) {
@@ -844,14 +989,16 @@ bool KtlsTransportSocket::enableKtls() {
   // 6. Set up socket splicing for zero-copy operations
   if (enable_tx_zerocopy_) {
 #ifdef HAS_SPLICE_SYSCALL
-    try {
+    TRY_ASSERT_MAIN_THREAD {
       socket_splicing_ =
           std::make_unique<KtlsSocketSplicing>(callbacks_->ioHandle(), callbacks_->ioHandle());
       ENVOY_LOG(debug, "kTLS socket splicing set up successfully");
-    } catch (const EnvoyException& e) {
+    }
+    END_TRY
+    CATCH(EnvoyException & e, {
       ENVOY_LOG(debug, "Failed to set up kTLS socket splicing: {}", e.what());
       // Not fatal, continue without splicing
-    }
+    })
 #else
     // Create a dummy socket_splicing_ that will always return EAGAIN
     socket_splicing_ =
@@ -918,45 +1065,54 @@ bool KtlsTransportSocket::canEnableKtls() const {
   ENVOY_LOG(debug, "Negotiated cipher for kTLS: {}", cipher);
 
   if (cipher.empty()) {
-    ENVOY_LOG(debug, "Cipher information not yet available, handshake may not be complete");
+    ENVOY_LOG(debug, "Cipher information not available");
     return false;
   }
 
-  // Check for supported ciphers
-  const std::vector<std::string> supported_ciphers = {"ECDHE-RSA-AES128-GCM-SHA256",
-                                                      "AES128-GCM-SHA256"};
-
-  bool cipher_supported = false;
-  for (const auto& supported_cipher : supported_ciphers) {
-    if (cipher.find(supported_cipher) != std::string::npos) {
-      cipher_supported = true;
-      break;
-    }
-  }
-
-  if (!cipher_supported) {
-    ENVOY_LOG(debug, "Unsupported cipher suite for kTLS: {}", cipher);
-    ENVOY_LOG(debug, "kTLS currently only supports AES128-GCM ciphers");
+  // Check if cipher is supported
+  bool is_aes_gcm_128 = cipher.find("AES128-GCM") != std::string::npos ||
+                     cipher.find("AES-128-GCM") != std::string::npos;
+  if (!is_aes_gcm_128) {
+    ENVOY_LOG(debug, "Unsupported cipher for kTLS: {}. Only AES-128-GCM is supported.", cipher);
     return false;
   }
 
-  // Check TLS version - for now we only support TLS 1.2
+  // Check TLS version - only TLS 1.2 is supported
   std::string version = std::string(ssl_connection->tlsVersion());
-
-  // Always log the TLS version for debugging
-  ENVOY_LOG(debug, "Negotiated TLS version for kTLS: {}", version);
-
-  if (version.empty()) {
-    ENVOY_LOG(debug, "TLS version info not yet available, handshake may not be complete");
-    return false;
-  }
+  ENVOY_LOG(debug, "TLS version: {}", version);
 
   if (version != "TLSv1.2") {
-    ENVOY_LOG(debug, "Unsupported TLS version for kTLS: {}", version);
-    ENVOY_LOG(debug, "kTLS currently only supports TLS 1.2");
+    ENVOY_LOG(debug, "Unsupported TLS version for kTLS: {}. Only TLSv1.2 is supported.", version);
     return false;
   }
 
+  // Check if CAP_NET_ADMIN capability is available
+  // This is a Linux-specific capability check
+#ifdef __linux__
+#ifdef HAS_CAPABILITY_SUPPORT
+  if (geteuid() != 0) {  // Not running as root
+    // Check if process has the capability
+    cap_t caps = cap_get_proc();
+    if (caps) {
+      cap_flag_value_t has_net_admin;
+      if (cap_get_flag(caps, CAP_NET_ADMIN, CAP_EFFECTIVE, &has_net_admin) == 0) {
+        if (has_net_admin != CAP_SET) {
+          ENVOY_LOG(debug, "CAP_NET_ADMIN capability is missing, needed for kTLS");
+          cap_free(caps);
+          return false;
+        }
+      }
+      cap_free(caps);
+    }
+  }
+#else
+  // If we're on Linux but don't have capability support, log a warning
+  ENVOY_LOG(debug, "Running on Linux without capability support. CAP_NET_ADMIN may be required for kTLS.");
+#endif
+#endif
+
+  // All checks passed
+  ENVOY_LOG(debug, "All checks passed: connection can enable kTLS");
   return true;
 }
 

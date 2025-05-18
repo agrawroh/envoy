@@ -39,6 +39,13 @@ public:
    * @return true if the parameters were successfully extracted, false otherwise.
    */
   virtual bool getRxCryptoInfo(tls_crypto_info_t& crypto_info) const PURE;
+
+  /**
+   * Extracts and prepares the crypto parameters needed for kTLS.
+   * Must be called before getTxCryptoInfo or getRxCryptoInfo.
+   * @return true if parameters were successfully extracted, false otherwise.
+   */
+  virtual bool extractCryptoParams() const PURE;
 };
 
 using KtlsInfoConstSharedPtr = std::shared_ptr<const KtlsInfo>;
