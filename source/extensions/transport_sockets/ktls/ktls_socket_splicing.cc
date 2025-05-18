@@ -56,7 +56,8 @@ KtlsSocketSplicing::~KtlsSocketSplicing() {
 bool KtlsSocketSplicing::initializePipe() {
   // Create a pipe for splicing
   if (::pipe(pipe_fds_) < 0) {
-    ENVOY_LOG(error, "Failed to create pipe for kTLS socket splicing: {}", ::strerror(errno));
+    ENVOY_LOG(error, "Failed to create pipe for kTLS socket splicing: {}",
+              Envoy::errorDetails(errno));
     return false;
   }
 
@@ -67,7 +68,8 @@ bool KtlsSocketSplicing::initializePipe() {
   constexpr int pipe_size = 1024 * 1024; // 1MB pipe buffer
   if (::fcntl(pipe_fds_[0], F_SETPIPE_SZ, pipe_size) < 0 ||
       ::fcntl(pipe_fds_[1], F_SETPIPE_SZ, pipe_size) < 0) {
-    ENVOY_LOG(warn, "Failed to set pipe size for kTLS socket splicing: {}", ::strerror(errno));
+    ENVOY_LOG(warn, "Failed to set pipe size for kTLS socket splicing: {}",
+              Envoy::errorDetails(errno));
     // Not fatal, continue
   }
 #endif
@@ -76,11 +78,11 @@ bool KtlsSocketSplicing::initializePipe() {
   for (int i = 0; i < 2; ++i) {
     int flags = ::fcntl(pipe_fds_[i], F_GETFL, 0);
     if (flags < 0) {
-      ENVOY_LOG(error, "Failed to get pipe flags: {}", ::strerror(errno));
+      ENVOY_LOG(error, "Failed to get pipe flags: {}", Envoy::errorDetails(errno));
       return false;
     }
     if (::fcntl(pipe_fds_[i], F_SETFL, flags | O_NONBLOCK) < 0) {
-      ENVOY_LOG(error, "Failed to set pipe to non-blocking: {}", ::strerror(errno));
+      ENVOY_LOG(error, "Failed to set pipe to non-blocking: {}", Envoy::errorDetails(errno));
       return false;
     }
   }
@@ -130,7 +132,7 @@ Api::IoCallUint64Result KtlsSocketSplicing::splice(uint64_t max_bytes) {
       ::splice(pipe_fds_[0], nullptr, dest_fd, nullptr, bytes_in_pipe, splice_flags);
   if (bytes_out < 0) {
     // This is a serious error as we now have data in the pipe but couldn't send it
-    ENVOY_LOG(error, "Failed to splice from pipe to destination: {}", ::strerror(errno));
+    ENVOY_LOG(error, "Failed to splice from pipe to destination: {}", Envoy::errorDetails(errno));
     return {0, Network::IoSocketError::create(errno)};
   }
 

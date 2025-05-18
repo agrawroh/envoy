@@ -220,7 +220,7 @@ bool KtlsTransportSocket::enableKtls() {
   // 1. Enable kTLS ULP on the socket
   const char* tls_ulp = "tls";
   if (setsockopt(fd, SOL_TCP, TCP_ULP, tls_ulp, strlen(tls_ulp)) < 0) {
-    ENVOY_LOG(debug, "Failed to set TCP_ULP for kTLS: {}", ::strerror(errno));
+    ENVOY_LOG(debug, "Failed to set TCP_ULP for kTLS: {}", Envoy::errorDetails(errno));
     return false;
   }
 
@@ -232,7 +232,7 @@ bool KtlsTransportSocket::enableKtls() {
   }
 
   if (setsockopt(fd, SOL_TLS, TLS_TX, &crypto_info, sizeof(crypto_info)) < 0) {
-    ENVOY_LOG(debug, "Failed to set TLS_TX crypto info: {}", ::strerror(errno));
+    ENVOY_LOG(debug, "Failed to set TLS_TX crypto info: {}", Envoy::errorDetails(errno));
     return false;
   }
 
@@ -243,7 +243,7 @@ bool KtlsTransportSocket::enableKtls() {
   }
 
   if (setsockopt(fd, SOL_TLS, TLS_RX, &crypto_info, sizeof(crypto_info)) < 0) {
-    ENVOY_LOG(debug, "Failed to set TLS_RX crypto info: {}", ::strerror(errno));
+    ENVOY_LOG(debug, "Failed to set TLS_RX crypto info: {}", Envoy::errorDetails(errno));
     return false;
   }
 
@@ -251,7 +251,7 @@ bool KtlsTransportSocket::enableKtls() {
   if (enable_tx_zerocopy_) {
     int val = 1;
     if (setsockopt(fd, SOL_TLS, TLS_TX_ZEROCOPY_RO, &val, sizeof(val)) < 0) {
-      ENVOY_LOG(debug, "Failed to enable TX zerocopy for kTLS: {}", ::strerror(errno));
+      ENVOY_LOG(debug, "Failed to enable TX zerocopy for kTLS: {}", Envoy::errorDetails(errno));
       // Not fatal, continue
     }
   }
@@ -260,7 +260,7 @@ bool KtlsTransportSocket::enableKtls() {
   if (enable_rx_no_pad_) {
     int val = 1;
     if (setsockopt(fd, SOL_TLS, TLS_RX_EXPECT_NO_PAD, &val, sizeof(val)) < 0) {
-      ENVOY_LOG(debug, "Failed to set RX no padding for kTLS: {}", ::strerror(errno));
+      ENVOY_LOG(debug, "Failed to set RX no padding for kTLS: {}", Envoy::errorDetails(errno));
       // Not fatal, continue
     }
   }

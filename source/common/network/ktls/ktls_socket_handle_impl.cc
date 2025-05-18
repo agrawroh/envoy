@@ -37,14 +37,14 @@ bool KTlsSocketHandleImpl::enableTlsTx(const tls12_crypto_info_aes_gcm_128& cryp
   static const char tls_ulp[] = "tls";
   int rc = setsockopt(fd_, SOL_TCP, TCP_ULP, tls_ulp, sizeof(tls_ulp));
   if (rc < 0) {
-    ENVOY_LOG_MISC(debug, "Failed to set TCP_ULP for kTLS: {}", strerror(errno));
+    ENVOY_LOG_MISC(debug, "Failed to set TCP_ULP for kTLS: {}", Envoy::errorDetails(errno));
     return false;
   }
 
   // Now set up the TLS TX crypto info
   rc = setsockopt(fd_, SOL_TLS, TLS_TX, &crypto_info, sizeof(crypto_info));
   if (rc < 0) {
-    ENVOY_LOG_MISC(debug, "Failed to set TLS_TX for kTLS: {}", strerror(errno));
+    ENVOY_LOG_MISC(debug, "Failed to set TLS_TX for kTLS: {}", Envoy::errorDetails(errno));
     return false;
   }
 
@@ -64,7 +64,7 @@ bool KTlsSocketHandleImpl::enableTlsRx(const tls12_crypto_info_aes_gcm_128& cryp
     static const char tls_ulp[] = "tls";
     int rc = setsockopt(fd_, SOL_TCP, TCP_ULP, tls_ulp, sizeof(tls_ulp));
     if (rc < 0) {
-      ENVOY_LOG_MISC(debug, "Failed to set TCP_ULP for kTLS: {}", strerror(errno));
+      ENVOY_LOG_MISC(debug, "Failed to set TCP_ULP for kTLS: {}", Envoy::errorDetails(errno));
       return false;
     }
   }
@@ -72,7 +72,7 @@ bool KTlsSocketHandleImpl::enableTlsRx(const tls12_crypto_info_aes_gcm_128& cryp
   // Set up the TLS RX crypto info
   int rc = setsockopt(fd_, SOL_TLS, TLS_RX, &crypto_info, sizeof(crypto_info));
   if (rc < 0) {
-    ENVOY_LOG_MISC(debug, "Failed to set TLS_RX for kTLS: {}", strerror(errno));
+    ENVOY_LOG_MISC(debug, "Failed to set TLS_RX for kTLS: {}", Envoy::errorDetails(errno));
     return false;
   }
 

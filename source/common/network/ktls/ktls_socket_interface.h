@@ -2,8 +2,7 @@
 
 #include "source/common/network/ktls/ktls_socket_handle_impl.h"
 #include "source/common/network/socket_interface.h"
-
-#include "google/protobuf/empty.pb.h"
+#include "source/common/protobuf/protobuf.h"
 
 namespace Envoy {
 namespace Network {

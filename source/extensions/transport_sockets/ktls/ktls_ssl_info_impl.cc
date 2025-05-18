@@ -4,6 +4,7 @@
 
 #include "source/common/common/assert.h"
 #include "source/common/common/logger.h"
+#include "source/common/common/safe_memcpy.h"
 #include "source/common/network/utility.h"
 #include "source/common/tls/utility.h"
 #include "source/extensions/transport_sockets/ktls/tls_compat.h"
@@ -54,6 +55,7 @@ bool KtlsSslInfoImpl::getTxCryptoInfo(tls_crypto_info_t& crypto_info) const {
       return false;
     }
 
+    // Copy data from vectors to crypto_info struct
     memcpy(crypto_info.key, client_key_.data(), sizeof(crypto_info.key));
     memcpy(crypto_info.iv, client_iv_.data(), sizeof(crypto_info.iv));
     memcpy(crypto_info.rec_seq, client_rec_seq_.data(), sizeof(crypto_info.rec_seq));
@@ -65,6 +67,7 @@ bool KtlsSslInfoImpl::getTxCryptoInfo(tls_crypto_info_t& crypto_info) const {
       return false;
     }
 
+    // Copy data from vectors to crypto_info struct
     memcpy(crypto_info.key, server_key_.data(), sizeof(crypto_info.key));
     memcpy(crypto_info.iv, server_iv_.data(), sizeof(crypto_info.iv));
     memcpy(crypto_info.rec_seq, server_rec_seq_.data(), sizeof(crypto_info.rec_seq));
@@ -99,6 +102,7 @@ bool KtlsSslInfoImpl::getRxCryptoInfo(tls_crypto_info_t& crypto_info) const {
       return false;
     }
 
+    // Copy data from vectors to crypto_info struct
     memcpy(crypto_info.key, server_key_.data(), sizeof(crypto_info.key));
     memcpy(crypto_info.iv, server_iv_.data(), sizeof(crypto_info.iv));
     memcpy(crypto_info.rec_seq, server_rec_seq_.data(), sizeof(crypto_info.rec_seq));
@@ -110,6 +114,7 @@ bool KtlsSslInfoImpl::getRxCryptoInfo(tls_crypto_info_t& crypto_info) const {
       return false;
     }
 
+    // Copy data from vectors to crypto_info struct
     memcpy(crypto_info.key, client_key_.data(), sizeof(crypto_info.key));
     memcpy(crypto_info.iv, client_iv_.data(), sizeof(crypto_info.iv));
     memcpy(crypto_info.rec_seq, client_rec_seq_.data(), sizeof(crypto_info.rec_seq));

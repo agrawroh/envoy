@@ -16,7 +16,7 @@ int main(int argc, char** argv) {
   args.push_back("--enable-core-dump");
 
   // Create MainCommon and run
-  try {
+  TRY_ASSERT_MAIN_THREAD {
     Envoy::MainCommon main_common(argc, argv);
     Envoy::Thread::threadFactoryForTest().createThread([&main_common]() { main_common.run(); });
 
@@ -32,13 +32,6 @@ int main(int argc, char** argv) {
     sigwait(&mask, &sig);
 
     return main_common.shutdown() ? 0 : 1;
-  } catch (const Envoy::NoServingException& e) {
-    return 0;
-  } catch (const Envoy::MalformedArgvException& e) {
-    std::cerr << e.what() << std::endl;
-    return 1;
-  } catch (const Envoy::EnvoyException& e) {
-    std::cerr << e.what() << std::endl;
-    return 1;
   }
+  CATCH_ASSERT { return 1; }
 }

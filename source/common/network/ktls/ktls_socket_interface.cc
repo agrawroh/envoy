@@ -61,7 +61,8 @@ IoHandlePtr KTlsSocketInterface::socket(Socket::Type socket_type, Address::Type 
   // Create the socket
   const Api::SysCallSocketResult result = os_sys_calls.socket(domain, flags, 0);
   if (SOCKET_INVALID(result.return_value_)) {
-    throw EnvoyException(fmt::format("socket failed: {}", strerror(result.errno_)));
+    ENVOY_LOG_MISC(debug, "socket failed: {}", Envoy::errorDetails(result.errno_));
+    return nullptr;
   }
 
   // Create the kTLS socket handle
@@ -74,8 +75,9 @@ IoHandlePtr KTlsSocketInterface::socket(Socket::Type socket_type, Address::Type 
         io_handle->setOption(IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
     if (v6only_result.return_value_ != 0) {
       io_handle->close();
-      throw EnvoyException(
-          fmt::format("setting v6only option failed: {}", strerror(v6only_result.errno_)));
+      ENVOY_LOG_MISC(debug, "setting v6only option failed: {}",
+                     Envoy::errorDetails(v6only_result.errno_));
+      return nullptr;
     }
   }
 
