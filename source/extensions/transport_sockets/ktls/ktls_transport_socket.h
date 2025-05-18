@@ -45,6 +45,12 @@ private:
   bool enableKtls();
 
   /**
+   * Disable kTLS with a reason, useful when errors occur.
+   * @param reason The reason for disabling kTLS, for logging.
+   */
+  void disableKtls(const std::string& reason);
+
+  /**
    * Check if kTLS can be enabled based on TLS parameters.
    * @return true if kTLS can be enabled, false otherwise.
    */

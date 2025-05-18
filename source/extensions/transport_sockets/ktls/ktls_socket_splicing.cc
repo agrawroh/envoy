@@ -108,6 +108,23 @@ Api::IoCallUint64Result KtlsSocketSplicing::splice(uint64_t max_bytes) {
 #if defined(__linux__) && HAS_SPLICE_SYSCALL
   // Linux-specific splice() implementation
 
+  // Check and clear O_APPEND flag on destination fd to prevent EINVAL
+  // Store original flags to restore them after the operation
+  int dest_flags = ::fcntl(dest_fd, F_GETFL);
+  bool had_append_flag = false;
+  
+  if (dest_flags < 0) {
+    ENVOY_LOG(warn, "Failed to get destination file flags: {}", Envoy::errorDetails(errno));
+  } else if (dest_flags & O_APPEND) {
+    // If destination has O_APPEND flag, temporarily clear it
+    ENVOY_LOG(debug, "Clearing O_APPEND flag on destination fd for splice operation");
+    had_append_flag = true;
+    if (::fcntl(dest_fd, F_SETFL, dest_flags & ~O_APPEND) < 0) {
+      ENVOY_LOG(warn, "Failed to clear O_APPEND flag: {}", Envoy::errorDetails(errno));
+      // Continue anyway, worst case splice will fail with EINVAL
+    }
+  }
+
   // Splice flags
   int splice_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK;
 
@@ -117,31 +134,111 @@ Api::IoCallUint64Result KtlsSocketSplicing::splice(uint64_t max_bytes) {
       ::splice(source_fd, nullptr, pipe_fds_[1], nullptr, max_bytes, splice_flags);
   if (bytes_in_pipe < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      // Restore append flag if we cleared it
+      if (had_append_flag && ::fcntl(dest_fd, F_SETFL, dest_flags) < 0) {
+        ENVOY_LOG(warn, "Failed to restore O_APPEND flag: {}", Envoy::errorDetails(errno));
+      }
       return {0, Network::IoSocketError::getIoSocketEagainError()};
+    }
+    
+    // If splice fails with EINVAL or ENOSYS, fall back to direct read/write
+    if (errno == EINVAL || errno == ENOSYS) {
+      ENVOY_LOG(debug, "Splice from source to pipe failed with {}, using direct read/write fallback",
+                errno == EINVAL ? "EINVAL" : "ENOSYS");
+      
+      // Restore append flag if we cleared it
+      if (had_append_flag && ::fcntl(dest_fd, F_SETFL, dest_flags) < 0) {
+        ENVOY_LOG(warn, "Failed to restore O_APPEND flag: {}", Envoy::errorDetails(errno));
+      }
+      
+      // Use direct read/write as fallback
+      char buffer[16384];
+      ssize_t bytes_read = ::read(source_fd, buffer, std::min(sizeof(buffer), static_cast<size_t>(max_bytes)));
+      
+      if (bytes_read < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          return {0, Network::IoSocketError::getIoSocketEagainError()};
+        }
+        return {0, Network::IoSocketError::create(errno)};
+      }
+      
+      if (bytes_read == 0) {
+        return {0, Api::IoError::none()};
+      }
+      
+      ssize_t bytes_written = ::write(dest_fd, buffer, bytes_read);
+      if (bytes_written < 0) {
+        return {0, Network::IoSocketError::create(errno)};
+      }
+      
+      return {static_cast<uint64_t>(bytes_written), Api::IoError::none()};
+    }
+    
+    // Restore append flag if we cleared it
+    if (had_append_flag && ::fcntl(dest_fd, F_SETFL, dest_flags) < 0) {
+      ENVOY_LOG(warn, "Failed to restore O_APPEND flag: {}", Envoy::errorDetails(errno));
     }
     return {0, Network::IoSocketError::create(errno)};
   }
 
   if (bytes_in_pipe == 0) {
     // No data to splice
+    // Restore append flag if we cleared it
+    if (had_append_flag && ::fcntl(dest_fd, F_SETFL, dest_flags) < 0) {
+      ENVOY_LOG(warn, "Failed to restore O_APPEND flag: {}", Envoy::errorDetails(errno));
+    }
     return {0, Api::IoError::none()};
   }
 
   // Then, splice from pipe to destination
   ssize_t bytes_out =
       ::splice(pipe_fds_[0], nullptr, dest_fd, nullptr, bytes_in_pipe, splice_flags);
+  
+  // Restore append flag if we cleared it
+  if (had_append_flag && ::fcntl(dest_fd, F_SETFL, dest_flags) < 0) {
+    ENVOY_LOG(warn, "Failed to restore O_APPEND flag: {}", Envoy::errorDetails(errno));
+  }
+  
   if (bytes_out < 0) {
     // This is a serious error as we now have data in the pipe but couldn't send it
     ENVOY_LOG(error, "Failed to splice from pipe to destination: {}", Envoy::errorDetails(errno));
+    if (errno == EINVAL) {
+      ENVOY_LOG(debug, "EINVAL error in splice - this may occur if destination is in append mode");
+    }
+    
+    // Although we have data in the pipe, we can't do much to recover it directly,
+    // so we just return the error
     return {0, Network::IoSocketError::create(errno)};
   }
 
   // Return the number of bytes transferred
   return {static_cast<uint64_t>(bytes_out), Api::IoError::none()};
 #else
-  // On non-Linux platforms or if splice is not available, return not implemented
+  // On non-Linux platforms or if splice is not available, use direct read/write
   UNREFERENCED_PARAMETER(max_bytes);
-  return {0, Network::IoSocketError::create(ENOSYS)};
+  ENVOY_LOG(debug, "Splice syscall not available, using direct read/write fallback");
+  
+  // Use direct read/write as fallback
+  char buffer[16384];
+  ssize_t bytes_read = ::read(source_fd, buffer, std::min(sizeof(buffer), static_cast<size_t>(max_bytes)));
+  
+  if (bytes_read < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return {0, Network::IoSocketError::getIoSocketEagainError()};
+    }
+    return {0, Network::IoSocketError::create(errno)};
+  }
+  
+  if (bytes_read == 0) {
+    return {0, Api::IoError::none()};
+  }
+  
+  ssize_t bytes_written = ::write(dest_fd, buffer, bytes_read);
+  if (bytes_written < 0) {
+    return {0, Network::IoSocketError::create(errno)};
+  }
+  
+  return {static_cast<uint64_t>(bytes_written), Api::IoError::none()};
 #endif
 }
 
