@@ -624,14 +624,19 @@ void KtlsTransportSocket::determineKtlsReadiness() {
     
     ENVOY_LOG(debug, "Current SSL sequence numbers - TX: {}, RX: {}", tx_seq, rx_seq);
     
-    // A reasonable threshold - if we've exchanged more than 5 records total,
-    // it's safer to stay with software TLS
-    const uint64_t SAFE_SEQ_THRESHOLD = 5;
+    // A reasonable threshold - if we've exchanged too many records,
+    // it's safer to stay with software TLS.
+    // Upstream connections are more sensitive, so use a stricter threshold.
+    uint64_t active_safe_seq_threshold = 5; // Default for downstream (original SAFE_SEQ_THRESHOLD)
+    if (is_upstream_) {
+      active_safe_seq_threshold = 1; // Stricter for upstream: allow at most 1 record
+      ENVOY_LOG(debug, "Using stricter SAFE_SEQ_THRESHOLD={} for upstream connection.", active_safe_seq_threshold);
+    }
     
-    if (tx_seq + rx_seq > SAFE_SEQ_THRESHOLD) {
-      ENVOY_LOG(warn, "Connection has already exchanged {} records (TX={}, RX={}). "
-                "Skipping kTLS enablement for safety.",
-                tx_seq + rx_seq, tx_seq, rx_seq);
+    if (tx_seq + rx_seq > active_safe_seq_threshold) {
+      ENVOY_LOG(warn, "Connection has already exchanged {} records (TX={}, RX={}), "
+                "which exceeds threshold of {}. Skipping kTLS enablement for safety.",
+                tx_seq + rx_seq, tx_seq, rx_seq, active_safe_seq_threshold);
       is_safe_to_enable = false;
     }
   }
@@ -1351,9 +1356,15 @@ bool KtlsTransportSocket::enableKtls() {
                   (current_rx_seq == rx_seq_verify) ? "YES" : "NO");
                   
         if (current_rx_seq != rx_seq_verify) {
-          ENVOY_LOG(warn, "RX sequence mismatch after kTLS setup - "
-                          "expect EBADMSG errors during read operations");
-          // Don't fail setup - we'll handle via resync if needed
+          ENVOY_LOG(warn, "RX sequence mismatch after kTLS setup (SSL={}, kernel={}).",
+                          current_rx_seq, rx_seq_verify);
+          if (is_upstream_) {
+            ENVOY_LOG(warn, "Forcing RX setup failure for upstream connection due to sequence mismatch to prevent EBADMSG.");
+            rx_success = false; // This will cause kTLS_success to be false later
+          } else {
+            ENVOY_LOG(warn, "For downstream, expect EBADMSG errors or resync for sequence mismatch.");
+             // Original behavior for downstream: Don't fail setup - we'll handle via resync if needed
+          }
         }
       }
     }
