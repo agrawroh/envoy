@@ -6,8 +6,8 @@
 #include "source/common/common/logger.h"
 #include "source/common/common/safe_memcpy.h"
 #include "source/common/network/utility.h"
-#include "source/common/tls/utility.h"
 #include "source/common/tls/connection_info_impl_base.h"
+#include "source/common/tls/utility.h"
 #include "source/extensions/transport_sockets/ktls/tls_compat.h"
 
 #include "openssl/ssl.h"
@@ -167,12 +167,13 @@ bool KtlsSslInfoImpl::extractKeyMaterial() {
   // Get the SSL object from ConnectionInfo
   // We need to cast to ConnectionInfoImplBase which provides ssl() access
   const Extensions::TransportSockets::Tls::ConnectionInfoImplBase* impl_base =
-      dynamic_cast<const Extensions::TransportSockets::Tls::ConnectionInfoImplBase*>(ssl_info_.get());
+      dynamic_cast<const Extensions::TransportSockets::Tls::ConnectionInfoImplBase*>(
+          ssl_info_.get());
   if (!impl_base) {
     ENVOY_LOG(debug, "Cannot cast SSL info to ConnectionInfoImplBase");
     return false;
   }
-  
+
   SSL* ssl_handle = impl_base->ssl();
   if (!ssl_handle) {
     ENVOY_LOG(debug, "Failed to get SSL handle from ConnectionInfo");
@@ -193,7 +194,7 @@ bool KtlsSslInfoImpl::extractKeyMaterial() {
   // Check if the TLS version is supported
   const char* version_str = SSL_get_version(ssl_handle);
   if (version_str == nullptr || std::string(version_str) != "TLSv1.2") {
-    ENVOY_LOG(debug, "Unsupported TLS version for kTLS: {}", 
+    ENVOY_LOG(debug, "Unsupported TLS version for kTLS: {}",
               version_str != nullptr ? version_str : "null");
     return false;
   }
@@ -218,12 +219,12 @@ bool KtlsSslInfoImpl::extractKeyMaterial() {
   uint8_t server_random[SSL3_RANDOM_SIZE];
   memset(client_random, 0, SSL3_RANDOM_SIZE);
   memset(server_random, 0, SSL3_RANDOM_SIZE);
-  
+
   if (SSL_get_client_random(ssl_handle, client_random, SSL3_RANDOM_SIZE) != SSL3_RANDOM_SIZE) {
     ENVOY_LOG(debug, "Failed to get client random");
     return false;
   }
-  
+
   if (SSL_get_server_random(ssl_handle, server_random, SSL3_RANDOM_SIZE) != SSL3_RANDOM_SIZE) {
     ENVOY_LOG(debug, "Failed to get server random");
     return false;
@@ -232,8 +233,8 @@ bool KtlsSslInfoImpl::extractKeyMaterial() {
   // Get master key
   uint8_t master_key[SSL_MAX_MASTER_KEY_LENGTH];
   memset(master_key, 0, SSL_MAX_MASTER_KEY_LENGTH);
-  size_t master_key_length = SSL_SESSION_get_master_key(session, master_key, 
-                                                       SSL_MAX_MASTER_KEY_LENGTH);
+  size_t master_key_length =
+      SSL_SESSION_get_master_key(session, master_key, SSL_MAX_MASTER_KEY_LENGTH);
   if (master_key_length == 0) {
     ENVOY_LOG(debug, "Failed to get master key");
     return false;
@@ -244,14 +245,14 @@ bool KtlsSslInfoImpl::extractKeyMaterial() {
   // For TLS 1.2, we need to derive:
   // 1. Client write key and IV (for encryption when we're client, decryption when server)
   // 2. Server write key and IV (for encryption when we're server, decryption when client)
-  
+
   // Allocate memory for keys and IVs
-  client_key_.resize(16);   // AES-128-GCM key is 16 bytes
-  server_key_.resize(16);   // AES-128-GCM key is 16 bytes
-  client_salt_.resize(4);   // Salt is first 4 bytes of IV
-  server_salt_.resize(4);   // Salt is first 4 bytes of IV
-  client_iv_.resize(8);     // Explicit nonce is 8 bytes
-  server_iv_.resize(8);     // Explicit nonce is 8 bytes
+  client_key_.resize(16);       // AES-128-GCM key is 16 bytes
+  server_key_.resize(16);       // AES-128-GCM key is 16 bytes
+  client_salt_.resize(4);       // Salt is first 4 bytes of IV
+  server_salt_.resize(4);       // Salt is first 4 bytes of IV
+  client_iv_.resize(8);         // Explicit nonce is 8 bytes
+  server_iv_.resize(8);         // Explicit nonce is 8 bytes
   client_rec_seq_.resize(8, 0); // Start with sequence 0
   server_rec_seq_.resize(8, 0); // Start with sequence 0
 
@@ -267,8 +268,8 @@ bool KtlsSslInfoImpl::extractKeyMaterial() {
   memcpy(seed + SSL3_RANDOM_SIZE, client_random, SSL3_RANDOM_SIZE);
 
   // Use TLS PRF to derive key material
-  if (!SSL_export_keying_material(ssl_handle, key_block, sizeof(key_block), 
-                                 label, strlen(label), seed, sizeof(seed), 0)) {
+  if (!SSL_export_keying_material(ssl_handle, key_block, sizeof(key_block), label, strlen(label),
+                                  seed, sizeof(seed), 0)) {
     ENVOY_LOG(debug, "Failed to export keying material");
     return false;
   }
@@ -278,7 +279,7 @@ bool KtlsSslInfoImpl::extractKeyMaterial() {
   // [client write key(16)][server write key(16)][client write IV(12)][server write IV(12)]
   memcpy(client_key_.data(), key_block, 16);
   memcpy(server_key_.data(), key_block + 16, 16);
-  
+
   // For kTLS with AES-GCM, IV is split into salt (first 4 bytes) and explicit nonce (8 bytes)
   memcpy(client_salt_.data(), key_block + 32, 4);
   memcpy(client_iv_.data(), key_block + 36, 8);

@@ -60,7 +60,10 @@ envoy_cc_library(
 envoy_cc_library(
     name = "ktls_transport_socket_lib",
     srcs = ["ktls_transport_socket.cc"],
-    hdrs = ["ktls_transport_socket.h"],
+    hdrs = [
+        "ktls_socket_splicing_stub.h",
+        "ktls_transport_socket.h",
+    ],
     external_deps = [
         "ssl",
         "abseil_strings",

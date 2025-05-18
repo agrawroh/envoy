@@ -112,7 +112,7 @@ Api::IoCallUint64Result KtlsSocketSplicing::splice(uint64_t max_bytes) {
   // Store original flags to restore them after the operation
   int dest_flags = ::fcntl(dest_fd, F_GETFL);
   bool had_append_flag = false;
-  
+
   if (dest_flags < 0) {
     ENVOY_LOG(warn, "Failed to get destination file flags: {}", Envoy::errorDetails(errno));
   } else if (dest_flags & O_APPEND) {
@@ -140,40 +140,42 @@ Api::IoCallUint64Result KtlsSocketSplicing::splice(uint64_t max_bytes) {
       }
       return {0, Network::IoSocketError::getIoSocketEagainError()};
     }
-    
+
     // If splice fails with EINVAL or ENOSYS, fall back to direct read/write
     if (errno == EINVAL || errno == ENOSYS) {
-      ENVOY_LOG(debug, "Splice from source to pipe failed with {}, using direct read/write fallback",
+      ENVOY_LOG(debug,
+                "Splice from source to pipe failed with {}, using direct read/write fallback",
                 errno == EINVAL ? "EINVAL" : "ENOSYS");
-      
+
       // Restore append flag if we cleared it
       if (had_append_flag && ::fcntl(dest_fd, F_SETFL, dest_flags) < 0) {
         ENVOY_LOG(warn, "Failed to restore O_APPEND flag: {}", Envoy::errorDetails(errno));
       }
-      
+
       // Use direct read/write as fallback
       char buffer[16384];
-      ssize_t bytes_read = ::read(source_fd, buffer, std::min(sizeof(buffer), static_cast<size_t>(max_bytes)));
-      
+      ssize_t bytes_read =
+          ::read(source_fd, buffer, std::min(sizeof(buffer), static_cast<size_t>(max_bytes)));
+
       if (bytes_read < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
           return {0, Network::IoSocketError::getIoSocketEagainError()};
         }
         return {0, Network::IoSocketError::create(errno)};
       }
-      
+
       if (bytes_read == 0) {
         return {0, Api::IoError::none()};
       }
-      
+
       ssize_t bytes_written = ::write(dest_fd, buffer, bytes_read);
       if (bytes_written < 0) {
         return {0, Network::IoSocketError::create(errno)};
       }
-      
+
       return {static_cast<uint64_t>(bytes_written), Api::IoError::none()};
     }
-    
+
     // Restore append flag if we cleared it
     if (had_append_flag && ::fcntl(dest_fd, F_SETFL, dest_flags) < 0) {
       ENVOY_LOG(warn, "Failed to restore O_APPEND flag: {}", Envoy::errorDetails(errno));
@@ -193,19 +195,19 @@ Api::IoCallUint64Result KtlsSocketSplicing::splice(uint64_t max_bytes) {
   // Then, splice from pipe to destination
   ssize_t bytes_out =
       ::splice(pipe_fds_[0], nullptr, dest_fd, nullptr, bytes_in_pipe, splice_flags);
-  
+
   // Restore append flag if we cleared it
   if (had_append_flag && ::fcntl(dest_fd, F_SETFL, dest_flags) < 0) {
     ENVOY_LOG(warn, "Failed to restore O_APPEND flag: {}", Envoy::errorDetails(errno));
   }
-  
+
   if (bytes_out < 0) {
     // This is a serious error as we now have data in the pipe but couldn't send it
     ENVOY_LOG(error, "Failed to splice from pipe to destination: {}", Envoy::errorDetails(errno));
     if (errno == EINVAL) {
       ENVOY_LOG(debug, "EINVAL error in splice - this may occur if destination is in append mode");
     }
-    
+
     // Although we have data in the pipe, we can't do much to recover it directly,
     // so we just return the error
     return {0, Network::IoSocketError::create(errno)};
@@ -217,27 +219,28 @@ Api::IoCallUint64Result KtlsSocketSplicing::splice(uint64_t max_bytes) {
   // On non-Linux platforms or if splice is not available, use direct read/write
   UNREFERENCED_PARAMETER(max_bytes);
   ENVOY_LOG(debug, "Splice syscall not available, using direct read/write fallback");
-  
+
   // Use direct read/write as fallback
   char buffer[16384];
-  ssize_t bytes_read = ::read(source_fd, buffer, std::min(sizeof(buffer), static_cast<size_t>(max_bytes)));
-  
+  ssize_t bytes_read =
+      ::read(source_fd, buffer, std::min(sizeof(buffer), static_cast<size_t>(max_bytes)));
+
   if (bytes_read < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
       return {0, Network::IoSocketError::getIoSocketEagainError()};
     }
     return {0, Network::IoSocketError::create(errno)};
   }
-  
+
   if (bytes_read == 0) {
     return {0, Api::IoError::none()};
   }
-  
+
   ssize_t bytes_written = ::write(dest_fd, buffer, bytes_read);
   if (bytes_written < 0) {
     return {0, Network::IoSocketError::create(errno)};
   }
-  
+
   return {static_cast<uint64_t>(bytes_written), Api::IoError::none()};
 #endif
 }

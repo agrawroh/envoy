@@ -7,9 +7,16 @@
 #include "envoy/upstream/upstream.h"
 
 #include "source/common/common/logger.h"
+#include "source/common/network/io_socket_error_impl.h"
 #include "source/extensions/transport_sockets/common/passthrough.h"
-#include "source/extensions/transport_sockets/ktls/ktls_socket_splicing.h"
 #include "source/extensions/transport_sockets/ktls/ktls_ssl_info.h"
+
+// Include the appropriate socket splicing implementation based on platform availability
+#ifdef HAS_SPLICE_SYSCALL
+#include "source/extensions/transport_sockets/ktls/ktls_socket_splicing.h"
+#else
+#include "source/extensions/transport_sockets/ktls/ktls_socket_splicing_stub.h"
+#endif
 
 namespace Envoy {
 namespace Extensions {
@@ -24,7 +31,7 @@ class KtlsTransportSocket : public TransportSockets::PassthroughSocket,
                             public Logger::Loggable<Logger::Id::connection> {
 public:
   KtlsTransportSocket(Network::TransportSocketPtr&& transport_socket, bool enable_tx_zerocopy,
-                     bool enable_rx_no_pad);
+                      bool enable_rx_no_pad);
   ~KtlsTransportSocket() override;
 
   // Network::TransportSocket
@@ -76,12 +83,12 @@ private:
    * Process any pending operations now that kTLS readiness is determined.
    */
   void processPendingOps();
-  
+
   /**
    * The current state of kTLS for this socket
    */
   enum class KtlsState { Unknown, Supported, Unsupported };
-  
+
   /**
    * Set the kTLS state and mark state as determined
    */
@@ -98,34 +105,32 @@ private:
   KtlsInfoConstSharedPtr ktls_info_;
   uint32_t ktls_handshake_attempts_{0};
   bool ktls_state_determined_{false};
-  
+
   // Timer for scheduling readiness checks with progressive delays
   Event::TimerPtr readiness_timer_;
-  
+
   // Buffered operations that should be processed after kTLS state is determined
   struct PendingReadOp {
     Buffer::Instance* buffer;
     Network::IoResult result;
     bool completed{false};
   };
-  
+
   struct PendingWriteOp {
     Buffer::Instance* buffer;
     bool end_stream;
     Network::IoResult result;
     bool completed{false};
   };
-  
+
   absl::optional<PendingReadOp> pending_read_;
   absl::optional<PendingWriteOp> pending_write_;
-  
+
   // Maximum number of attempts to enable kTLS before giving up
   static constexpr uint32_t MAX_KTLS_ATTEMPTS = 5;
 
-#ifdef HAS_SPLICE_SYSCALL  
-  // Only declare splicing support if the syscall is available
+  // Always declare socket_splicing_ to make the code simpler
   std::unique_ptr<KtlsSocketSplicing> socket_splicing_;
-#endif
 };
 
 /**
