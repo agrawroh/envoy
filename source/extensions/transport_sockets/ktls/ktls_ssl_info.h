@@ -53,6 +53,13 @@ public:
    * @return true if parameters were successfully extracted, false otherwise.
    */
   virtual bool extractCryptoParams() const PURE;
+  
+  /**
+   * Initialize sequence numbers based on kernel version and capabilities
+   * @param ktls_mode The kernel capability mode (0=basic, 1=partial, 2=full)
+   * @return true if sequence numbers were successfully initialized, false otherwise
+   */
+  virtual bool initializeSequenceNumbers(int ktls_mode) const PURE;
 };
 
 using KtlsInfoConstSharedPtr = std::shared_ptr<const KtlsInfo>;

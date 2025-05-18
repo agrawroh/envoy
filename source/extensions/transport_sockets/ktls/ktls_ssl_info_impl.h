@@ -1,7 +1,20 @@
 #pragma once
 
+#include <string>
+#include <vector>
+
+#include "envoy/ssl/connection.h"
+
 #include "source/common/common/logger.h"
 #include "source/extensions/transport_sockets/ktls/ktls_ssl_info.h"
+
+#ifdef __linux__
+#include <sys/socket.h>
+#include <linux/tls.h>
+using tls_crypto_info_t = struct tls12_crypto_info_aes_gcm_128;
+#else
+using tls_crypto_info_t = void*;
+#endif
 
 namespace Envoy {
 namespace Extensions {
@@ -23,6 +36,9 @@ public:
   
   // Override from KtlsInfo
   bool extractCryptoParams() const override;
+
+  // Initialize sequence numbers according to kernel capabilities
+  bool initializeSequenceNumbers(int ktls_mode) const override;
 
 private:
   /**

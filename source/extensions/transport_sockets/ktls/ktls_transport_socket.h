@@ -73,6 +73,11 @@ public:
   // Set whether this is an upstream or downstream connection
   void setIsUpstream(bool is_upstream) { is_upstream_ = is_upstream; }
 
+  // Methods for stack-driven resynchronization
+  void scheduleResynchronization();
+  bool performResynchronization();
+  void resetResyncState();
+
 private:
   /**
    * Try to enable kTLS on the socket.
@@ -133,14 +138,26 @@ private:
   bool ktls_enabled_{false};
   KtlsInfoConstSharedPtr ktls_info_;
   uint32_t ktls_handshake_attempts_{0};
+  uint32_t readiness_attempts_{0};
   bool ktls_state_determined_{false};
 
-  // Timer for scheduling delayed kTLS readiness checks
+  // Timer for delayed kTLS readiness check
   Event::TimerPtr readiness_timer_;
   
-  // Counter for kTLS readiness attempts
-  uint32_t readiness_attempts_{0};
+  // Timer for resynchronization
+  Event::TimerPtr resync_timer_;
+
+  // Sequence numbers at time of kTLS initialization
+  uint64_t saved_tx_seq_{0};
+  uint64_t saved_rx_seq_{0};
   
+  // Resynchronization related members
+  uint32_t consecutive_decrypt_failures_{0};
+  bool resync_in_progress_{false};
+  uint64_t last_resync_attempt_time_ms_{0};
+  absl::optional<uint64_t> next_expected_rx_seq_;
+  bool resync_scheduled_{false};
+
   // Direction flag - whether this is upstream or downstream
   bool is_upstream_{false};
 

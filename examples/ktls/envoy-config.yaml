@@ -38,8 +38,8 @@ static_resources:
             name: envoy.transport_sockets.ktls
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.transport_sockets.ktls.v3.KtlsTransportSocket
-              enable_tx_zerocopy: true
-              enable_rx_no_pad: true
+              enable_tx_zerocopy: false
+              enable_rx_no_pad: false
               tls_socket_config:
                 name: envoy.transport_sockets.tls
                 typed_config:
@@ -55,7 +55,7 @@ static_resources:
                         - ECDHE-RSA-AES128-GCM-SHA256
   clusters:
     - name: service
-      connect_timeout: 0.25s
+      connect_timeout: 5s
       type: STRICT_DNS
       dns_lookup_family: V4_ONLY 
       lb_policy: ROUND_ROBIN
@@ -66,7 +66,7 @@ static_resources:
               - endpoint:
                   address:
                     socket_address:
-                      address: www.google.com
+                      address: mirror.pkgbuild.com
                       port_value: 443
       transport_socket:
         name: envoy.transport_sockets.ktls
@@ -78,7 +78,7 @@ static_resources:
             name: envoy.transport_sockets.tls
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-              sni: www.google.com
+              sni: mirror.pkgbuild.com
               common_tls_context:
                 tls_params:
                   tls_minimum_protocol_version: TLSv1_2

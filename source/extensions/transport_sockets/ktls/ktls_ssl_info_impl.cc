@@ -330,65 +330,13 @@ bool KtlsSslInfoImpl::extractKeyMaterial() const {
     return false;
   }
 
-  // Get current sequence numbers and store them in network byte order.
-  uint64_t seq_num_hton;
+  // Initialize sequence number vectors with zeros
+  // The actual sequence numbers will be set in initializeSequenceNumbers
+  // based on kernel version capabilities
+  memset(client_write_seq_.data(), 0, 8);
+  memset(server_write_seq_.data(), 0, 8);
   
-  // CRITICAL FIX: Always initialize sequence number vectors first
-  client_write_seq_.resize(8, 0);
-  server_write_seq_.resize(8, 0);
-  
-  // Log original sequence numbers for diagnostic purposes
-  ENVOY_LOG(debug, "=== SEQUENCE NUMBER HANDLING FOR kTLS ===");
-  
-  if (is_client_) {
-    // CLIENT SIDE HANDLING
-    uint64_t client_tx_seq = SSL_get_write_sequence(ssl_handle);
-    uint64_t client_rx_seq = SSL_get_read_sequence(ssl_handle);
-    
-    ENVOY_LOG(debug, "CLIENT original TX sequence number: {}", client_tx_seq);
-    ENVOY_LOG(debug, "CLIENT original RX sequence number: {}", client_rx_seq);
-    
-    // ALWAYS FORCE TO ZERO for kTLS - key to preventing EBADMSG errors
-    client_tx_seq = 0;
-    client_rx_seq = 0;
-    
-    ENVOY_LOG(debug, "CLIENT forced TX sequence number: {}", client_tx_seq);
-    ENVOY_LOG(debug, "CLIENT forced RX sequence number: {}", client_rx_seq);
-    
-    // Write to client_write_seq_ (client sending direction)
-    seq_num_hton = htobe64(client_tx_seq);
-    memcpy(client_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
-    
-    // Write to server_write_seq_ (server sending to client direction)
-    seq_num_hton = htobe64(client_rx_seq);
-    memcpy(server_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
-  } else {
-    // SERVER SIDE HANDLING
-    uint64_t server_tx_seq = SSL_get_write_sequence(ssl_handle);
-    uint64_t server_rx_seq = SSL_get_read_sequence(ssl_handle);
-    
-    ENVOY_LOG(debug, "SERVER original TX sequence number: {}", server_tx_seq);
-    ENVOY_LOG(debug, "SERVER original RX sequence number: {}", server_rx_seq);
-    
-    // ALWAYS FORCE TO ZERO for kTLS - key to preventing EBADMSG errors
-    server_tx_seq = 0;
-    server_rx_seq = 0;
-    
-    ENVOY_LOG(debug, "SERVER forced TX sequence number: {}", server_tx_seq);
-    ENVOY_LOG(debug, "SERVER forced RX sequence number: {}", server_rx_seq);
-    
-    // Write to server_write_seq_ (server sending direction)
-    seq_num_hton = htobe64(server_tx_seq);
-    memcpy(server_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
-    
-    // Write to client_write_seq_ (client sending to server direction)
-    seq_num_hton = htobe64(server_rx_seq);
-    memcpy(client_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
-  }
-  
-  ENVOY_LOG(debug, "=== END SEQUENCE NUMBER HANDLING ===");
-
-  ENVOY_LOG(debug, "Successfully extracted TLS key material and sequence numbers");
+  ENVOY_LOG(debug, "Successfully extracted TLS key material");
 
   ENVOY_LOG(debug, "Client write key size: {}", client_write_key_.size());
   ENVOY_LOG(debug, "Server write key size: {}", server_write_key_.size());
@@ -396,24 +344,112 @@ bool KtlsSslInfoImpl::extractKeyMaterial() const {
   ENVOY_LOG(debug, "Server write IV size: {}", server_write_iv_.size());
   ENVOY_LOG(debug, "Client write SEQ size: {}", client_write_seq_.size());
   ENVOY_LOG(debug, "Server write SEQ size: {}", server_write_seq_.size());
-  
-  // Log first byte of sequence numbers for quick verification
-  if (!client_write_seq_.empty()) ENVOY_LOG(debug, "Client Write SEQ[0]: 0x{:02x}", client_write_seq_[0]);
-  if (!server_write_seq_.empty()) ENVOY_LOG(debug, "Server Write SEQ[0]: 0x{:02x}", server_write_seq_[0]);
-
-  // Add detailed logging of all 8 bytes of sequence numbers in hex
-  if (client_write_seq_.size() == 8) {
-    ENVOY_LOG(debug, "Client Write SEQ full (hex): {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-              client_write_seq_[0], client_write_seq_[1], client_write_seq_[2], client_write_seq_[3],
-              client_write_seq_[4], client_write_seq_[5], client_write_seq_[6], client_write_seq_[7]);
-  }
-  if (server_write_seq_.size() == 8) {
-    ENVOY_LOG(debug, "Server Write SEQ full (hex): {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-              server_write_seq_[0], server_write_seq_[1], server_write_seq_[2], server_write_seq_[3],
-              server_write_seq_[4], server_write_seq_[5], server_write_seq_[6], server_write_seq_[7]);
-  }
 
   params_extracted_ = true;
+  return true;
+}
+
+bool KtlsSslInfoImpl::initializeSequenceNumbers(int ktls_mode) const {
+  // Make sure we have extracted parameters first
+  if (!params_extracted_ || !extractCryptoParams()) {
+    ENVOY_LOG(debug, "Cannot initialize sequence numbers: parameters not extracted");
+    return false;
+  }
+  
+  // Get the SSL handle to access current sequence numbers
+  SSL* ssl_handle = nullptr;
+  const Extensions::TransportSockets::Tls::ConnectionInfoImplBase* impl_base =
+      dynamic_cast<const Extensions::TransportSockets::Tls::ConnectionInfoImplBase*>(
+          ssl_info_.get());
+  if (impl_base) {
+    ssl_handle = impl_base->ssl();
+  }
+  
+  if (!ssl_handle) {
+    ENVOY_LOG(debug, "Cannot initialize sequence numbers: no SSL handle");
+    return false;
+  }
+  
+  // Get current sequence numbers - FIXED: The order of these is switched on server side
+  // For client: TX = write, RX = read
+  // For server: TX = read, RX = write  <-- This was incorrect 
+  // Correct mapping: For both client and server, TX = write_sequence, RX = read_sequence
+  uint64_t current_tx_seq = SSL_get_write_sequence(ssl_handle);
+  uint64_t current_rx_seq = SSL_get_read_sequence(ssl_handle);
+  
+  ENVOY_LOG(debug, "Current SSL sequence numbers - TX: {}, RX: {}", current_tx_seq, current_rx_seq);
+  
+  // Handle sequence numbers based on kernel mode:
+  // ktls_mode = 0: Basic kTLS (4.13-4.16) - requires zero sequence numbers
+  // ktls_mode = 1: Partial support (4.17-5.14) - can handle non-zero but with limitations
+  // ktls_mode = 2: Full support (5.15+) - fully supports non-zero sequence numbers
+  
+  uint64_t tx_seq_to_use, rx_seq_to_use;
+  
+  if (ktls_mode >= 2) {
+    // Full non-zero sequence number support
+    ENVOY_LOG(debug, "Using full non-zero sequence number support (kernel 5.15+)");
+    tx_seq_to_use = current_tx_seq;
+    rx_seq_to_use = current_rx_seq;
+  } else if (ktls_mode == 1) {
+    // Partial non-zero sequence number support
+    // Use sequence numbers if they're both small (< 1000), otherwise zero them
+    if (current_tx_seq < 1000 && current_rx_seq < 1000) {
+      ENVOY_LOG(debug, "Using non-zero sequence numbers with partial support (kernel 4.17-5.14)");
+      tx_seq_to_use = current_tx_seq;
+      rx_seq_to_use = current_rx_seq;
+    } else {
+      ENVOY_LOG(warn, "Sequence numbers too large for partial support kernel: TX={}, RX={}. "
+                "Falling back to zeroed sequence numbers.", current_tx_seq, current_rx_seq);
+      tx_seq_to_use = 0;
+      rx_seq_to_use = 0;
+    }
+  } else {
+    // Basic support - must use zero sequence numbers
+    ENVOY_LOG(debug, "Using zeroed sequence numbers for basic kTLS support (kernel 4.13-4.16)");
+    tx_seq_to_use = 0;
+    rx_seq_to_use = 0;
+  }
+  
+  // Update the sequence numbers in our buffers
+  uint64_t seq_num_hton;
+  
+  // Always initialize sequence number vectors first
+  client_write_seq_.resize(8, 0);
+  server_write_seq_.resize(8, 0);
+  
+  ENVOY_LOG(debug, "Using sequence numbers for kTLS: TX={}, RX={}", tx_seq_to_use, rx_seq_to_use);
+  
+  if (is_client_) {
+    // CLIENT SIDE HANDLING
+    // Write to client_write_seq_ (client sending direction)
+    seq_num_hton = htobe64(tx_seq_to_use);
+    memcpy(client_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
+    
+    // Write to server_write_seq_ (server sending to client direction)
+    seq_num_hton = htobe64(rx_seq_to_use);
+    memcpy(server_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
+  } else {
+    // SERVER SIDE HANDLING
+    // Write to server_write_seq_ (server sending direction)
+    seq_num_hton = htobe64(tx_seq_to_use);
+    memcpy(server_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
+    
+    // Write to client_write_seq_ (client sending to server direction)
+    seq_num_hton = htobe64(rx_seq_to_use);
+    memcpy(client_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
+  }
+  
+  // Verify the sequence numbers were properly stored in big endian
+  uint64_t client_verify = 0, server_verify = 0;
+  memcpy(&client_verify, client_write_seq_.data(), 8);
+  memcpy(&server_verify, server_write_seq_.data(), 8);
+  
+  ENVOY_LOG(debug, "Client write seq stored as big-endian={:#016x}, decoded={}", 
+            client_verify, be64toh(client_verify));
+  ENVOY_LOG(debug, "Server write seq stored as big-endian={:#016x}, decoded={}", 
+            server_verify, be64toh(server_verify));
+  
   return true;
 }
 
