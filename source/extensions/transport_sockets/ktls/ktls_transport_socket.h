@@ -56,9 +56,34 @@ private:
   void determineKtlsReadiness();
 
   /**
+   * Schedule the next kTLS readiness determination with progressive delay.
+   */
+  void scheduleKtlsReadinessCheck();
+
+  /**
+   * Check if the SSL handshake is complete.
+   * @return true if the handshake is complete, false otherwise.
+   */
+  bool isSslHandshakeComplete() const;
+
+  /**
    * Process any pending operations now that kTLS readiness is determined.
    */
   void processPendingOps();
+  
+  /**
+   * The current state of kTLS for this socket
+   */
+  enum class KtlsState { Unknown, Supported, Unsupported };
+  
+  /**
+   * Set the kTLS state and mark state as determined
+   */
+  void setKtlsState(KtlsState state) {
+    ktls_enabled_ = (state == KtlsState::Supported);
+    ktls_state_determined_ = true;
+    processPendingOps();
+  }
 
   Network::TransportSocketCallbacks* callbacks_{};
   bool enable_tx_zerocopy_{false};
@@ -67,6 +92,9 @@ private:
   KtlsInfoConstSharedPtr ktls_info_;
   uint32_t ktls_handshake_attempts_{0};
   bool ktls_state_determined_{false};
+  
+  // Timer for scheduling readiness checks with progressive delays
+  Event::TimerPtr readiness_timer_;
   
   // Buffered operations that should be processed after kTLS state is determined
   struct PendingReadOp {

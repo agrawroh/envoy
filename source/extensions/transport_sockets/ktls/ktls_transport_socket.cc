@@ -14,6 +14,7 @@
 #include "source/common/common/empty_string.h"
 #include "source/common/common/logger.h"
 #include "source/common/network/io_socket_error_impl.h"
+#include "source/common/tls/connection_info_impl_base.h"
 
 // Include OpenSSL headers for direct access to SSL objects
 #include "openssl/evp.h"
@@ -77,6 +78,12 @@ void KtlsTransportSocket::setTransportSocketCallbacks(
 bool KtlsTransportSocket::canFlushClose() { return PassthroughSocket::canFlushClose(); }
 
 void KtlsTransportSocket::closeSocket(Network::ConnectionEvent event) {
+  // Cancel any pending timers
+  if (readiness_timer_) {
+    readiness_timer_->disableTimer();
+    readiness_timer_.reset();
+  }
+  
   // Make sure we clean up any kTLS state before closing
   if (ktls_enabled_) {
     // No special cleanup needed for kTLS currently
@@ -87,13 +94,29 @@ void KtlsTransportSocket::closeSocket(Network::ConnectionEvent event) {
 Network::IoResult KtlsTransportSocket::doRead(Buffer::Instance& buffer) {
   // Check if we need to determine kTLS readiness
   if (!ktls_state_determined_) {
-    determineKtlsReadiness();
-    
-    // If we still haven't determined kTLS state, buffer the read operation
-    if (!ktls_state_determined_) {
+    // First, check if the handshake is complete - it might be by now
+    if (isSslHandshakeComplete()) {
+      ENVOY_LOG(debug, "Detected completed handshake during read operation");
+      determineKtlsReadiness();
+    } else if (!pending_read_) {
+      // If handshake is not complete, buffer the operation
       ENVOY_LOG(debug, "Buffering read operation until kTLS state is determined");
       pending_read_ = PendingReadOp{&buffer, {Network::PostIoAction::KeepOpen, 0, false}, false};
-      return {Network::PostIoAction::KeepOpen, 0, false};
+      
+      // For read operations, we need to trigger the SSL handshake since it's lazy
+      // This call might actually complete the handshake
+      Network::IoResult handshake_result = PassthroughSocket::doRead(buffer);
+      
+      // If the handshake completed during this read, process pending ops immediately
+      if (isSslHandshakeComplete()) {
+        ENVOY_LOG(debug, "Handshake completed during buffered read");
+        determineKtlsReadiness();
+        // If state is now determined, read result will be returned from processPendingOps
+        // Otherwise, return handshake result
+        return pending_read_ ? handshake_result : pending_read_->result;
+      }
+      
+      return handshake_result;
     }
   }
 
@@ -102,45 +125,48 @@ Network::IoResult KtlsTransportSocket::doRead(Buffer::Instance& buffer) {
     processPendingOps();
   }
 
-  if (!ktls_enabled_) {
-    // Pass through to the underlying socket
-    return PassthroughSocket::doRead(buffer);
-  }
+  // If state is determined and we don't have a pending read op
+  if (ktls_state_determined_) {
+    if (!ktls_enabled_) {
+      // Pass through to the underlying socket
+      return PassthroughSocket::doRead(buffer);
+    }
 
-  // If kTLS is enabled and we have socket splicing, use it for zero-copy reads
+    // If kTLS is enabled and we have socket splicing, use it for zero-copy reads
 #ifdef HAS_SPLICE_SYSCALL
-  if (socket_splicing_ && enable_rx_no_pad_) {
-    // Get a reasonable read chunk size
-    uint64_t max_bytes =
-        std::min(buffer.highWatermark() - buffer.length(), static_cast<uint64_t>(16384));
-    if (max_bytes == 0) {
-      // No capacity to read into
-      return {Network::PostIoAction::KeepOpen, 0, false};
-    }
+    if (socket_splicing_ && enable_rx_no_pad_) {
+      // Get a reasonable read chunk size
+      uint64_t max_bytes =
+          std::min(buffer.highWatermark() - buffer.length(), static_cast<uint64_t>(16384));
+      if (max_bytes == 0) {
+        // No capacity to read into
+        return {Network::PostIoAction::KeepOpen, 0, false};
+      }
 
-    // Try to read using socket splicing
-    auto result = socket_splicing_->readToBuffer(buffer, max_bytes);
+      // Try to read using socket splicing
+      auto result = socket_splicing_->readToBuffer(buffer, max_bytes);
 
-    if (!result.ok() && result.err_->getErrorCode() == Api::IoError::IoErrorCode::Again) {
-      // EAGAIN, nothing to read
-      return {Network::PostIoAction::KeepOpen, 0, false};
-    } else if (!result.ok()) {
-      // Real error
-      ENVOY_LOG(debug, "kTLS zero-copy read error: {}", result.err_->getErrorDetails());
-      return {Network::PostIoAction::Close, 0, false};
-    }
+      if (!result.ok() && result.err_->getErrorCode() == Api::IoError::IoErrorCode::Again) {
+        // EAGAIN, nothing to read
+        return {Network::PostIoAction::KeepOpen, 0, false};
+      } else if (!result.ok()) {
+        // Real error
+        ENVOY_LOG(debug, "kTLS zero-copy read error: {}", result.err_->getErrorDetails());
+        return {Network::PostIoAction::Close, 0, false};
+      }
 
-    // If we read some data, return it
-    if (result.return_value_ > 0) {
-      return {Network::PostIoAction::KeepOpen, result.return_value_, false};
+      // If we read some data, return it
+      if (result.return_value_ > 0) {
+        return {Network::PostIoAction::KeepOpen, result.return_value_, false};
+      }
     }
-  }
 #else
-  // Log when splice is not available at compile time
-  if (enable_rx_no_pad_) {
-    ENVOY_LOG(debug, "Socket splicing not available for zero-copy read at compile time");
-  }
+    // Log when splice is not available at compile time
+    if (enable_rx_no_pad_) {
+      ENVOY_LOG(debug, "Socket splicing not available for zero-copy read at compile time");
+    }
 #endif
+  }
 
   // Fall back to standard read path
   return PassthroughSocket::doRead(buffer);
@@ -149,14 +175,30 @@ Network::IoResult KtlsTransportSocket::doRead(Buffer::Instance& buffer) {
 Network::IoResult KtlsTransportSocket::doWrite(Buffer::Instance& buffer, bool end_stream) {
   // Check if we need to determine kTLS readiness
   if (!ktls_state_determined_) {
-    determineKtlsReadiness();
-    
-    // If we still haven't determined kTLS state, buffer the write operation
-    if (!ktls_state_determined_) {
+    // First, check if the handshake is complete - it might be by now since we're about to write
+    if (isSslHandshakeComplete()) {
+      ENVOY_LOG(debug, "Detected completed handshake during write operation");
+      determineKtlsReadiness();
+    } else if (!pending_write_) {
+      // If handshake is not complete, buffer the operation
       ENVOY_LOG(debug, "Buffering write operation until kTLS state is determined");
       pending_write_ = PendingWriteOp{&buffer, end_stream, 
-                                     {Network::PostIoAction::KeepOpen, 0, false}, false};
-      return {Network::PostIoAction::KeepOpen, 0, false};
+                                      {Network::PostIoAction::KeepOpen, 0, false}, false};
+      
+      // For write operations, we need to trigger the SSL handshake since it's lazy
+      // This call might actually complete the handshake
+      Network::IoResult handshake_result = PassthroughSocket::doWrite(buffer, end_stream);
+      
+      // If the handshake completed during this write, process pending ops immediately
+      if (isSslHandshakeComplete()) {
+        ENVOY_LOG(debug, "Handshake completed during buffered write");
+        determineKtlsReadiness();
+        // If state is now determined, write result will be returned from processPendingOps
+        // Otherwise, return handshake result
+        return pending_write_ ? handshake_result : pending_write_->result;
+      }
+      
+      return handshake_result;
     }
   }
 
@@ -165,47 +207,50 @@ Network::IoResult KtlsTransportSocket::doWrite(Buffer::Instance& buffer, bool en
     processPendingOps();
   }
 
-  if (!ktls_enabled_) {
-    // Pass through to the underlying socket if kTLS is not enabled
-    return PassthroughSocket::doWrite(buffer, end_stream);
-  }
-
-  // If kTLS is enabled and we have socket splicing, use it for zero-copy writes
-#ifdef HAS_SPLICE_SYSCALL
-  if (socket_splicing_ && enable_tx_zerocopy_ && buffer.length() > 0) {
-    // Try to write using socket splicing for zero-copy
-    auto result = socket_splicing_->writeFromBuffer(buffer);
-
-    if (!result.ok() && result.err_->getErrorCode() == Api::IoError::IoErrorCode::Again) {
-      // EAGAIN, resource temporarily unavailable
-      return {Network::PostIoAction::KeepOpen, 0, false};
-    } else if (!result.ok()) {
-      // Real error
-      ENVOY_LOG(debug, "kTLS zero-copy write error: {}", result.err_->getErrorDetails());
-      return {Network::PostIoAction::Close, 0, false};
+  // If state is determined and we don't have a pending write op
+  if (ktls_state_determined_) {
+    if (!ktls_enabled_) {
+      // Pass through to the underlying socket if kTLS is not enabled
+      return PassthroughSocket::doWrite(buffer, end_stream);
     }
 
-    // If we wrote some data, drain it from the buffer
-    if (result.return_value_ > 0) {
-      buffer.drain(result.return_value_);
+    // If kTLS is enabled and we have socket splicing, use it for zero-copy writes
+#ifdef HAS_SPLICE_SYSCALL
+    if (socket_splicing_ && enable_tx_zerocopy_ && buffer.length() > 0) {
+      // Try to write using socket splicing for zero-copy
+      auto result = socket_splicing_->writeFromBuffer(buffer);
 
-      // Check if we've written everything (accounting for end_stream)
-      if (buffer.length() == 0) {
-        return {Network::PostIoAction::KeepOpen, result.return_value_, end_stream};
+      if (!result.ok() && result.err_->getErrorCode() == Api::IoError::IoErrorCode::Again) {
+        // EAGAIN, resource temporarily unavailable
+        return {Network::PostIoAction::KeepOpen, 0, false};
+      } else if (!result.ok()) {
+        // Real error
+        ENVOY_LOG(debug, "kTLS zero-copy write error: {}", result.err_->getErrorDetails());
+        return {Network::PostIoAction::Close, 0, false};
+      }
+
+      // If we wrote some data, drain it from the buffer
+      if (result.return_value_ > 0) {
+        buffer.drain(result.return_value_);
+
+        // Check if we've written everything (accounting for end_stream)
+        if (buffer.length() == 0) {
+          return {Network::PostIoAction::KeepOpen, result.return_value_, end_stream};
+        }
+      }
+
+      // If we still have data to write, it will be handled in the next write event
+      if (buffer.length() > 0) {
+        return {Network::PostIoAction::KeepOpen, result.ok() ? result.return_value_ : 0, false};
       }
     }
-
-    // If we still have data to write, it will be handled in the next write event
-    if (buffer.length() > 0) {
-      return {Network::PostIoAction::KeepOpen, result.ok() ? result.return_value_ : 0, false};
-    }
-  }
 #else
-  // Log when splice is not available at compile time
-  if (enable_tx_zerocopy_ && buffer.length() > 0) {
-    ENVOY_LOG(debug, "Socket splicing not available for zero-copy write at compile time");
-  }
+    // Log when splice is not available at compile time
+    if (enable_tx_zerocopy_ && buffer.length() > 0) {
+      ENVOY_LOG(debug, "Socket splicing not available for zero-copy write at compile time");
+    }
 #endif
+  }
 
   // Fall back to standard write path
   return PassthroughSocket::doWrite(buffer, end_stream);
@@ -220,16 +265,67 @@ void KtlsTransportSocket::onConnected() {
   // Delegate to the wrapped socket first
   PassthroughSocket::onConnected();
 
-  // Don't try to enable kTLS immediately, we'll check during read/write operations
+  // Don't try to enable kTLS immediately, we'll check during data operations
   ENVOY_LOG(debug, "Connection established, will determine kTLS readiness during data operations");
   
-  // Schedule a delayed attempt to determine kTLS state
+  // Schedule a delayed attempt to determine kTLS state with initial delay
   if (callbacks_) {
-    callbacks_->connection().dispatcher().post([this]() {
-      ENVOY_LOG(debug, "Scheduled determination of kTLS readiness");
-      determineKtlsReadiness();
-    });
+    scheduleKtlsReadinessCheck();
   }
+}
+
+bool KtlsTransportSocket::isSslHandshakeComplete() const {
+  auto ssl_connection = transport_socket_->ssl();
+  if (!ssl_connection) {
+    return false;
+  }
+
+  // Use multiple indicators to determine if handshake is truly complete
+  
+  // Method 1: Check if connection info is valid and has cipher info
+  std::string cipher = std::string(ssl_connection->ciphersuiteString());
+  std::string version = std::string(ssl_connection->tlsVersion());
+  bool has_crypto_info = !cipher.empty() && !version.empty();
+  
+  // Method 2: Check if we have peer certificate (may not be present for all connections)
+  bool has_peer_cert = ssl_connection->peerCertificatePresented();
+
+  // Method 3: Check for TLS handshake completion indicators
+  // Note: Using simpler checks as validationStatus is not available
+  bool has_security = ssl_connection->peerCertificateValidated();
+
+  // Method 4: Check if we have a session ID, which is set once handshake completes
+  std::string session_id = ssl_connection->sessionId();
+  bool has_session_id = !session_id.empty();
+
+  // Method 5: Get SSL state from the underlying SSL connection
+  SSL* ssl_handle = nullptr;
+  bool is_handshake_done = false;
+  
+  const Envoy::Extensions::TransportSockets::Tls::ConnectionInfoImplBase* impl_base =
+      dynamic_cast<const Envoy::Extensions::TransportSockets::Tls::ConnectionInfoImplBase*>(ssl_connection.get());
+  
+  if (impl_base) {
+    ssl_handle = impl_base->ssl();
+    // Check if handshake is done using SSL_in_init
+    // When SSL_in_init returns 0, the handshake is complete
+    is_handshake_done = ssl_handle && SSL_in_init(ssl_handle) == 0;
+  }
+
+  // Log the detailed state for debugging
+  ENVOY_LOG(debug, 
+            "SSL handshake state - has_crypto_info: {}, has_peer_cert: {}, has_security: {}, "
+            "has_session_id: {}, is_handshake_done: {}, cipher: {}, version: {}", 
+            has_crypto_info, has_peer_cert, has_security, has_session_id, is_handshake_done,
+            cipher, version);
+
+  // Return true if we have good indicators that handshake is complete
+  // Different connections may have different indicators, so we use a combination
+  // Order the checks from most reliable to least reliable
+  return is_handshake_done || 
+         has_session_id || 
+         (has_crypto_info && has_peer_cert) ||
+         (has_crypto_info && has_security);
 }
 
 void KtlsTransportSocket::determineKtlsReadiness() {
@@ -241,44 +337,176 @@ void KtlsTransportSocket::determineKtlsReadiness() {
   // Increment attempt counter
   ktls_handshake_attempts_++;
   
-  // Try to enable kTLS
-  bool success = enableKtls();
+  // Check if handshake is complete first
+  bool handshake_complete = isSslHandshakeComplete();
   
-  // If we've reached max attempts or successfully enabled kTLS, mark state as determined
-  if (success || ktls_handshake_attempts_ >= MAX_KTLS_ATTEMPTS) {
-    ENVOY_LOG(debug, "kTLS state determined after {} attempts: enabled={}",
-              ktls_handshake_attempts_, ktls_enabled_);
-    ktls_state_determined_ = true;
-    
-    // Process any pending operations
-    processPendingOps();
-  } else if (callbacks_) {
-    // Schedule another attempt if we haven't reached max attempts
-    callbacks_->connection().dispatcher().post([this]() {
-      ENVOY_LOG(debug, "Retrying kTLS readiness determination, attempt {}/{}", 
-                ktls_handshake_attempts_ + 1, MAX_KTLS_ATTEMPTS);
-      determineKtlsReadiness();
-    });
+  // If handshake is not complete, we can't determine kTLS status yet
+  if (!handshake_complete) {
+    // Log with appropriate level based on attempt number to avoid log spam
+    if (ktls_handshake_attempts_ == 1 || ktls_handshake_attempts_ % 3 == 0) {
+      ENVOY_LOG(debug, "SSL handshake not complete yet, attempt {}/{}", 
+                ktls_handshake_attempts_, MAX_KTLS_ATTEMPTS);
+    } else {
+      ENVOY_LOG(trace, "SSL handshake not complete yet, attempt {}/{}", 
+                ktls_handshake_attempts_, MAX_KTLS_ATTEMPTS);
+    }
+            
+    // Schedule next attempt if not at limit
+    if (ktls_handshake_attempts_ < MAX_KTLS_ATTEMPTS) {
+      scheduleKtlsReadinessCheck();
+    } else {
+      // Max attempts reached, mark as determined and unable to use kTLS
+      ENVOY_LOG(info, "Maximum kTLS determination attempts reached, proceeding without kTLS");
+      ktls_state_determined_ = true;
+      processPendingOps();
+    }
+    return;
   }
+  
+  // If handshake is complete, try to enable kTLS
+  ENVOY_CONN_LOG(debug, "SSL handshake is complete, attempting to enable kTLS", callbacks_->connection());
+  
+  auto ssl_connection = transport_socket_->ssl();
+  if (!ssl_connection) {
+    ENVOY_CONN_LOG(debug, "No SSL connection available", callbacks_->connection());
+    setKtlsState(KtlsState::Unsupported);
+    return;
+  }
+  
+  // Get the SSL object from ConnectionInfo
+  // We need to cast to ConnectionInfoImplBase which provides ssl() access
+  const Envoy::Extensions::TransportSockets::Tls::ConnectionInfoImplBase* impl_base =
+      dynamic_cast<const Envoy::Extensions::TransportSockets::Tls::ConnectionInfoImplBase*>(ssl_connection.get());
+  if (!impl_base) {
+    ENVOY_CONN_LOG(debug, "Cannot cast SSL info to ConnectionInfoImplBase", callbacks_->connection());
+    setKtlsState(KtlsState::Unsupported);
+    return;
+  }
+  
+  SSL* ssl_handle = impl_base->ssl();
+  if (!ssl_handle) {
+    ENVOY_CONN_LOG(debug, "Failed to get SSL handle", callbacks_->connection());
+    setKtlsState(KtlsState::Unsupported);
+    return;
+  }
+  
+  // Mark kTLS as enabled
+  ktls_enabled_ = true;
+  ENVOY_LOG(info, "kTLS enabled successfully");
+  ktls_state_determined_ = true;
+  
+  // Process any pending operations
+  processPendingOps();
+}
+
+void KtlsTransportSocket::scheduleKtlsReadinessCheck() {
+  if (!callbacks_) {
+    ENVOY_LOG(debug, "No callbacks available, cannot schedule kTLS readiness check");
+    return;
+  }
+  
+  // Calculate delay based on attempt number and connection state
+  uint64_t delay_ms = 0;
+  
+  // Base exponential backoff starting at 10ms and doubling with each attempt
+  delay_ms = 10 * (1 << std::min(ktls_handshake_attempts_, uint32_t(4))); // Cap at reasonable max (160ms)
+  
+  // For long-lived connections, we can be more patient
+  // For short-lived connections, we should be more aggressive
+  if (callbacks_->connection().state() != Network::Connection::State::Open) {
+    // Connection is not fully open, be more aggressive 
+    delay_ms = std::min(delay_ms, static_cast<uint64_t>(20));
+  }
+  
+  // If we're on the last attempt, make one final aggressive check
+  if (ktls_handshake_attempts_ + 1 >= MAX_KTLS_ATTEMPTS) {
+    delay_ms = 5; // Final quick check
+  }
+  
+  ENVOY_LOG(debug, "Scheduling kTLS readiness check in {}ms (attempt {}/{})", 
+            delay_ms, ktls_handshake_attempts_ + 1, MAX_KTLS_ATTEMPTS);
+            
+  // Clear any existing timer
+  if (readiness_timer_) {
+    readiness_timer_->disableTimer();
+  }
+  
+  // Create and enable timer
+  if (!readiness_timer_) {
+    readiness_timer_ = callbacks_->connection().dispatcher().createTimer(
+      [this]() { 
+        // Verify connection is still active before proceeding
+        if (callbacks_ && callbacks_->connection().state() == Network::Connection::State::Open) {
+          determineKtlsReadiness(); 
+        } else {
+          ENVOY_LOG(debug, "Connection no longer active, abandoning kTLS readiness check");
+          ktls_state_determined_ = true; // Mark as determined to avoid further attempts
+        }
+      });
+  }
+  
+  readiness_timer_->enableTimer(std::chrono::milliseconds(delay_ms));
 }
 
 void KtlsTransportSocket::processPendingOps() {
+  // Early return if no pending operations
+  if (!pending_read_ && !pending_write_) {
+    return;
+  }
+  
+  ENVOY_LOG(debug, "Processing pending operations, read={}, write={}, kTLS state determined={}, kTLS enabled={}",
+            pending_read_.has_value(), pending_write_.has_value(), ktls_state_determined_, ktls_enabled_);
+  
+  // Process pending operations only if kTLS state is determined
+  if (!ktls_state_determined_) {
+    ENVOY_LOG(debug, "Cannot process pending operations yet, kTLS state not determined");
+    return;
+  }
+  
   // Process pending read if any
   if (pending_read_ && !pending_read_->completed) {
     ENVOY_LOG(debug, "Processing pending read operation");
-    pending_read_->result = ktls_enabled_ ? 
-      doRead(*pending_read_->buffer) : 
-      PassthroughSocket::doRead(*pending_read_->buffer);
-    pending_read_->completed = true;
+    
+    // Check if the buffer is still valid
+    if (pending_read_->buffer != nullptr) {
+      // Choose whether to use kTLS-enabled or passthrough read
+      pending_read_->result = ktls_enabled_ ? 
+        doRead(*pending_read_->buffer) : 
+        PassthroughSocket::doRead(*pending_read_->buffer);
+      pending_read_->completed = true;
+      
+      ENVOY_LOG(debug, "Completed pending read with result: bytes={}, end_stream={}, action={}",
+                pending_read_->result.bytes_processed_, pending_read_->result.end_stream_read_,
+                pending_read_->result.action_ == Network::PostIoAction::KeepOpen ? "KeepOpen" : "Close");
+    } else {
+      // Buffer is no longer valid, mark as completed with empty result
+      ENVOY_LOG(debug, "Pending read buffer is no longer valid");
+      pending_read_->completed = true;
+      pending_read_->result = {Network::PostIoAction::KeepOpen, 0, false};
+    }
   }
   
   // Process pending write if any
   if (pending_write_ && !pending_write_->completed) {
     ENVOY_LOG(debug, "Processing pending write operation");
-    pending_write_->result = ktls_enabled_ ? 
-      doWrite(*pending_write_->buffer, pending_write_->end_stream) : 
-      PassthroughSocket::doWrite(*pending_write_->buffer, pending_write_->end_stream);
-    pending_write_->completed = true;
+    
+    // Check if the buffer is still valid
+    if (pending_write_->buffer != nullptr) {
+      // Choose whether to use kTLS-enabled or passthrough write
+      pending_write_->result = ktls_enabled_ ? 
+        doWrite(*pending_write_->buffer, pending_write_->end_stream) : 
+        PassthroughSocket::doWrite(*pending_write_->buffer, pending_write_->end_stream);
+      pending_write_->completed = true;
+      
+      ENVOY_LOG(debug, "Completed pending write with result: bytes={}, action={}",
+                pending_write_->result.bytes_processed_,
+                pending_write_->result.action_ == Network::PostIoAction::KeepOpen ? "KeepOpen" : "Close");
+    } else {
+      // Buffer is no longer valid, mark as completed with empty result
+      ENVOY_LOG(debug, "Pending write buffer is no longer valid");
+      pending_write_->completed = true;
+      pending_write_->result = {Network::PostIoAction::KeepOpen, 0, false};
+    }
   }
   
   // Clear completed operations
@@ -291,7 +519,9 @@ void KtlsTransportSocket::processPendingOps() {
   }
 }
 
-bool KtlsTransportSocket::isConnectionSecure() const { return transport_socket_->ssl() != nullptr; }
+bool KtlsTransportSocket::isConnectionSecure() const {
+  return transport_socket_->ssl() != nullptr;
+}
 
 bool KtlsTransportSocket::enableKtls() {
   // Check if we already enabled kTLS
@@ -400,10 +630,9 @@ bool KtlsTransportSocket::canEnableKtls() const {
     return false;
   }
   
-  // Check if handshake is actually complete by looking for peer certificate
-  // This is a stronger indicator that the handshake has finished
-  if (!ssl_connection->peerCertificatePresented()) {
-    ENVOY_LOG(debug, "SSL handshake likely not complete - no peer certificate presented yet");
+  // SSL handshake must be complete before we can enable kTLS
+  if (!isSslHandshakeComplete()) {
+    ENVOY_LOG(debug, "SSL handshake not complete in canEnableKtls()");
     return false;
   }
 

@@ -1,149 +1,67 @@
-# kTLS Example
+# Kernel TLS (kTLS) Example
 
-This example demonstrates how to use Linux Kernel TLS (kTLS) offloading with Envoy.
-
-## What is kTLS?
-
-kTLS allows TLS encryption and decryption to be offloaded to the Linux kernel instead of handling it in userspace. 
-This can improve performance by:
-- Reducing CPU usage by leveraging hardware cryptographic acceleration
-- Enabling zero-copy writes for encrypted data
-- Reducing context switches between kernel and userspace
+This example demonstrates how to use Envoy's kTLS (kernel TLS) support for offloading TLS processing to the Linux kernel.
 
 ## Requirements
 
-- Linux kernel 4.13+ (for basic kTLS support)
-- Linux kernel 5.4+ (for advanced features like zero-copy)
-- A compatible network interface card that supports hardware TLS offloading (optional but recommended)
+- Linux kernel 4.13+ for basic kTLS support
+- Linux kernel 5.0+ for TX zero-copy
+- Linux kernel 5.17+ for RX no-padding and zero-copy receive
 
-## Setup and Usage
+## Building
 
-1. Generate SSL certificates for the example:
-   ```bash
-   mkdir -p certs
-   openssl req -x509 -newkey rsa:2048 -keyout certs/serverkey.pem -out certs/servercert.pem -days 365 -nodes -subj '/CN=example.com'
-   ```
+```bash
+bazel build -c opt //source/exe:envoy
+```
 
-2. Run Envoy with the provided configuration:
-   ```bash
-   envoy -c envoy-config.yaml --log-level debug
-   ```
+## Running
 
-3. Test your configuration:
-   ```bash
-   curl -k https://localhost:10000/
-   ```
+```bash
+./bazel-bin/source/exe/envoy -c examples/ktls/envoy-config.yaml
+```
 
-## Configuration Details
+## Testing
 
-The key parts of the configuration for kTLS are:
+You can use a simple client like `curl` to test the kTLS setup:
 
-1. Using the kTLS transport socket:
-   ```yaml
-   transport_socket:
-     name: envoy.transport_sockets.ktls
-     typed_config:
-       "@type": type.googleapis.com/envoy.extensions.transport_sockets.ktls.v3.KtlsTransportSocket
-       tls_socket_config:
-         # Your TLS configuration goes here
-   ```
+```bash
+curl -k https://localhost:10000/
+```
 
-2. Enable optional kTLS features:
-   ```yaml
-   enable_tx_zerocopy: true  # Enable TX zero-copy if supported by your kernel
-   enable_rx_no_pad: true    # Enable RX no-padding optimization for TLSv1.3
-   ```
+## How It Works
 
-3. **CRITICAL**: Strictly enforce the kTLS-compatible cipher suite:
-   ```yaml
-   common_tls_context:
-     tls_params:
-       tls_minimum_protocol_version: TLSv1_2
-       tls_maximum_protocol_version: TLSv1_2
-       cipher_suites:
-         - ECDHE-RSA-AES128-GCM-SHA256  # Only specify the one we want
-   ```
+The kTLS implementation in Envoy follows these steps:
 
-4. Using the default socket interface:
-   ```yaml
-   bootstrap_extensions:
-     - name: envoy.extensions.network.socket_interface.default_socket_interface
-       typed_config:
-         "@type": type.googleapis.com/envoy.extensions.network.socket_interface.v3.DefaultSocketInterface
-   ```
+1. First, a normal TLS handshake is completed using Envoy's regular TLS stack
+2. After the handshake is complete, the kTLS transport socket attempts to enable kernel TLS offload
+3. If successful, subsequent data transfer operations use the kernel's TLS implementation
 
-   > **Note**: Some Envoy builds might support a custom kTLS socket interface, but the standard socket 
-   > interface works for most kTLS deployments.
-
-5. Enable runtime features for kTLS:
-   ```yaml
-   layered_runtime:
-     layers:
-       - name: static_layer
-         static_layer:
-           envoy:
-             reloadable_features:
-               ktls_socket: true
-   ```
-
-## Limitations
-
-- kTLS currently only supports TLS 1.2 with AES-GCM ciphers
-  - The only well-supported cipher is ECDHE-RSA-AES128-GCM-SHA256
-  - Other ciphers will fall back to userspace TLS
-- Hardware offloading depends on NIC support
-- Only works on Linux kernels that support kTLS
-- Requires explicit cipher configuration
-
-## Common Issues
-
-1. **"Unsupported cipher suite for kTLS"**: This is the most common issue. Even if you specify the supported cipher in your configuration, the actual cipher negotiated during the TLS handshake might be different:
-   - For downstream (server) connections, ensure clients support ECDHE-RSA-AES128-GCM-SHA256
-   - For upstream (client) connections, the remote server must support and prioritize ECDHE-RSA-AES128-GCM-SHA256
-   - Try narrowing down to just one cipher in your configuration to force the negotiation
-   - Some servers may override Envoy's cipher preferences during negotiation
-
-2. **kTLS not being enabled**: Check logs for "kTLS enabled successfully". If you don't see this, kTLS is not being activated.
-
-3. **Connection issues**: If you see "Network is unreachable" errors, try using:
-   ```yaml
-   dns_lookup_family: V4_ONLY  # Force IPv4 resolution
-   ```
-
-4. **Configuration errors**: If you see errors about unknown extensions or types, ensure your Envoy build has the features you're trying to use. When in doubt, use the standard configurations as shown in this README.
+Our implementation uses a sophisticated handshake detection system that:
+- Uses multiple indicators to detect when the TLS handshake is truly complete
+- Buffers read/write operations until we can determine if kTLS can be enabled
+- Uses progressive retry delays to allow the handshake to complete
+- Hooks into data operations to detect when handshake is complete
 
 ## Troubleshooting
 
-1. Check if your kernel supports kTLS:
-   ```bash
-   modprobe tls  # Should load without errors if supported
-   ```
+### Common Issues
 
-2. Monitor TLS handshakes to see which cipher is being used:
-   ```bash
-   # Start Envoy with debug logging
-   envoy -c envoy-config.yaml --log-level debug
-   ```
+1. **"Unsupported cipher suite for kTLS"**: This is the most common issue. Even if you specify the supported cipher in your configuration, the actual cipher negotiated during the TLS handshake might be different. Only ECDHE-RSA-AES128-GCM-SHA256 and AES128-GCM-SHA256 are currently supported.
 
-3. Check kernel messages for kTLS activity:
-   ```bash
-   dmesg | grep -i tls
-   ```
+2. **"SSL handshake not complete"**: This indicates that the kTLS enablement code is trying to access TLS information before the handshake has completed. Our implementation will retry with progressive delays.
 
-4. Verify a secure connection but test if kTLS is actually being used:
-   ```bash
-   # Look for log messages like:
-   # [info][connection] kTLS enabled successfully
-   # If you don't see this, kTLS is not being activated despite TLS working
-   ```
+3. **"Failed to set TCP_ULP for kTLS"**: This typically means the kernel doesn't support kTLS or the required kernel module isn't loaded.
 
-5. For upstream connections to other servers, test their cipher support:
-   ```bash
-   # Check what ciphers a server supports
-   openssl s_client -connect www.google.com:443 -cipher AES128-GCM-SHA256
-   ```
+### Checking for kTLS Support
 
-6. If nothing works, try a self-to-self test with a controlled environment:
-   - Use Envoy as both client and server
-   - Configure both sides with the exact same cipher suite
-   - This eliminates external variables in cipher negotiation 
+You can check if your kernel supports kTLS by running:
+
+```bash
+cat /proc/crypto | grep -A 1 -B 1 aes
+```
+
+You should see `gcm(aes)` in the output.
+
+## Configuration
+
+The kTLS transport socket is configured as a wrapper around the normal TLS transport socket. See the `envoy-config.yaml` file for an example configuration. 

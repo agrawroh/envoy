@@ -7,6 +7,7 @@
 #include "source/common/common/safe_memcpy.h"
 #include "source/common/network/utility.h"
 #include "source/common/tls/utility.h"
+#include "source/common/tls/connection_info_impl_base.h"
 #include "source/extensions/transport_sockets/ktls/tls_compat.h"
 
 #include "openssl/ssl.h"
@@ -158,33 +159,138 @@ bool KtlsSslInfoImpl::extractCryptoParams() {
 }
 
 bool KtlsSslInfoImpl::extractKeyMaterial() {
-  // In Envoy, we don't have direct access to the SSL* structure from ConnectionInfo
-  // We would need to enhance the ConnectionInfo interface to expose methods for extracting
-  // key material needed for kTLS.
+  // Check if we already extracted params
+  if (params_extracted_) {
+    return true;
+  }
 
-  // For now, simulate this with placeholder values to make it compile
-  // But in a real implementation, we would get the SSL* and extract the real key material
+  // Get the SSL object from ConnectionInfo
+  // We need to cast to ConnectionInfoImplBase which provides ssl() access
+  const Extensions::TransportSockets::Tls::ConnectionInfoImplBase* impl_base =
+      dynamic_cast<const Extensions::TransportSockets::Tls::ConnectionInfoImplBase*>(ssl_info_.get());
+  if (!impl_base) {
+    ENVOY_LOG(debug, "Cannot cast SSL info to ConnectionInfoImplBase");
+    return false;
+  }
+  
+  SSL* ssl_handle = impl_base->ssl();
+  if (!ssl_handle) {
+    ENVOY_LOG(debug, "Failed to get SSL handle from ConnectionInfo");
+    return false;
+  }
 
-  // Determine if we're client or server based on ConnectionInfo
-  // In a real implementation, we would determine this from the SSL connection
-  is_client_ = false;
+  // Get the SSL_SESSION which contains key material
+  SSL_SESSION* session = SSL_get_session(ssl_handle);
+  if (!session) {
+    ENVOY_LOG(debug, "Failed to get SSL session, handshake may not be complete");
+    return false;
+  }
 
-  // In a real implementation based on ktls-utils, we would:
-  // 1. Extract master secret using SSL_SESSION_get_master_key
-  // 2. Extract client/server random values
-  // 3. Derive the key material using SSL_export_keying_material or similar
-  // 4. Set up proper record sequence numbers based on handshake completion
+  // Determine if this is a client or server
+  is_client_ = SSL_is_server(ssl_handle) == 0;
+  ENVOY_LOG(debug, "This endpoint is acting as {}", is_client_ ? "client" : "server");
 
-  // For now, use placeholder values for development
-  client_key_.resize(16, 0x01);
-  server_key_.resize(16, 0x02);
-  client_iv_.resize(8, 0x03);
-  server_iv_.resize(8, 0x04);
-  client_salt_.resize(4, 0x05);
-  server_salt_.resize(4, 0x06);
-  client_rec_seq_.resize(8, 0);
-  server_rec_seq_.resize(8, 0);
+  // Check if the TLS version is supported
+  const char* version_str = SSL_get_version(ssl_handle);
+  if (version_str == nullptr || std::string(version_str) != "TLSv1.2") {
+    ENVOY_LOG(debug, "Unsupported TLS version for kTLS: {}", 
+              version_str != nullptr ? version_str : "null");
+    return false;
+  }
 
+  // Check if the cipher suite is supported (AES128-GCM)
+  const SSL_CIPHER* cipher = SSL_get_current_cipher(ssl_handle);
+  if (cipher == nullptr) {
+    ENVOY_LOG(debug, "Failed to get current cipher");
+    return false;
+  }
+
+  // Get cipher name directly from SSL_CIPHER_get_name
+  const char* cipher_name = SSL_CIPHER_get_name(cipher);
+  if (!cipher_name || strstr(cipher_name, "AES128-GCM") == nullptr) {
+    ENVOY_LOG(debug, "Unsupported cipher for kTLS: {}", cipher_name ? cipher_name : "unknown");
+    return false;
+  }
+  ENVOY_LOG(debug, "Using cipher: {}", cipher_name);
+
+  // Get client and server random values
+  uint8_t client_random[SSL3_RANDOM_SIZE];
+  uint8_t server_random[SSL3_RANDOM_SIZE];
+  memset(client_random, 0, SSL3_RANDOM_SIZE);
+  memset(server_random, 0, SSL3_RANDOM_SIZE);
+  
+  if (SSL_get_client_random(ssl_handle, client_random, SSL3_RANDOM_SIZE) != SSL3_RANDOM_SIZE) {
+    ENVOY_LOG(debug, "Failed to get client random");
+    return false;
+  }
+  
+  if (SSL_get_server_random(ssl_handle, server_random, SSL3_RANDOM_SIZE) != SSL3_RANDOM_SIZE) {
+    ENVOY_LOG(debug, "Failed to get server random");
+    return false;
+  }
+
+  // Get master key
+  uint8_t master_key[SSL_MAX_MASTER_KEY_LENGTH];
+  memset(master_key, 0, SSL_MAX_MASTER_KEY_LENGTH);
+  size_t master_key_length = SSL_SESSION_get_master_key(session, master_key, 
+                                                       SSL_MAX_MASTER_KEY_LENGTH);
+  if (master_key_length == 0) {
+    ENVOY_LOG(debug, "Failed to get master key");
+    return false;
+  }
+  ENVOY_LOG(debug, "Master key length: {}", master_key_length);
+
+  // TLS 1.2 key derivation (RFC 5246)
+  // For TLS 1.2, we need to derive:
+  // 1. Client write key and IV (for encryption when we're client, decryption when server)
+  // 2. Server write key and IV (for encryption when we're server, decryption when client)
+  
+  // Allocate memory for keys and IVs
+  client_key_.resize(16);   // AES-128-GCM key is 16 bytes
+  server_key_.resize(16);   // AES-128-GCM key is 16 bytes
+  client_salt_.resize(4);   // Salt is first 4 bytes of IV
+  server_salt_.resize(4);   // Salt is first 4 bytes of IV
+  client_iv_.resize(8);     // Explicit nonce is 8 bytes
+  server_iv_.resize(8);     // Explicit nonce is 8 bytes
+  client_rec_seq_.resize(8, 0); // Start with sequence 0
+  server_rec_seq_.resize(8, 0); // Start with sequence 0
+
+  // Use OpenSSL's key expansion function to derive key material
+  // We need 2 keys (client, server) of 16 bytes each, and 2 IVs (client, server) of 12 bytes each
+  uint8_t key_block[64]; // Plenty of space for key material
+  memset(key_block, 0, sizeof(key_block));
+
+  // Define key expansion label and seed
+  const char* label = "key expansion";
+  uint8_t seed[SSL3_RANDOM_SIZE * 2];
+  memcpy(seed, server_random, SSL3_RANDOM_SIZE);
+  memcpy(seed + SSL3_RANDOM_SIZE, client_random, SSL3_RANDOM_SIZE);
+
+  // Use TLS PRF to derive key material
+  if (!SSL_export_keying_material(ssl_handle, key_block, sizeof(key_block), 
+                                 label, strlen(label), seed, sizeof(seed), 0)) {
+    ENVOY_LOG(debug, "Failed to export keying material");
+    return false;
+  }
+
+  // Parse key block according to TLS 1.2 with AES-128-GCM
+  // Key block format (in bytes):
+  // [client write key(16)][server write key(16)][client write IV(12)][server write IV(12)]
+  memcpy(client_key_.data(), key_block, 16);
+  memcpy(server_key_.data(), key_block + 16, 16);
+  
+  // For kTLS with AES-GCM, IV is split into salt (first 4 bytes) and explicit nonce (8 bytes)
+  memcpy(client_salt_.data(), key_block + 32, 4);
+  memcpy(client_iv_.data(), key_block + 36, 8);
+  memcpy(server_salt_.data(), key_block + 44, 4);
+  memcpy(server_iv_.data(), key_block + 48, 8);
+
+  // Record sequence numbers start at 0
+  memset(client_rec_seq_.data(), 0, client_rec_seq_.size());
+  memset(server_rec_seq_.data(), 0, server_rec_seq_.size());
+
+  ENVOY_LOG(debug, "Successfully extracted key material for kTLS");
+  params_extracted_ = true;
   return true;
 }
 
