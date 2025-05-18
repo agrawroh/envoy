@@ -5,6 +5,13 @@
 #include "source/extensions/transport_sockets/ktls/tls_compat.h"
 
 namespace Envoy {
+
+// Forward declarations
+namespace Ssl {
+class CertificateSelectionCallback;
+using CertificateSelectionCallbackPtr = std::unique_ptr<CertificateSelectionCallback>;
+}
+
 namespace Extensions {
 namespace TransportSockets {
 namespace Ktls {

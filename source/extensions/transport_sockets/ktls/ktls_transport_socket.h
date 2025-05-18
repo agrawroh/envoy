@@ -1,21 +1,38 @@
 #pragma once
 
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "envoy/network/transport_socket.h"
 #include "envoy/upstream/host_description.h"
 #include "envoy/upstream/upstream.h"
+#include "envoy/ssl/private_key/private_key.h"
+#include "envoy/ssl/ssl_socket_extended_info.h"
+#include "envoy/ssl/ssl_socket_state.h"
+#include "envoy/stats/scope.h"
+#include "envoy/stats/stats_macros.h"
 
 #include "source/common/common/logger.h"
 #include "source/common/network/io_socket_error_impl.h"
 #include "source/extensions/transport_sockets/common/passthrough.h"
 #include "source/extensions/transport_sockets/ktls/ktls_ssl_info.h"
+#include "source/extensions/transport_sockets/ktls/ktls_ssl_info_impl.h"
 
 // Include the appropriate socket splicing implementation based on platform availability
 #ifdef HAS_SPLICE_SYSCALL
 #include "source/extensions/transport_sockets/ktls/ktls_socket_splicing.h"
 #else
 #include "source/extensions/transport_sockets/ktls/ktls_socket_splicing_stub.h"
+#endif
+
+// Include Linux-specific headers only in Linux builds
+#ifdef __linux__
+#include <linux/tls.h>
+#else
+// Provide a dummy definition for non-Linux platforms
+using tls_crypto_info_t = void*;
 #endif
 
 namespace Envoy {
@@ -44,11 +61,17 @@ public:
   void onConnected() override;
   bool isConnectionSecure() const;
 
+  // Network::TransportSocketCallbacks (called by the underlying SslSocket)
+  void raiseEvent(Network::ConnectionEvent event);
+
   /**
    * Check if kTLS is enabled for this socket.
    * @return true if kTLS is enabled, false otherwise.
    */
   bool isKtlsEnabled() const;
+
+  // Set whether this is an upstream or downstream connection
+  void setIsUpstream(bool is_upstream) { is_upstream_ = is_upstream; }
 
 private:
   /**
@@ -112,8 +135,14 @@ private:
   uint32_t ktls_handshake_attempts_{0};
   bool ktls_state_determined_{false};
 
-  // Timer for scheduling readiness checks with progressive delays
+  // Timer for scheduling delayed kTLS readiness checks
   Event::TimerPtr readiness_timer_;
+  
+  // Counter for kTLS readiness attempts
+  uint32_t readiness_attempts_{0};
+  
+  // Direction flag - whether this is upstream or downstream
+  bool is_upstream_{false};
 
   // Buffered operations that should be processed after kTLS state is determined
   struct PendingReadOp {

@@ -11,6 +11,10 @@
 namespace Envoy {
 namespace Ssl {
 
+// Forward declare CertificateSelectionCallback
+class CertificateSelectionCallback;
+using CertificateSelectionCallbackPtr = std::unique_ptr<CertificateSelectionCallback>;
+
 // Opaque type defined and used by the ``ServerContext``.
 struct TlsContext;
 

@@ -96,4 +96,4 @@ bootstrap_extensions:
       "@type": type.googleapis.com/envoy.extensions.network.socket_interface.v3.KTlsSocketInterface
       enabled: true
       enable_tx_zerocopy: false
-      enable_rx_no_pad: false 
+      enable_rx_no_pad: false

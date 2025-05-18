@@ -4,6 +4,7 @@
 #include <random>
 
 #include "source/common/common/assert.h"
+#include "source/common/common/byte_order.h"
 #include "source/common/common/empty_string.h"
 #include "source/common/common/logger.h"
 #include "source/common/common/safe_memcpy.h"
@@ -237,9 +238,7 @@ bool KtlsSslInfoImpl::extractKeyMaterial() const {
   }
 
   ENVOY_LOG(debug, "Starting key material extraction for kTLS");
-  
-  // Get the SSL object from ConnectionInfo
-  // We need to cast to ConnectionInfoImplBase which provides ssl() access
+
   const Extensions::TransportSockets::Tls::ConnectionInfoImplBase* impl_base =
       dynamic_cast<const Extensions::TransportSockets::Tls::ConnectionInfoImplBase*>(
           ssl_info_.get());
@@ -254,37 +253,35 @@ bool KtlsSslInfoImpl::extractKeyMaterial() const {
     return false;
   }
 
-  // Get the SSL_SESSION which contains key material
+  if (SSL_in_init(ssl_handle) != 0) {
+    ENVOY_LOG(debug, "Handshake not complete, cannot extract key material for kTLS yet.");
+    return false;
+  }
+
   SSL_SESSION* session = SSL_get_session(ssl_handle);
   if (!session) {
     ENVOY_LOG(debug, "Failed to get SSL session");
     return false;
   }
 
-  // Determine if we're the client or server
-  int is_server = SSL_is_server(ssl_handle);
-  is_client_ = !is_server;
+  is_client_ = (SSL_is_server(ssl_handle) == 0);
   ENVOY_LOG(debug, "SSL connection is {}", is_client_ ? "client" : "server");
 
-  // Get the master key
   const SSL_CIPHER* cipher = SSL_SESSION_get0_cipher(session);
   if (!cipher) {
     ENVOY_LOG(debug, "Failed to get cipher from SSL session");
     return false;
   }
 
-  // Determine the key size based on the cipher
-  const EVP_CIPHER* evp_cipher = NULL;
-  
-  // For AES-128-GCM
+  const EVP_CIPHER* evp_cipher = nullptr;
   const char* cipher_name = SSL_CIPHER_get_name(cipher);
   ENVOY_LOG(debug, "Cipher name from SSL: {}", cipher_name ? cipher_name : "null");
-  
+
   if (cipher_name && (strstr(cipher_name, "AES128-GCM") || strstr(cipher_name, "AES-128-GCM"))) {
     evp_cipher = EVP_aes_128_gcm();
     ENVOY_LOG(debug, "Using AES-128-GCM for key extraction");
   } else {
-    ENVOY_LOG(debug, "Unsupported cipher for kTLS");
+    ENVOY_LOG(debug, "Unsupported cipher for kTLS: {}", cipher_name ? cipher_name : "unknown");
     return false;
   }
 
@@ -293,90 +290,129 @@ bool KtlsSslInfoImpl::extractKeyMaterial() const {
     return false;
   }
 
-  // Get the key length
   int key_len = EVP_CIPHER_key_length(evp_cipher);
-  int iv_len = EVP_CIPHER_iv_length(evp_cipher);
-  ENVOY_LOG(debug, "Cipher key length: {}, IV length: {}", key_len, iv_len);
+  int expected_iv_len = 12; 
+  ENVOY_LOG(debug, "Cipher key length: {}, Expected IV length for kTLS: {}", key_len, expected_iv_len);
 
-  // Buffer for key material
   client_write_key_.resize(key_len);
   server_write_key_.resize(key_len);
-  
-  // For TLS 1.2 GCM, the IV is 4 byte salt + 8 byte nonce
-  // The kernel expects the full 12 bytes
-  client_write_iv_.resize(12);
-  server_write_iv_.resize(12);
-  
-  // Resize sequence numbers (8 bytes per TLS spec)
-  client_write_seq_.resize(8, 0);
-  server_write_seq_.resize(8, 0);
+  client_write_iv_.resize(expected_iv_len);
+  server_write_iv_.resize(expected_iv_len);
+  client_write_seq_.resize(8);
+  server_write_seq_.resize(8);
 
-  // Extract key material using OpenSSL's exporters
   const char* client_key_label = "EXPORTER_CLIENT_WRITE_KEY";
   const char* server_key_label = "EXPORTER_SERVER_WRITE_KEY";
   const char* client_iv_label = "EXPORTER_CLIENT_WRITE_IV";
   const char* server_iv_label = "EXPORTER_SERVER_WRITE_IV";
-  
-  // Empty context for TLS 1.2
   const uint8_t context[] = {};
-  
-  // Extract client write key
-  if (SSL_export_keying_material(ssl_handle, 
-                                client_write_key_.data(), key_len,
-                                client_key_label, strlen(client_key_label),
-                                context, 0, 0) != 1) {
-    unsigned long err = ERR_get_error();
-    char err_buf[256];
-    ERR_error_string_n(err, err_buf, sizeof(err_buf));
-    ENVOY_LOG(debug, "Failed to export client write key: {}", err_buf);
+
+  if (SSL_export_keying_material(ssl_handle, client_write_key_.data(), key_len,
+                                 client_key_label, strlen(client_key_label), context, 0,
+                                 0) != 1) {
+    ENVOY_LOG(debug, "Failed to export client write key: {}", ERR_reason_error_string(ERR_get_error()));
     return false;
   }
-  
-  // Extract server write key
-  if (SSL_export_keying_material(ssl_handle, 
-                                server_write_key_.data(), key_len,
-                                server_key_label, strlen(server_key_label),
-                                context, 0, 0) != 1) {
-    unsigned long err = ERR_get_error();
-    char err_buf[256];
-    ERR_error_string_n(err, err_buf, sizeof(err_buf));
-    ENVOY_LOG(debug, "Failed to export server write key: {}", err_buf);
+  if (SSL_export_keying_material(ssl_handle, server_write_key_.data(), key_len,
+                                 server_key_label, strlen(server_key_label), context, 0,
+                                 0) != 1) {
+    ENVOY_LOG(debug, "Failed to export server write key: {}", ERR_reason_error_string(ERR_get_error()));
     return false;
   }
-  
-  // Extract client write IV
-  if (SSL_export_keying_material(ssl_handle, 
-                                client_write_iv_.data(), 12,
-                                client_iv_label, strlen(client_iv_label),
-                                context, 0, 0) != 1) {
-    unsigned long err = ERR_get_error();
-    char err_buf[256];
-    ERR_error_string_n(err, err_buf, sizeof(err_buf));
-    ENVOY_LOG(debug, "Failed to export client write IV: {}", err_buf);
+  if (SSL_export_keying_material(ssl_handle, client_write_iv_.data(), expected_iv_len,
+                                 client_iv_label, strlen(client_iv_label), context, 0, 0) != 1) {
+    ENVOY_LOG(debug, "Failed to export client write IV: {}", ERR_reason_error_string(ERR_get_error()));
     return false;
   }
-  
-  // Extract server write IV
-  if (SSL_export_keying_material(ssl_handle, 
-                                server_write_iv_.data(), 12,
-                                server_iv_label, strlen(server_iv_label),
-                                context, 0, 0) != 1) {
-    unsigned long err = ERR_get_error();
-    char err_buf[256];
-    ERR_error_string_n(err, err_buf, sizeof(err_buf));
-    ENVOY_LOG(debug, "Failed to export server write IV: {}", err_buf);
+  if (SSL_export_keying_material(ssl_handle, server_write_iv_.data(), expected_iv_len,
+                                 server_iv_label, strlen(server_iv_label), context, 0, 0) != 1) {
+    ENVOY_LOG(debug, "Failed to export server write IV: {}", ERR_reason_error_string(ERR_get_error()));
     return false;
   }
 
-  ENVOY_LOG(debug, "Successfully extracted TLS key material");
+  // Get current sequence numbers and store them in network byte order.
+  uint64_t seq_num_hton;
   
-  // Log key material sizes for debugging
+  // CRITICAL FIX: Always initialize sequence number vectors first
+  client_write_seq_.resize(8, 0);
+  server_write_seq_.resize(8, 0);
+  
+  // Log original sequence numbers for diagnostic purposes
+  ENVOY_LOG(debug, "=== SEQUENCE NUMBER HANDLING FOR kTLS ===");
+  
+  if (is_client_) {
+    // CLIENT SIDE HANDLING
+    uint64_t client_tx_seq = SSL_get_write_sequence(ssl_handle);
+    uint64_t client_rx_seq = SSL_get_read_sequence(ssl_handle);
+    
+    ENVOY_LOG(debug, "CLIENT original TX sequence number: {}", client_tx_seq);
+    ENVOY_LOG(debug, "CLIENT original RX sequence number: {}", client_rx_seq);
+    
+    // ALWAYS FORCE TO ZERO for kTLS - key to preventing EBADMSG errors
+    client_tx_seq = 0;
+    client_rx_seq = 0;
+    
+    ENVOY_LOG(debug, "CLIENT forced TX sequence number: {}", client_tx_seq);
+    ENVOY_LOG(debug, "CLIENT forced RX sequence number: {}", client_rx_seq);
+    
+    // Write to client_write_seq_ (client sending direction)
+    seq_num_hton = htobe64(client_tx_seq);
+    memcpy(client_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
+    
+    // Write to server_write_seq_ (server sending to client direction)
+    seq_num_hton = htobe64(client_rx_seq);
+    memcpy(server_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
+  } else {
+    // SERVER SIDE HANDLING
+    uint64_t server_tx_seq = SSL_get_write_sequence(ssl_handle);
+    uint64_t server_rx_seq = SSL_get_read_sequence(ssl_handle);
+    
+    ENVOY_LOG(debug, "SERVER original TX sequence number: {}", server_tx_seq);
+    ENVOY_LOG(debug, "SERVER original RX sequence number: {}", server_rx_seq);
+    
+    // ALWAYS FORCE TO ZERO for kTLS - key to preventing EBADMSG errors
+    server_tx_seq = 0;
+    server_rx_seq = 0;
+    
+    ENVOY_LOG(debug, "SERVER forced TX sequence number: {}", server_tx_seq);
+    ENVOY_LOG(debug, "SERVER forced RX sequence number: {}", server_rx_seq);
+    
+    // Write to server_write_seq_ (server sending direction)
+    seq_num_hton = htobe64(server_tx_seq);
+    memcpy(server_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
+    
+    // Write to client_write_seq_ (client sending to server direction)
+    seq_num_hton = htobe64(server_rx_seq);
+    memcpy(client_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
+  }
+  
+  ENVOY_LOG(debug, "=== END SEQUENCE NUMBER HANDLING ===");
+
+  ENVOY_LOG(debug, "Successfully extracted TLS key material and sequence numbers");
+
   ENVOY_LOG(debug, "Client write key size: {}", client_write_key_.size());
   ENVOY_LOG(debug, "Server write key size: {}", server_write_key_.size());
   ENVOY_LOG(debug, "Client write IV size: {}", client_write_iv_.size());
   ENVOY_LOG(debug, "Server write IV size: {}", server_write_iv_.size());
+  ENVOY_LOG(debug, "Client write SEQ size: {}", client_write_seq_.size());
+  ENVOY_LOG(debug, "Server write SEQ size: {}", server_write_seq_.size());
+  
+  // Log first byte of sequence numbers for quick verification
+  if (!client_write_seq_.empty()) ENVOY_LOG(debug, "Client Write SEQ[0]: 0x{:02x}", client_write_seq_[0]);
+  if (!server_write_seq_.empty()) ENVOY_LOG(debug, "Server Write SEQ[0]: 0x{:02x}", server_write_seq_[0]);
 
-  // Set the flag indicating we've extracted the parameters
+  // Add detailed logging of all 8 bytes of sequence numbers in hex
+  if (client_write_seq_.size() == 8) {
+    ENVOY_LOG(debug, "Client Write SEQ full (hex): {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+              client_write_seq_[0], client_write_seq_[1], client_write_seq_[2], client_write_seq_[3],
+              client_write_seq_[4], client_write_seq_[5], client_write_seq_[6], client_write_seq_[7]);
+  }
+  if (server_write_seq_.size() == 8) {
+    ENVOY_LOG(debug, "Server Write SEQ full (hex): {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+              server_write_seq_[0], server_write_seq_[1], server_write_seq_[2], server_write_seq_[3],
+              server_write_seq_[4], server_write_seq_[5], server_write_seq_[6], server_write_seq_[7]);
+  }
+
   params_extracted_ = true;
   return true;
 }
