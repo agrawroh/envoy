@@ -45,7 +45,7 @@ private:
   Network::IoHandle& dest_io_handle_;
   int pipe_fds_[2]{-1, -1};
   bool pipe_initialized_{false};
-  
+
   /**
    * Initialize the pipe used for splicing.
    * @return true if successful, false otherwise.
@@ -56,4 +56,4 @@ private:
 } // namespace Ktls
 } // namespace TransportSockets
 } // namespace Extensions
-} // namespace Envoy 
+} // namespace Envoy

@@ -23,18 +23,14 @@ envoy_cc_extension(
     ],
 )
 
-# Add alias for config_envoy_extension
+# Create an alias for config_envoy_extension that references upstream_config
+# instead of duplicating the compilation
 envoy_cc_extension(
     name = "config_envoy_extension",
-    srcs = ["config.cc"],
-    hdrs = ["config.h"],
+    # Make this target visible to external targets
+    visibility = ["//visibility:public"],
     deps = [
-        ":upstream_proxy_protocol",
-        "//envoy/network:transport_socket_interface",
-        "//envoy/registry",
-        "//envoy/server:transport_socket_config_interface",
-        "//source/common/config:utility_lib",
-        "@envoy_api//envoy/extensions/transport_sockets/proxy_protocol/v3:pkg_cc_proto",
+        ":upstream_config",
     ],
 )
 

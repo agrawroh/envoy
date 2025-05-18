@@ -94,6 +94,7 @@ public:
   absl::optional<std::chrono::milliseconds> lastRoundTripTime() override { return absl::nullopt; }
   absl::optional<uint64_t> congestionWindowInBytes() const override { return absl::nullopt; }
   absl::optional<std::string> interfaceName() override { return absl::nullopt; }
+  bool supportsTls() const override { return false; }
 
   void setWatermarks(uint32_t watermark) { pending_received_data_.setWatermarks(watermark); }
   void onBelowLowWatermark() {

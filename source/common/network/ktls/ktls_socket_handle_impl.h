@@ -1,8 +1,17 @@
 #pragma once
 
-#include <sys/types.h>
+#include <stdint.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+
+#ifdef __linux__
 #include <linux/tls.h>
+#else
+// Stub for non-Linux platforms
+struct tls12_crypto_info_aes_gcm_128 {
+  uint8_t dummy[16];
+};
+#endif
 
 #include "envoy/network/io_handle.h"
 
@@ -21,8 +30,7 @@ public:
    * @param fd supplies the socket.
    * @param socket_v6only specifies whether the socket is IPv6 only.
    */
-  KTlsSocketHandleImpl(os_fd_t fd, bool socket_v6only)
-      : IoSocketHandleImpl(fd, socket_v6only) {}
+  KTlsSocketHandleImpl(os_fd_t fd, bool socket_v6only) : IoSocketHandleImpl(fd, socket_v6only) {}
 
   /**
    * Enables kTLS encryption for the transmit direction (TX).
@@ -61,4 +69,4 @@ private:
 using KTlsSocketHandleImplSharedPtr = std::shared_ptr<KTlsSocketHandleImpl>;
 
 } // namespace Network
-} // namespace Envoy 
+} // namespace Envoy

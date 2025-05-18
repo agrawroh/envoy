@@ -145,6 +145,11 @@ public:
     return {};
   }
 
+  bool supportsTls() const override {
+    // Delegate to the underlying io_handle
+    return io_handle_.supportsTls();
+  }
+
 private:
   Network::IoHandle& io_handle_;
   bool closed_{false};

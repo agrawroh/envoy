@@ -3,8 +3,30 @@
 #include <netinet/tcp.h>
 
 #include "envoy/common/exception.h"
+
 #include "source/common/common/assert.h"
 #include "source/common/common/logger.h"
+
+// Define constants for platforms without kTLS support
+#ifndef SOL_TLS
+#define SOL_TLS 282
+#endif
+
+#ifndef TLS_TX
+#define TLS_TX 1
+#endif
+
+#ifndef TLS_RX
+#define TLS_RX 2
+#endif
+
+#ifndef SOL_TCP
+#define SOL_TCP 6
+#endif
+
+#ifndef TCP_ULP
+#define TCP_ULP 31
+#endif
 
 namespace Envoy {
 namespace Network {
@@ -18,14 +40,14 @@ bool KTlsSocketHandleImpl::enableTlsTx(const tls12_crypto_info_aes_gcm_128& cryp
     ENVOY_LOG_MISC(debug, "Failed to set TCP_ULP for kTLS: {}", strerror(errno));
     return false;
   }
-  
+
   // Now set up the TLS TX crypto info
   rc = setsockopt(fd_, SOL_TLS, TLS_TX, &crypto_info, sizeof(crypto_info));
   if (rc < 0) {
     ENVOY_LOG_MISC(debug, "Failed to set TLS_TX for kTLS: {}", strerror(errno));
     return false;
   }
-  
+
   tls_tx_enabled_ = true;
   return true;
 #else
@@ -46,14 +68,14 @@ bool KTlsSocketHandleImpl::enableTlsRx(const tls12_crypto_info_aes_gcm_128& cryp
       return false;
     }
   }
-  
+
   // Set up the TLS RX crypto info
   int rc = setsockopt(fd_, SOL_TLS, TLS_RX, &crypto_info, sizeof(crypto_info));
   if (rc < 0) {
     ENVOY_LOG_MISC(debug, "Failed to set TLS_RX for kTLS: {}", strerror(errno));
     return false;
   }
-  
+
   tls_rx_enabled_ = true;
   return true;
 #else
@@ -64,4 +86,4 @@ bool KTlsSocketHandleImpl::enableTlsRx(const tls12_crypto_info_aes_gcm_128& cryp
 }
 
 } // namespace Network
-} // namespace Envoy 
+} // namespace Envoy

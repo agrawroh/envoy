@@ -46,4 +46,4 @@ using KtlsInfoConstSharedPtr = std::shared_ptr<const KtlsInfo>;
 } // namespace Ktls
 } // namespace TransportSockets
 } // namespace Extensions
-} // namespace Envoy 
+} // namespace Envoy

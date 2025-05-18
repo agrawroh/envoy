@@ -3,8 +3,8 @@
 #include <memory>
 
 #include "envoy/network/transport_socket.h"
-#include "envoy/upstream/upstream.h"
 #include "envoy/upstream/host_description.h"
+#include "envoy/upstream/upstream.h"
 
 #include "source/common/common/logger.h"
 #include "source/extensions/transport_sockets/common/passthrough.h"
@@ -23,8 +23,8 @@ namespace Ktls {
 class KtlsTransportSocket : public TransportSockets::PassthroughSocket,
                             public Logger::Loggable<Logger::Id::connection> {
 public:
-  KtlsTransportSocket(Network::TransportSocketPtr&& transport_socket,
-                      bool enable_tx_zerocopy, bool enable_rx_no_pad);
+  KtlsTransportSocket(Network::TransportSocketPtr&& transport_socket, bool enable_tx_zerocopy,
+                      bool enable_rx_no_pad);
   ~KtlsTransportSocket() override;
 
   // Network::TransportSocket
@@ -35,7 +35,7 @@ public:
   Network::IoResult doWrite(Buffer::Instance& buffer, bool end_stream) override;
   bool startSecureTransport() override;
   void onConnected() override;
-  
+
   // Not in base class, implement directly
   bool isConnectionSecure() const;
 
@@ -58,17 +58,16 @@ private:
 class KtlsTransportSocketFactory : public Network::CommonUpstreamTransportSocketFactory {
 public:
   KtlsTransportSocketFactory(Network::UpstreamTransportSocketFactoryPtr&& transport_socket_factory,
-                           bool enable_tx_zerocopy,
-                           bool enable_rx_no_pad);
+                             bool enable_tx_zerocopy, bool enable_rx_no_pad);
 
   // Network::TransportSocketFactory
-  Network::TransportSocketPtr createTransportSocket(
-      Network::TransportSocketOptionsConstSharedPtr options,
-      std::shared_ptr<const Upstream::HostDescription> host) const override;
+  Network::TransportSocketPtr
+  createTransportSocket(Network::TransportSocketOptionsConstSharedPtr options,
+                        std::shared_ptr<const Upstream::HostDescription> host) const override;
 
   // Network::TransportSocketFactory
-  bool implementsSecureTransport() const override { 
-    return inner_factory_->implementsSecureTransport(); 
+  bool implementsSecureTransport() const override {
+    return inner_factory_->implementsSecureTransport();
   }
 
   absl::string_view defaultServerNameIndication() const override {
@@ -76,9 +75,7 @@ public:
   }
 
   // We need to correctly use the ClientContextSharedPtr return type
-  Ssl::ClientContextSharedPtr sslCtx() override { 
-    return inner_factory_->sslCtx(); 
-  }
+  Ssl::ClientContextSharedPtr sslCtx() override { return inner_factory_->sslCtx(); }
 
 private:
   Network::UpstreamTransportSocketFactoryPtr inner_factory_;
@@ -94,8 +91,7 @@ class DownstreamKtlsTransportSocketFactory : public TransportSockets::Downstream
 public:
   DownstreamKtlsTransportSocketFactory(
       Network::DownstreamTransportSocketFactoryPtr&& transport_socket_factory,
-      bool enable_tx_zerocopy,
-      bool enable_rx_no_pad);
+      bool enable_tx_zerocopy, bool enable_rx_no_pad);
 
   // Network::DownstreamTransportSocketFactory
   Network::TransportSocketPtr createDownstreamTransportSocket() const override;
@@ -108,4 +104,4 @@ private:
 } // namespace Ktls
 } // namespace TransportSockets
 } // namespace Extensions
-} // namespace Envoy 
+} // namespace Envoy

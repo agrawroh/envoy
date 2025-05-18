@@ -2,12 +2,12 @@ load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_extension",
     "envoy_cc_library",
-    "envoy_package",
+    "envoy_extension_package",
 )
 
 licenses(["notice"])  # Apache 2
 
-envoy_package()
+envoy_extension_package()
 
 envoy_cc_library(
     name = "ktls_socket_handle_lib",
@@ -37,8 +37,8 @@ envoy_cc_library(
         "//source/common/common:assert_lib",
         "//source/common/common:logger_lib",
         "//source/common/network:utility_lib",
-        "//source/common/tls:utility_lib",
         "//source/common/tls:ssl_socket_lib",
+        "//source/common/tls:utility_lib",
     ],
 )
 
@@ -68,8 +68,8 @@ envoy_cc_library(
         ":ktls_ssl_info_lib",
         "//envoy/network:transport_socket_interface",
         "//envoy/ssl:connection_interface",
-        "//envoy/upstream:upstream_interface",
         "//envoy/upstream:host_description_interface",
+        "//envoy/upstream:upstream_interface",
         "//source/common/common:assert_lib",
         "//source/common/common:minimal_logger_lib",
         "//source/common/network:transport_socket_options_lib",
@@ -83,7 +83,7 @@ envoy_cc_library(
     hdrs = ["ktls_socket_interface.h"],
     deps = [
         ":ktls_socket_handle_lib",
-        "//envoy/registry:registry",
+        "//envoy/registry",
         "//source/common/api:os_sys_calls_lib",
         "//source/common/common:assert_lib",
         "//source/common/network:address_lib",
@@ -99,15 +99,14 @@ envoy_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":ktls_socket_interface_lib",
-        "//envoy/registry:registry",
+        "//envoy/registry",
         "//source/common/api:os_sys_calls_lib",
         "//source/common/common:assert_lib",
         "//source/common/network:address_lib",
         "//source/common/network:socket_interface_lib",
         "//source/common/network:socket_lib",
-        "@com_google_protobuf//:protobuf",
-        "@envoy_api//envoy/extensions/network/socket_interface/v3:pkg_cc_proto",
         "@com_github_cncf_xds//udpa/annotations:pkg_cc_proto",
+        "@com_google_protobuf//:protobuf",
     ],
     alwayslink = 1,
 )
@@ -119,11 +118,11 @@ envoy_cc_extension(
     hdrs = ["config.h"],
     deps = [
         ":ktls_transport_socket_lib",
-        "//envoy/registry:registry",
+        "//envoy/registry",
         "//envoy/server:transport_socket_config_interface",
         "//source/common/config:utility_lib",
         "//source/common/protobuf:utility_lib",
-        "@envoy_api//envoy/extensions/transport_sockets/ktls/v3:pkg_cc_proto",
         "@com_github_cncf_xds//udpa/annotations:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/transport_sockets/ktls/v3:pkg_cc_proto",
     ],
-) 
+)

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "source/extensions/transport_sockets/ktls/ktls_ssl_info.h"
 #include "source/common/common/logger.h"
+#include "source/extensions/transport_sockets/ktls/ktls_ssl_info.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -35,7 +35,7 @@ private:
   bool extractKeyMaterial();
 
   Ssl::ConnectionInfoConstSharedPtr ssl_info_;
-  
+
   // Storage for returned cipher suite string
   mutable std::string cipher_suite_storage_;
 
@@ -59,4 +59,4 @@ using KtlsSslInfoImplConstSharedPtr = std::shared_ptr<const KtlsSslInfoImpl>;
 } // namespace Ktls
 } // namespace TransportSockets
 } // namespace Extensions
-} // namespace Envoy 
+} // namespace Envoy

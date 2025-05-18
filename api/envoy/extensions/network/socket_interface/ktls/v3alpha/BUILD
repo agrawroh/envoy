@@ -6,4 +6,4 @@ api_proto_package(
     deps = [
         "@com_github_cncf_udpa//udpa/annotations:pkg",
     ],
-) 
+)

@@ -5,7 +5,9 @@
 namespace Envoy {
 namespace Network {
 
-MockIoHandle::MockIoHandle() = default;
+MockIoHandle::MockIoHandle() {
+  ON_CALL(*this, supportsTls()).WillByDefault(testing::Return(false));
+}
 MockIoHandle::~MockIoHandle() = default;
 
 } // namespace Network

@@ -1,12 +1,31 @@
 #include "source/extensions/transport_sockets/ktls/ktls_socket_splicing.h"
 
+#include <vector>
+
 #include "source/common/common/assert.h"
 #include "source/common/network/io_socket_error_impl.h"
 
 // Only include Linux-specific headers when compiling on Linux
 #ifdef __linux__
-#include <sys/splice.h>
 #include <sys/uio.h>
+// Check if we're on Linux but the header is missing
+#if __has_include(<sys/splice.h>)
+#include <sys/splice.h>
+#define HAS_SPLICE_SYSCALL 1
+#else
+#define HAS_SPLICE_SYSCALL 0
+#endif
+#else
+// Define empty stubs for non-Linux platforms
+#ifndef SPLICE_F_MOVE
+#define SPLICE_F_MOVE 0
+#endif
+#ifndef SPLICE_F_NONBLOCK
+#define SPLICE_F_NONBLOCK 0
+#endif
+#define HAS_SPLICE_SYSCALL 0
+// Stub for splice() function (not implemented on non-Linux)
+inline ssize_t splice(int, void*, int, void*, size_t, unsigned int) { return -1; }
 #endif
 
 namespace Envoy {
@@ -14,8 +33,8 @@ namespace Extensions {
 namespace TransportSockets {
 namespace Ktls {
 
-KtlsSocketSplicing::KtlsSocketSplicing(Network::IoHandle& source_io_handle, 
-                                   Network::IoHandle& dest_io_handle)
+KtlsSocketSplicing::KtlsSocketSplicing(Network::IoHandle& source_io_handle,
+                                       Network::IoHandle& dest_io_handle)
     : source_io_handle_(source_io_handle), dest_io_handle_(dest_io_handle) {
   // Initialize the pipe for splicing
   pipe_initialized_ = initializePipe();
@@ -40,10 +59,10 @@ bool KtlsSocketSplicing::initializePipe() {
     ENVOY_LOG(error, "Failed to create pipe for kTLS socket splicing: {}", ::strerror(errno));
     return false;
   }
-  
+
   // Set pipe size for optimal performance
   // In a real implementation, you would tune this based on throughput requirements
-#ifdef __linux__
+#if defined(__linux__) && HAS_SPLICE_SYSCALL
   // F_SETPIPE_SZ is Linux-specific
   constexpr int pipe_size = 1024 * 1024; // 1MB pipe buffer
   if (::fcntl(pipe_fds_[0], F_SETPIPE_SZ, pipe_size) < 0 ||
@@ -52,7 +71,7 @@ bool KtlsSocketSplicing::initializePipe() {
     // Not fatal, continue
   }
 #endif
-  
+
   // Set the pipe to non-blocking mode
   for (int i = 0; i < 2; ++i) {
     int flags = ::fcntl(pipe_fds_[i], F_GETFL, 0);
@@ -65,7 +84,7 @@ bool KtlsSocketSplicing::initializePipe() {
       return false;
     }
   }
-  
+
   return true;
 }
 
@@ -74,73 +93,69 @@ Api::IoCallUint64Result KtlsSocketSplicing::splice(uint64_t max_bytes) {
   if (!pipe_initialized_) {
     return {0, Network::IoSocketError::getIoSocketEbadfError()};
   }
-  
+
   // Get file descriptors from IO handles
   int source_fd = source_io_handle_.fdDoNotUse();
   int dest_fd = dest_io_handle_.fdDoNotUse();
-  
+
   // Validate file descriptors
   if (source_fd < 0 || dest_fd < 0) {
     return {0, Network::IoSocketError::getIoSocketEbadfError()};
   }
-  
-#ifdef __linux__
+
+#if defined(__linux__) && HAS_SPLICE_SYSCALL
   // Linux-specific splice() implementation
-  
+
   // Splice flags
   int splice_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK;
-  
+
   // Perform two-stage splice
   // First, splice from source to pipe
-  ssize_t bytes_in_pipe = ::splice(source_fd, nullptr, pipe_fds_[1], nullptr, 
-                                  max_bytes, splice_flags);
+  ssize_t bytes_in_pipe =
+      ::splice(source_fd, nullptr, pipe_fds_[1], nullptr, max_bytes, splice_flags);
   if (bytes_in_pipe < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
       return {0, Network::IoSocketError::getIoSocketEagainError()};
     }
     return {0, Network::IoSocketError::create(errno)};
   }
-  
+
   if (bytes_in_pipe == 0) {
     // No data to splice
     return {0, Api::IoError::none()};
   }
-  
+
   // Then, splice from pipe to destination
-  ssize_t bytes_out = ::splice(pipe_fds_[0], nullptr, dest_fd, nullptr, 
-                              bytes_in_pipe, splice_flags);
+  ssize_t bytes_out =
+      ::splice(pipe_fds_[0], nullptr, dest_fd, nullptr, bytes_in_pipe, splice_flags);
   if (bytes_out < 0) {
     // This is a serious error as we now have data in the pipe but couldn't send it
     ENVOY_LOG(error, "Failed to splice from pipe to destination: {}", ::strerror(errno));
     return {0, Network::IoSocketError::create(errno)};
   }
-  
+
   // Return the number of bytes transferred
-  return {static_cast<uint64_t>(bytes_out), nullptr};
+  return {static_cast<uint64_t>(bytes_out), Api::IoError::none()};
 #else
-  // On non-Linux platforms, splice is not available, so return not implemented
+  // On non-Linux platforms or if splice is not available, return not implemented
   UNREFERENCED_PARAMETER(max_bytes);
   return {0, Network::IoSocketError::create(ENOSYS)};
 #endif
 }
 
 Api::IoCallUint64Result KtlsSocketSplicing::writeFromBuffer(Buffer::Instance& buffer) {
-#ifdef __linux__
+#if defined(__linux__)
   // Get all the buffer fragments
-  const uint64_t num_slices = buffer.getRawSlices(nullptr, 0);
-  if (num_slices == 0) {
+  Buffer::RawSliceVector slices = buffer.getRawSlices();
+  if (slices.empty()) {
     return {0, Api::IoError::none()}; // Nothing to write
   }
-  
-  // Allocate array for slices
-  Buffer::RawSlice slices[num_slices];
-  buffer.getRawSlices(slices, num_slices);
-  
-  // Create iovec array for writev
-  struct iovec iov[num_slices];
+
+  // Create iovec array for writev using std::vector instead of VLA
+  std::vector<struct iovec> iov(slices.size());
   uint64_t total_size = 0;
-  
-  for (uint64_t i = 0; i < num_slices; i++) {
+
+  for (size_t i = 0; i < slices.size(); i++) {
     if (slices[i].len_ == 0) {
       continue;
     }
@@ -148,28 +163,28 @@ Api::IoCallUint64Result KtlsSocketSplicing::writeFromBuffer(Buffer::Instance& bu
     iov[i].iov_len = slices[i].len_;
     total_size += slices[i].len_;
   }
-  
+
   if (total_size == 0) {
     return {0, Api::IoError::none()}; // Nothing to write
   }
-  
+
   // Get file descriptor from IO handle
   int fd = dest_io_handle_.fdDoNotUse();
   if (fd < 0) {
     return {0, Network::IoSocketError::getIoSocketEbadfError()};
   }
-  
+
   // Write data in a single syscall using writev
-  ssize_t written = ::writev(fd, iov, num_slices);
+  ssize_t written = ::writev(fd, iov.data(), iov.size());
   if (written < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
       return {0, Network::IoSocketError::getIoSocketEagainError()};
     }
     return {0, Network::IoSocketError::create(errno)};
   }
-  
+
   // Return the number of bytes written
-  return {static_cast<uint64_t>(written), nullptr};
+  return {static_cast<uint64_t>(written), Api::IoError::none()};
 #else
   // On non-Linux platforms, return not implemented
   UNREFERENCED_PARAMETER(buffer);
@@ -177,43 +192,36 @@ Api::IoCallUint64Result KtlsSocketSplicing::writeFromBuffer(Buffer::Instance& bu
 #endif
 }
 
-Api::IoCallUint64Result KtlsSocketSplicing::readToBuffer(Buffer::Instance& buffer, uint64_t max_bytes) {
-#ifdef __linux__
-  // Reserve space in the buffer
-  Buffer::RawSlice slice;
-  buffer.reserve(max_bytes, &slice, 1);
-  
-  if (slice.len_ == 0) {
-    return {0, Network::IoSocketError::getIoSocketEnomemError()};
-  }
-  
-  // Adjust slice length to max_bytes if needed
-  slice.len_ = std::min(slice.len_, max_bytes);
-  
+Api::IoCallUint64Result KtlsSocketSplicing::readToBuffer(Buffer::Instance& buffer,
+                                                         uint64_t max_bytes) {
+#if defined(__linux__)
   // Get file descriptor from IO handle
   int fd = source_io_handle_.fdDoNotUse();
   if (fd < 0) {
     return {0, Network::IoSocketError::getIoSocketEbadfError()};
   }
-  
-  // Read data directly into buffer's reserved space
-  ssize_t bytes_read = ::read(fd, slice.mem_, slice.len_);
-  
+
+  // Use a temporary buffer for reading
+  char read_buffer[16384];
+  const size_t read_size = std::min(static_cast<size_t>(max_bytes), sizeof(read_buffer));
+
+  // Read data directly
+  ssize_t bytes_read = ::read(fd, read_buffer, read_size);
+
   if (bytes_read < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
       return {0, Network::IoSocketError::getIoSocketEagainError()};
     }
     return {0, Network::IoSocketError::create(errno)};
   }
-  
-  // Commit the data to the buffer only if we read something
+
+  // Add the data to the buffer if we read something
   if (bytes_read > 0) {
-    slice.len_ = bytes_read;
-    buffer.commit(&slice, 1);
+    buffer.add(read_buffer, bytes_read);
   }
-  
+
   // Return the number of bytes read
-  return {static_cast<uint64_t>(bytes_read), nullptr};
+  return {static_cast<uint64_t>(bytes_read), Api::IoError::none()};
 #else
   // On non-Linux platforms, return not implemented
   UNREFERENCED_PARAMETER(buffer);
@@ -225,4 +233,4 @@ Api::IoCallUint64Result KtlsSocketSplicing::readToBuffer(Buffer::Instance& buffe
 } // namespace Ktls
 } // namespace TransportSockets
 } // namespace Extensions
-} // namespace Envoy 
+} // namespace Envoy

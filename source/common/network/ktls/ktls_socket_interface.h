@@ -1,7 +1,7 @@
 #pragma once
 
-#include "source/common/network/socket_interface.h"
 #include "source/common/network/ktls/ktls_socket_handle_impl.h"
+#include "source/common/network/socket_interface.h"
 
 #include "google/protobuf/empty.pb.h"
 
@@ -46,4 +46,4 @@ public:
 DECLARE_FACTORY(KTlsSocketInterface);
 
 } // namespace Network
-} // namespace Envoy 
+} // namespace Envoy

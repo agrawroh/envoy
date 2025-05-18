@@ -35,6 +35,11 @@ public:
   absl::optional<uint64_t> congestionWindowInBytes() const override;
   absl::optional<std::string> interfaceName() override;
 
+  /**
+   * @return false by default. Derived classes can override.
+   */
+  bool supportsTls() const override { return false; }
+
 protected:
   os_fd_t fd_;
   int socket_v6only_;

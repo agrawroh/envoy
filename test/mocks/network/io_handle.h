@@ -67,6 +67,7 @@ public:
   MOCK_METHOD(Api::SysCallIntResult, ioctl,
               (unsigned long, void*, unsigned long, void*, unsigned long, unsigned long*));
   MOCK_METHOD(absl::optional<std::string>, interfaceName, ());
+  MOCK_METHOD(bool, supportsTls, (), (const));
 };
 
 } // namespace Network

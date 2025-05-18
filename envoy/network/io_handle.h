@@ -366,6 +366,11 @@ public:
    * @return the interface name for the socket, if the OS supports it. Otherwise, absl::nullopt.
    */
   virtual absl::optional<std::string> interfaceName() PURE;
+
+  /**
+   * @return true if the handle supports TLS, false otherwise.
+   */
+  virtual bool supportsTls() const PURE;
 };
 
 using IoHandlePtr = std::unique_ptr<IoHandle>;

@@ -25,7 +25,7 @@ envoy_cc_library(
     hdrs = ["ktls_socket_interface.h"],
     deps = [
         ":ktls_socket_handle_lib",
-        "//envoy/registry:registry",
+        "//envoy/registry",
         "//source/common/api:os_sys_calls_lib",
         "//source/common/common:assert_lib",
         "//source/common/network:address_lib",
@@ -41,14 +41,13 @@ envoy_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":ktls_socket_interface_lib",
-        "//envoy/registry:registry",
+        "//envoy/registry",
         "//source/common/api:os_sys_calls_lib",
         "//source/common/common:assert_lib",
         "//source/common/network:address_lib",
         "//source/common/network:socket_interface_lib",
         "//source/common/network:socket_lib",
         "@com_google_protobuf//:protobuf",
-        "@envoy_api//envoy/extensions/network/socket_interface/v3:pkg_cc_proto",
     ],
     alwayslink = 1,
-) 
+)

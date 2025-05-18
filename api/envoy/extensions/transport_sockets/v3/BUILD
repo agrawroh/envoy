@@ -7,4 +7,4 @@ api_proto_package(
         "//envoy/config/core/v3:pkg",
         "@com_google_googleapis//google/api:annotations_proto",
     ],
-) 
+)
