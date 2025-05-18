@@ -23,7 +23,9 @@ Our implementation includes:
 
 4. **Transport Socket** (`ktls_transport_socket.h` and implementations): Main transport socket implementation that enables kTLS and handles data transfer with fallback mechanisms.
 
-5. **Configuration** (`config.h/cc`): Protocol buffer definitions and factory classes for enabling kTLS through Envoy configuration.
+5. **Socket Interface** (`ktls_socket_interface.h` and implementations): Provides a custom socket interface with kTLS support. This should be used through the bootstrap extensions.
+
+6. **Configuration** (`config.h/cc`): Protocol buffer definitions and factory classes for enabling kTLS through Envoy configuration.
 
 ## Configuration Example
 
@@ -53,6 +55,15 @@ static_resources:
             sni: example.com
         enable_tx_zerocopy: true
         enable_rx_no_pad: true
+
+# Enable kTLS socket interface via bootstrap extension
+bootstrap_extensions:
+  - name: envoy.extensions.network.socket_interface.ktls_socket_interface
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.network.socket_interface.v3.KTlsSocketInterface
+      enabled: true
+      enable_tx_zerocopy: true
+      enable_rx_no_pad: true
 ```
 
 ## Current Status and Limitations
@@ -61,7 +72,11 @@ static_resources:
 2. Only tested on Linux kernels 4.13+
 3. Requires specific implementation of SSL socket to access key material
 4. No support for TLS 1.3 yet
-5. Implementation is a work in progress and not ready for production use
+
+## Implementation Notes
+
+1. The kTLS socket interface implementation has been consolidated in the `source/extensions/transport_sockets/ktls` directory. The duplicate implementation in `source/common/network/ktls` is deprecated and will be removed.
+2. Socket interface and transport socket are configured separately but work together. The socket interface creates socket handles that are kTLS-capable, while the transport socket handles the TLS handshake and offloading.
 
 ## References
 

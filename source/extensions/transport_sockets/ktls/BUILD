@@ -14,9 +14,11 @@ envoy_cc_library(
     srcs = ["ktls_socket_handle_impl.cc"],
     hdrs = ["ktls_socket_handle_impl.h"],
     deps = [
+        "//envoy/api:io_error_interface",
         "//envoy/network:io_handle_interface",
+        "//source/common/common:assert_lib",
         "//source/common/common:logger_lib",
-        "//source/common/network:default_socket_interface_lib",
+        "//source/common/network:socket_interface_lib",
     ],
 )
 
@@ -84,27 +86,32 @@ envoy_cc_library(
     deps = [
         ":ktls_socket_handle_lib",
         "//envoy/registry",
+        "//envoy/server:bootstrap_extension_config_interface",
         "//source/common/api:os_sys_calls_lib",
         "//source/common/common:assert_lib",
         "//source/common/network:address_lib",
         "//source/common/network:socket_interface_lib",
         "//source/common/network:socket_lib",
+        "//source/common/protobuf:utility_lib",
         "@com_google_protobuf//:protobuf",
+        "@envoy_api//envoy/extensions/network/socket_interface/v3:pkg_cc_proto",
     ],
 )
 
 # Add the extension library target with proper visibility
-envoy_cc_library(
+envoy_cc_extension(
     name = "ktls_socket_interface_lib_envoy_extension",
     visibility = ["//visibility:public"],
     deps = [
         ":ktls_socket_interface_lib",
         "//envoy/registry",
+        "//envoy/server:bootstrap_extension_config_interface",
         "//source/common/api:os_sys_calls_lib",
         "//source/common/common:assert_lib",
         "//source/common/network:address_lib",
         "//source/common/network:socket_interface_lib",
         "//source/common/network:socket_lib",
+        "//source/common/protobuf:utility_lib",
         "@com_github_cncf_xds//udpa/annotations:pkg_cc_proto",
         "@com_google_protobuf//:protobuf",
     ],

@@ -24,7 +24,7 @@ class KtlsTransportSocket : public TransportSockets::PassthroughSocket,
                             public Logger::Loggable<Logger::Id::connection> {
 public:
   KtlsTransportSocket(Network::TransportSocketPtr&& transport_socket, bool enable_tx_zerocopy,
-                      bool enable_rx_no_pad);
+                     bool enable_rx_no_pad);
   ~KtlsTransportSocket() override;
 
   // Network::TransportSocket
@@ -35,21 +35,63 @@ public:
   Network::IoResult doWrite(Buffer::Instance& buffer, bool end_stream) override;
   bool startSecureTransport() override;
   void onConnected() override;
-
-  // Not in base class, implement directly
   bool isConnectionSecure() const;
 
 private:
+  /**
+   * Try to enable kTLS on the socket.
+   * @return true if kTLS was enabled, false otherwise.
+   */
   bool enableKtls();
+
+  /**
+   * Check if kTLS can be enabled based on TLS parameters.
+   * @return true if kTLS can be enabled, false otherwise.
+   */
   bool canEnableKtls() const;
 
-  Network::TransportSocketCallbacks* callbacks_{nullptr};
-  bool ktls_enabled_{false};
+  /**
+   * Try to determine if kTLS is ready or impossible, and update state accordingly.
+   */
+  void determineKtlsReadiness();
+
+  /**
+   * Process any pending operations now that kTLS readiness is determined.
+   */
+  void processPendingOps();
+
+  Network::TransportSocketCallbacks* callbacks_{};
   bool enable_tx_zerocopy_{false};
   bool enable_rx_no_pad_{false};
-
+  bool ktls_enabled_{false};
   KtlsInfoConstSharedPtr ktls_info_;
+  uint32_t ktls_handshake_attempts_{0};
+  bool ktls_state_determined_{false};
+  
+  // Buffered operations that should be processed after kTLS state is determined
+  struct PendingReadOp {
+    Buffer::Instance* buffer;
+    Network::IoResult result;
+    bool completed{false};
+  };
+  
+  struct PendingWriteOp {
+    Buffer::Instance* buffer;
+    bool end_stream;
+    Network::IoResult result;
+    bool completed{false};
+  };
+  
+  absl::optional<PendingReadOp> pending_read_;
+  absl::optional<PendingWriteOp> pending_write_;
+  
+  // Maximum number of attempts to enable kTLS before giving up
+  static constexpr uint32_t MAX_KTLS_ATTEMPTS = 5;
+
+#ifdef HAS_SPLICE_SYSCALL  
+  // Only declare splicing support if the syscall is available
   std::unique_ptr<KtlsSocketSplicing> socket_splicing_;
+#endif
 };
 
 /**

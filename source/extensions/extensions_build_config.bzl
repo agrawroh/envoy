@@ -524,7 +524,7 @@ EXTENSIONS = {
     #"envoy.network.connection_balance.dlb":             "//source/extensions/network/connection_balance/dlb:config",
     #"envoy.network.connection_balance.dynamic_connection_balancing": "//source/extensions/network/connection_balance/dynamic_connection_balancing:config",
     "envoy.network.socket_interface.default_socket_interface": "//source/common/network:socket_interface_lib",
-    "envoy.network.socket_interface.ktls_socket_interface": "//source/common/network/ktls:ktls_socket_interface_lib",
+    "envoy.extensions.network.socket_interface.ktls_socket_interface": "//source/extensions/transport_sockets/ktls:ktls_socket_interface_lib_envoy_extension",
 }
 
 # These can be changed to ["//visibility:public"], for  downstream builds which

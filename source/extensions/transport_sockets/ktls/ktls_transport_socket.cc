@@ -85,14 +85,31 @@ void KtlsTransportSocket::closeSocket(Network::ConnectionEvent event) {
 }
 
 Network::IoResult KtlsTransportSocket::doRead(Buffer::Instance& buffer) {
+  // Check if we need to determine kTLS readiness
+  if (!ktls_state_determined_) {
+    determineKtlsReadiness();
+    
+    // If we still haven't determined kTLS state, buffer the read operation
+    if (!ktls_state_determined_) {
+      ENVOY_LOG(debug, "Buffering read operation until kTLS state is determined");
+      pending_read_ = PendingReadOp{&buffer, {Network::PostIoAction::KeepOpen, 0, false}, false};
+      return {Network::PostIoAction::KeepOpen, 0, false};
+    }
+  }
+
+  // Process any pending operations first
+  if (pending_read_ || pending_write_) {
+    processPendingOps();
+  }
+
   if (!ktls_enabled_) {
     // Pass through to the underlying socket
     return PassthroughSocket::doRead(buffer);
   }
 
   // If kTLS is enabled and we have socket splicing, use it for zero-copy reads
-  if (socket_splicing_ && enable_rx_no_pad_) {
 #ifdef HAS_SPLICE_SYSCALL
+  if (socket_splicing_ && enable_rx_no_pad_) {
     // Get a reasonable read chunk size
     uint64_t max_bytes =
         std::min(buffer.highWatermark() - buffer.length(), static_cast<uint64_t>(16384));
@@ -117,25 +134,45 @@ Network::IoResult KtlsTransportSocket::doRead(Buffer::Instance& buffer) {
     if (result.return_value_ > 0) {
       return {Network::PostIoAction::KeepOpen, result.return_value_, false};
     }
-#else
-    // Splice not available, fall back to standard read
-    ENVOY_LOG(debug, "Splice not available for zero-copy read, falling back to standard read");
-#endif
   }
+#else
+  // Log when splice is not available at compile time
+  if (enable_rx_no_pad_) {
+    ENVOY_LOG(debug, "Socket splicing not available for zero-copy read at compile time");
+  }
+#endif
 
   // Fall back to standard read path
   return PassthroughSocket::doRead(buffer);
 }
 
 Network::IoResult KtlsTransportSocket::doWrite(Buffer::Instance& buffer, bool end_stream) {
+  // Check if we need to determine kTLS readiness
+  if (!ktls_state_determined_) {
+    determineKtlsReadiness();
+    
+    // If we still haven't determined kTLS state, buffer the write operation
+    if (!ktls_state_determined_) {
+      ENVOY_LOG(debug, "Buffering write operation until kTLS state is determined");
+      pending_write_ = PendingWriteOp{&buffer, end_stream, 
+                                     {Network::PostIoAction::KeepOpen, 0, false}, false};
+      return {Network::PostIoAction::KeepOpen, 0, false};
+    }
+  }
+
+  // Process any pending operations first
+  if (pending_read_ || pending_write_) {
+    processPendingOps();
+  }
+
   if (!ktls_enabled_) {
     // Pass through to the underlying socket if kTLS is not enabled
     return PassthroughSocket::doWrite(buffer, end_stream);
   }
 
   // If kTLS is enabled and we have socket splicing, use it for zero-copy writes
-  if (socket_splicing_ && enable_tx_zerocopy_ && buffer.length() > 0) {
 #ifdef HAS_SPLICE_SYSCALL
+  if (socket_splicing_ && enable_tx_zerocopy_ && buffer.length() > 0) {
     // Try to write using socket splicing for zero-copy
     auto result = socket_splicing_->writeFromBuffer(buffer);
 
@@ -162,11 +199,13 @@ Network::IoResult KtlsTransportSocket::doWrite(Buffer::Instance& buffer, bool en
     if (buffer.length() > 0) {
       return {Network::PostIoAction::KeepOpen, result.ok() ? result.return_value_ : 0, false};
     }
-#else
-    // Splice not available, fall back to standard write
-    ENVOY_LOG(debug, "Splice not available for zero-copy write, falling back to standard write");
-#endif
   }
+#else
+  // Log when splice is not available at compile time
+  if (enable_tx_zerocopy_ && buffer.length() > 0) {
+    ENVOY_LOG(debug, "Socket splicing not available for zero-copy write at compile time");
+  }
+#endif
 
   // Fall back to standard write path
   return PassthroughSocket::doWrite(buffer, end_stream);
@@ -181,8 +220,75 @@ void KtlsTransportSocket::onConnected() {
   // Delegate to the wrapped socket first
   PassthroughSocket::onConnected();
 
-  // After the handshake is complete, try to enable kTLS
-  enableKtls();
+  // Don't try to enable kTLS immediately, we'll check during read/write operations
+  ENVOY_LOG(debug, "Connection established, will determine kTLS readiness during data operations");
+  
+  // Schedule a delayed attempt to determine kTLS state
+  if (callbacks_) {
+    callbacks_->connection().dispatcher().post([this]() {
+      ENVOY_LOG(debug, "Scheduled determination of kTLS readiness");
+      determineKtlsReadiness();
+    });
+  }
+}
+
+void KtlsTransportSocket::determineKtlsReadiness() {
+  // Check if we already determined the state
+  if (ktls_state_determined_) {
+    return;
+  }
+
+  // Increment attempt counter
+  ktls_handshake_attempts_++;
+  
+  // Try to enable kTLS
+  bool success = enableKtls();
+  
+  // If we've reached max attempts or successfully enabled kTLS, mark state as determined
+  if (success || ktls_handshake_attempts_ >= MAX_KTLS_ATTEMPTS) {
+    ENVOY_LOG(debug, "kTLS state determined after {} attempts: enabled={}",
+              ktls_handshake_attempts_, ktls_enabled_);
+    ktls_state_determined_ = true;
+    
+    // Process any pending operations
+    processPendingOps();
+  } else if (callbacks_) {
+    // Schedule another attempt if we haven't reached max attempts
+    callbacks_->connection().dispatcher().post([this]() {
+      ENVOY_LOG(debug, "Retrying kTLS readiness determination, attempt {}/{}", 
+                ktls_handshake_attempts_ + 1, MAX_KTLS_ATTEMPTS);
+      determineKtlsReadiness();
+    });
+  }
+}
+
+void KtlsTransportSocket::processPendingOps() {
+  // Process pending read if any
+  if (pending_read_ && !pending_read_->completed) {
+    ENVOY_LOG(debug, "Processing pending read operation");
+    pending_read_->result = ktls_enabled_ ? 
+      doRead(*pending_read_->buffer) : 
+      PassthroughSocket::doRead(*pending_read_->buffer);
+    pending_read_->completed = true;
+  }
+  
+  // Process pending write if any
+  if (pending_write_ && !pending_write_->completed) {
+    ENVOY_LOG(debug, "Processing pending write operation");
+    pending_write_->result = ktls_enabled_ ? 
+      doWrite(*pending_write_->buffer, pending_write_->end_stream) : 
+      PassthroughSocket::doWrite(*pending_write_->buffer, pending_write_->end_stream);
+    pending_write_->completed = true;
+  }
+  
+  // Clear completed operations
+  if (pending_read_ && pending_read_->completed) {
+    pending_read_.reset();
+  }
+  
+  if (pending_write_ && pending_write_->completed) {
+    pending_write_.reset();
+  }
 }
 
 bool KtlsTransportSocket::isConnectionSecure() const { return transport_socket_->ssl() != nullptr; }
@@ -290,14 +396,28 @@ bool KtlsTransportSocket::canEnableKtls() const {
   // Get the SSL connection
   auto ssl_connection = transport_socket_->ssl();
   if (!ssl_connection) {
+    ENVOY_LOG(debug, "SSL connection is null in canEnableKtls()");
+    return false;
+  }
+  
+  // Check if handshake is actually complete by looking for peer certificate
+  // This is a stronger indicator that the handshake has finished
+  if (!ssl_connection->peerCertificatePresented()) {
+    ENVOY_LOG(debug, "SSL handshake likely not complete - no peer certificate presented yet");
     return false;
   }
 
-  // Check if the SSL handshake is complete - this is implementation dependent
-  // In a real implementation you'd need to check if the SSL session is established
-
   // Check cipher suite - for now we only support AES-GCM-128 with TLS 1.2
   std::string cipher = std::string(ssl_connection->ciphersuiteString());
+
+  // Always log the negotiated cipher for debugging
+  ENVOY_LOG(debug, "Negotiated cipher for kTLS: {}", cipher);
+  
+  if (cipher.empty()) {
+    ENVOY_LOG(debug, "Cipher information not yet available, handshake may not be complete");
+    return false;
+  }
+
   if (cipher.find("ECDHE-RSA-AES128-GCM-SHA256") == std::string::npos &&
       cipher.find("AES128-GCM-SHA256") == std::string::npos) {
     ENVOY_LOG(debug, "Unsupported cipher suite for kTLS: {}", cipher);
@@ -306,6 +426,15 @@ bool KtlsTransportSocket::canEnableKtls() const {
 
   // Check TLS version - for now we only support TLS 1.2
   std::string version = std::string(ssl_connection->tlsVersion());
+
+  // Always log the TLS version for debugging
+  ENVOY_LOG(debug, "Negotiated TLS version for kTLS: {}", version);
+  
+  if (version.empty()) {
+    ENVOY_LOG(debug, "TLS version info not yet available, handshake may not be complete");
+    return false;
+  }
+
   if (version != "TLSv1.2") {
     ENVOY_LOG(debug, "Unsupported TLS version for kTLS: {}", version);
     return false;

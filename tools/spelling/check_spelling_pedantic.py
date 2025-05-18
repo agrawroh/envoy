@@ -9,6 +9,9 @@ import os
 import re
 import subprocess
 import sys
+import json
+import requests
+from collections import defaultdict
 
 from functools import partial
 from itertools import chain
@@ -29,126 +32,134 @@ except NameError:
 
 CURR_DIR = os.path.dirname(os.path.realpath(__file__))
 
-# Special comment commands control behavior. These may appear anywhere
-# within a comment, but only one per line. The command applies to the
-# entire line on which it appears. The "off" command disables spell
-# checking until the next "on" command, or end-of-file. The
-# "skip-file" command disables spell checking in the entire file (even
-# previous comments). In a multi-line (/* */) comment, "skip-block"
-# disables spell checking for the remainder of the comment. For
-# sequences of full-line comments (only white space before a //
-# comment), "skip-block" disables spell checking the sequence of
-# comments is interrupted by a blank line or a line with code.
-SPELLCHECK_OFF = "SPELLCHECKER(off)"  # disable SPELLCHECK_ON (or EOF)
-SPELLCHECK_ON = "SPELLCHECKER(on)"  # (re-)enable
-SPELLCHECK_SKIP_FILE = "SPELLCHECKER(skip-file)"  # disable checking this entire file
-SPELLCHECK_SKIP_BLOCK = "SPELLCHECKER(skip-block)"  # disable to end of comment
+# Special comment commands control behavior.
+SPELLCHECK_OFF = "SPELLCHECKER(off)"
+SPELLCHECK_ON = "SPELLCHECKER(on)"
+SPELLCHECK_SKIP_FILE = "SPELLCHECKER(skip-file)"
+SPELLCHECK_SKIP_BLOCK = "SPELLCHECKER(skip-block)"
 
-# Single line comments: // comment OR /* comment */
-# Limit the characters that may precede // to help filter out some code
-# mistakenly processed as a comment.
+# Comment extraction patterns
 INLINE_COMMENT = re.compile(r'(?:^|[^:"])//( .*?$|$)|/\*+(.*?)\*+/')
-
-# Multi-line comments: /* comment */ (multiple lines)
 MULTI_COMMENT_START = re.compile(r'/\*(.*?)$')
 MULTI_COMMENT_END = re.compile(r'^(.*?)\*/')
 
-# Envoy TODO comment style.
-TODO = re.compile(r'(TODO|NOTE)\s*\(@?[A-Za-z0-9-]+\):?')
+# Proto-specific patterns
+PROTO_SERVICE = re.compile(r'service\s+\w+')
+PROTO_MESSAGE = re.compile(r'message\s+\w+')
+PROTO_ENUM = re.compile(r'enum\s+\w+')
+PROTO_FIELD_TYPE = re.compile(r'\b(string|int32|int64|uint32|uint64|bool|double|float|bytes|repeated|optional|required|oneof|map|google\.protobuf\.\w+)\b')
 
-# Ignore parameter names in doxygen comments.
-METHOD_DOC = re.compile(r'@(param\s+\w+|return(\s+const)?\s+\w+)')
+# TODO and doc patterns
+TODO = re.compile(r'(TODO|NOTE|FIXME|HACK|XXX)\s*\(@?[A-Za-z0-9-]+\):?')
+METHOD_DOC = re.compile(r'@(param\s+\w+|return(\s+const)?\s+\w+|brief|details|note|warning)')
 
-# Camel Case splitter
+# Text patterns to mask
 CAMEL_CASE = re.compile(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)')
-
-# Base64: we assume base64 encoded data in tests is never mixed with
-# other comments on a single line.
 BASE64 = re.compile(r'^[\s*]+([A-Za-z0-9/+=]{16,})\s*$')
 NUMBER = re.compile(r'\d')
-
-# Hex: match 1) longish strings of hex digits (to avoid matching "add" and
-# other simple words that happen to look like hex), 2) 2 or more two digit
-# hex numbers separated by colons, 3) "0x" prefixed hex numbers of any length,
-# or 4) UUIDs.
 HEX = re.compile(r'(?:^|\s|[(])([A-Fa-f0-9]{8,})(?:$|\s|[.,)])')
 HEX_SIG = re.compile(r'(?:\W|^)([A-Fa-f0-9]{2}(:[A-Fa-f0-9]{2})+)(?:\W|$)')
 PREFIXED_HEX = re.compile(r'0x[A-Fa-f0-9]+')
 UUID = re.compile(r'[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}')
-BIT_FIELDS = re.compile(r'[01]+[XxYy]+')
-AB_FIELDS = re.compile(r'\W([AB]+)\W')
-
-# Matches e.g. FC00::/8 or 2001::abcd/64. Does not match ::1/128, but
-# aspell ignores that anyway.
 IPV6_ADDR = re.compile(r'(?:\W|^)([A-Fa-f0-9]+:[A-Fa-f0-9:]+/[0-9]{1,3})(?:\W|$)')
-
-# Quoted words: "word", 'word', or *word*.
 QUOTED_WORD = re.compile(r'((["\'])[A-Za-z0-9.:-]+(\2))|(\*[A-Za-z0-9.:-]+\*)')
-
-# Backtick-quoted words that look like code. Note the overlap with RST_LINK.
 QUOTED_EXPR = re.compile(r'`[A-Za-z0-9:()<>_.,/{}\[\]&*-]+`')
-
-# Tuple expressions like (abc, def).
-TUPLE_EXPR = re.compile(r'\([A-Za-z0-9]+(?:, *[A-Za-z0-9]+){1,}\)')
-
-# Command flags (e.g. "-rf") and percent specifiers.
 FLAG = re.compile(r'\W([-%][A-Za-z]+)')
-
-# Bare github users (e.g. @user).
 USER = re.compile(r'\W(@[A-Za-z0-9-]+)')
-
-# RST Links (e.g. `text <https://example.com>`_, :ref:`text <internal_ref>`)
-RST_LINK = re.compile(r'`([^`<])+<([^ ]+)>`')
-
-# RST inline literals.
-RST_LITERAL = re.compile(r'``.*``')
-
-# RST code block marker.
-RST_CODE_BLOCK = '.. code-block::'
-
-# RST literal include.
-RST_LITERAL_INCLUDE = '.. literalinclude::'
-
-# Path names.
 ABSPATH = re.compile(r'(?:\s|^)((/[A-Za-z0-9_.*-]+)+)(?:\s|$)')
-FILEREF = re.compile(r'(?:\s|^)([A-Za-z0-9_./-]+\.(cc|js|h|py|sh))(?:\s|$)')
-
-# Ordinals (1st, 2nd, 3rd, 4th, ...)
+FILEREF = re.compile(r'(?:\s|^)([A-Za-z0-9_./-]+\.(cc|js|h|py|sh|proto|yaml|json))(?:\s|$)')
 ORDINALS = re.compile(r'([0-9]*1st|[0-9]*2nd|[0-9]*3rd|[0-9]+th)')
 
-# Start of string indent.
-INDENT = re.compile(r'^( *)')
+# Grammar and style patterns
+PASSIVE_VOICE = re.compile(r'\b(is|are|was|were|be|been|being)\s+\w+ed\b', re.IGNORECASE)
+REDUNDANT_WORDS = re.compile(r'\b(very\s+unique|more\s+perfect|most\s+unique|completely\s+finished|totally\s+destroyed|absolutely\s+essential)\b', re.IGNORECASE)
+SENTENCE_STARTERS = re.compile(r'^\s*(This|That|These|Those|There|Here)\s+', re.IGNORECASE)
+WEAK_WORDS = re.compile(r'\b(very|really|quite|rather|somewhat|just|actually|basically|literally)\b', re.IGNORECASE)
 
-SMART_QUOTES = {
-    "\u2018": "'",
-    "\u2019": "'",
-    "\u201c": '"',
-    "\u201d": '"',
+# Common word confusions
+WORD_CONFUSIONS = {
+    'there': ['their', 'they\'re'],
+    'their': ['there', 'they\'re'],
+    'they\'re': ['there', 'their'],
+    'its': ['it\'s'],
+    'it\'s': ['its'],
+    'your': ['you\'re'],
+    'you\'re': ['your'],
+    'then': ['than'],
+    'than': ['then'],
+    'affect': ['effect'],
+    'effect': ['affect'],
+    'accept': ['except'],
+    'except': ['accept'],
+    'loose': ['lose'],
+    'lose': ['loose']
 }
 
-# Valid dictionary words. Anything else crashes aspell.
+# Valid dictionary words
 DICTIONARY_WORD = re.compile(r"^[A-Za-z']+$")
 
 DEBUG = 0
 COLOR = True
 MARK = False
 
+# Error severity levels
+SEVERITY_SPELLING = "spelling"
+SEVERITY_GRAMMAR = "grammar"
+SEVERITY_STYLE = "style"
+SEVERITY_CLARITY = "clarity"
 
 def red(s):
     if COLOR:
         return "\33[1;31m" + s + "\033[0m"
     return s
 
+def green(s):
+    if COLOR:
+        return "\33[1;32m" + s + "\033[0m"
+    return s
+
+def blue(s):
+    if COLOR:
+        return "\33[1;34m" + s + "\033[0m"
+    return s
+
+def yellow(s):
+    if COLOR:
+        return "\33[1;33m" + s + "\033[0m"
+    return s
+
+def magenta(s):
+    if COLOR:
+        return "\33[1;35m" + s + "\033[0m"
+    return s
 
 def debug(s):
     if DEBUG > 0:
         print(s)
 
-
 def debug1(s):
     if DEBUG > 1:
         print(s)
 
+class Error:
+    """Represents an error with type, position, and suggestions."""
+
+    def __init__(self, word, offset, suggestions, severity, rule_id=None, message=None):
+        self.word = word
+        self.offset = offset
+        self.suggestions = suggestions
+        self.severity = severity
+        self.rule_id = rule_id
+        self.message = message or f"Misspelled word: {word}"
+
+    def get_color(self):
+        color_map = {
+            SEVERITY_SPELLING: red,
+            SEVERITY_GRAMMAR: magenta,
+            SEVERITY_STYLE: yellow,
+            SEVERITY_CLARITY: blue
+        }
+        return color_map.get(self.severity, red)
 
 class SpellChecker:
     """Aspell-based spell checker."""
@@ -222,26 +233,17 @@ class SpellChecker:
 
             t = result[0]
             if t == "*" or t == "-" or t == "+":
-                # *: found in dictionary.
-                # -: found run-together words in dictionary.
-                # +: found root word in dictionary.
                 continue
 
-            # & <original> <N> <offset>: m1, m2, ... mN, g1, g2, ...
-            # ? <original> 0 <offset>: g1, g2, ....
-            # # <original> <offset>
             original, rem = result[2:].split(" ", 1)
 
             if t == "#":
-                # Not in dictionary, but no suggestions.
-                errors.append((original, int(rem), []))
+                errors.append(Error(original, int(rem), [], SEVERITY_SPELLING))
             elif t == '&' or t == '?':
-                # Near misses and/or guesses.
-                _, rem = rem.split(" ", 1)  # Drop N (may be 0).
-                o, rem = rem.split(": ", 1)  # o is offset from start of line.
+                _, rem = rem.split(" ", 1)
+                o, rem = rem.split(": ", 1)
                 suggestions = rem.split(", ")
-
-                errors.append((original, int(o), suggestions))
+                errors.append(Error(original, int(o), suggestions, SEVERITY_SPELLING))
             else:
                 print("aspell produced unexpected output: %s" % (result))
                 sys.exit(2)
@@ -249,20 +251,14 @@ class SpellChecker:
         return errors
 
     def load_dictionary(self):
-        # Read the custom dictionary.
         all_words = []
         with open(self.dictionary_file, 'r') as f:
             all_words = f.readlines()
 
-        # Strip comments, invalid words, and blank lines.
         words = [w for w in all_words if len(w.strip()) > 0 and re.match(DICTIONARY_WORD, w)]
-
         suffixes = [w.strip()[1:] for w in all_words if w.startswith('-')]
         prefixes = [w.strip()[:-1] for w in all_words if w.strip().endswith('-')]
 
-        # Allow acronyms and abbreviations to be spelled in lowercase.
-        # (e.g. Convert "HTTP" into "HTTP" and "http" which also matches
-        # "Http").
         for word in words:
             if word.isupper():
                 words += word.lower()
@@ -277,7 +273,6 @@ class SpellChecker:
         additions = [w + os.linesep for w in additions]
         additions.sort()
 
-        # Insert additions into the lines ignoring comments, suffixes, and blank lines.
         idx = 0
         add_idx = 0
         while idx < len(lines) and add_idx < len(additions):
@@ -291,7 +286,6 @@ class SpellChecker:
                     add_idx += 1
             idx += 1
 
-        # Append any remaining additions.
         lines += additions[add_idx:]
 
         with open(self.dictionary_file, 'w') as f:
@@ -300,72 +294,165 @@ class SpellChecker:
         self.stop()
         self.start()
 
+class GrammarChecker:
+    """LanguageTool-based grammar checker."""
 
-# Split camel case words and run them through the dictionary. Returns
-# a replacement list of errors. The replacement list may contain just
-# the original error (if the word is not camel case), may be empty if
-# the split words are all spelled correctly, or may be a new set of
-# errors referencing the misspelled sub-words.
+    def __init__(self, server_url="http://localhost:8081", use_online=False):
+        self.server_url = server_url
+        self.use_online = use_online
+        self.online_url = "https://api.languagetool.org/v2/check"
+        self.available = self._check_availability()
+
+    def _check_availability(self):
+        """Check if LanguageTool server is available."""
+        try:
+            if self.use_online:
+                response = requests.get(f"{self.online_url.replace('/check', '')}/languages", timeout=5)
+                return response.status_code == 200
+            else:
+                response = requests.get(f"{self.server_url}/v2/languages", timeout=5)
+                return response.status_code == 200
+        except:
+            return False
+
+    def check(self, text):
+        """Check text for grammar errors."""
+        if not self.available:
+            return []
+
+        try:
+            url = self.online_url if self.use_online else f"{self.server_url}/v2/check"
+            data = {
+                'text': text,
+                'language': 'en-US',
+                'enabledRules': 'PASSIVE_VOICE,REDUNDANT_WORDS,SENTENCE_WHITESPACE,DOUBLE_PUNCTUATION'
+            }
+
+            response = requests.post(url, data=data, timeout=10)
+            result = response.json()
+
+            errors = []
+            for match in result.get('matches', []):
+                offset = match['offset']
+                length = match['length']
+                word = text[offset:offset+length]
+
+                suggestions = [r['value'] for r in match.get('replacements', [])]
+                rule_id = match.get('rule', {}).get('id', '')
+                message = match.get('message', '')
+
+                # Determine severity based on rule category
+                category = match.get('rule', {}).get('category', {}).get('id', '')
+                if 'GRAMMAR' in rule_id or 'VERB' in rule_id:
+                    severity = SEVERITY_GRAMMAR
+                elif 'STYLE' in rule_id or 'PASSIVE' in rule_id:
+                    severity = SEVERITY_STYLE
+                else:
+                    severity = SEVERITY_CLARITY
+
+                errors.append(Error(word, offset, suggestions, severity, rule_id, message))
+
+            return errors
+        except Exception as e:
+            debug(f"Grammar check failed: {e}")
+            return []
+
+class StyleChecker:
+    """Checks for style and clarity issues."""
+
+    def check(self, text):
+        """Check text for style issues."""
+        errors = []
+
+        # Check for passive voice
+        for match in PASSIVE_VOICE.finditer(text):
+            errors.append(Error(
+                match.group(),
+                match.start(),
+                ["Consider using active voice"],
+                SEVERITY_STYLE,
+                "PASSIVE_VOICE",
+                "Passive voice can make text less engaging"
+            ))
+
+        # Check for redundant words
+        for match in REDUNDANT_WORDS.finditer(text):
+            errors.append(Error(
+                match.group(),
+                match.start(),
+                [match.group().split()[1]],  # Suggest removing redundant word
+                SEVERITY_STYLE,
+                "REDUNDANT_WORDS",
+                "Remove redundant words for clearer writing"
+            ))
+
+        # Check for weak words
+        for match in WEAK_WORDS.finditer(text):
+            errors.append(Error(
+                match.group(),
+                match.start(),
+                ["Consider a stronger word"],
+                SEVERITY_STYLE,
+                "WEAK_WORDS",
+                "Weak words can dilute your message"
+            ))
+
+        # Check for word confusions
+        words = re.findall(r'\b\w+\'?\w*\b', text.lower())
+        for i, word in enumerate(words):
+            if word in WORD_CONFUSIONS:
+                start_pos = text.lower().find(word)
+                if start_pos != -1:
+                    errors.append(Error(
+                        word,
+                        start_pos,
+                        WORD_CONFUSIONS[word],
+                        SEVERITY_SPELLING,
+                        "WORD_CONFUSION",
+                        f"Commonly confused with: {', '.join(WORD_CONFUSIONS[word])}"
+                    ))
+
+        return errors
+
 def check_camel_case(checker, err):
-    (word, word_offset, _) = err
+    """Split camel case words and check them."""
+    parts = re.findall(CAMEL_CASE, err.word)
 
-    debug("check camel case %s" % (word))
-    parts = re.findall(CAMEL_CASE, word)
-
-    # Word is not camel case: the previous result stands.
     if len(parts) <= 1:
-        debug("  -> not camel case")
         return [err]
 
     split_errs = []
     part_offset = 0
     for part in parts:
-        debug("  -> part: %s" % (part))
         split_err = checker.check(part)
         if split_err:
-            debug("    -> not found in dictionary")
-            split_errs += [(part, word_offset + part_offset, split_err[0][2])]
+            split_errs += [Error(part, err.offset + part_offset, split_err[0].suggestions, SEVERITY_SPELLING)]
         part_offset += len(part)
 
     return split_errs
 
-
-# Check for affixes and run them through the dictionary again. Returns
-# a replacement list of errors which may just be the original errors
-# or empty if an affix was successfully handled.
 def check_affix(checker, err):
-    (word, word_offset, _) = err
-
-    debug("check affix %s" % (word))
-
+    """Check for valid affixes."""
     for prefix in checker.prefixes:
-        debug("  -> try %s" % (prefix))
-        if word.lower().startswith(prefix.lower()):
-            root = word[len(prefix):]
+        if err.word.lower().startswith(prefix.lower()):
+            root = err.word[len(prefix):]
             if root != '':
-                debug("  -> check %s" % (root))
                 root_err = checker.check(root)
                 if not root_err:
-                    debug("  -> ok")
                     return []
 
     for suffix in checker.suffixes:
-        if word.lower().endswith(suffix.lower()):
-            root = word[:-len(suffix)]
+        if err.word.lower().endswith(suffix.lower()):
+            root = err.word[:-len(suffix)]
             if root != '':
-                debug("  -> try %s" % (root))
                 root_err = checker.check(root)
                 if not root_err:
-                    debug("  -> ok")
                     return []
 
     return [err]
 
-
-# Find occurrences of the regex within comment and replace the numbered
-# matching group with spaces. If secondary is defined, the matching
-# group must also match secondary to be masked.
 def mask_with_regex(comment, regex, group, secondary=None):
+    """Mask patterns in comment to avoid false positives."""
     found = False
     for m in regex.finditer(comment):
         if secondary and secondary.search(m.group(group)) is None:
@@ -373,158 +460,176 @@ def mask_with_regex(comment, regex, group, secondary=None):
 
         start = m.start(group)
         end = m.end(group)
-
         comment = comment[:start] + (' ' * (end - start)) + comment[end:]
         found = True
 
     return (comment, found)
 
+def check_comment(spell_checker, grammar_checker, style_checker, offset, comment, check_grammar=True, check_style=True):
+    """Check comment for spelling, grammar, and style issues."""
+    original_comment = comment
 
-# Checks the comment at offset against the spell checker. Result is an array
-# of tuples where each tuple is the misspelled word, it's offset from the
-# start of the line, and an array of possible replacements.
-def check_comment(checker, offset, comment):
-    # Strip smart quotes which cause problems sometimes.
-    for sq, q in SMART_QUOTES.items():
+    # Strip smart quotes
+    smart_quotes = {"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'}
+    for sq, q in smart_quotes.items():
         comment = comment.replace(sq, q)
 
-    # Replace TODO comments with spaces to preserve string offsets.
+    # Mask various patterns to avoid false positives
     comment, _ = mask_with_regex(comment, TODO, 0)
-
-    # Ignore @param varname
     comment, _ = mask_with_regex(comment, METHOD_DOC, 0)
-
-    # Similarly, look for base64 sequences, but they must have at least one
-    # digit.
     comment, _ = mask_with_regex(comment, BASE64, 1, NUMBER)
-
-    # Various hex constants:
     comment, _ = mask_with_regex(comment, HEX, 1)
-    comment, _ = mask_with_regex(comment, HEX_SIG, 1)
     comment, _ = mask_with_regex(comment, PREFIXED_HEX, 0)
-    comment, _ = mask_with_regex(comment, BIT_FIELDS, 0)
-    comment, _ = mask_with_regex(comment, AB_FIELDS, 1)
     comment, _ = mask_with_regex(comment, UUID, 0)
     comment, _ = mask_with_regex(comment, IPV6_ADDR, 1)
-
-    # Single words in quotes:
+    comment, _ = mask_with_regex(comment, PROTO_FIELD_TYPE, 0)
     comment, _ = mask_with_regex(comment, QUOTED_WORD, 0)
-
-    # RST inline literals:
-    comment, _ = mask_with_regex(comment, RST_LITERAL, 0)
-
-    # Mask the reference part of an RST link (but not the link text). Otherwise, check for a quoted
-    # code-like expression (which would mask the link text if not guarded).
-    comment, found = mask_with_regex(comment, RST_LINK, 0)
-    if not found:
-        comment, _ = mask_with_regex(comment, QUOTED_EXPR, 0)
-
-    comment, _ = mask_with_regex(comment, TUPLE_EXPR, 0)
-
-    # Command flags:
+    comment, _ = mask_with_regex(comment, QUOTED_EXPR, 0)
     comment, _ = mask_with_regex(comment, FLAG, 1)
-
-    # Github user refs:
     comment, _ = mask_with_regex(comment, USER, 1)
-
-    # Absolutew paths and references to source files.
     comment, _ = mask_with_regex(comment, ABSPATH, 1)
     comment, _ = mask_with_regex(comment, FILEREF, 1)
-
-    # Ordinals (1st, 2nd...)
     comment, _ = mask_with_regex(comment, ORDINALS, 0)
 
-    if checker.prefix_re is not None:
-        comment, _ = mask_with_regex(comment, checker.prefix_re, 1)
+    if spell_checker.prefix_re:
+        comment, _ = mask_with_regex(comment, spell_checker.prefix_re, 1)
+    if spell_checker.suffix_re:
+        comment, _ = mask_with_regex(comment, spell_checker.suffix_re, 1)
 
-    if checker.suffix_re is not None:
-        comment, _ = mask_with_regex(comment, checker.suffix_re, 1)
-
-    # Everything got masked, return early.
-    if comment == "" or comment.strip() == "":
+    if comment.strip() == "":
         return []
 
-    # Mask leading punctuation.
     if not comment[0].isalnum():
         comment = ' ' + comment[1:]
 
-    errors = checker.check(comment)
+    all_errors = []
 
-    # Fix up offsets relative to the start of the line vs start of the comment.
-    errors = [(w, o + offset, s) for (w, o, s) in errors]
+    # Spell checking
+    spelling_errors = spell_checker.check(comment)
+    for err in spelling_errors:
+        err.offset += offset
 
-    # CamelCase words get split and re-checked
-    errors = [*chain.from_iterable(map(lambda err: check_camel_case(checker, err), errors))]
+    # Process camel case and affixes
+    spelling_errors = [*chain.from_iterable(map(lambda err: check_camel_case(spell_checker, err), spelling_errors))]
+    spelling_errors = [*chain.from_iterable(map(lambda err: check_affix(spell_checker, err), spelling_errors))]
 
-    errors = [*chain.from_iterable(map(lambda err: check_affix(checker, err), errors))]
+    all_errors.extend(spelling_errors)
 
-    return errors
+    # Grammar checking
+    if check_grammar and grammar_checker and grammar_checker.available:
+        grammar_errors = grammar_checker.check(original_comment)
+        for err in grammar_errors:
+            err.offset += offset
+        all_errors.extend(grammar_errors)
 
+    # Style checking
+    if check_style and style_checker:
+        style_errors = style_checker.check(original_comment)
+        for err in style_errors:
+            err.offset += offset
+        all_errors.extend(style_errors)
 
-def print_error(file, line_offset, lines, errors):
-    # Highlight misspelled words.
+    return all_errors
+
+def print_error_detailed(file, line_offset, lines, errors):
+    """Print detailed error information with context."""
     line = lines[line_offset]
-    prefix = "%s:%d:" % (file, line_offset + 1)
-    for (word, offset, suggestions) in reversed(errors):
-        line = line[:offset] + red(word) + line[offset + len(word):]
+    prefix = f"{file}:{line_offset + 1}:"
 
-    print("%s%s" % (prefix, line.rstrip()))
+    # Group errors by type
+    errors_by_type = defaultdict(list)
+    for error in errors:
+        errors_by_type[error.severity].append(error)
+
+    # Create highlighted line
+    highlighted_line = line
+    for error in reversed(sorted(errors, key=lambda e: e.offset)):
+        color_func = error.get_color()
+        highlighted_line = (highlighted_line[:error.offset] +
+                          color_func(error.word) +
+                          highlighted_line[error.offset + len(error.word):])
+
+    print(f"{prefix}{highlighted_line.rstrip()}")
 
     if MARK:
-        # Print a caret at the start of each misspelled word.
+        # Print carets
         marks = ' ' * len(prefix)
         last = 0
-        for (word, offset, suggestions) in errors:
-            marks += (' ' * (offset - last)) + '^'
-            last = offset + 1
+        for error in errors:
+            marks += (' ' * (error.offset - last)) + '^'
+            last = error.offset + 1
         print(marks)
 
+    # Print detailed error information
+    for severity, severity_errors in errors_by_type.items():
+        severity_name = severity.upper()
+        color_func = severity_errors[0].get_color()
+        print(f"  {color_func(f'{severity_name} ISSUES:')}")
 
-def print_fix_options(word, suggestions):
-    print("%s:" % (word))
-    print("  a: accept and add to dictionary")
-    print("  A: accept and add to dictionary as ALLCAPS (for acronyms)")
-    print("  f <word>: replace with the given word without modifying dictionary")
-    print("  i: ignore")
-    print("  r <word>: replace with given word and add to dictionary")
-    print("  R <word>: replace with given word and add to dictionary as ALLCAPS (for acronyms)")
-    print("  x: abort")
+        for error in severity_errors:
+            print(f"    • {error.word}: {error.message}")
+            if error.suggestions:
+                suggestions_str = ', '.join(error.suggestions[:5])
+                print(f"      Suggestions: {suggestions_str}")
+            if error.rule_id:
+                print(f"      Rule: {error.rule_id}")
+            print()
 
-    if not suggestions:
-        return
+def print_error_summary(file, line_offset, lines, errors):
+    """Print summary of errors."""
+    line = lines[line_offset]
+    prefix = f"{file}:{line_offset + 1}:"
 
-    col_width = max(len(word) for word in suggestions)
-    opt_width = int(math.log(len(suggestions), 10)) + 1
-    padding = 2  # Two spaces of padding.
-    delim = 2  # Colon and space after number.
-    num_cols = int(78 / (col_width + padding + opt_width + delim))
-    num_rows = int(len(suggestions) / num_cols + 1)
-    rows = [""] * num_rows
+    # Highlight all errors
+    highlighted_line = line
+    for error in reversed(sorted(errors, key=lambda e: e.offset)):
+        color_func = error.get_color()
+        highlighted_line = (highlighted_line[:error.offset] +
+                          color_func(error.word) +
+                          highlighted_line[error.offset + len(error.word):])
 
-    indent = " " * padding
-    for idx, sugg in enumerate(suggestions):
-        row = idx % len(rows)
-        row_data = "%d: %s" % (idx, sugg)
+    print(f"{prefix}{highlighted_line.rstrip()}")
 
-        rows[row] += indent + row_data.ljust(col_width + opt_width + delim)
+    # Count errors by type
+    error_counts = defaultdict(int)
+    for error in errors:
+        error_counts[error.severity] += 1
 
-    for row in rows:
-        print(row)
+    # Print summary
+    summary_parts = []
+    for severity, count in error_counts.items():
+        color_func = Error("", 0, [], severity).get_color()
+        summary_parts.append(f"{color_func(severity)}: {count}")
 
+    print(f"  Errors: {', '.join(summary_parts)}")
+    print()
 
-def fix_error(checker, file, line_offset, lines, errors):
-    print_error(file, line_offset, lines, errors)
+def fix_error(spell_checker, file, line_offset, lines, errors):
+    """Interactive error fixing."""
+    print_error_detailed(file, line_offset, lines, errors)
 
     fixed = {}
     replacements = []
     additions = []
-    for (word, offset, suggestions) in errors:
-        if word in fixed:
-            # Same typo was repeated in a line, so just reuse the previous choice.
-            replacements += [fixed[word]]
+
+    for error in errors:
+        if error.word in fixed:
+            replacements.append(fixed[error.word])
             continue
 
-        print_fix_options(word, suggestions)
+        print(f"\n{error.get_color()(error.word)} ({error.severity}): {error.message}")
+
+        if error.suggestions:
+            print("Suggestions:")
+            for i, suggestion in enumerate(error.suggestions):
+                print(f"  {i}: {suggestion}")
+
+        print("Options:")
+        print("  a: accept and add to dictionary (spelling errors only)")
+        print("  f <word>: replace with given word")
+        print("  i: ignore this error")
+        print("  r <word>: replace and add to dictionary (spelling errors only)")
+        print("  x: abort")
 
         replacement = ""
         while replacement == "":
@@ -533,79 +638,46 @@ def fix_error(checker, file, line_offset, lines, errors):
             except EOFError:
                 choice = "x"
 
-            add = None
             if choice == "x":
-                print("Spell checking aborted.")
+                print("Checking aborted.")
                 sys.exit(2)
-            elif choice == "a":
-                replacement = word
-                add = word
-            elif choice == "A":
-                replacement = word
-                add = word.upper()
-            elif choice[:1] == "f":
-                replacement = choice[1:].strip()
-                if replacement == "":
-                    print(
-                        "Invalid choice: '%s'. Must specify a replacement (e.g. 'f corrected')." %
-                        (choice))
-                    continue
+            elif choice == "a" and error.severity == SEVERITY_SPELLING:
+                replacement = error.word
+                additions.append(error.word)
+            elif choice.startswith("f "):
+                replacement = choice[2:].strip()
             elif choice == "i":
-                replacement = word
-            elif choice[:1] == "r" or choice[:1] == "R":
-                replacement = choice[1:].strip()
-                if replacement == "":
-                    print(
-                        "Invalid choice: '%s'. Must specify a replacement (e.g. 'r corrected')." %
-                        (choice))
-                    continue
-
-                if choice[:1] == "R":
-                    if replacement.upper() not in suggestions:
-                        add = replacement.upper()
-                elif replacement not in suggestions:
-                    add = replacement
+                replacement = error.word
+            elif choice.startswith("r ") and error.severity == SEVERITY_SPELLING:
+                replacement = choice[2:].strip()
+                if re.match(DICTIONARY_WORD, replacement):
+                    additions.append(replacement)
             else:
                 try:
                     idx = int(choice)
+                    if 0 <= idx < len(error.suggestions):
+                        replacement = error.suggestions[idx]
+                    else:
+                        print("Invalid choice")
                 except ValueError:
-                    idx = -1
-                if idx >= 0 and idx < len(suggestions):
-                    replacement = suggestions[idx]
-                else:
-                    print("Invalid choice: '%s'" % (choice))
+                    print("Invalid choice")
 
-        fixed[word] = replacement
-        replacements += [replacement]
-        if add:
-            if re.match(DICTIONARY_WORD, add):
-                additions += [add]
-            else:
-                print(
-                    "Cannot add %s to the dictionary: it may only contain letter and apostrophes"
-                    % add)
+        fixed[error.word] = replacement
+        replacements.append(replacement)
 
-    if len(errors) != len(replacements):
-        print("Internal error %d errors with %d replacements" % (len(errors), len(replacements)))
-        sys.exit(2)
-
-    # Perform replacements on the line.
+    # Apply replacements
     line = lines[line_offset]
-    for idx in range(len(replacements) - 1, -1, -1):
-        word, offset, _ = errors[idx]
-        replacement = replacements[idx]
-        if word == replacement:
-            continue
-
-        line = line[:offset] + replacement + line[offset + len(word):]
+    for error, replacement in zip(reversed(sorted(errors, key=lambda e: e.offset)), reversed(replacements)):
+        if error.word != replacement:
+            line = line[:error.offset] + replacement + line[error.offset + len(error.word):]
     lines[line_offset] = line
 
-    # Update the dictionary.
-    checker.add_words(additions)
-
+    # Update dictionary
+    if additions:
+        spell_checker.add_words(additions)
 
 class Comment:
-    """Comment represents a comment at a location within a file."""
+    """Comment with location information."""
 
     def __init__(self, line, col, text, last_on_line):
         self.line = line
@@ -613,36 +685,33 @@ class Comment:
         self.text = text
         self.last_on_line = last_on_line
 
-
-# Extract comments from lines. Returns an array of Comment.
 def extract_comments(lines):
+    """Extract comments from source lines."""
     in_comment = False
     comments = []
+
     for line_idx, line in enumerate(lines):
         line_comments = []
         last = 0
+
         if in_comment:
             mc_end = MULTI_COMMENT_END.search(line)
             if mc_end is None:
-                # Full line is within a multi-line comment.
                 line_comments.append((0, line))
             else:
-                # Start of line is the end of a multi-line comment.
                 line_comments.append((0, mc_end.group(1)))
                 last = mc_end.end()
                 in_comment = False
 
         if not in_comment:
             for inline in INLINE_COMMENT.finditer(line, last):
-                # Single-line comment.
-                m = inline.lastindex  # 1 is //, 2 is /* ... */
+                m = inline.lastindex
                 line_comments.append((inline.start(m), inline.group(m)))
                 last = inline.end(m)
 
             if last < len(line):
                 mc_start = MULTI_COMMENT_START.search(line, last)
                 if mc_start is not None:
-                    # New multi-lie comment starts at end of line.
                     line_comments.append((mc_start.start(1), mc_start.group(1)))
                     in_comment = True
 
@@ -651,63 +720,26 @@ def extract_comments(lines):
             last_on_line = idx + 1 >= len(line_comments)
             comments.append(Comment(line=line_idx, col=col, text=text, last_on_line=last_on_line))
 
-    # Handle control statements and filter out comments that are part of
-    # RST code block and literal include directives.
+    # Handle control statements
     result = []
     n = 0
-    nc = len(comments)
 
-    while n < nc:
+    while n < len(comments):
         text = comments[n].text
 
         if SPELLCHECK_SKIP_FILE in text:
-            # Skip the file: just don't return any comments.
             return []
 
-        pos = text.find(SPELLCHECK_ON)
-        if pos != -1:
-            # Ignored because spellchecking isn't disabled. Just mask out the command.
-            comments[n].text = text[:pos] + ' ' * len(SPELLCHECK_ON) + text[pos
-                                                                            + len(SPELLCHECK_ON):]
+        if SPELLCHECK_ON in text:
+            pos = text.find(SPELLCHECK_ON)
+            comments[n].text = text[:pos] + ' ' * len(SPELLCHECK_ON) + text[pos + len(SPELLCHECK_ON):]
             result.append(comments[n])
             n += 1
         elif SPELLCHECK_OFF in text or SPELLCHECK_SKIP_BLOCK in text:
-            skip_block = SPELLCHECK_SKIP_BLOCK in text
-            last_line = n
             n += 1
-            while n < nc:
-                if skip_block:
-                    if comments[n].line - last_line > 1:
-                        # Gap in comments. We've skipped the block.
-                        break
-                    line = lines[comments[n].line]
-                    if line[:comments[n].col].strip() != "":
-                        # Some code here. We've skipped the block.
-                        break
-                elif SPELLCHECK_ON in comments[n].text:
-                    # Turn checking back on.
-                    n += 1
-                    break
-
+            while n < len(comments) and SPELLCHECK_ON not in comments[n].text:
                 n += 1
-        elif text.strip().startswith(RST_CODE_BLOCK) or text.strip().startswith(
-                RST_LITERAL_INCLUDE):
-            # Start of a code block.
-            indent = len(INDENT.search(text).group(1))
-            last_line = comments[n].line
-            n += 1
-
-            while n < nc:
-                if comments[n].line - last_line > 1:
-                    # Gap in comments. Code block is finished.
-                    break
-                last_line = comments[n].line
-
-                if comments[n].text.strip() != "":
-                    # Blank lines are ignored in code blocks.
-                    if len(INDENT.search(comments[n].text).group(1)) <= indent:
-                        # Back to original indent, or less. The code block is done.
-                        break
+            if n < len(comments):
                 n += 1
         else:
             result.append(comments[n])
@@ -715,60 +747,110 @@ def extract_comments(lines):
 
     return result
 
-
-def check_file(checker, file, lines, error_handler):
-    in_code_block = 0
-    code_block_indent = 0
-    num_errors = 0
-
+def check_file(spell_checker, grammar_checker, style_checker, file, lines, error_handler, check_grammar=True, check_style=True):
+    """Check a file for all types of errors."""
     comments = extract_comments(lines)
-    errors = []
+    total_errors = 0
+
     for comment in comments:
-        errors += check_comment(checker, comment.col, comment.text)
-        if comment.last_on_line and len(errors) > 0:
-            # Handle all the errors in a line.
-            num_errors += len(errors)
+        errors = check_comment(spell_checker, grammar_checker, style_checker,
+                             comment.col, comment.text, check_grammar, check_style)
+
+        if comment.last_on_line and errors:
+            total_errors += len(errors)
             error_handler(file, comment.line, lines, errors)
-            errors = []
 
-    return (len(comments), num_errors)
+    return (len(comments), total_errors)
 
+def execute(files, dictionary_file, fix, detailed_output=False, check_grammar=True, check_style=True, use_online_grammar=False):
+    """Execute the checking process."""
+    # Initialize checkers
+    spell_checker = SpellChecker(dictionary_file)
+    spell_checker.start()
 
-def execute(files, dictionary_file, fix):
-    checker = SpellChecker(dictionary_file)
-    checker.start()
+    grammar_checker = None
+    if check_grammar:
+        grammar_checker = GrammarChecker(use_online=use_online_grammar)
+        if not grammar_checker.available:
+            print(f"{yellow('Warning: Grammar checker not available. Install LanguageTool server or use --online-grammar')}")
 
-    handler = print_error
+    style_checker = StyleChecker() if check_style else None
+
+    # Determine error handler
     if fix:
-        handler = partial(fix_error, checker)
+        handler = partial(fix_error, spell_checker)
+    elif detailed_output:
+        handler = print_error_detailed
+    else:
+        handler = print_error_summary
 
+    # Process files
     total_files = 0
     total_comments = 0
     total_errors = 0
+    files_with_errors = []
+    error_summary = defaultdict(int)
+
+    print(f"\n{blue('='*70)}")
+    print(f"{blue('INTELLIGENT SPELL & GRAMMAR CHECKER')}")
+    print(f"{blue('='*70)}")
+
+    checkers_enabled = []
+    if spell_checker: checkers_enabled.append("Spelling")
+    if grammar_checker and grammar_checker.available: checkers_enabled.append("Grammar")
+    if style_checker: checkers_enabled.append("Style")
+
+    print(f"Enabled checkers: {green(', '.join(checkers_enabled))}")
+    print(f"Processing {len(files)} files...")
+    print()
+
     for path in files:
-        with open(path, 'r') as f:
-            lines = f.readlines()
-            total_files += 1
-            (num_comments, num_errors) = check_file(checker, path, lines, handler)
-            total_comments += num_comments
-            total_errors += num_errors
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                total_files += 1
 
-        if fix and num_errors > 0:
-            with open(path, 'w') as f:
-                f.writelines(lines)
+                (num_comments, num_errors) = check_file(
+                    spell_checker, grammar_checker, style_checker,
+                    path, lines, handler, check_grammar, check_style
+                )
 
-    checker.stop()
+                total_comments += num_comments
+                total_errors += num_errors
 
-    print(
-        "Checked %d file(s) and %d comment(s), found %d error(s)." %
-        (total_files, total_comments, total_errors))
+                if num_errors > 0:
+                    files_with_errors.append((path, num_errors))
+
+            if fix and num_errors > 0:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.writelines(lines)
+
+        except Exception as e:
+            print(f"{red(f'Error processing {path}: {e}')}")
+
+    spell_checker.stop()
+
+    # Print summary
+    print(f"{blue('='*70)}")
+    print(f"{blue('SUMMARY')}")
+    print(f"{blue('='*70)}")
+    print(f"Files processed: {green(str(total_files))}")
+    print(f"Comments checked: {green(str(total_comments))}")
+    print(f"Total errors: {red(str(total_errors)) if total_errors > 0 else green(str(total_errors))}")
+
+    if files_with_errors:
+        print(f"\n{red('Files with errors:')}")
+        for file_path, error_count in files_with_errors:
+            print(f"  • {file_path}: {error_count} error(s)")
+    else:
+        print(f"\n{green('✓ No errors found!')}")
+
+    print(f"{blue('='*70)}\n")
 
     return total_errors == 0
 
-
 if __name__ == "__main__":
-    # Force UTF-8 across all open and popen calls. Fallback to 'C' as the
-    # language to handle hosts where en_US is not recognized (e.g. CI).
+    # Set locale
     try:
         locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
     except:
@@ -776,70 +858,70 @@ if __name__ == "__main__":
 
     default_dictionary = os.path.join(CURR_DIR, 'spelling_dictionary.txt')
 
-    parser = argparse.ArgumentParser(description="Check comment spelling.")
-    parser.add_argument(
-        'operation_type',
-        type=str,
-        choices=['check', 'fix'],
-        help="specify if the run should 'check' or 'fix' spelling.")
-    parser.add_argument(
-        'target_paths', type=str, nargs="*", help="specify the files for the script to process.")
-    parser.add_argument(
-        '-d', '--debug', action='count', default=0, help="Debug spell checker subprocess.")
-    parser.add_argument(
-        '--mark', action='store_true', help="Emits extra output to mark misspelled words.")
-    parser.add_argument(
-        '--dictionary',
-        type=str,
-        default=default_dictionary,
-        help="specify a location for Envoy-specific dictionary words")
-    parser.add_argument(
-        '--color',
-        type=str,
-        choices=['on', 'off', 'auto'],
-        default="auto",
-        help="Controls colorized output. Auto limits color to TTY devices.")
-    parser.add_argument(
-        '--test-ignore-exts',
-        dest='test_ignore_exts',
-        action='store_true',
-        help="For testing, ignore file extensions.")
+    parser = argparse.ArgumentParser(description="Intelligent spell, grammar, and style checker for code comments.")
+    parser.add_argument('operation_type', choices=['check', 'fix'], help="Check or fix errors")
+    parser.add_argument('target_paths', nargs="*", help="Files or directories to process")
+    parser.add_argument('-d', '--debug', action='count', default=0, help="Debug mode")
+    parser.add_argument('--mark', action='store_true', help="Mark errors with carets")
+    parser.add_argument('--dictionary', default=default_dictionary, help="Dictionary file")
+    parser.add_argument('--color', choices=['on', 'off', 'auto'], default="auto", help="Colorized output")
+    parser.add_argument('--proto-only', action='store_true', help="Check only .proto files")
+    parser.add_argument('--detailed', action='store_true', help="Detailed error output")
+    parser.add_argument('--no-grammar', action='store_true', help="Disable grammar checking")
+    parser.add_argument('--no-style', action='store_true', help="Disable style checking")
+    parser.add_argument('--online-grammar', action='store_true', help="Use online LanguageTool API")
+    parser.add_argument('--test-ignore-exts', action='store_true', help="Ignore file extensions (for testing)")
+
     args = parser.parse_args()
 
+    # Configure output
     COLOR = args.color == "on" or (args.color == "auto" and sys.stdout.isatty())
     DEBUG = args.debug
     MARK = args.mark
 
-    paths = args.target_paths
-    if not paths:
-        paths = ['./api', './include', './source', './test', './tools']
+    # Determine file paths
+    if not args.target_paths:
+        args.target_paths = ['./api'] if args.proto_only else ['./api', './include', './source', './test', './tools']
 
-    # Exclude ./third_party/ directory from spell checking, even when requested through arguments.
-    # Otherwise git pre-push hook checks it for merged commits.
-    paths = [path for path in paths if not path.startswith('./third_party/')]
+    # Filter out third_party
+    paths = [p for p in args.target_paths if not p.startswith('./third_party/')]
 
-    exts = ['.cc', '.js', '.h', '.proto']
-    if args.test_ignore_exts:
+    # Determine file extensions
+    if args.proto_only:
+        exts = ['.proto']
+    elif args.test_ignore_exts:
         exts = None
+    else:
+        exts = ['.cc', '.js', '.h', '.proto']
+
+    # Collect target files
     target_paths = []
     for p in paths:
         if os.path.isdir(p):
             for root, _, files in os.walk(p):
-                target_paths += [
-                    os.path.join(root, f)
-                    for f in files
-                    if (exts is None or os.path.splitext(f)[1] in exts)
-                ]
-        if os.path.isfile(p) and (exts is None or os.path.splitext(p)[1] in exts):
-            target_paths += [p]
+                target_paths.extend([
+                    os.path.join(root, f) for f in files
+                    if exts is None or os.path.splitext(f)[1] in exts
+                ])
+        elif os.path.isfile(p) and (exts is None or os.path.splitext(p)[1] in exts):
+            target_paths.append(p)
 
-    rv = execute(target_paths, args.dictionary, args.operation_type == 'fix')
+    if args.proto_only:
+        target_paths = [p for p in target_paths if p.endswith('.proto')]
 
-    if args.operation_type == 'check':
-        if not rv:
-            print(
-                "ERROR: spell check failed. Run 'tools/spelling/check_spelling_pedantic.py fix and/or add new "
-                "words to tools/spelling/spelling_dictionary.txt'")
-            sys.exit(1)
+    # Execute checking
+    success = execute(
+        target_paths,
+        args.dictionary,
+        args.operation_type == 'fix',
+        args.detailed,
+        not args.no_grammar,
+        not args.no_style,
+        args.online_grammar
+    )
 
-        print("PASS")
+    if args.operation_type == 'check' and not success:
+        print(f"{red('FAILED: Errors found. Run with fix to correct them.')}")
+        sys.exit(1)
+    elif args.operation_type == 'check':
+        print(f"{green('SUCCESS: All checks passed!')}")

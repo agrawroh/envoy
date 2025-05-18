@@ -56,10 +56,10 @@ bool KtlsSslInfoImpl::getTxCryptoInfo(tls_crypto_info_t& crypto_info) const {
     }
 
     // Copy data from vectors to crypto_info struct
-    memcpy(crypto_info.key, client_key_.data(), sizeof(crypto_info.key));
-    memcpy(crypto_info.iv, client_iv_.data(), sizeof(crypto_info.iv));
-    memcpy(crypto_info.rec_seq, client_rec_seq_.data(), sizeof(crypto_info.rec_seq));
-    memcpy(crypto_info.salt, client_salt_.data(), sizeof(crypto_info.salt));
+    safeMemcpyUnsafeSrc(crypto_info.key, client_key_.data());
+    safeMemcpyUnsafeSrc(crypto_info.iv, client_iv_.data());
+    safeMemcpyUnsafeSrc(crypto_info.rec_seq, client_rec_seq_.data());
+    safeMemcpyUnsafeSrc(crypto_info.salt, client_salt_.data());
   } else {
     if (server_key_.size() != sizeof(crypto_info.key) ||
         server_iv_.size() != sizeof(crypto_info.iv) ||
@@ -68,10 +68,10 @@ bool KtlsSslInfoImpl::getTxCryptoInfo(tls_crypto_info_t& crypto_info) const {
     }
 
     // Copy data from vectors to crypto_info struct
-    memcpy(crypto_info.key, server_key_.data(), sizeof(crypto_info.key));
-    memcpy(crypto_info.iv, server_iv_.data(), sizeof(crypto_info.iv));
-    memcpy(crypto_info.rec_seq, server_rec_seq_.data(), sizeof(crypto_info.rec_seq));
-    memcpy(crypto_info.salt, server_salt_.data(), sizeof(crypto_info.salt));
+    safeMemcpyUnsafeSrc(crypto_info.key, server_key_.data());
+    safeMemcpyUnsafeSrc(crypto_info.iv, server_iv_.data());
+    safeMemcpyUnsafeSrc(crypto_info.rec_seq, server_rec_seq_.data());
+    safeMemcpyUnsafeSrc(crypto_info.salt, server_salt_.data());
   }
 
   return true;
@@ -103,10 +103,10 @@ bool KtlsSslInfoImpl::getRxCryptoInfo(tls_crypto_info_t& crypto_info) const {
     }
 
     // Copy data from vectors to crypto_info struct
-    memcpy(crypto_info.key, server_key_.data(), sizeof(crypto_info.key));
-    memcpy(crypto_info.iv, server_iv_.data(), sizeof(crypto_info.iv));
-    memcpy(crypto_info.rec_seq, server_rec_seq_.data(), sizeof(crypto_info.rec_seq));
-    memcpy(crypto_info.salt, server_salt_.data(), sizeof(crypto_info.salt));
+    safeMemcpyUnsafeSrc(crypto_info.key, server_key_.data());
+    safeMemcpyUnsafeSrc(crypto_info.iv, server_iv_.data());
+    safeMemcpyUnsafeSrc(crypto_info.rec_seq, server_rec_seq_.data());
+    safeMemcpyUnsafeSrc(crypto_info.salt, server_salt_.data());
   } else {
     if (client_key_.size() != sizeof(crypto_info.key) ||
         client_iv_.size() != sizeof(crypto_info.iv) ||
@@ -115,10 +115,10 @@ bool KtlsSslInfoImpl::getRxCryptoInfo(tls_crypto_info_t& crypto_info) const {
     }
 
     // Copy data from vectors to crypto_info struct
-    memcpy(crypto_info.key, client_key_.data(), sizeof(crypto_info.key));
-    memcpy(crypto_info.iv, client_iv_.data(), sizeof(crypto_info.iv));
-    memcpy(crypto_info.rec_seq, client_rec_seq_.data(), sizeof(crypto_info.rec_seq));
-    memcpy(crypto_info.salt, client_salt_.data(), sizeof(crypto_info.salt));
+    safeMemcpyUnsafeSrc(crypto_info.key, client_key_.data());
+    safeMemcpyUnsafeSrc(crypto_info.iv, client_iv_.data());
+    safeMemcpyUnsafeSrc(crypto_info.rec_seq, client_rec_seq_.data());
+    safeMemcpyUnsafeSrc(crypto_info.salt, client_salt_.data());
   }
 
   return true;

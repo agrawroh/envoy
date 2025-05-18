@@ -1,0 +1,99 @@
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
+static_resources:
+  listeners:
+    - name: listener_0
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      listener_filters:
+        - name: envoy.filters.listener.tls_inspector
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local_service
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: service
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+          transport_socket:
+            name: envoy.transport_sockets.ktls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.ktls.v3.KtlsTransportSocket
+              enable_tx_zerocopy: true
+              enable_rx_no_pad: true
+              tls_socket_config:
+                name: envoy.transport_sockets.tls
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+                  common_tls_context:
+                    tls_certificates:
+                      - certificate_chain: { filename: "certs/servercert.pem" }
+                        private_key: { filename: "certs/serverkey.pem" }
+                    tls_params:
+                      tls_minimum_protocol_version: TLSv1_2
+                      tls_maximum_protocol_version: TLSv1_2
+                      cipher_suites:
+                        - ECDHE-RSA-AES128-GCM-SHA256
+  clusters:
+    - name: service
+      connect_timeout: 0.25s
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY 
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: service
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: www.google.com
+                      port_value: 443
+      transport_socket:
+        name: envoy.transport_sockets.ktls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.ktls.v3.KtlsTransportSocket
+          enable_tx_zerocopy: true
+          enable_rx_no_pad: true
+          tls_socket_config:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+              sni: www.google.com
+              common_tls_context:
+                tls_params:
+                  tls_minimum_protocol_version: TLSv1_2
+                  tls_maximum_protocol_version: TLSv1_2
+                  cipher_suites:
+                    - ECDHE-RSA-AES128-GCM-SHA256  # Enforce only this cipher
+
+# Use default socket interface as kTLS is integrated through the transport_socket
+bootstrap_extensions:
+  - name: envoy.bootstrap.internal_listener
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.bootstrap.internal_listener.v3.InternalListener
+  - name: envoy.extensions.network.socket_interface.ktls_socket_interface
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.network.socket_interface.v3.KTlsSocketInterface
+      enabled: true
+      enable_tx_zerocopy: true
+      enable_rx_no_pad: true 

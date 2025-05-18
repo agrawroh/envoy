@@ -6,8 +6,13 @@ load(
 
 licenses(["notice"])  # Apache 2
 
+# THIS IMPLEMENTATION IS DEPRECATED AND SHOULD BE REMOVED
+# The kTLS socket interface implementation has been moved to source/extensions/transport_sockets/ktls
+# All new code should use the implementation in the extensions directory
+
 envoy_package()
 
+# TODO: Remove this implementation in favor of the one in source/extensions/transport_sockets/ktls
 envoy_cc_library(
     name = "ktls_socket_handle_lib",
     srcs = ["ktls_socket_handle_impl.cc"],
@@ -19,6 +24,7 @@ envoy_cc_library(
     ],
 )
 
+# TODO: Remove this implementation in favor of the one in source/extensions/transport_sockets/ktls
 envoy_cc_library(
     name = "ktls_socket_interface_lib",
     srcs = ["ktls_socket_interface.cc"],
@@ -35,7 +41,7 @@ envoy_cc_library(
     ],
 )
 
-# Add the extension library target with proper visibility
+# TODO: Remove this implementation in favor of the one in source/extensions/transport_sockets/ktls
 envoy_cc_library(
     name = "ktls_socket_interface_lib_envoy_extension",
     visibility = ["//visibility:public"],

@@ -6,7 +6,8 @@
 #include "envoy/network/io_handle.h"
 
 #include "source/common/common/logger.h"
-#include "source/common/network/default_socket_interface.h"
+
+#include "absl/status/statusor.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -35,18 +36,51 @@ public:
                                absl::optional<uint64_t> max_length) override;
   Api::IoCallUint64Result writev(const Buffer::RawSlice* slices, uint64_t num_slice) override;
   Api::IoCallUint64Result write(Buffer::Instance& buffer) override;
-  Api::IoCallUint64Result writev(uint64_t num_slice, Buffer::RawSliceData* slice_data) override;
-  Api::IoCallUint64Result send(const Buffer::RawSlice* slices, uint64_t num_slice,
-                               int flags) override;
+
+  // Socket status methods
+  bool wasConnected() const override;
+  Api::SysCallIntResult bind(Network::Address::InstanceConstSharedPtr address) override;
+  Api::SysCallIntResult listen(int backlog) override;
+  std::unique_ptr<Network::IoHandle> accept(struct sockaddr* addr, socklen_t* addrlen) override;
+  Api::SysCallIntResult connect(Network::Address::InstanceConstSharedPtr address) override;
+  Api::SysCallIntResult setOption(int level, int optname, const void* optval,
+                                  socklen_t optlen) override;
+  Api::SysCallIntResult getOption(int level, int optname, void* optval, socklen_t* optlen) override;
+  Api::SysCallIntResult ioctl(unsigned long control_code, void* in_buffer,
+                              unsigned long in_buffer_len, void* out_buffer,
+                              unsigned long out_buffer_len, unsigned long* bytes_returned) override;
+  Api::SysCallIntResult setBlocking(bool blocking) override;
+  absl::optional<int> domain() override;
+  absl::StatusOr<Network::Address::InstanceConstSharedPtr> localAddress() override;
+  absl::StatusOr<Network::Address::InstanceConstSharedPtr> peerAddress() override;
+  std::unique_ptr<Network::IoHandle> duplicate() override;
+  void initializeFileEvent(Event::Dispatcher& dispatcher, Event::FileReadyCb cb,
+                           Event::FileTriggerType trigger, uint32_t events) override;
+  void activateFileEvents(uint32_t events) override;
+  void enableFileEvents(uint32_t events) override;
+  void resetFileEvents() override;
+  Api::SysCallIntResult shutdown(int how) override;
+  absl::optional<std::chrono::milliseconds> lastRoundTripTime() override;
+  absl::optional<uint64_t> congestionWindowInBytes() const override;
+  absl::optional<std::string> interfaceName() override;
+  bool supportsTls() const override;
+
+  // Datagram-specific UDP functionality
   Api::IoCallUint64Result sendmsg(const Buffer::RawSlice* slices, uint64_t num_slice, int flags,
                                   const Network::Address::Ip* self_ip,
                                   const Network::Address::Instance& peer_address) override;
-  Api::IoCallUint64Result recv(Buffer::RawSlice* slices, uint64_t num_slice, int flags) override;
-  Api::IoCallUint64Result recvmsg(Buffer::RawSlice* slices, uint64_t num_slice, int flags,
-                                  uint32_t* self_port,
-                                  Network::Address::InstancePtr* peer_address) override;
-  Api::IoCallUint64Result recvmmsg(RawSliceArrays& slices, uint32_t* self_port,
-                                   Network::Address::InstancePtr* peer_address) override;
+
+  Api::IoCallUint64Result recvmsg(Buffer::RawSlice* slices, const uint64_t num_slice,
+                                  uint32_t self_port,
+                                  const Network::IoHandle::UdpSaveCmsgConfig& save_cmsg_config,
+                                  Network::IoHandle::RecvMsgOutput& output) override;
+
+  Api::IoCallUint64Result recvmmsg(RawSliceArrays& slices, uint32_t self_port,
+                                   const Network::IoHandle::UdpSaveCmsgConfig& save_cmsg_config,
+                                   Network::IoHandle::RecvMsgOutput& output) override;
+
+  Api::IoCallUint64Result recv(void* buffer, size_t length, int flags) override;
+
   bool supportsMmsg() const override;
   bool supportsUdpGro() const override;
 
@@ -55,7 +89,6 @@ public:
 
 private:
   Network::IoHandlePtr io_handle_;
-  bool ktls_enabled_{false};
 };
 
 } // namespace Ktls
