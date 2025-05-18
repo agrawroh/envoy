@@ -206,13 +206,25 @@ bool KtlsSslInfoImpl::extractCryptoParams() const {
     if (client_write_key_.size() != 16 || server_write_key_.size() != 16) {
       ENVOY_LOG(debug, "Invalid key size for AES-128-GCM (expected 16 bytes)");
       params_extracted_ = false;
+      return false;
     }
     
-    // Validate IV size - must be at least 8 bytes for GCM
-    if (client_write_iv_.size() < 8 || server_write_iv_.size() < 8) {
-      ENVOY_LOG(debug, "Invalid IV size for GCM (expected at least 8 bytes)");
+    // Validate IV size - must be at least 12 bytes for GCM (should be 12 exactly in TLS 1.2)
+    if (client_write_iv_.size() < 12 || server_write_iv_.size() < 12) {
+      ENVOY_LOG(debug, "Invalid IV size for GCM (expected at least 12 bytes)");
       params_extracted_ = false;
+      return false;
     }
+    
+    // Ensure sequence numbers are initialized
+    if (client_write_seq_.size() != 8 || server_write_seq_.size() != 8) {
+      ENVOY_LOG(debug, "Invalid sequence number size (expected 8 bytes)");
+      params_extracted_ = false;
+      return false;
+    }
+  } else {
+    ENVOY_LOG(debug, "Parameter extraction reported false");
+    return false;
   }
   
   return params_extracted_;

@@ -1,6 +1,11 @@
 #pragma once
 
+#include <memory>
+
+#include "envoy/api/io_error.h"
 #include "envoy/buffer/buffer.h"
+#include "envoy/common/exception.h"
+#include "envoy/common/platform.h"
 #include "envoy/network/io_handle.h"
 
 #include "source/common/common/logger.h"

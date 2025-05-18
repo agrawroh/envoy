@@ -44,6 +44,12 @@ public:
   void onConnected() override;
   bool isConnectionSecure() const;
 
+  /**
+   * Check if kTLS is enabled for this socket.
+   * @return true if kTLS is enabled, false otherwise.
+   */
+  bool isKtlsEnabled() const;
+
 private:
   /**
    * Try to enable kTLS on the socket.
