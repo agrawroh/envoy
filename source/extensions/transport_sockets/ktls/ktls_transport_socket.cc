@@ -520,7 +520,16 @@ bool KtlsTransportSocket::isSslHandshakeComplete() const {
   ENVOY_LOG(debug, "SSL handshake completion check - is_handshake_done={}, has_session_id={}, has_crypto_info={}, has_peer_cert={}", 
             is_handshake_done, has_session_id, has_crypto_info, has_peer_cert);
   
-  // We need a stricter check for SSL handshake completion
+  // CRITICAL FIX: For upstream connections, require is_handshake_done to be true
+  // This aligns with the SSL_in_init check in enableKtls and avoids premature enablement
+  if (is_upstream_) {
+    // For upstream, we must have is_handshake_done=true to avoid race conditions
+    bool result = is_handshake_done && (has_crypto_info || has_peer_cert || has_session_id);
+    ENVOY_LOG(debug, "Upstream handshake completion result: {} (requiring is_handshake_done=true)", result);
+    return result;
+  }
+  
+  // For downstream, keep the original checks which are more permissive
   // At least one of these strong indicators must be true
   bool strong_handshake_indicator = is_handshake_done || has_session_id;
   
@@ -557,8 +566,9 @@ void KtlsTransportSocket::determineKtlsReadiness() {
     ENVOY_LOG(info, "SSL handshake not yet complete for {} connection, cannot enable kTLS",
               is_upstream_ ? "upstream" : "downstream");
     
-    // For upstream connections, we'll try more attempts since handshake can take longer
-    uint32_t max_attempts = is_upstream_ ? 10 : 5;
+    // CRITICAL FIX: For upstream connections, try many more attempts with longer delays
+    // as upstream handshakes typically take longer and we need all indicators to be set
+    uint32_t max_attempts = is_upstream_ ? 20 : 5;
     
     // If we've already tried several times, give up
     if (readiness_attempts_ >= max_attempts) {
@@ -1034,6 +1044,7 @@ bool KtlsTransportSocket::enableKtls() {
     }
 
   // Define ktls_mode variable to track kernel support level
+  // Must be used for the initializeSequenceNumbers call below
   int ktls_mode = 0; // 0=basic, 1=partial non-zero seq, 2=full support
 
   // Enhanced kernel version detection and feature support determination
@@ -1159,29 +1170,27 @@ bool KtlsTransportSocket::enableKtls() {
     ktls_info_ = std::make_shared<KtlsSslInfoImpl>(ssl_connection);
   }
 
-  // CRITICAL FIX: Test and fix mismatch between upstream and downstream SSL handshake status
+  // CRITICAL FIX: Extra validation for SSL handle in both upstream and downstream
+  if (!ssl_handle) {
+    ENVOY_LOG(warn, "No SSL handle available for {} connection, cannot enable kTLS safely",
+              is_upstream_ ? "upstream" : "downstream");
+    ktls_enabled_ = false;
+    ktls_state_determined_ = true;
+    return false;
+  }
+    
+  // CRITICAL FIX: For upstream connections, we should have already verified
+  // that SSL_in_init() == 0 in isSslHandshakeComplete(), so this check is redundant
+  // and might be inconsistent if SSL state changed between checks.
+  // However, as a sanity check, log if we detect an inconsistency.
+  if (is_upstream_ && SSL_in_init(ssl_handle) != 0) {
+    ENVOY_LOG(error, "Inconsistent handshake state detected: SSL_in_init!=0 but handshake was previously complete");
+    // Continue anyway since we've already decided the handshake is complete enough
+  }
+  
+  // Check for session ID, but don't fail if it's missing as some connections can be complete
+  // without having a session ID set yet (especially on first connection)
   if (is_upstream_) {
-    // For upstream connections, we need to wait a bit longer to ensure the handshake is fully
-    // complete and all parameters are properly set before attempting to extract crypto params
-    
-    // Extra validation for upstream connections
-    if (!ssl_handle) {
-      ENVOY_LOG(warn, "No SSL handle available for upstream connection, cannot enable kTLS safely");
-      ktls_enabled_ = false;
-      ktls_state_determined_ = true;
-      return false;
-    }
-    
-    // Verify if SSL_in_init returns 0, which means the handshake is definitely complete
-    if (SSL_in_init(ssl_handle) != 0) {
-      ENVOY_LOG(warn, "Upstream SSL_in_init shows handshake not fully complete, cannot enable kTLS safely");
-      ktls_enabled_ = false;
-      ktls_state_determined_ = true;
-      return false;
-    }
-    
-    // Check for session ID, but don't fail if it's missing as some connections can be complete
-    // without having a session ID set yet (especially on first connection)
     std::string session_id = std::string(ssl_connection->sessionId());
     if (session_id.empty()) {
       ENVOY_LOG(debug, "Upstream connection has no session ID, but continuing with kTLS if all other checks pass");

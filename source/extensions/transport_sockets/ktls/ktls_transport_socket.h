@@ -109,6 +109,7 @@ private:
 
   /**
    * Check if the SSL handshake is complete.
+   * Uses different criteria for upstream vs downstream connections.
    * @return true if the handshake is complete, false otherwise.
    */
   bool isSslHandshakeComplete() const;
