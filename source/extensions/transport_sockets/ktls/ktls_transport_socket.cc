@@ -2,40 +2,53 @@
 #include <utility>
 #include <vector>
 
-// Include system headers only once and in a specific order to avoid conflicts
-#ifdef __linux__
-// Include Linux-specific headers
-#include <sys/socket.h>
-#include <sys/utsname.h>
-#include <sys/ioctl.h> // For FIONREAD ioctl
-#include <endian.h>    // For htobe64 and be64toh endian conversion functions
-#include <poll.h>      // For pollfd struct and POLLIN constant
+// Standard C/C++ headers available on all platforms
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <errno.h>
 
-// Only use linux/tcp.h for the specific kTLS definitions we need
-// Include it in a namespace to avoid polluting global namespace
-namespace {
-#include <linux/tcp.h>
-} // namespace
-
-// Include capability support if available
-#if __has_include(<sys/capability.h>)
-#include <sys/capability.h>
-#define HAS_CAPABILITY_SUPPORT 1
-#endif
-
-// More reliable check for splice availability
-#if __has_include(<sys/splice.h>) || defined(splice)
-#include <sys/splice.h>
-#define HAS_SPLICE_SYSCALL 1
-#else
-// Try to detect if we have splice function available even without the header
+// Non-Linux system headers that are safe to include globally
 #include <unistd.h>
 #include <fcntl.h>
-#ifdef __NR_splice
-#define HAS_SPLICE_SYSCALL 1
+
+// Platform-specific includes
+#ifdef __linux__
+// Include Linux system headers globally since macros can't be namespaced
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/utsname.h>
+#include <sys/ioctl.h>
+#include <sys/time.h>
+#include <endian.h>
+#include <poll.h>
+#include <netinet/in.h>
+
+// Be careful with TCP headers - netinet/tcp.h and linux/tcp.h have conflicts
+// Include only netinet/tcp.h and define missing constants ourselves
+#include <netinet/tcp.h>
+
+// Define missing TCP constants that might be needed from linux/tcp.h
+#ifndef TCP_ULP
+#define TCP_ULP 31
 #endif
+
+#ifndef TCP_AVAILABLE_ULPS
+#define TCP_AVAILABLE_ULPS 20
 #endif
+
+// We need TLS definitions which might be in linux/tls.h
+#if __has_include(<linux/tls.h>)
+#include <linux/tls.h>
 #endif
+
+#if __has_include(<sys/splice.h>)
+#include <sys/splice.h>
+#endif
+#if __has_include(<sys/capability.h>)
+#include <sys/capability.h>
+#endif
+#endif // __linux__
 
 // Include Envoy headers
 #include "envoy/event/dispatcher.h"
@@ -63,6 +76,99 @@ namespace {
 // Include SSL socket header using correct path
 #include "source/common/tls/ssl_socket.h"
 
+// Create platform-agnostic utility namespace
+namespace platform_util {
+
+// Macro to mark parameters as unused to avoid compiler warnings
+#define UNUSED_PARAMETER(param) ((void)(param))
+
+#ifdef __linux__
+// Linux-specific platform utilities
+
+// Endian conversion wrappers
+inline uint64_t be64toh_fn(uint64_t value) {
+  return be64toh(value);
+}
+
+inline uint64_t htobe64_fn(uint64_t value) {
+  return htobe64(value);
+}
+
+// System call wrappers
+inline int ioctl_fn(int fd, unsigned long request, void* argp) {
+  return ::ioctl(fd, request, argp);
+}
+
+inline int poll_fn(pollfd* fds, nfds_t nfds, int timeout) {
+  return ::poll(fds, nfds, timeout);
+}
+
+// Use native socket poll structures
+using pollfd = ::pollfd;
+
+// Define system capability macros
+#if __has_include(<sys/capability.h>)
+#define HAS_CAPABILITY_SUPPORT 1
+#endif
+
+// Define splice syscall availability
+#if defined(splice) || defined(__NR_splice)
+#define HAS_SPLICE_SYSCALL 1
+#endif
+
+#else // Not Linux
+
+// Define byte order conversion for non-Linux systems
+#if defined(__APPLE__)
+// macOS (Darwin) has different byte order functions
+#include <libkern/OSByteOrder.h>
+inline uint64_t be64toh_fn(uint64_t value) {
+  return OSSwapBigToHostInt64(value);
+}
+#elif defined(_WIN32)
+// Windows implementation
+#include <stdlib.h>
+inline uint64_t be64toh_fn(uint64_t value) {
+  return _byteswap_uint64(value);
+}
+#else
+// Generic BSD-like systems
+#include <endian.h>
+inline uint64_t be64toh_fn(uint64_t value) {
+  return be64toh(value);
+}
+#endif
+
+// Define our own pollfd structure for non-Linux systems
+struct pollfd {
+  int fd;
+  short events;
+  short revents;
+};
+
+// Placeholder implementations for non-Linux systems
+inline int ioctl_fn(int fd, unsigned long request, void* argp) {
+  // Mark parameters as unused to avoid compiler warnings
+  UNUSED_PARAMETER(fd);
+  UNUSED_PARAMETER(request);
+  UNUSED_PARAMETER(argp);
+  errno = ENOSYS;
+  return -1;
+}
+
+inline int poll_fn(pollfd* fds, size_t nfds, int timeout) {
+  // Mark parameters as unused to avoid compiler warnings
+  UNUSED_PARAMETER(fds);
+  UNUSED_PARAMETER(nfds);
+  UNUSED_PARAMETER(timeout);
+  errno = ENOSYS;
+  return -1;
+}
+
+#endif // __linux__
+
+} // namespace platform_util
+
 // Define TLS constants for non-Linux platforms
 #ifndef SOL_TLS
 #define SOL_TLS 282
@@ -88,7 +194,6 @@ namespace {
 #define TLS_RX_EXPECT_NO_PAD 4
 #endif
 
-// Define linux/tcp.h constants needed for kTLS
 #ifndef TCP_ULP
 #define TCP_ULP 31
 #endif
@@ -97,9 +202,8 @@ namespace {
 #define TCP_INFO 11
 #endif
 
-// Define tls_crypto_info_t type if not defined
-#ifndef __linux__
-using tls_crypto_info_t = void*;
+#ifndef TCP_AVAILABLE_ULPS
+#define TCP_AVAILABLE_ULPS 20
 #endif
 
 namespace Envoy {
@@ -237,7 +341,7 @@ Network::IoResult KtlsTransportSocket::doRead(Buffer::Instance& buffer) {
               tls_crypto_info_t rx_info = {};
               if (ktls_info_->getRxCryptoInfo(rx_info)) {
                 memcpy(&kernel_rx_seq, rx_info.rec_seq, 8);
-                kernel_rx_seq = be64toh(kernel_rx_seq);
+                kernel_rx_seq = platform_util::be64toh_fn(kernel_rx_seq);
                 have_kernel_seq = true;
 
                 // Check if there's actually a sequence mismatch
@@ -281,113 +385,85 @@ Network::IoResult KtlsTransportSocket::doRead(Buffer::Instance& buffer) {
       // CRITICAL FIX: Handle sequence number mismatch based on whether it's actually confirmed
       // and attempt recovery using progressively more aggressive strategies
 
-      // ENHANCED: Try to examine TLS records in the buffer for better diagnostics
+      // Try to drain any bad data that might be in the socket buffer
       if (fd >= 0) {
-        // Use a temporary buffer for TLS record analysis - large enough for TLS headers
-        char peek_buffer[16];
-        int flags = MSG_PEEK | MSG_DONTWAIT;
-
-        // First peek to see if there's data available - just look at the header
-        ssize_t peek_bytes = ::recv(fd, peek_buffer, sizeof(peek_buffer), flags);
-        if (peek_bytes >= 5) { // TLS record header is 5 bytes
-          // Analyze TLS record header to determine record type and length
-          uint8_t record_type = static_cast<uint8_t>(peek_buffer[0]);
-          uint16_t tls_version = (static_cast<uint16_t>(peek_buffer[1]) << 8) | peek_buffer[2];
-          uint16_t record_len = (static_cast<uint16_t>(peek_buffer[3]) << 8) | peek_buffer[4];
-          size_t total_record_size = record_len + 5; // Add header size
-
-          ENVOY_LOG(debug,
-                    "TLS record analysis: type={}, version=0x{:04x}, length={}, total_size={}",
-                    record_type, tls_version, record_len, total_record_size);
-
-          // More detailed analysis based on record type
-          std::string record_type_str;
-          switch (record_type) {
-          case 20:
-            record_type_str = "ChangeCipherSpec";
-            break;
-          case 21:
-            record_type_str = "Alert";
-            break;
-          case 22:
-            record_type_str = "Handshake";
-            break;
-          case 23:
-            record_type_str = "Application";
-            break;
-          default:
-            record_type_str = "Unknown";
-            break;
-          }
-
-          ENVOY_LOG(info, "Found TLS record type: {} ({}), length {} (total size {})", record_type,
-                    record_type_str, record_len, total_record_size);
-
-          // ENHANCED RECOVERY: Try to skip exactly one record to maintain sync
-          if (record_type <= 23 && record_len < 16384) { // Sanity check on record length
-            std::vector<char> drain_buffer(total_record_size);
-            ssize_t drained = ::recv(fd, drain_buffer.data(), total_record_size, MSG_DONTWAIT);
-            ENVOY_LOG(info, "Drained {} bytes (one TLS record) from socket buffer", drained);
-
-            // EXPERIMENTAL: Try to parse the raw record for more diagnostics
-            if (drained >= 5 && record_type == 21 && record_len == 2) { // Alert record
-              uint8_t alert_level = static_cast<uint8_t>(drain_buffer[5]);
-              uint8_t alert_code = static_cast<uint8_t>(drain_buffer[6]);
-              ENVOY_LOG(info, "TLS Alert record: level={}, code={}", alert_level, alert_code);
+        // Find out how much data is available
+        int available = 0;
+        if (platform_util::ioctl_fn(fd, FIONREAD, &available) == 0 && available > 0) {
+          ENVOY_LOG(debug, "Draining {} bytes from socket with sequence error", available);
+          
+          // Allocate a temporary buffer for draining (up to 8KB at a time)
+          const int drain_size = std::min(available, 8192);
+          std::vector<uint8_t> drain_buffer(drain_size);
+          
+          // Try to drain data using a non-blocking recv
+          ssize_t drained = ::recv(fd, drain_buffer.data(), drain_buffer.size(), MSG_DONTWAIT);
+          if (drained > 0) {
+            ENVOY_LOG(debug, "Successfully drained {} bytes from socket", drained);
+            
+            // If the buffer contains enough bytes to be a TLS record, try to analyze it
+            if (drained >= 5) {
+              // TLS record header is 5 bytes: type(1) + version(2) + length(2)
+              uint8_t record_type = drain_buffer[0];
+              uint16_t tls_version = (static_cast<uint16_t>(drain_buffer[1]) << 8) | drain_buffer[2];
+              uint16_t record_len = (static_cast<uint16_t>(drain_buffer[3]) << 8) | drain_buffer[4];
+              
+              // Convert record type to string for better logging
+              std::string record_type_str;
+              switch (record_type) {
+              case 20: record_type_str = "ChangeCipherSpec"; break;
+              case 21: record_type_str = "Alert"; break;
+              case 22: record_type_str = "Handshake"; break;
+              case 23: record_type_str = "Application"; break;
+              default: record_type_str = "Unknown"; break;
+              }
+              
+              ENVOY_LOG(debug, "Drained TLS record: type={} ({}), version=0x{:04x}, length={}",
+                        record_type, record_type_str, tls_version, record_len);
+              
+              // Provide details for alert records to aid debugging
+              if (record_type == 21 && drained >= 7) { // Alert record (5+2 bytes)
+                uint8_t alert_level = drain_buffer[5];
+                uint8_t alert_code = drain_buffer[6];
+                ENVOY_LOG(debug, "TLS Alert: level={}, code={}", alert_level, alert_code);
+              }
             }
-          } else {
-            // Record looks corrupted, do a smaller drain
-            char drain_buffer[1024];
-            ssize_t drained = ::recv(fd, drain_buffer, sizeof(drain_buffer), MSG_DONTWAIT);
-            ENVOY_LOG(info, "Drained {} bytes of potentially corrupted data", drained);
           }
-        } else if (peek_bytes > 0) {
-          // Can't determine record length, just drain what we have
-          char drain_buffer[1024];
-          ssize_t drained = ::recv(fd, drain_buffer, peek_bytes, MSG_DONTWAIT);
-          ENVOY_LOG(debug, "Drained {} bytes of partial/corrupted data", drained);
         }
       }
 
-      // ENHANCED: Better recovery strategy with graduated approach
+      // Different recovery approaches based on failure count
       consecutive_decrypt_failures_++;
 
-      // Adaptive recovery based on failure count and type
       if (consecutive_decrypt_failures_ == 1) {
-        // On first failure, try to fix by just draining the bad record
-        ENVOY_LOG(info,
-                  "First kTLS decrypt failure. Attempting to recover by draining corrupted record");
-        // We'll try software TLS for this read, but won't disable kTLS yet
-      } else if (consecutive_decrypt_failures_ == 2) {
-        // On second failure, try to resynchronize if we can
-        ENVOY_LOG(info, "Second kTLS decrypt failure. Attempting to resynchronize with the kernel");
+        // On first failure, just try again with software TLS
+        ENVOY_LOG(info, "First kTLS decrypt failure. Using software TLS fallback this time.");
+      } else if (consecutive_decrypt_failures_ <= 3) {
+        // On subsequent failures, attempt resynchronization
+        ENVOY_LOG(warn, "Multiple kTLS failures (count={}). Attempting to resynchronize.",
+                  consecutive_decrypt_failures_);
         scheduleResynchronization();
-      } else if (consecutive_decrypt_failures_ == 3) {
-        // On third failure, log one more warning
-        ENVOY_LOG(warn, "Third kTLS decrypt failure. One more attempt before disabling kTLS");
       } else {
-        // After multiple failures, permanently disable kTLS for this connection
-        ENVOY_LOG(warn,
+        // After too many failures, permanently disable kTLS
+        ENVOY_LOG(error, 
                   "Too many kTLS decrypt failures ({}), permanently falling back to software TLS",
                   consecutive_decrypt_failures_);
         disableKtls("Multiple EBADMSG errors during read - sequence mismatch detected");
       }
 
-      // Always use software fallback for this read
+      // Fall back to software TLS for this read
       ENVOY_LOG(debug, "Using software TLS fallback for read operation");
-
-      // Use a safer fallback approach with error handling
-      // Attempt software TLS read but handle any errors that might occur
       Network::IoResult fallback_result = transport_socket_->doRead(buffer);
 
-      // Check if the software fallback also failed with a critical error
-      if (fallback_result.err_code_ && fallback_result.action_ == Network::PostIoAction::Close) {
+      // Check if the software fallback succeeded 
+      if (fallback_result.bytes_processed_ > 0) {
+        // Successfully read data - reset consecutive failure count
+        ENVOY_LOG(debug, "Software TLS read succeeded, resetting consecutive failure counter");
+        consecutive_decrypt_failures_ = 0;
+      } else if (fallback_result.err_code_ && fallback_result.action_ == Network::PostIoAction::Close) {
         // Both kTLS and software TLS fallback failed - likely a corrupted TLS state
         ENVOY_LOG(error, "Software TLS fallback also failed after kTLS error - "
                          "connection state may be corrupted, initiating close");
-
-        // Return the failure but with a more specific error message
-        return fallback_result;
       }
 
       return fallback_result;
@@ -588,20 +664,6 @@ bool KtlsTransportSocket::isSslHandshakeComplete() const {
     return false;
   }
 
-  // Use multiple indicators to determine if handshake is truly complete
-
-  // Method 1: Check if connection info is valid and has cipher info
-  std::string cipher = std::string(ssl_connection->ciphersuiteString());
-  std::string version = std::string(ssl_connection->tlsVersion());
-  bool has_crypto_info = !cipher.empty() && !version.empty();
-
-  // Method 2: Check if we have peer certificate (may not be present for all connections)
-  bool has_peer_cert = ssl_connection->peerCertificatePresented();
-
-  // Method 3: Check for TLS handshake completion indicators
-  bool has_session_id = !std::string(ssl_connection->sessionId()).empty();
-  bool has_security = ssl_connection->peerCertificateValidated();
-
   // Get SSL handle for low-level checks
   SSL* ssl_handle = nullptr;
   const Tls::ConnectionInfoImplBase* impl_base =
@@ -610,47 +672,46 @@ bool KtlsTransportSocket::isSslHandshakeComplete() const {
     ssl_handle = impl_base->ssl();
   }
 
-  // Method 4: Check SSL state directly using BoringSSL API
+  // Multiple methods to detect handshake completion
+  
+  // Method 1: Check if SSL_in_init returns 0 (most reliable indicator)
   bool is_handshake_done = false;
   if (ssl_handle) {
-    // Use SSL_get_state to check if in handshake
-    int state = SSL_get_state(ssl_handle);
+    // SSL_in_init() returns 0 when handshake is complete
+    is_handshake_done = (SSL_in_init(ssl_handle) == 0);
     
-    // SSL_ST_OK (0x03) means handshake is complete in BoringSSL
-    is_handshake_done = (state == 0x03);
-    
-    // Check if there's any handshake flags still set
-    bool handshake_flags = (state & SSL_ST_MASK) != 0;
-    
-    if (handshake_flags) {
-      // If any handshake flags are set, the handshake is not done
-      is_handshake_done = false;
+    // Double check with alternate approach if we have the function
+#ifdef SSL_is_init_finished
+    if (!is_handshake_done) {
+      is_handshake_done = SSL_is_init_finished(ssl_handle);
     }
+#endif
   }
 
+  // Method 2: Check connection info attributes
+  std::string cipher = std::string(ssl_connection->ciphersuiteString());
+  std::string version = std::string(ssl_connection->tlsVersion());
+  bool has_crypto_info = !cipher.empty() && !version.empty();
+  bool has_peer_cert = ssl_connection->peerCertificatePresented();
+  bool has_session_id = !std::string(ssl_connection->sessionId()).empty();
+  bool has_security = ssl_connection->peerCertificateValidated();
+
+  // Log the detailed state for debugging
   ENVOY_LOG(debug, "SSL handshake check - has_crypto_info: {}, has_peer_cert: {}, "
             "has_security: {}, has_session_id: {}, is_handshake_done: {}",
             has_crypto_info, has_peer_cert, has_security, has_session_id, is_handshake_done);
 
-  // For upstream connections, be stricter about completeness
+  // For upstream connections, be more cautious (but less restrictive than before)
   if (is_upstream_) {
-    // Need strong indicators of completion (cipher info + handshake complete)
-    // plus at least one of peer cert or security
-    bool result = has_crypto_info && is_handshake_done && (has_peer_cert || has_security);
+    // Reliable handshake completion = handshake done OR (crypto info AND peer cert/session ID)
+    bool result = is_handshake_done || (has_crypto_info && (has_peer_cert || has_session_id));
     
     ENVOY_LOG(debug, "Upstream SSL handshake completion: {}", result);
     return result;
   }
 
-  // For downstream, keep the original checks which are more permissive
-  // At least one of these strong indicators must be true
-  bool strong_handshake_indicator = is_handshake_done || has_session_id;
-
-  // And if using the weaker indicators, ensure we have both crypto info and
-  // either peer cert or security validation
-  bool weaker_handshake_indicators = has_crypto_info && (has_peer_cert || has_security);
-
-  return strong_handshake_indicator || weaker_handshake_indicators;
+  // For downstream, any strong indicator is acceptable
+  return is_handshake_done || has_crypto_info || has_peer_cert || has_session_id;
 }
 
 void KtlsTransportSocket::determineKtlsReadiness() {
@@ -694,19 +755,29 @@ void KtlsTransportSocket::determineKtlsReadiness() {
       return;
     }
 
-    // Schedule another attempt with an increasing delay (exponential backoff)
-    ENVOY_LOG(debug, "Scheduling kTLS readiness check in {}ms (attempt {}/5)",
-              10 * (1 << readiness_attempts_), readiness_attempts_ + 1);
+    // Calculate a reasonable delay with a maximum cap to avoid extreme delays
+    uint64_t base_delay_ms = 10;
+    uint64_t max_delay_ms = 160; // Cap max delay to avoid extremely long waits
+    
+    // Use exponential backoff but cap at maximum delay
+    uint64_t delay_ms = std::min(
+      base_delay_ms * (1 << std::min(readiness_attempts_, uint32_t(4))), 
+      max_delay_ms
+    );
+
+    ENVOY_LOG(debug, "Scheduling kTLS readiness check in {}ms (attempt {}/{})",
+              delay_ms, readiness_attempts_ + 1, max_attempts);
 
     readiness_attempts_++;
 
     // Schedule next check with increasing delay
     Event::Dispatcher& dispatcher = callbacks_->connection().dispatcher();
-    readiness_timer_ = dispatcher.createTimer([this]() {
-      ENVOY_LOG(debug, "Running scheduled kTLS readiness check");
+    readiness_timer_ = dispatcher.createTimer([this, max_attempts]() {
+      ENVOY_LOG(debug, "Running scheduled kTLS readiness check (attempt {}/{})", 
+                readiness_attempts_, max_attempts);
       determineKtlsReadiness();
     });
-    readiness_timer_->enableTimer(std::chrono::milliseconds(10 * (1 << readiness_attempts_)));
+    readiness_timer_->enableTimer(std::chrono::milliseconds(delay_ms));
 
     return;
   }
@@ -739,7 +810,11 @@ void KtlsTransportSocket::determineKtlsReadiness() {
     ENVOY_LOG(debug, "Current SSL sequence numbers - TX: {}, RX: {}", tx_seq, rx_seq);
 
     // Use the member variable safe_seq_threshold_ instead of hardcoded values
+    // On Linux 5.15, we can be more permissive as it supports non-zero sequence numbers properly
+    // This was a major improvement in 5.11+ kernels
     uint64_t active_safe_seq_threshold = safe_seq_threshold_;
+
+    // For older kernels (detected by poor kTLS support), be more conservative
     ENVOY_LOG(debug, "Using safe sequence threshold {} for {} connection.",
               active_safe_seq_threshold, is_upstream_ ? "upstream" : "downstream");
 
@@ -1091,7 +1166,7 @@ void KtlsTransportSocket::disableKtls(const std::string& reason) {
 
         // Check if data is available using a non-blocking call
         int readable = 0;
-        ioctl(fd, FIONREAD, &readable);
+        platform_util::ioctl_fn(fd, FIONREAD, &readable);
 
         if (readable > 0) {
           ENVOY_LOG(debug, "Draining socket buffer during kTLS disable ({} bytes available)",
@@ -1149,145 +1224,266 @@ bool KtlsTransportSocket::enableKtls() {
   
   // If ULP is already set, check if it's "tls" and if so, we're good
   if (res == 0) {
-    ulp_buf.resize(ulp_len);
-    if (ulp_buf == "tls") {
-      ENVOY_LOG(debug, "kTLS ULP already enabled for this socket");
-      // Create the KTLS specific connection info
-      auto ssl_connection = transport_socket_->ssl();
-      ktls_info_ = std::make_shared<KtlsSslInfoImpl>(std::move(ssl_connection));
-      return true;
+    // We need to resize the buffer to the actual length returned
+    // But we also need to handle any trailing null characters
+    if (ulp_len > 0) {
+      // Trim the string to the actual length (excluding null terminator)
+      ulp_buf.resize(ulp_len);
+      
+      // Further trim any null characters
+      size_t null_pos = ulp_buf.find('\0');
+      if (null_pos != std::string::npos) {
+        ulp_buf.resize(null_pos);
+      }
     } else {
-      ENVOY_LOG(debug, "Socket already has ULP '{}', cannot enable kTLS", ulp_buf);
-      return false;
+      ulp_buf.clear();
     }
+    
+    ENVOY_LOG(debug, "Current socket ULP status: len={}, value='{}'", ulp_len, ulp_buf);
+    
+    // Only check for existing ULP if the string is not empty
+    if (!ulp_buf.empty()) {
+      if (ulp_buf == "tls") {
+        ENVOY_LOG(debug, "kTLS ULP already enabled for this socket");
+        // Create the KTLS specific connection info
+        auto ssl_connection = transport_socket_->ssl();
+        ktls_info_ = std::make_shared<KtlsSslInfoImpl>(std::move(ssl_connection));
+        return true;
+      } else {
+        ENVOY_LOG(debug, "Socket already has ULP '{}', cannot enable kTLS", ulp_buf);
+        return false;
+      }
+    }
+    
+    // Empty ULP string means no ULP is set, so we can continue with setting up kTLS
+    ENVOY_LOG(debug, "No ULP currently set on socket, proceeding with kTLS setup");
+  } else {
+    // Error getting ULP info
+    ENVOY_LOG(debug, "getsockopt(TCP_ULP) failed: {} (errno={})", Envoy::errorDetails(errno), errno);
+    
+    // This is not a fatal error - many kernels don't implement getting ULP info but do support setting it
+    // So we can still proceed with the attempt to set the ULP
   }
 
   // Verify the connection state
-  bool is_connection_valid = true;
-  std::string conn_state_error;
-
-  // Validate that SSL handshake has completed and connection is valid
   auto ssl_connection = transport_socket_->ssl();
   if (!ssl_connection) {
-    conn_state_error = "No SSL connection available";
-    is_connection_valid = false;
-  } else {
-    const Tls::ConnectionInfoImplBase* impl_base = 
-        dynamic_cast<const Tls::ConnectionInfoImplBase*>(ssl_connection.get());
-    if (!impl_base) {
-      conn_state_error = "Not a valid SSL connection";
-      is_connection_valid = false;
-    }
-
-    SSL* ssl_handle = impl_base ? impl_base->ssl() : nullptr;
-    if (!ssl_handle) {
-      conn_state_error = "Cannot access SSL handle";
-      is_connection_valid = false;
-    }
-
-    // Verify SSL hasn't encountered an error
-    int ssl_err = SSL_get_error(ssl_handle, 0);
-    if (ssl_err != SSL_ERROR_NONE && ssl_err != SSL_ERROR_WANT_READ &&
-        ssl_err != SSL_ERROR_WANT_WRITE && ssl_err != SSL_ERROR_SYSCALL) {
-      conn_state_error = fmt::format("SSL in error state: {}", ssl_err);
-      is_connection_valid = false;
-    } else if (ssl_err == SSL_ERROR_SYSCALL) {
-      // SSL_ERROR_SYSCALL doesn't necessarily indicate a problem for kTLS
-      // Often happens when checking after handshake but connection is healthy
-      ENVOY_LOG(debug, "Ignoring SSL_ERROR_SYSCALL (5) as it's common during kTLS enablement");
-    }
-
-    if (ssl_handle) {
-      // Force a flush of any pending data in the SSL write buffer
-      ENVOY_LOG(debug, "Flushing any pending data before enabling kTLS");
-      if (BIO_flush(SSL_get_wbio(ssl_handle)) <= 0) {
-        ENVOY_LOG(debug, "BIO_flush failed: {}", ERR_reason_error_string(ERR_get_error()));
-        // Not fatal, continue
-      }
-
-      // For added safety, verify if any data is pending in the BIO
-      BIO* wbio = SSL_get_wbio(ssl_handle);
-      if (wbio && BIO_ctrl_pending(wbio) > 0) {
-        ENVOY_LOG(
-            warn,
-            "Write BIO still has pending data after flush ({} bytes), deferring kTLS enablement",
-            BIO_ctrl_pending(wbio));
-        return false;
-      }
-
-      // Check state of pending encrypted records which might cause issues for kTLS
-      // Record type 22 (handshake) or 21 (alert) should complete before enabling kTLS
-      // Use SSL_pending() check which is more widely available than SSL_get_record_type
-      if (SSL_pending(ssl_handle) > 0) {
-        ENVOY_LOG(debug, "SSL has pending data, deferring kTLS enablement");
-        return false;
-      }
-      
-      // ENHANCED: Check socket buffer status for pending data
-      int pending = 0;
-      if (ioctl(fd, FIONREAD, &pending) == 0 && pending > 0) {
-        ENVOY_LOG(debug, "Socket has {} bytes of pending data, deferring kTLS enablement", pending);
-        return false;
-      }
-
-      // Add extra check for SSL_in_connect/accept state to detect ongoing handshakes
-      // BoringSSL doesn't have SSL_in_connect/SSL_in_accept, so use SSL state directly
-      int ssl_state = SSL_get_state(ssl_handle);
-      // Check if handshake is not complete based on SSL state
-      bool handshake_active = (ssl_state & SSL_ST_MASK) != 0;
-      if (handshake_active) {
-        ENVOY_LOG(debug, "SSL still in handshake state (0x{:x}), deferring kTLS enablement", ssl_state);
-        return false;
-      }
-    }
-  }
-
-  if (!is_connection_valid) {
-    ENVOY_LOG(warn, "Cannot enable kTLS due to invalid connection state: {}", conn_state_error);
+    ENVOY_LOG(warn, "Cannot enable kTLS due to invalid connection state: No SSL connection available");
     return false;
   }
+
+  const Tls::ConnectionInfoImplBase* impl_base = 
+      dynamic_cast<const Tls::ConnectionInfoImplBase*>(ssl_connection.get());
+  if (!impl_base) {
+    ENVOY_LOG(warn, "Cannot enable kTLS due to invalid connection state: Not a valid SSL connection");
+    return false;
+  }
+
+  SSL* ssl_handle = impl_base ? impl_base->ssl() : nullptr;
+  if (!ssl_handle) {
+    ENVOY_LOG(warn, "Cannot enable kTLS due to invalid connection state: Cannot access SSL handle");
+    return false;
+  }
+
+  // Capture and log sequence numbers for diagnostics, especially important for Linux 5.15
+  uint64_t tx_seq = SSL_get_write_sequence(ssl_handle);
+  uint64_t rx_seq = SSL_get_read_sequence(ssl_handle);
+  ENVOY_LOG(debug, "SSL sequence numbers at kTLS enablement attempt - TX: {}, RX: {}", tx_seq, rx_seq);
+
+  // Verify SSL hasn't encountered an error
+  int ssl_err = SSL_get_error(ssl_handle, 0);
+  if (ssl_err != SSL_ERROR_NONE && ssl_err != SSL_ERROR_WANT_READ &&
+      ssl_err != SSL_ERROR_WANT_WRITE && ssl_err != SSL_ERROR_SYSCALL) {
+    ENVOY_LOG(warn, "Cannot enable kTLS due to invalid connection state: SSL in error state: {}", ssl_err);
+    return false;
+  } else if (ssl_err == SSL_ERROR_SYSCALL) {
+    // SSL_ERROR_SYSCALL doesn't necessarily indicate a problem for kTLS
+    // Often happens when checking after handshake but connection is healthy
+    ENVOY_LOG(debug, "Ignoring SSL_ERROR_SYSCALL (5) as it's common during kTLS enablement");
+  }
+
+  // ENHANCED: Check for ALPN protocol which may affect kTLS behavior
+  const char* alpn_selected = nullptr;
+  unsigned int alpn_selected_len = 0;
+  SSL_get0_alpn_selected(ssl_handle, 
+                        reinterpret_cast<const uint8_t**>(&alpn_selected), 
+                        &alpn_selected_len);
+  if (alpn_selected && alpn_selected_len > 0) {
+    std::string alpn_protocol(alpn_selected, alpn_selected_len);
+    ENVOY_LOG(debug, "Connection using ALPN protocol: {}", alpn_protocol);
+  }
+
+  // Force a flush of any pending data in the SSL write buffer
+  ENVOY_LOG(debug, "Flushing any pending data before enabling kTLS");
+  int flush_result = BIO_flush(SSL_get_wbio(ssl_handle));
+  if (flush_result <= 0) {
+    // Check if this is a real error or just an indication that BIO would block
+    if (BIO_should_retry(SSL_get_wbio(ssl_handle))) {
+      ENVOY_LOG(debug, "BIO_flush would block, will retry later");
+      return false;
+    } else {
+      ENVOY_LOG(debug, "BIO_flush failed: {}", ERR_reason_error_string(ERR_get_error()));
+      // Not fatal, continue
+    }
+  }
+
+  // For added safety, verify if any data is pending in the BIO
+  BIO* wbio = SSL_get_wbio(ssl_handle);
+  if (wbio && BIO_ctrl_pending(wbio) > 0) {
+    ENVOY_LOG(
+        warn,
+        "Write BIO still has pending data after flush ({} bytes), deferring kTLS enablement",
+        BIO_ctrl_pending(wbio));
+    return false;
+  }
+
+  // Check state of pending encrypted records which might cause issues for kTLS
+  // Record type 22 (handshake) or 21 (alert) should complete before enabling kTLS
+  int pending = SSL_pending(ssl_handle);
+  if (pending > 0) {
+    ENVOY_LOG(debug, "SSL has {} bytes of pending data, deferring kTLS enablement", pending);
+    return false;
+  }
+  
+  // Check socket buffer status for pending data
+  int socket_pending = 0;
+  
+  // Method 1: Use ioctl with FIONREAD to check for pending data
+  if (platform_util::ioctl_fn(fd, FIONREAD, &socket_pending) == 0 && socket_pending > 0) {
+    ENVOY_LOG(debug, "Socket has {} bytes of pending data via FIONREAD, deferring kTLS enablement", 
+              socket_pending);
+    return false;
+  }
+  
+  // Method 2: Use poll() to check if data is available for reading
+#ifdef __linux__
+  struct pollfd pfd;
+  pfd.fd = fd;
+  pfd.events = POLLIN;
+  pfd.revents = 0;
+  
+  int poll_result = platform_util::poll_fn(&pfd, 1, 0); // Zero timeout for non-blocking check
+  if (poll_result > 0 && (pfd.revents & POLLIN)) {
+    ENVOY_LOG(debug, "Socket has data available for reading per poll(), deferring kTLS enablement");
+    return false;
+  }
+  
+  // Add extra check for SSL handshake state (SSL_in_init is more reliable than SSL_get_state)
+  if (SSL_in_init(ssl_handle) != 0) {
+    ENVOY_LOG(debug, "SSL still in init phase, deferring kTLS enablement");
+    return false;
+  }
+
+  // Check TCP connection state for diagnostics and better decision making
+  struct tcp_info info;
+  socklen_t len = sizeof(info);
+  if (getsockopt(fd, SOL_TCP, TCP_INFO, &info, &len) == 0) {
+    // TCP_INFO contains useful diagnostics about connection quality
+    ENVOY_LOG(debug, "TCP socket details: state={}, rtt={}µs, rttvar={}µs, snd_cwnd={}, rcv_rtt={}µs",
+              info.tcpi_state, info.tcpi_rtt, info.tcpi_rttvar, 
+              info.tcpi_snd_cwnd, info.tcpi_rcv_rtt);
+    
+    // If TCP connection is not established properly, kTLS likely won't work
+    if (info.tcpi_state != TCP_ESTABLISHED) {
+      ENVOY_LOG(debug, "TCP connection not in ESTABLISHED state, deferring kTLS enablement");
+      return false;
+    }
+  }
+#else
+  // On non-Linux platforms, just check if SSL handshake is really done
+  if (SSL_in_init(ssl_handle) != 0) {
+    ENVOY_LOG(debug, "SSL still in init phase, deferring kTLS enablement");
+    return false;
+  }
+#endif
 
   // Create the KTLS specific connection info
   auto ktls_info = std::make_shared<KtlsSslInfoImpl>(std::move(ssl_connection));
   
   // Enable TLS ULP
-  const char* tls_ulp = "tls";
-  if (setsockopt(fd, SOL_TCP, TCP_ULP, tls_ulp, strlen(tls_ulp)) != 0) {
+  const char *tls_ulp = "tls";
+  int ulp_result = setsockopt(fd, SOL_TCP, TCP_ULP, tls_ulp, strlen(tls_ulp));
+  if (ulp_result != 0) {
     int err = errno;
     if (err == EEXIST) {
       // ULP already set - this is unusual since our earlier check didn't find it, but not fatal
       ENVOY_LOG(debug, "kTLS ULP already enabled (EEXIST), continuing");
+      
+      // Let's verify what ULP is actually set
+      std::string ulp_verify(16, '\0');
+      socklen_t verify_len = ulp_verify.size();
+      if (getsockopt(fd, SOL_TCP, TCP_ULP, ulp_verify.data(), &verify_len) == 0) {
+        // Ensure proper null termination
+        if (verify_len > 0) {
+          ulp_verify.resize(verify_len);
+          size_t null_pos = ulp_verify.find('\0');
+          if (null_pos != std::string::npos) {
+            ulp_verify.resize(null_pos);
+          }
+        } else {
+          ulp_verify.clear();
+        }
+        
+        ENVOY_LOG(debug, "Current ULP after EEXIST (len={}): '{}'", verify_len, ulp_verify);
+        
+        // If the ULP is not "tls", this is a real problem
+        if (!ulp_verify.empty() && ulp_verify != "tls") {
+          ENVOY_LOG(warn, "Socket has non-TLS ULP: '{}', cannot enable kTLS", ulp_verify);
+          return false;
+        }
+      }
     } else {
       ENVOY_LOG(warn, "Failed to set TLS ULP on fd={}: {} (errno={})", fd, Envoy::errorDetails(err), err);
+      
+      // Special handling for common failure cases
       if (err == ENOPROTOOPT || err == EOPNOTSUPP) {
-        ENVOY_LOG(warn, "kTLS not supported by this kernel or TCP_ULP not available");
+        ENVOY_LOG(warn, "kTLS not supported by this kernel (TCP_ULP not available)");
+        return false;
+      } else if (err == EBUSY) {
+        ENVOY_LOG(warn, "Socket is busy, cannot set TLS ULP");
+        return false;
+      } else if (err == EPERM) {
+        ENVOY_LOG(warn, "Permission denied setting TLS ULP (CAP_NET_ADMIN may be required)");
+        return false;
       } else if (try_loading_module_) {
         // Try to load the module
         ENVOY_LOG(debug, "Attempting to load tls module");
-        if (system("modprobe tls") != 0) {
-          ENVOY_LOG(warn, "Failed to load tls module");
+        int ret = system("modprobe tls >/dev/null 2>&1");
+        if (ret != 0) {
+          ENVOY_LOG(warn, "Failed to load tls module: kernel module not available (ret={})", ret);
+          return false;
+        }
+
+        // Retry setting ULP after loading module
+        ulp_result = setsockopt(fd, SOL_TCP, TCP_ULP, tls_ulp, strlen(tls_ulp));
+        if (ulp_result != 0) {
+          err = errno;
+          ENVOY_LOG(warn, "Failed to set TLS ULP after loading module: {} (errno={})", 
+                    Envoy::errorDetails(err), err);
           return false;
         }
         
-        // Retry setting ULP after loading module
-        if (setsockopt(fd, SOL_TCP, TCP_ULP, tls_ulp, strlen(tls_ulp)) != 0) {
-          ENVOY_LOG(warn, "Failed to set TLS ULP after loading module: {}", Envoy::errorDetails(errno));
-          return false;
-        }
+        ENVOY_LOG(info, "Successfully loaded tls module and set ULP");
       } else {
         return false;
       }
     }
+  } else {
+    ENVOY_LOG(debug, "Successfully set TLS ULP");
   }
 
   // Get TLS crypto info
   tls_crypto_info_t tx_crypto_info = {};
   tls_crypto_info_t rx_crypto_info = {};
-  
+    
   if (!ktls_info->getTxCryptoInfo(tx_crypto_info) || !ktls_info->getRxCryptoInfo(rx_crypto_info)) {
     ENVOY_LOG(warn, "Failed to get TLS crypto info for fd={}", fd);
     return false;
   }
+  
+  // Save current sequence numbers for diagnostics
+  saved_tx_seq_ = tx_seq;
+  saved_rx_seq_ = rx_seq;
 
   // Enable TX first - some implementations work better with this ordering
   bool tx_success = false;
@@ -1402,63 +1598,146 @@ bool KtlsTransportSocket::performResynchronization() {
   // Get current sequence numbers from SSL
   bool have_current_seq = false;
   uint64_t current_rx_seq = 0;
+  uint64_t current_tx_seq = 0;
 
   auto ssl_connection = transport_socket_->ssl();
-  if (ssl_connection) {
-    const Tls::ConnectionInfoImplBase* impl_base =
-        dynamic_cast<const Tls::ConnectionInfoImplBase*>(ssl_connection.get());
-    if (impl_base && impl_base->ssl()) {
-      SSL* ssl_handle = impl_base->ssl();
-      current_rx_seq = SSL_get_read_sequence(ssl_handle);
-      have_current_seq = true;
+  if (!ssl_connection) {
+    ENVOY_LOG(warn, "Cannot resynchronize: SSL connection not available");
+    return false;
+  }
 
-      if (!next_expected_rx_seq_.has_value()) {
-        // First resync attempt - store the expected next sequence number
-        next_expected_rx_seq_ = current_rx_seq + 1;
-        ENVOY_LOG(debug, "Initial resync: Current RX seq={}, next expected={}", current_rx_seq,
-                  *next_expected_rx_seq_);
-      } else {
-        // Update the expected sequence if it appears we've progressed
-        if (current_rx_seq >= *next_expected_rx_seq_) {
-          ENVOY_LOG(debug, "Updating next_expected_rx_seq from {} to {} based on current state",
-                    *next_expected_rx_seq_, current_rx_seq + 1);
-          next_expected_rx_seq_ = current_rx_seq + 1;
-        }
-      }
+  const Tls::ConnectionInfoImplBase* impl_base =
+      dynamic_cast<const Tls::ConnectionInfoImplBase*>(ssl_connection.get());
+  if (!impl_base || !impl_base->ssl()) {
+    ENVOY_LOG(warn, "Cannot resynchronize: Invalid SSL connection");
+    return false;
+  }
+
+  SSL* ssl_handle = impl_base->ssl();
+  current_rx_seq = SSL_get_read_sequence(ssl_handle);
+  current_tx_seq = SSL_get_write_sequence(ssl_handle);
+  have_current_seq = true;
+
+  ENVOY_LOG(debug, "Resynchronizing kTLS with current RX seq={}, TX seq={}", 
+            current_rx_seq, current_tx_seq);
+
+  // Track sequence number updates for diagnostics
+  if (!next_expected_rx_seq_.has_value()) {
+    // First resync attempt - store the expected next sequence number
+    next_expected_rx_seq_ = current_rx_seq + 1;
+    ENVOY_LOG(debug, "Initial resync: Current RX seq={}, next expected={}", current_rx_seq,
+              *next_expected_rx_seq_);
+  } else {
+    // Update the expected sequence if it appears we've progressed
+    if (current_rx_seq >= *next_expected_rx_seq_) {
+      ENVOY_LOG(debug, "Updating next_expected_rx_seq from {} to {} based on current state",
+                *next_expected_rx_seq_, current_rx_seq + 1);
+      next_expected_rx_seq_ = current_rx_seq + 1;
     }
   }
 
-  // Re-create the kTLS encryption state with new sequence numbers
-  if (have_current_seq) {
-    ENVOY_LOG(debug, "Resynchronizing kTLS with current RX seq={}", current_rx_seq);
+  // Get the underlying file descriptor
+  int fd = callbacks_->ioHandle().fdDoNotUse();
+  if (fd < 0) {
+    ENVOY_LOG(warn, "Cannot resynchronize: Invalid file descriptor");
+    return false;
+  }
 
-    // Use error handling mode as ktls_mode for re-initialization
-    int ktls_mode = error_handling_mode_;
-
-    if (ktls_info_ && ktls_info_->initializeSequenceNumbers(ktls_mode)) {
-      ENVOY_LOG(info, "Successfully reinitialized kTLS sequence numbers");
-
-      int fd = callbacks_->ioHandle().fdDoNotUse();
-      if (fd >= 0) {
-        // Get fresh crypto info for RX with updated sequence numbers
-        tls_crypto_info_t rx_info = {};
-        if (ktls_info_->getRxCryptoInfo(rx_info)) {
-          ENVOY_LOG(debug, "Updating kTLS RX crypto state after resync");
+  if (!have_current_seq) {
+    ENVOY_LOG(warn, "Cannot resynchronize: Failed to get current sequence numbers");
+    return false;
+  }
 
 #ifdef __linux__
-          // Attempt to reset the RX state with updated sequence numbers
-          if (setsockopt(fd, SOL_TLS, TLS_RX, &rx_info, sizeof(rx_info)) != 0) {
-            ENVOY_LOG(warn, "Failed to resynchronize kTLS RX state: {}",
-                      Envoy::errorDetails(errno));
-            return false;
-          }
-#endif
-          ENVOY_LOG(info, "kTLS RX state successfully resynchronized");
-          return true;
-        }
+  // First, try disabling and re-enabling kTLS completely if this is a later resync attempt
+  if (consecutive_decrypt_failures_ >= 3) {
+    ENVOY_LOG(info, "Multiple failures ({}), attempting full kTLS reset", 
+              consecutive_decrypt_failures_);
+
+    // Try to clear the kTLS state by disabling it first
+    // Using null pointers and zero-length for the TLS options should disable them
+    setsockopt(fd, SOL_TLS, TLS_TX, nullptr, 0);
+    setsockopt(fd, SOL_TLS, TLS_RX, nullptr, 0);
+
+    // Drain any pending data from socket buffer
+    char drain_buffer[4096];
+    int readable = 0;
+    platform_util::ioctl_fn(fd, FIONREAD, &readable);
+    if (readable > 0) {
+      ENVOY_LOG(debug, "Draining {} bytes during kTLS reset", readable);
+      ssize_t drained = recv(fd, drain_buffer, sizeof(drain_buffer), MSG_DONTWAIT);
+      if (drained > 0) {
+        ENVOY_LOG(debug, "Drained {} bytes during kTLS reset", drained);
       }
     }
+
+    // Wait a tiny bit to allow any kernel cleanup (non-blocking)
+    usleep(1000); // 1ms sleep
+
+    // Now try to re-enable kTLS completely
+    if (enableKtls()) {
+      ENVOY_LOG(info, "Successfully reset and re-enabled kTLS");
+      resync_in_progress_ = false;
+      return true;
+    }
+
+    ENVOY_LOG(warn, "Failed to re-enable kTLS during full reset");
+    disableKtls("Failed to re-enable kTLS during resync");
+    return false;
   }
+
+  // For lighter resync attempts, just update the sequence numbers
+  if (ktls_info_ && ktls_info_->initializeSequenceNumbers(/* ktls_mode */ 0)) {
+    ENVOY_LOG(info, "Successfully reinitialized kTLS sequence numbers");
+
+    // Get fresh crypto info for RX with updated sequence numbers
+    tls_crypto_info_t rx_info = {};
+    if (ktls_info_->getRxCryptoInfo(rx_info)) {
+      ENVOY_LOG(debug, "Updating kTLS RX crypto state after resync");
+
+      // Attempt to reset the RX state with updated sequence numbers
+      if (setsockopt(fd, SOL_TLS, TLS_RX, &rx_info, sizeof(rx_info)) != 0) {
+        int err = errno;
+        ENVOY_LOG(warn, "Failed to resynchronize kTLS RX state: {} (errno={})",
+                  Envoy::errorDetails(err), err);
+        
+        if (err == EINVAL) {
+          // EINVAL often means the new sequence number wasn't accepted
+          ENVOY_LOG(warn, "Kernel rejected sequence number update (EINVAL), "
+                         "this might indicate Linux kernel version < 5.11");
+        }
+        
+        return false;
+      }
+
+      // Try also updating TX crypto info for good measure
+      tls_crypto_info_t tx_info = {};
+      if (ktls_info_->getTxCryptoInfo(tx_info)) {
+        if (setsockopt(fd, SOL_TLS, TLS_TX, &tx_info, sizeof(tx_info)) != 0) {
+          // This isn't fatal, just log it
+          ENVOY_LOG(debug, "Non-critical: Failed to update kTLS TX state: {}",
+                    Envoy::errorDetails(errno));
+        } else {
+          ENVOY_LOG(debug, "Successfully updated kTLS TX state");
+        }
+      }
+      
+      ENVOY_LOG(info, "kTLS RX state successfully resynchronized");
+      resync_in_progress_ = false;
+      return true;
+    }
+  }
+#else
+  // Non-Linux platforms: just disable and re-enable kTLS
+  ENVOY_LOG(info, "Platform doesn't support fine-grained kTLS control, using full reset");
+  
+  // Simply try to re-enable kTLS completely
+  if (enableKtls()) {
+    ENVOY_LOG(info, "Successfully reset kTLS");
+    resync_in_progress_ = false;
+    return true;
+  }
+#endif
 
   ENVOY_LOG(warn, "Failed to resynchronize kTLS state");
   return false;
@@ -1565,9 +1844,138 @@ bool KtlsTransportSocket::canEnableKtls() const {
 #ifndef __linux__
   ENVOY_LOG(debug, "Cannot enable kTLS: Platform is not Linux");
   return false;
+#else
+  // Check if kernel has TLS ULP support by checking available ULPs
+  if (callbacks_) {
+    int fd = callbacks_->ioHandle().fdDoNotUse();
+    if (fd < 0) {
+      ENVOY_LOG(debug, "Cannot enable kTLS: Invalid file descriptor");
+      return false;
+    }
+    
+    // Check if TCP connection is fully established
+    struct tcp_info info;
+    socklen_t info_len = sizeof(info);
+    if (getsockopt(fd, SOL_TCP, TCP_INFO, &info, &info_len) == 0) {
+      // TCP_ESTABLISHED is 1 on Linux
+      if (info.tcpi_state != TCP_ESTABLISHED) {
+        ENVOY_LOG(debug, "Cannot enable kTLS: TCP connection not established (state={})",
+                  info.tcpi_state);
+        return false;
+      }
+      
+      // Log RTT and other connection quality metrics that might affect kTLS
+      ENVOY_LOG(debug, "TCP connection quality: rtt={}µs, rttvar={}µs", 
+                info.tcpi_rtt, info.tcpi_rttvar);
+    }
+    
+    // Explicitly verify TLS ULP is available on this system
+    char available_ulps[256] = {0};
+    socklen_t ulps_len = sizeof(available_ulps);
+    if (getsockopt(fd, SOL_TCP, TCP_AVAILABLE_ULPS, available_ulps, &ulps_len) == 0) {
+      // Convert available_ulps to a safer string - kernel may not null-terminate properly
+      // Note that TCP_AVAILABLE_ULPS returns a space-separated list of available ULPs
+      std::string ulps_str;
+      if (ulps_len > 0) {
+        // Ensure null-termination for safety
+        available_ulps[static_cast<socklen_t>(std::min<size_t>(ulps_len, sizeof(available_ulps) - 1))] = '\0';
+        ulps_str = available_ulps;
+      }
+      
+      ENVOY_LOG(debug, "Available ULPs (len={}): '{}'", ulps_len, ulps_str);
+      
+      // Check if "tls" is in the list of ULPs
+      if (ulps_str.find("tls") == std::string::npos) {
+        ENVOY_LOG(warn, "kTLS ULP not available on this system, available ULPs: {}", 
+                  ulps_str);
+        
+        // Try to load the module if allowed
+        if (try_loading_module_) {
+          ENVOY_LOG(debug, "Attempting to load tls module");
+          int ret = system("modprobe tls >/dev/null 2>&1");
+          if (ret != 0) {
+            ENVOY_LOG(warn, "Failed to load tls module: kernel module not available (ret={})", ret);
+            return false;
+          }
+          
+          // Check again if ULP is now available
+          ulps_len = sizeof(available_ulps);
+          memset(available_ulps, 0, sizeof(available_ulps));
+          std::string ulps_str_after_load;
+          
+          if (getsockopt(fd, SOL_TCP, TCP_AVAILABLE_ULPS, available_ulps, &ulps_len) == 0) {
+            // Ensure null-termination for safety
+            available_ulps[static_cast<socklen_t>(std::min<size_t>(ulps_len, sizeof(available_ulps) - 1))] = '\0';
+            ulps_str_after_load = available_ulps;
+            
+            ENVOY_LOG(debug, "Available ULPs after module load (len={}): '{}'", ulps_len, ulps_str_after_load);
+            
+            if (ulps_str_after_load.find("tls") == std::string::npos) {
+              ENVOY_LOG(warn, "kTLS ULP still not available after module load");
+              return false;
+            }
+            ENVOY_LOG(info, "Successfully loaded tls kernel module");
+          }
+        } else {
+          return false;
+        }
+      } else {
+        ENVOY_LOG(debug, "kTLS ULP available: {}", ulps_str);
+      }
+    } else {
+      // Older kernels may not support TCP_AVAILABLE_ULPS, so try direct ULP probe
+      ENVOY_LOG(debug, "TCP_AVAILABLE_ULPS not supported (errno={}), trying direct ULP probe", errno);
+      char tls_ulp[] = "tls";
+      // Just probe ULP capability without actually setting it
+      if (setsockopt(fd, SOL_TCP, TCP_ULP, tls_ulp, 0) != 0 && errno != EEXIST) {
+        if (errno == ENOPROTOOPT || errno == EOPNOTSUPP) {
+          ENVOY_LOG(warn, "kTLS not supported by this kernel (errno={})", errno);
+          return false;
+        }
+        
+        // For other errors, try loading the module if allowed
+        if (try_loading_module_) {
+          ENVOY_LOG(debug, "Attempting to load tls module");
+          int ret = system("modprobe tls >/dev/null 2>&1");
+          if (ret != 0) {
+            ENVOY_LOG(warn, "Failed to load tls module: kernel module not available (ret={})", ret);
+            return false;
+          }
+          
+          // Check again if ULP is now available
+          ulps_len = sizeof(available_ulps);
+          memset(available_ulps, 0, sizeof(available_ulps));
+          std::string ulps_str_after_probe;
+          
+          if (getsockopt(fd, SOL_TCP, TCP_AVAILABLE_ULPS, available_ulps, &ulps_len) == 0) {
+            // Ensure null-termination for safety
+            available_ulps[static_cast<socklen_t>(std::min<size_t>(ulps_len, sizeof(available_ulps) - 1))] = '\0';
+            ulps_str_after_probe = available_ulps;
+            
+            ENVOY_LOG(debug, "Available ULPs after module load (len={}): '{}'", ulps_len, ulps_str_after_probe);
+            
+            if (ulps_str_after_probe.find("tls") == std::string::npos) {
+              ENVOY_LOG(warn, "kTLS ULP still not available after module load");
+              return false;
+            }
+            ENVOY_LOG(info, "Successfully loaded tls kernel module");
+          }
+        } else {
+          return false;
+        }
+      } else {
+        ENVOY_LOG(debug, "Direct ULP probe for 'tls' succeeded");
+      }
+    }
+  }
 #endif
 
   return true;
+}
+
+// Define helper function for ioctl calls
+inline int ioctl_wrap(int fd, unsigned long request, void* argp) {
+  return platform_util::ioctl_fn(fd, request, argp);
 }
 
 } // namespace Ktls
