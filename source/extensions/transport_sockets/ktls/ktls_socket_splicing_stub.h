@@ -22,7 +22,7 @@ public:
     UNREFERENCED_PARAMETER(source_handle);
     UNREFERENCED_PARAMETER(dest_handle);
   }
-  
+
   ~KtlsSocketSplicing() = default;
 
   /**
@@ -32,8 +32,7 @@ public:
    */
   Api::IoCallUint64Result writeFromBuffer(Buffer::Instance& buffer) {
     UNREFERENCED_PARAMETER(buffer);
-    return Api::IoCallUint64Result(
-        0, Network::IoSocketError::create(ENOSYS));
+    return Api::IoCallUint64Result(0, Network::IoSocketError::create(ENOSYS));
   }
 
   /**

@@ -6,6 +6,7 @@ import "envoy/config/core/v3/socket_option.proto";
 import "google/protobuf/any.proto";
 import "udpa/annotations/status.proto";
 import "udpa/annotations/versioning.proto";
+import "google/protobuf/wrappers.proto";
 
 option java_package = "io.envoyproxy.envoy.extensions.transport_sockets.ktls.v3";
 option java_outer_classname = "KTlsProto";
@@ -44,4 +45,41 @@ message KtlsTransportSocket {
   // Additional socket options specific to kTLS.
   // [#not-implemented-hide:]
   repeated envoy.config.core.v3.SocketOption additional_options = 4;
+  
+  // Specifies the safe sequence threshold for upstream connections.
+  // Controls how many TLS records can be exchanged before kTLS enablement
+  // is considered unsafe. Lower values are safer but might prevent kTLS
+  // from being enabled on some connections.
+  // Default: 1
+  google.protobuf.UInt64Value upstream_safe_seq_threshold = 5;
+  
+  // Specifies the safe sequence threshold for downstream connections. 
+  // Controls how many TLS records can be exchanged before kTLS enablement
+  // is considered unsafe. Lower values are safer but might prevent kTLS
+  // from being enabled on some connections.
+  // Default: 5
+  google.protobuf.UInt64Value downstream_safe_seq_threshold = 6;
+  
+  // Controls whether to retry kTLS enabling after initial handshake.
+  // Some connections may not be ready for kTLS immediately after handshake,
+  // this setting enables automatic retries. 
+  // Default: true
+  google.protobuf.BoolValue retry_on_failure = 7;
+  
+  // Maximum attempts to enable kTLS before giving up.
+  // Only applies if retry_on_failure is true.
+  // Default: 5
+  google.protobuf.UInt32Value max_retry_attempts = 8;
+  
+  // Controls whether to try loading the kTLS kernel module if not already loaded.
+  // Only works when Envoy is running as root or with CAP_SYS_MODULE capability.
+  // Default: false
+  google.protobuf.BoolValue try_loading_module = 9;
+  
+  // Controls the error recovery strategy when sequence number errors occur.
+  // 0: Disable kTLS completely on first error (safest)
+  // 1: Attempt recovery by draining buffer and retrying (balanced)
+  // 2: Aggressive recovery with resynchronization attempts (experimental)
+  // Default: 1
+  google.protobuf.UInt32Value error_handling_mode = 10;
 } 

@@ -46,7 +46,7 @@ bool KtlsSslInfoImpl::getTxCryptoInfo(tls_crypto_info_t& crypto_info) const {
     crypto_info.version = TLS_1_2_VERSION;
   } else {
     // Only support TLS 1.2 for now
-    ENVOY_LOG(debug, "Cannot get TX crypto info: unsupported TLS version: {}", 
+    ENVOY_LOG(debug, "Cannot get TX crypto info: unsupported TLS version: {}",
               !tlsVersion().empty() ? std::string(tlsVersion()) : "empty");
     return false;
   }
@@ -61,19 +61,19 @@ bool KtlsSslInfoImpl::getTxCryptoInfo(tls_crypto_info_t& crypto_info) const {
                 client_write_key_.size(), client_write_iv_.size());
       return false;
     }
-    
+
     // Copy the key
     memcpy(crypto_info.key, client_write_key_.data(), 16);
-    
+
     // Copy the salt (first 4 bytes of IV)
     memcpy(crypto_info.salt, client_write_iv_.data(), 4);
-    
+
     // Copy the IV (next 8 bytes)
     memcpy(crypto_info.iv, client_write_iv_.data() + 4, 8);
-    
+
     // Copy the record sequence number
     memcpy(crypto_info.rec_seq, client_write_seq_.data(), 8);
-    
+
     ENVOY_LOG(debug, "Using client write key/IV for TX (we are client)");
   } else {
     // Server endpoint sending data - use server_write_key/iv
@@ -82,19 +82,19 @@ bool KtlsSslInfoImpl::getTxCryptoInfo(tls_crypto_info_t& crypto_info) const {
                 server_write_key_.size(), server_write_iv_.size());
       return false;
     }
-    
+
     // Copy the key
     memcpy(crypto_info.key, server_write_key_.data(), 16);
-    
+
     // Copy the salt (first 4 bytes of IV)
     memcpy(crypto_info.salt, server_write_iv_.data(), 4);
-    
+
     // Copy the IV (next 8 bytes)
     memcpy(crypto_info.iv, server_write_iv_.data() + 4, 8);
-    
+
     // Copy the record sequence number
     memcpy(crypto_info.rec_seq, server_write_seq_.data(), 8);
-    
+
     ENVOY_LOG(debug, "Using server write key/IV for TX (we are server)");
   }
 
@@ -115,7 +115,7 @@ bool KtlsSslInfoImpl::getRxCryptoInfo(tls_crypto_info_t& crypto_info) const {
     crypto_info.version = TLS_1_2_VERSION;
   } else {
     // Only support TLS 1.2 for now
-    ENVOY_LOG(debug, "Cannot get RX crypto info: unsupported TLS version: {}", 
+    ENVOY_LOG(debug, "Cannot get RX crypto info: unsupported TLS version: {}",
               !tlsVersion().empty() ? std::string(tlsVersion()) : "empty");
     return false;
   }
@@ -130,19 +130,19 @@ bool KtlsSslInfoImpl::getRxCryptoInfo(tls_crypto_info_t& crypto_info) const {
                 server_write_key_.size(), server_write_iv_.size());
       return false;
     }
-    
+
     // Copy the key
     memcpy(crypto_info.key, server_write_key_.data(), 16);
-    
+
     // Copy the salt (first 4 bytes of IV)
     memcpy(crypto_info.salt, server_write_iv_.data(), 4);
-    
+
     // Copy the IV (next 8 bytes)
     memcpy(crypto_info.iv, server_write_iv_.data() + 4, 8);
-    
+
     // Copy the record sequence number
     memcpy(crypto_info.rec_seq, server_write_seq_.data(), 8);
-    
+
     ENVOY_LOG(debug, "Using server write key/IV for RX (we are client)");
   } else {
     // Server endpoint receiving data - use client_write_key/iv
@@ -151,19 +151,19 @@ bool KtlsSslInfoImpl::getRxCryptoInfo(tls_crypto_info_t& crypto_info) const {
                 client_write_key_.size(), client_write_iv_.size());
       return false;
     }
-    
+
     // Copy the key
     memcpy(crypto_info.key, client_write_key_.data(), 16);
-    
+
     // Copy the salt (first 4 bytes of IV)
     memcpy(crypto_info.salt, client_write_iv_.data(), 4);
-    
+
     // Copy the IV (next 8 bytes)
     memcpy(crypto_info.iv, client_write_iv_.data() + 4, 8);
-    
+
     // Copy the record sequence number
     memcpy(crypto_info.rec_seq, client_write_seq_.data(), 8);
-    
+
     ENVOY_LOG(debug, "Using client write key/IV for RX (we are server)");
   }
 
@@ -172,51 +172,50 @@ bool KtlsSslInfoImpl::getRxCryptoInfo(tls_crypto_info_t& crypto_info) const {
 
 bool KtlsSslInfoImpl::extractCryptoParams() const {
   ENVOY_LOG(debug, "Extracting crypto parameters for kTLS");
-  
+
   // Get the underlying cipher suite
   std::string cipher = std::string(cipherSuite());
   ENVOY_LOG(debug, "Cipher suite: {}", cipher);
-  
+
   // For TLS 1.2, we need to ensure we use an AES-GCM-128 cipher
-  if (cipher.find("AES128-GCM") == std::string::npos && 
+  if (cipher.find("AES128-GCM") == std::string::npos &&
       cipher.find("AES-128-GCM") == std::string::npos) {
     ENVOY_LOG(debug, "Unsupported cipher for kTLS: {}. Only AES-GCM-128 is supported.", cipher);
     return false;
   }
-  
+
   // Check if we successfully extracted the key material
   if (!extractKeyMaterial()) {
     ENVOY_LOG(debug, "Failed to extract key material");
     return false;
   }
-  
+
   // Validate the extracted parameters
   if (params_extracted_) {
     ENVOY_LOG(debug, "Crypto params extraction successful");
-    
+
     // Debug log the parameter lengths (not the actual contents for security)
-    ENVOY_LOG(debug, "Client key size: {}, Server key size: {}", 
-              client_write_key_.size(), server_write_key_.size());
-    ENVOY_LOG(debug, "Client IV size: {}, Server IV size: {}", 
-              client_write_iv_.size(), server_write_iv_.size());
-    ENVOY_LOG(debug, "Client salt size: {}, Server salt size: {}", 
-              client_write_iv_.size() >= 4 ? 4 : 0, 
-              server_write_iv_.size() >= 4 ? 4 : 0);
-              
+    ENVOY_LOG(debug, "Client key size: {}, Server key size: {}", client_write_key_.size(),
+              server_write_key_.size());
+    ENVOY_LOG(debug, "Client IV size: {}, Server IV size: {}", client_write_iv_.size(),
+              server_write_iv_.size());
+    ENVOY_LOG(debug, "Client salt size: {}, Server salt size: {}",
+              client_write_iv_.size() >= 4 ? 4 : 0, server_write_iv_.size() >= 4 ? 4 : 0);
+
     // Validate key size - must be 16 bytes for AES-128-GCM
     if (client_write_key_.size() != 16 || server_write_key_.size() != 16) {
       ENVOY_LOG(debug, "Invalid key size for AES-128-GCM (expected 16 bytes)");
       params_extracted_ = false;
       return false;
     }
-    
+
     // Validate IV size - must be at least 12 bytes for GCM (should be 12 exactly in TLS 1.2)
     if (client_write_iv_.size() < 12 || server_write_iv_.size() < 12) {
       ENVOY_LOG(debug, "Invalid IV size for GCM (expected at least 12 bytes)");
       params_extracted_ = false;
       return false;
     }
-    
+
     // Ensure sequence numbers are initialized
     if (client_write_seq_.size() != 8 || server_write_seq_.size() != 8) {
       ENVOY_LOG(debug, "Invalid sequence number size (expected 8 bytes)");
@@ -227,7 +226,7 @@ bool KtlsSslInfoImpl::extractCryptoParams() const {
     ENVOY_LOG(debug, "Parameter extraction reported false");
     return false;
   }
-  
+
   return params_extracted_;
 }
 
@@ -291,8 +290,9 @@ bool KtlsSslInfoImpl::extractKeyMaterial() const {
   }
 
   int key_len = EVP_CIPHER_key_length(evp_cipher);
-  int expected_iv_len = 12; 
-  ENVOY_LOG(debug, "Cipher key length: {}, Expected IV length for kTLS: {}", key_len, expected_iv_len);
+  int expected_iv_len = 12;
+  ENVOY_LOG(debug, "Cipher key length: {}, Expected IV length for kTLS: {}", key_len,
+            expected_iv_len);
 
   client_write_key_.resize(key_len);
   server_write_key_.resize(key_len);
@@ -307,26 +307,28 @@ bool KtlsSslInfoImpl::extractKeyMaterial() const {
   const char* server_iv_label = "EXPORTER_SERVER_WRITE_IV";
   const uint8_t context[] = {};
 
-  if (SSL_export_keying_material(ssl_handle, client_write_key_.data(), key_len,
-                                 client_key_label, strlen(client_key_label), context, 0,
-                                 0) != 1) {
-    ENVOY_LOG(debug, "Failed to export client write key: {}", ERR_reason_error_string(ERR_get_error()));
+  if (SSL_export_keying_material(ssl_handle, client_write_key_.data(), key_len, client_key_label,
+                                 strlen(client_key_label), context, 0, 0) != 1) {
+    ENVOY_LOG(debug, "Failed to export client write key: {}",
+              ERR_reason_error_string(ERR_get_error()));
     return false;
   }
-  if (SSL_export_keying_material(ssl_handle, server_write_key_.data(), key_len,
-                                 server_key_label, strlen(server_key_label), context, 0,
-                                 0) != 1) {
-    ENVOY_LOG(debug, "Failed to export server write key: {}", ERR_reason_error_string(ERR_get_error()));
+  if (SSL_export_keying_material(ssl_handle, server_write_key_.data(), key_len, server_key_label,
+                                 strlen(server_key_label), context, 0, 0) != 1) {
+    ENVOY_LOG(debug, "Failed to export server write key: {}",
+              ERR_reason_error_string(ERR_get_error()));
     return false;
   }
   if (SSL_export_keying_material(ssl_handle, client_write_iv_.data(), expected_iv_len,
                                  client_iv_label, strlen(client_iv_label), context, 0, 0) != 1) {
-    ENVOY_LOG(debug, "Failed to export client write IV: {}", ERR_reason_error_string(ERR_get_error()));
+    ENVOY_LOG(debug, "Failed to export client write IV: {}",
+              ERR_reason_error_string(ERR_get_error()));
     return false;
   }
   if (SSL_export_keying_material(ssl_handle, server_write_iv_.data(), expected_iv_len,
                                  server_iv_label, strlen(server_iv_label), context, 0, 0) != 1) {
-    ENVOY_LOG(debug, "Failed to export server write IV: {}", ERR_reason_error_string(ERR_get_error()));
+    ENVOY_LOG(debug, "Failed to export server write IV: {}",
+              ERR_reason_error_string(ERR_get_error()));
     return false;
   }
 
@@ -335,7 +337,7 @@ bool KtlsSslInfoImpl::extractKeyMaterial() const {
   // based on kernel version capabilities
   memset(client_write_seq_.data(), 0, 8);
   memset(server_write_seq_.data(), 0, 8);
-  
+
   ENVOY_LOG(debug, "Successfully extracted TLS key material");
 
   ENVOY_LOG(debug, "Client write key size: {}", client_write_key_.size());
@@ -355,7 +357,7 @@ bool KtlsSslInfoImpl::initializeSequenceNumbers(int ktls_mode) const {
     ENVOY_LOG(debug, "Cannot initialize sequence numbers: parameters not extracted");
     return false;
   }
-  
+
   // Get the SSL handle to access current sequence numbers
   SSL* ssl_handle = nullptr;
   const Extensions::TransportSockets::Tls::ConnectionInfoImplBase* impl_base =
@@ -364,28 +366,28 @@ bool KtlsSslInfoImpl::initializeSequenceNumbers(int ktls_mode) const {
   if (impl_base) {
     ssl_handle = impl_base->ssl();
   }
-  
+
   if (!ssl_handle) {
     ENVOY_LOG(debug, "Cannot initialize sequence numbers: no SSL handle");
     return false;
   }
-  
+
   // Get current sequence numbers - FIXED: The order of these is switched on server side
   // For client: TX = write, RX = read
-  // For server: TX = read, RX = write  <-- This was incorrect 
+  // For server: TX = read, RX = write  <-- This was incorrect
   // Correct mapping: For both client and server, TX = write_sequence, RX = read_sequence
   uint64_t current_tx_seq = SSL_get_write_sequence(ssl_handle);
   uint64_t current_rx_seq = SSL_get_read_sequence(ssl_handle);
-  
+
   ENVOY_LOG(debug, "Current SSL sequence numbers - TX: {}, RX: {}", current_tx_seq, current_rx_seq);
-  
+
   // Handle sequence numbers based on kernel mode:
   // ktls_mode = 0: Basic kTLS (4.13-4.16) - requires zero sequence numbers
   // ktls_mode = 1: Partial support (4.17-5.14) - can handle non-zero but with limitations
   // ktls_mode = 2: Full support (5.15+) - fully supports non-zero sequence numbers
-  
+
   uint64_t tx_seq_to_use, rx_seq_to_use;
-  
+
   if (ktls_mode >= 2) {
     // Full non-zero sequence number support
     ENVOY_LOG(debug, "Using full non-zero sequence number support (kernel 5.15+)");
@@ -399,8 +401,10 @@ bool KtlsSslInfoImpl::initializeSequenceNumbers(int ktls_mode) const {
       tx_seq_to_use = current_tx_seq;
       rx_seq_to_use = current_rx_seq;
     } else {
-      ENVOY_LOG(warn, "Sequence numbers too large for partial support kernel: TX={}, RX={}. "
-                "Falling back to zeroed sequence numbers.", current_tx_seq, current_rx_seq);
+      ENVOY_LOG(warn,
+                "Sequence numbers too large for partial support kernel: TX={}, RX={}. "
+                "Falling back to zeroed sequence numbers.",
+                current_tx_seq, current_rx_seq);
       tx_seq_to_use = 0;
       rx_seq_to_use = 0;
     }
@@ -410,22 +414,22 @@ bool KtlsSslInfoImpl::initializeSequenceNumbers(int ktls_mode) const {
     tx_seq_to_use = 0;
     rx_seq_to_use = 0;
   }
-  
+
   // Update the sequence numbers in our buffers
   uint64_t seq_num_hton;
-  
+
   // Always initialize sequence number vectors first
   client_write_seq_.resize(8, 0);
   server_write_seq_.resize(8, 0);
-  
+
   ENVOY_LOG(debug, "Using sequence numbers for kTLS: TX={}, RX={}", tx_seq_to_use, rx_seq_to_use);
-  
+
   if (is_client_) {
     // CLIENT SIDE HANDLING
     // Write to client_write_seq_ (client sending direction)
     seq_num_hton = htobe64(tx_seq_to_use);
     memcpy(client_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
-    
+
     // Write to server_write_seq_ (server sending to client direction)
     seq_num_hton = htobe64(rx_seq_to_use);
     memcpy(server_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
@@ -434,22 +438,22 @@ bool KtlsSslInfoImpl::initializeSequenceNumbers(int ktls_mode) const {
     // Write to server_write_seq_ (server sending direction)
     seq_num_hton = htobe64(tx_seq_to_use);
     memcpy(server_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
-    
+
     // Write to client_write_seq_ (client sending to server direction)
     seq_num_hton = htobe64(rx_seq_to_use);
     memcpy(client_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
   }
-  
+
   // Verify the sequence numbers were properly stored in big endian
   uint64_t client_verify = 0, server_verify = 0;
   memcpy(&client_verify, client_write_seq_.data(), 8);
   memcpy(&server_verify, server_write_seq_.data(), 8);
-  
-  ENVOY_LOG(debug, "Client write seq stored as big-endian={:#016x}, decoded={}", 
-            client_verify, be64toh(client_verify));
-  ENVOY_LOG(debug, "Server write seq stored as big-endian={:#016x}, decoded={}", 
-            server_verify, be64toh(server_verify));
-  
+
+  ENVOY_LOG(debug, "Client write seq stored as big-endian={:#016x}, decoded={}", client_verify,
+            be64toh(client_verify));
+  ENVOY_LOG(debug, "Server write seq stored as big-endian={:#016x}, decoded={}", server_verify,
+            be64toh(server_verify));
+
   return true;
 }
 

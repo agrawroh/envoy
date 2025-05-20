@@ -33,7 +33,7 @@ public:
   absl::string_view cipherSuite() const override;
   bool getTxCryptoInfo(tls_crypto_info_t& crypto_info) const override;
   bool getRxCryptoInfo(tls_crypto_info_t& crypto_info) const override;
-  
+
   // Override from KtlsInfo
   bool extractCryptoParams() const override;
 

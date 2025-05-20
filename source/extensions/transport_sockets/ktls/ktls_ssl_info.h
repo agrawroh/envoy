@@ -10,7 +10,7 @@ namespace Envoy {
 namespace Ssl {
 class CertificateSelectionCallback;
 using CertificateSelectionCallbackPtr = std::unique_ptr<CertificateSelectionCallback>;
-}
+} // namespace Ssl
 
 namespace Extensions {
 namespace TransportSockets {
@@ -53,7 +53,7 @@ public:
    * @return true if parameters were successfully extracted, false otherwise.
    */
   virtual bool extractCryptoParams() const PURE;
-  
+
   /**
    * Initialize sequence numbers based on kernel version and capabilities
    * @param ktls_mode The kernel capability mode (0=basic, 1=partial, 2=full)

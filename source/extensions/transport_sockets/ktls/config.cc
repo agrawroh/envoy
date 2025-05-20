@@ -32,7 +32,6 @@ KtlsClientTransportSocketConfigFactory::createTransportSocketFactory(
       const envoy::extensions::transport_sockets::ktls::v3::KtlsTransportSocket&>(
       message, context.messageValidationVisitor());
 
-  // Find inner transport socket factory by name
   auto& inner_config_factory = Config::Utility::getAndCheckFactoryByName<
       Server::Configuration::UpstreamTransportSocketConfigFactory>(
       outer_config.tls_socket_config().name());
@@ -49,9 +48,45 @@ KtlsClientTransportSocketConfigFactory::createTransportSocketFactory(
     return inner_factory_or.status();
   }
 
-  return std::make_unique<KtlsTransportSocketFactory>(std::move(inner_factory_or).value(),
-                                                      outer_config.enable_tx_zerocopy(),
-                                                      outer_config.enable_rx_no_pad());
+  // Extract safe sequence threshold configuration with default of 1 for upstream
+  uint64_t safe_seq_threshold = 1;
+  if (outer_config.has_upstream_safe_seq_threshold()) {
+    safe_seq_threshold = outer_config.upstream_safe_seq_threshold().value();
+  }
+
+  // Extract new parameters (added in our enhancement)
+  bool retry_on_failure = true; // Default value
+  if (outer_config.has_retry_on_failure()) {
+    retry_on_failure = outer_config.retry_on_failure().value();
+  }
+
+  uint32_t max_retry_attempts = 5; // Default value
+  if (outer_config.has_max_retry_attempts()) {
+    max_retry_attempts = outer_config.max_retry_attempts().value();
+  }
+
+  bool try_loading_module = false; // Default value
+  if (outer_config.has_try_loading_module()) {
+    try_loading_module = outer_config.try_loading_module().value();
+  }
+
+  uint32_t error_handling_mode = 1; // Default to balanced approach
+  if (outer_config.has_error_handling_mode()) {
+    error_handling_mode = outer_config.error_handling_mode().value();
+  }
+
+  // Create upstream socket factory with all parameters
+  auto factory = std::make_unique<KtlsTransportSocketFactory>(
+      std::move(inner_factory_or).value(), outer_config.enable_tx_zerocopy(),
+      outer_config.enable_rx_no_pad(), safe_seq_threshold);
+
+  // Configure the additional parameters
+  factory->setRetryOnFailure(retry_on_failure);
+  factory->setMaxRetryAttempts(max_retry_attempts);
+  factory->setTryLoadingModule(try_loading_module);
+  factory->setErrorHandlingMode(error_handling_mode);
+
+  return factory;
 }
 
 absl::StatusOr<Network::DownstreamTransportSocketFactoryPtr>
@@ -62,7 +97,6 @@ KtlsServerTransportSocketConfigFactory::createTransportSocketFactory(
       const envoy::extensions::transport_sockets::ktls::v3::KtlsTransportSocket&>(
       message, context.messageValidationVisitor());
 
-  // Find inner transport socket factory by name
   auto& inner_config_factory = Config::Utility::getAndCheckFactoryByName<
       Server::Configuration::DownstreamTransportSocketConfigFactory>(
       outer_config.tls_socket_config().name());
@@ -79,9 +113,45 @@ KtlsServerTransportSocketConfigFactory::createTransportSocketFactory(
     return inner_factory_or.status();
   }
 
-  return std::make_unique<DownstreamKtlsTransportSocketFactory>(std::move(inner_factory_or).value(),
-                                                                outer_config.enable_tx_zerocopy(),
-                                                                outer_config.enable_rx_no_pad());
+  // Extract safe sequence threshold configuration with default of 5 for downstream
+  uint64_t safe_seq_threshold = 5;
+  if (outer_config.has_downstream_safe_seq_threshold()) {
+    safe_seq_threshold = outer_config.downstream_safe_seq_threshold().value();
+  }
+
+  // Extract new parameters (added in our enhancement)
+  bool retry_on_failure = true; // Default value
+  if (outer_config.has_retry_on_failure()) {
+    retry_on_failure = outer_config.retry_on_failure().value();
+  }
+
+  uint32_t max_retry_attempts = 5; // Default value
+  if (outer_config.has_max_retry_attempts()) {
+    max_retry_attempts = outer_config.max_retry_attempts().value();
+  }
+
+  bool try_loading_module = false; // Default value
+  if (outer_config.has_try_loading_module()) {
+    try_loading_module = outer_config.try_loading_module().value();
+  }
+
+  uint32_t error_handling_mode = 1; // Default to balanced approach
+  if (outer_config.has_error_handling_mode()) {
+    error_handling_mode = outer_config.error_handling_mode().value();
+  }
+
+  // Create downstream socket factory with all parameters
+  auto factory = std::make_unique<DownstreamKtlsTransportSocketFactory>(
+      std::move(inner_factory_or).value(), outer_config.enable_tx_zerocopy(),
+      outer_config.enable_rx_no_pad(), safe_seq_threshold);
+
+  // Configure the additional parameters
+  factory->setRetryOnFailure(retry_on_failure);
+  factory->setMaxRetryAttempts(max_retry_attempts);
+  factory->setTryLoadingModule(try_loading_module);
+  factory->setErrorHandlingMode(error_handling_mode);
+
+  return factory;
 }
 
 REGISTER_FACTORY(KtlsClientTransportSocketConfigFactory,

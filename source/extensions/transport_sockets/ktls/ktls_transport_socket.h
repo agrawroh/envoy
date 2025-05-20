@@ -6,13 +6,13 @@
 #include <vector>
 
 #include "envoy/network/transport_socket.h"
-#include "envoy/upstream/host_description.h"
-#include "envoy/upstream/upstream.h"
 #include "envoy/ssl/private_key/private_key.h"
 #include "envoy/ssl/ssl_socket_extended_info.h"
 #include "envoy/ssl/ssl_socket_state.h"
 #include "envoy/stats/scope.h"
 #include "envoy/stats/stats_macros.h"
+#include "envoy/upstream/host_description.h"
+#include "envoy/upstream/upstream.h"
 
 #include "source/common/common/logger.h"
 #include "source/common/network/io_socket_error_impl.h"
@@ -72,6 +72,21 @@ public:
 
   // Set whether this is an upstream or downstream connection
   void setIsUpstream(bool is_upstream) { is_upstream_ = is_upstream; }
+
+  // Set the safe sequence threshold for this socket
+  void setSafeSeqThreshold(uint64_t threshold) { safe_seq_threshold_ = threshold; }
+
+  // Enhanced parameter setters
+  void setRetryOnFailure(bool retry) { retry_on_failure_ = retry; }
+  void setMaxRetryAttempts(uint32_t attempts) { max_retry_attempts_ = attempts; }
+  void setTryLoadingModule(bool try_loading) { try_loading_module_ = try_loading; }
+  void setErrorHandlingMode(uint32_t mode) { error_handling_mode_ = mode; }
+
+  // Enhanced parameter getters
+  bool retryOnFailure() const { return retry_on_failure_; }
+  uint32_t maxRetryAttempts() const { return max_retry_attempts_; }
+  bool tryLoadingModule() const { return try_loading_module_; }
+  uint32_t errorHandlingMode() const { return error_handling_mode_; }
 
   // Methods for stack-driven resynchronization
   void scheduleResynchronization();
@@ -144,14 +159,24 @@ private:
 
   // Timer for delayed kTLS readiness check
   Event::TimerPtr readiness_timer_;
-  
+
   // Timer for resynchronization
   Event::TimerPtr resync_timer_;
 
   // Sequence numbers at time of kTLS initialization
   uint64_t saved_tx_seq_{0};
   uint64_t saved_rx_seq_{0};
-  
+
+  // Configurable safe sequence threshold
+  uint64_t safe_seq_threshold_{5}; // Default of 5 for backward compatibility
+
+  // Enhanced configuration parameters
+  bool retry_on_failure_{true};
+  uint32_t max_retry_attempts_{5};
+  bool try_loading_module_{false};
+  uint32_t error_handling_mode_{
+      1}; // 0=disable immediately, 1=balanced recovery, 2=aggressive recovery
+
   // Resynchronization related members
   uint32_t consecutive_decrypt_failures_{0};
   bool resync_in_progress_{false};
@@ -192,7 +217,8 @@ private:
 class KtlsTransportSocketFactory : public Network::CommonUpstreamTransportSocketFactory {
 public:
   KtlsTransportSocketFactory(Network::UpstreamTransportSocketFactoryPtr&& transport_socket_factory,
-                             bool enable_tx_zerocopy, bool enable_rx_no_pad);
+                             bool enable_tx_zerocopy, bool enable_rx_no_pad,
+                             uint64_t safe_seq_threshold = 1);
 
   // Network::TransportSocketFactory
   Network::TransportSocketPtr
@@ -211,10 +237,30 @@ public:
   // We need to correctly use the ClientContextSharedPtr return type
   Ssl::ClientContextSharedPtr sslCtx() override { return inner_factory_->sslCtx(); }
 
+  // Getters for additional parameters
+  uint64_t safeSeqThreshold() const { return safe_seq_threshold_; }
+  bool retryOnFailure() const { return retry_on_failure_; }
+  uint32_t maxRetryAttempts() const { return max_retry_attempts_; }
+  bool tryLoadingModule() const { return try_loading_module_; }
+  uint32_t errorHandlingMode() const { return error_handling_mode_; }
+
+  // Setters for additional parameters
+  void setRetryOnFailure(bool retry) { retry_on_failure_ = retry; }
+  void setMaxRetryAttempts(uint32_t attempts) { max_retry_attempts_ = attempts; }
+  void setTryLoadingModule(bool try_loading) { try_loading_module_ = try_loading; }
+  void setErrorHandlingMode(uint32_t mode) { error_handling_mode_ = mode; }
+
 private:
   Network::UpstreamTransportSocketFactoryPtr inner_factory_;
   bool enable_tx_zerocopy_;
   bool enable_rx_no_pad_;
+  uint64_t safe_seq_threshold_;
+
+  // Added configuration parameters
+  bool retry_on_failure_{true};
+  uint32_t max_retry_attempts_{5};
+  bool try_loading_module_{false};
+  uint32_t error_handling_mode_{1};
 };
 
 /**
@@ -225,14 +271,34 @@ class DownstreamKtlsTransportSocketFactory : public TransportSockets::Downstream
 public:
   DownstreamKtlsTransportSocketFactory(
       Network::DownstreamTransportSocketFactoryPtr&& transport_socket_factory,
-      bool enable_tx_zerocopy, bool enable_rx_no_pad);
+      bool enable_tx_zerocopy, bool enable_rx_no_pad, uint64_t safe_seq_threshold = 5);
 
   // Network::DownstreamTransportSocketFactory
   Network::TransportSocketPtr createDownstreamTransportSocket() const override;
 
+  // Getters for additional parameters
+  uint64_t safeSeqThreshold() const { return safe_seq_threshold_; }
+  bool retryOnFailure() const { return retry_on_failure_; }
+  uint32_t maxRetryAttempts() const { return max_retry_attempts_; }
+  bool tryLoadingModule() const { return try_loading_module_; }
+  uint32_t errorHandlingMode() const { return error_handling_mode_; }
+
+  // Setters for additional parameters
+  void setRetryOnFailure(bool retry) { retry_on_failure_ = retry; }
+  void setMaxRetryAttempts(uint32_t attempts) { max_retry_attempts_ = attempts; }
+  void setTryLoadingModule(bool try_loading) { try_loading_module_ = try_loading; }
+  void setErrorHandlingMode(uint32_t mode) { error_handling_mode_ = mode; }
+
 private:
   bool enable_tx_zerocopy_;
   bool enable_rx_no_pad_;
+  uint64_t safe_seq_threshold_;
+
+  // Added configuration parameters
+  bool retry_on_failure_{true};
+  uint32_t max_retry_attempts_{5};
+  bool try_loading_module_{false};
+  uint32_t error_handling_mode_{1};
 };
 
 } // namespace Ktls

@@ -53,6 +53,13 @@ static_resources:
                       tls_maximum_protocol_version: TLSv1_2
                       cipher_suites:
                         - ECDHE-RSA-AES128-GCM-SHA256
+              # Sequence threshold for downstream connections - higher is more permissive
+              downstream_safe_seq_threshold: 5
+              # Retry settings
+              retry_on_failure: true
+              max_retry_attempts: 5
+              # Error handling strategy (1 = balanced recovery)
+              error_handling_mode: 1
   clusters:
     - name: service
       connect_timeout: 5s
@@ -85,6 +92,13 @@ static_resources:
                   tls_maximum_protocol_version: TLSv1_2
                   cipher_suites:
                     - ECDHE-RSA-AES128-GCM-SHA256  # Enforce only this cipher
+          # Sequence threshold for upstream connections - lower is more cautious
+          upstream_safe_seq_threshold: 5
+          # Retry settings
+          retry_on_failure: true
+          max_retry_attempts: 3
+          # Error handling strategy (1 = balanced recovery)
+          error_handling_mode: 1
 
 # Use default socket interface as kTLS is integrated through the transport_socket
 bootstrap_extensions:
