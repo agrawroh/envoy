@@ -10,7 +10,6 @@
 #include "source/common/common/safe_memcpy.h"
 #include "source/common/network/utility.h"
 #include "source/common/tls/connection_info_impl_base.h"
-#include "source/common/tls/utility.h"
 #include "source/extensions/transport_sockets/ktls/tls_compat.h"
 
 #include "openssl/ssl.h"
@@ -20,38 +19,104 @@ namespace Extensions {
 namespace TransportSockets {
 namespace Ktls {
 
-KtlsSslInfoImpl::KtlsSslInfoImpl(Ssl::ConnectionInfoConstSharedPtr ssl_info)
-    : ssl_info_(ssl_info), is_client_(false), params_extracted_(false) {}
-
-absl::string_view KtlsSslInfoImpl::tlsVersion() const { return ssl_info_->tlsVersion(); }
-
-absl::string_view KtlsSslInfoImpl::cipherSuite() const {
-  std::string cipher_str = ssl_info_->ciphersuiteString();
-  // Store the string so we can return a string_view to it
-  cipher_suite_storage_ = cipher_str;
-  return cipher_suite_storage_;
+KtlsSslInfoImpl::KtlsSslInfoImpl(Network::TransportSocketPtr&& ssl_socket)
+    : ssl_socket_(std::move(ssl_socket)), is_client_(false), params_extracted_(false) {
+  // Attempt to extract parameters immediately, but don't fail if they're not ready yet
+  extractCryptoParams();
 }
 
-bool KtlsSslInfoImpl::getTxCryptoInfo(tls_crypto_info_t& crypto_info) const {
+const std::string& KtlsSslInfoImpl::tlsVersion() const {
+  if (ssl_socket_ && ssl_socket_->ssl()) {
+    tls_version_storage_ = ssl_socket_->ssl()->tlsVersion();
+    return tls_version_storage_;
+  }
+  static const std::string empty_string;
+  return empty_string;
+}
+
+const std::string& KtlsSslInfoImpl::ciphersuiteString() const {
+  if (ssl_socket_ && ssl_socket_->ssl()) {
+    cipher_suite_storage_ = ssl_socket_->ssl()->ciphersuiteString();
+    return cipher_suite_storage_;
+  }
+  static const std::string empty_string;
+  return empty_string;
+}
+
+const std::string& KtlsSslInfoImpl::sessionId() const {
+  if (ssl_socket_ && ssl_socket_->ssl()) {
+    session_id_storage_ = ssl_socket_->ssl()->sessionId();
+    return session_id_storage_;
+  }
+  static const std::string empty_string;
+  return empty_string;
+}
+
+bool KtlsSslInfoImpl::peerCertificatePresented() const {
+  if (ssl_socket_ && ssl_socket_->ssl()) {
+    return ssl_socket_->ssl()->peerCertificatePresented();
+  }
+  return false;
+}
+
+bool KtlsSslInfoImpl::peerCertificateValidated() const {
+  if (ssl_socket_ && ssl_socket_->ssl()) {
+    return ssl_socket_->ssl()->peerCertificateValidated();
+  }
+  return false;
+}
+
+Ssl::ConnectionInfoConstSharedPtr KtlsSslInfoImpl::ssl() const {
+  return ssl_socket_ ? ssl_socket_->ssl() : nullptr;
+}
+
+bool KtlsSslInfoImpl::getTxCryptoInfo(tls_crypto_info_t& crypto_info) {
+  // Try to extract params if not already done
+  if (!params_extracted_) {
+    if (!extractCryptoParams()) {
+      ENVOY_LOG(debug, "Cannot get TX crypto info: failed to extract parameters");
+      return false;
+    }
+  }
+
   if (!params_extracted_) {
     ENVOY_LOG(debug, "Cannot get TX crypto info: parameters not extracted yet");
     return false;
   }
 
   // Fill in common fields - zero initialize the structure
-  tls_crypto_info_t zeroed_info = {};
-  crypto_info = zeroed_info;
+  memset(&crypto_info, 0, sizeof(crypto_info));
 
-  if (tlsVersion() == "TLSv1.2") {
+  std::string tls_version_str = tlsVersion();
+  if (tls_version_str == "TLSv1.2") {
     crypto_info.version = TLS_1_2_VERSION;
+  } else if (tls_version_str == "TLSv1.3") {
+    // TLS 1.3 is also supported by kTLS since kernel 5.1
+    crypto_info.version = TLS_1_3_VERSION;
   } else {
-    // Only support TLS 1.2 for now
-    ENVOY_LOG(debug, "Cannot get TX crypto info: unsupported TLS version: {}",
-              !tlsVersion().empty() ? std::string(tlsVersion()) : "empty");
+    ENVOY_LOG(debug, "Cannot get TX crypto info: unsupported TLS version: '{}'",
+              tls_version_str);
     return false;
   }
 
-  crypto_info.cipher_type = TLS_CIPHER_AES_GCM_128;
+  // Get cipher name to determine the cipher type for kTLS
+  std::string cipher = ciphersuiteString();
+  ENVOY_LOG(debug, "Using cipher for TX crypto: '{}'", cipher);
+
+  // Determine cipher type
+  if (cipher.find("AES128-GCM") != std::string::npos ||
+      cipher.find("AES-128-GCM") != std::string::npos) {
+    crypto_info.cipher_type = TLS_CIPHER_AES_GCM_128;
+  } else if (cipher.find("AES256-GCM") != std::string::npos ||
+             cipher.find("AES-256-GCM") != std::string::npos) {
+    crypto_info.cipher_type = TLS_CIPHER_AES_GCM_256;
+  } else if (cipher.find("CHACHA20") != std::string::npos) {
+    crypto_info.cipher_type = TLS_CIPHER_CHACHA20_POLY1305;
+    ENVOY_LOG(warn, "CHACHA20-POLY1305 support in kTLS may not be complete");
+  } else {
+    ENVOY_LOG(debug, "Unsupported cipher for kTLS: '{}'", cipher);
+    return false;
+  }
 
   // Use client or server keys based on whether we're the client or server
   if (is_client_) {
@@ -98,29 +163,61 @@ bool KtlsSslInfoImpl::getTxCryptoInfo(tls_crypto_info_t& crypto_info) const {
     ENVOY_LOG(debug, "Using server write key/IV for TX (we are server)");
   }
 
+  // Dump some debug info about the TX crypto
+  uint64_t seq_num;
+  memcpy(&seq_num, crypto_info.rec_seq, sizeof(seq_num));
+  ENVOY_LOG(debug, "TX rec_seq (big-endian): {:#016x}, decoded: {}", seq_num, be64toh(seq_num));
+
   return true;
 }
 
-bool KtlsSslInfoImpl::getRxCryptoInfo(tls_crypto_info_t& crypto_info) const {
+bool KtlsSslInfoImpl::getRxCryptoInfo(tls_crypto_info_t& crypto_info) {
+  // Try to extract params if not already done
+  if (!params_extracted_) {
+    if (!extractCryptoParams()) {
+      ENVOY_LOG(debug, "Cannot get RX crypto info: failed to extract parameters");
+      return false;
+    }
+  }
+
   if (!params_extracted_) {
     ENVOY_LOG(debug, "Cannot get RX crypto info: parameters not extracted yet");
     return false;
   }
 
   // Fill in common fields - zero initialize the structure
-  tls_crypto_info_t zeroed_info = {};
-  crypto_info = zeroed_info;
+  memset(&crypto_info, 0, sizeof(crypto_info));
 
-  if (tlsVersion() == "TLSv1.2") {
+  std::string tls_version_str = tlsVersion();
+  if (tls_version_str == "TLSv1.2") {
     crypto_info.version = TLS_1_2_VERSION;
+  } else if (tls_version_str == "TLSv1.3") {
+    // TLS 1.3 is also supported by kTLS since kernel 5.1
+    crypto_info.version = TLS_1_3_VERSION;
   } else {
-    // Only support TLS 1.2 for now
-    ENVOY_LOG(debug, "Cannot get RX crypto info: unsupported TLS version: {}",
-              !tlsVersion().empty() ? std::string(tlsVersion()) : "empty");
+    ENVOY_LOG(debug, "Cannot get RX crypto info: unsupported TLS version: '{}'",
+              tls_version_str);
     return false;
   }
 
-  crypto_info.cipher_type = TLS_CIPHER_AES_GCM_128;
+  // Get cipher name to determine the cipher type for kTLS
+  std::string cipher = ciphersuiteString();
+  ENVOY_LOG(debug, "Using cipher for RX crypto: '{}'", cipher);
+
+  // Determine cipher type
+  if (cipher.find("AES128-GCM") != std::string::npos ||
+      cipher.find("AES-128-GCM") != std::string::npos) {
+    crypto_info.cipher_type = TLS_CIPHER_AES_GCM_128;
+  } else if (cipher.find("AES256-GCM") != std::string::npos ||
+             cipher.find("AES-256-GCM") != std::string::npos) {
+    crypto_info.cipher_type = TLS_CIPHER_AES_GCM_256;
+  } else if (cipher.find("CHACHA20") != std::string::npos) {
+    crypto_info.cipher_type = TLS_CIPHER_CHACHA20_POLY1305;
+    ENVOY_LOG(warn, "CHACHA20-POLY1305 support in kTLS may not be complete");
+  } else {
+    ENVOY_LOG(debug, "Unsupported cipher for kTLS: '{}'", cipher);
+    return false;
+  }
 
   // For receiving, use the opposite keys from transmitting
   if (is_client_) {
@@ -167,90 +264,109 @@ bool KtlsSslInfoImpl::getRxCryptoInfo(tls_crypto_info_t& crypto_info) const {
     ENVOY_LOG(debug, "Using client write key/IV for RX (we are server)");
   }
 
+  // Dump some debug info about the RX crypto
+  uint64_t seq_num;
+  memcpy(&seq_num, crypto_info.rec_seq, sizeof(seq_num));
+  ENVOY_LOG(debug, "RX rec_seq (big-endian): {:#016x}, decoded: {}", seq_num, be64toh(seq_num));
+
   return true;
 }
 
-bool KtlsSslInfoImpl::extractCryptoParams() const {
-  ENVOY_LOG(debug, "Extracting crypto parameters for kTLS");
-
-  // Get the underlying cipher suite
-  std::string cipher = std::string(cipherSuite());
-  ENVOY_LOG(debug, "Cipher suite: {}", cipher);
-
-  // For TLS 1.2, we need to ensure we use an AES-GCM-128 cipher
-  if (cipher.find("AES128-GCM") == std::string::npos &&
-      cipher.find("AES-128-GCM") == std::string::npos) {
-    ENVOY_LOG(debug, "Unsupported cipher for kTLS: {}. Only AES-GCM-128 is supported.", cipher);
-    return false;
-  }
-
-  // Check if we successfully extracted the key material
-  if (!extractKeyMaterial()) {
-    ENVOY_LOG(debug, "Failed to extract key material");
-    return false;
-  }
-
-  // Validate the extracted parameters
+bool KtlsSslInfoImpl::extractCryptoParams() {
+  // Check if we already extracted
   if (params_extracted_) {
-    ENVOY_LOG(debug, "Crypto params extraction successful");
-
-    // Debug log the parameter lengths (not the actual contents for security)
-    ENVOY_LOG(debug, "Client key size: {}, Server key size: {}", client_write_key_.size(),
-              server_write_key_.size());
-    ENVOY_LOG(debug, "Client IV size: {}, Server IV size: {}", client_write_iv_.size(),
-              server_write_iv_.size());
-    ENVOY_LOG(debug, "Client salt size: {}, Server salt size: {}",
-              client_write_iv_.size() >= 4 ? 4 : 0, server_write_iv_.size() >= 4 ? 4 : 0);
-
-    // Validate key size - must be 16 bytes for AES-128-GCM
-    if (client_write_key_.size() != 16 || server_write_key_.size() != 16) {
-      ENVOY_LOG(debug, "Invalid key size for AES-128-GCM (expected 16 bytes)");
-      params_extracted_ = false;
-      return false;
-    }
-
-    // Validate IV size - must be at least 12 bytes for GCM (should be 12 exactly in TLS 1.2)
-    if (client_write_iv_.size() < 12 || server_write_iv_.size() < 12) {
-      ENVOY_LOG(debug, "Invalid IV size for GCM (expected at least 12 bytes)");
-      params_extracted_ = false;
-      return false;
-    }
-
-    // Ensure sequence numbers are initialized
-    if (client_write_seq_.size() != 8 || server_write_seq_.size() != 8) {
-      ENVOY_LOG(debug, "Invalid sequence number size (expected 8 bytes)");
-      params_extracted_ = false;
-      return false;
-    }
-  } else {
-    ENVOY_LOG(debug, "Parameter extraction reported false");
-    return false;
-  }
-
-  return params_extracted_;
-}
-
-bool KtlsSslInfoImpl::extractKeyMaterial() const {
-  // Check if we already extracted params
-  if (params_extracted_) {
+    ENVOY_LOG(debug, "Crypto parameters already extracted");
     return true;
   }
 
-  ENVOY_LOG(debug, "Starting key material extraction for kTLS");
+  ENVOY_LOG(debug, "Extracting crypto parameters for kTLS");
 
+  // First, make sure we have a valid SSL connection
+  if (!ssl_socket_ || !ssl_socket_->ssl()) {
+    ENVOY_LOG(debug, "Cannot extract crypto params: no SSL connection");
+    return false;
+  }
+
+  // Get the SSL handle to access the SSL object directly
   const Extensions::TransportSockets::Tls::ConnectionInfoImplBase* impl_base =
       dynamic_cast<const Extensions::TransportSockets::Tls::ConnectionInfoImplBase*>(
-          ssl_info_.get());
+          ssl_socket_->ssl().get());
   if (!impl_base) {
-    ENVOY_LOG(debug, "Cannot cast SSL info to ConnectionInfoImplBase");
+    ENVOY_LOG(debug, "Cannot cast SSL connection to ConnectionInfoImplBase");
     return false;
   }
 
   SSL* ssl_handle = impl_base->ssl();
   if (!ssl_handle) {
-    ENVOY_LOG(debug, "Failed to get SSL handle from ConnectionInfo");
+    ENVOY_LOG(debug, "Failed to get SSL handle");
     return false;
   }
+
+  // Check if handshake is complete - no point extracting if not
+  if (SSL_in_init(ssl_handle) != 0) {
+    ENVOY_LOG(debug, "Handshake not complete, deferring key material extraction");
+    return false;
+  }
+
+  // Check if the connection is a client or server
+  is_client_ = (SSL_is_server(ssl_handle) == 0);
+  ENVOY_LOG(debug, "SSL connection is {} side", is_client_ ? "client" : "server");
+
+  // Get the underlying cipher suite
+  std::string cipher = ciphersuiteString();
+  if (cipher.empty()) {
+    ENVOY_LOG(debug, "Cannot get cipher suite");
+    return false;
+  }
+  ENVOY_LOG(debug, "Cipher suite: {}", cipher);
+
+  // Currently, only AES-GCM is well supported in kTLS
+  bool supports_cipher = false;
+  if (cipher.find("AES128-GCM") != std::string::npos ||
+      cipher.find("AES-128-GCM") != std::string::npos) {
+    supports_cipher = true;
+  } else if (cipher.find("AES256-GCM") != std::string::npos ||
+             cipher.find("AES-256-GCM") != std::string::npos) {
+    supports_cipher = true;
+  } else if (cipher.find("CHACHA20") != std::string::npos) {
+    // CHACHA20-POLY1305 is supported in newer kernels
+    supports_cipher = true;
+  }
+
+  if (!supports_cipher) {
+    ENVOY_LOG(debug, "Unsupported cipher for kTLS: {}. Only AES-GCM and CHACHA20-POLY1305 are supported.", cipher);
+    return false;
+  }
+
+  // Now extract the actual key material
+  if (!extractKeyMaterial(ssl_handle)) {
+    ENVOY_LOG(debug, "Failed to extract key material");
+    return false;
+  }
+
+  // Now that we've extracted keys, we need to initialize sequence numbers
+  if (!initializeSequenceNumbers(2)) { // Use mode 2 for modern kernels
+    ENVOY_LOG(debug, "Failed to initialize sequence numbers");
+    params_extracted_ = false;
+    return false;
+  }
+
+  ENVOY_LOG(debug, "Successfully extracted crypto parameters for kTLS");
+  return true;
+}
+
+bool KtlsSslInfoImpl::extractKeyMaterial(SSL* ssl_handle) {
+  // Check if we already extracted keys
+  if (params_extracted_) {
+    return true;
+  }
+
+  if (!ssl_handle) {
+    ENVOY_LOG(debug, "Cannot extract key material: no SSL handle");
+    return false;
+  }
+
+  ENVOY_LOG(debug, "Starting key material extraction for kTLS");
 
   if (SSL_in_init(ssl_handle) != 0) {
     ENVOY_LOG(debug, "Handshake not complete, cannot extract key material for kTLS yet.");
@@ -263,9 +379,6 @@ bool KtlsSslInfoImpl::extractKeyMaterial() const {
     return false;
   }
 
-  is_client_ = (SSL_is_server(ssl_handle) == 0);
-  ENVOY_LOG(debug, "SSL connection is {}", is_client_ ? "client" : "server");
-
   const SSL_CIPHER* cipher = SSL_SESSION_get0_cipher(session);
   if (!cipher) {
     ENVOY_LOG(debug, "Failed to get cipher from SSL session");
@@ -276,9 +389,22 @@ bool KtlsSslInfoImpl::extractKeyMaterial() const {
   const char* cipher_name = SSL_CIPHER_get_name(cipher);
   ENVOY_LOG(debug, "Cipher name from SSL: {}", cipher_name ? cipher_name : "null");
 
+  // Determine the cipher parameters
   if (cipher_name && (strstr(cipher_name, "AES128-GCM") || strstr(cipher_name, "AES-128-GCM"))) {
     evp_cipher = EVP_aes_128_gcm();
     ENVOY_LOG(debug, "Using AES-128-GCM for key extraction");
+  } else if (cipher_name && (strstr(cipher_name, "AES256-GCM") || strstr(cipher_name, "AES-256-GCM"))) {
+    evp_cipher = EVP_aes_256_gcm();
+    ENVOY_LOG(debug, "Using AES-256-GCM for key extraction");
+  } else if (cipher_name && strstr(cipher_name, "CHACHA20")) {
+    // Use a placeholder for CHACHA20
+#ifdef EVP_CIPHER_CTX_FLAG_WRAP_ALLOW
+    evp_cipher = EVP_chacha20_poly1305();
+#else
+    ENVOY_LOG(warn, "CHACHA20-POLY1305 not available in this OpenSSL version");
+    return false;
+#endif
+    ENVOY_LOG(debug, "Using CHACHA20-POLY1305 for key extraction");
   } else {
     ENVOY_LOG(debug, "Unsupported cipher for kTLS: {}", cipher_name ? cipher_name : "unknown");
     return false;
@@ -290,23 +416,27 @@ bool KtlsSslInfoImpl::extractKeyMaterial() const {
   }
 
   int key_len = EVP_CIPHER_key_length(evp_cipher);
-  int expected_iv_len = 12;
+  int expected_iv_len = 12; // GCM/CCM always uses 12 bytes in TLS
   ENVOY_LOG(debug, "Cipher key length: {}, Expected IV length for kTLS: {}", key_len,
             expected_iv_len);
 
+  // Resize our vectors to hold the key material
   client_write_key_.resize(key_len);
   server_write_key_.resize(key_len);
   client_write_iv_.resize(expected_iv_len);
   server_write_iv_.resize(expected_iv_len);
-  client_write_seq_.resize(8);
-  server_write_seq_.resize(8);
+  client_write_seq_.resize(8, 0); // 8-byte sequence number
+  server_write_seq_.resize(8, 0);
 
+  // Define the labels for exporting key material
   const char* client_key_label = "EXPORTER_CLIENT_WRITE_KEY";
   const char* server_key_label = "EXPORTER_SERVER_WRITE_KEY";
   const char* client_iv_label = "EXPORTER_CLIENT_WRITE_IV";
   const char* server_iv_label = "EXPORTER_SERVER_WRITE_IV";
-  const uint8_t context[] = {};
+  const uint8_t context[] = {}; // No context
 
+  // Export the key material using TLS exporters
+  // TLS 1.2 and TLS 1.3 both support these exporters
   if (SSL_export_keying_material(ssl_handle, client_write_key_.data(), key_len, client_key_label,
                                  strlen(client_key_label), context, 0, 0) != 1) {
     ENVOY_LOG(debug, "Failed to export client write key: {}",
@@ -332,14 +462,10 @@ bool KtlsSslInfoImpl::extractKeyMaterial() const {
     return false;
   }
 
-  // Initialize sequence number vectors with zeros
-  // The actual sequence numbers will be set in initializeSequenceNumbers
-  // based on kernel version capabilities
-  memset(client_write_seq_.data(), 0, 8);
-  memset(server_write_seq_.data(), 0, 8);
-
+  // Sequence numbers will be initialized later in initializeSequenceNumbers
   ENVOY_LOG(debug, "Successfully extracted TLS key material");
 
+  // Log the sizes of our exported keys (not the content, for security)
   ENVOY_LOG(debug, "Client write key size: {}", client_write_key_.size());
   ENVOY_LOG(debug, "Server write key size: {}", server_write_key_.size());
   ENVOY_LOG(debug, "Client write IV size: {}", client_write_iv_.size());
@@ -351,9 +477,9 @@ bool KtlsSslInfoImpl::extractKeyMaterial() const {
   return true;
 }
 
-bool KtlsSslInfoImpl::initializeSequenceNumbers(int ktls_mode) const {
+bool KtlsSslInfoImpl::initializeSequenceNumbers(int ktls_mode) {
   // Make sure we have extracted parameters first
-  if (!params_extracted_ || !extractCryptoParams()) {
+  if (!params_extracted_) {
     ENVOY_LOG(debug, "Cannot initialize sequence numbers: parameters not extracted");
     return false;
   }
@@ -362,7 +488,7 @@ bool KtlsSslInfoImpl::initializeSequenceNumbers(int ktls_mode) const {
   SSL* ssl_handle = nullptr;
   const Extensions::TransportSockets::Tls::ConnectionInfoImplBase* impl_base =
       dynamic_cast<const Extensions::TransportSockets::Tls::ConnectionInfoImplBase*>(
-          ssl_info_.get());
+          ssl_socket_->ssl().get());
   if (impl_base) {
     ssl_handle = impl_base->ssl();
   }
@@ -372,10 +498,7 @@ bool KtlsSslInfoImpl::initializeSequenceNumbers(int ktls_mode) const {
     return false;
   }
 
-  // Get current sequence numbers - FIXED: The order of these is switched on server side
-  // For client: TX = write, RX = read
-  // For server: TX = read, RX = write  <-- This was incorrect
-  // Correct mapping: For both client and server, TX = write_sequence, RX = read_sequence
+  // Get current sequence numbers from SSL
   uint64_t current_tx_seq = SSL_get_write_sequence(ssl_handle);
   uint64_t current_rx_seq = SSL_get_read_sequence(ssl_handle);
 
@@ -385,17 +508,16 @@ bool KtlsSslInfoImpl::initializeSequenceNumbers(int ktls_mode) const {
   // ktls_mode = 0: Basic kTLS (4.13-4.16) - requires zero sequence numbers
   // ktls_mode = 1: Partial support (4.17-5.14) - can handle non-zero but with limitations
   // ktls_mode = 2: Full support (5.15+) - fully supports non-zero sequence numbers
-
   uint64_t tx_seq_to_use, rx_seq_to_use;
 
   if (ktls_mode >= 2) {
-    // Full non-zero sequence number support
+    // Full non-zero sequence number support (5.15+)
     ENVOY_LOG(debug, "Using full non-zero sequence number support (kernel 5.15+)");
     tx_seq_to_use = current_tx_seq;
     rx_seq_to_use = current_rx_seq;
   } else if (ktls_mode == 1) {
-    // Partial non-zero sequence number support
-    // Use sequence numbers if they're both small (< 1000), otherwise zero them
+    // Partial non-zero sequence number support (4.17-5.14)
+    // Use sequence numbers if they're both small, otherwise zero them
     if (current_tx_seq < 1000 && current_rx_seq < 1000) {
       ENVOY_LOG(debug, "Using non-zero sequence numbers with partial support (kernel 4.17-5.14)");
       tx_seq_to_use = current_tx_seq;
@@ -409,39 +531,31 @@ bool KtlsSslInfoImpl::initializeSequenceNumbers(int ktls_mode) const {
       rx_seq_to_use = 0;
     }
   } else {
-    // Basic support - must use zero sequence numbers
+    // Basic support - must use zero sequence numbers (4.13-4.16)
     ENVOY_LOG(debug, "Using zeroed sequence numbers for basic kTLS support (kernel 4.13-4.16)");
     tx_seq_to_use = 0;
     rx_seq_to_use = 0;
   }
 
-  // Update the sequence numbers in our buffers
-  uint64_t seq_num_hton;
-
-  // Always initialize sequence number vectors first
-  client_write_seq_.resize(8, 0);
-  server_write_seq_.resize(8, 0);
-
   ENVOY_LOG(debug, "Using sequence numbers for kTLS: TX={}, RX={}", tx_seq_to_use, rx_seq_to_use);
 
+  // Convert to network byte order (big-endian)
+  uint64_t tx_seq_be = htobe64(tx_seq_to_use);
+  uint64_t rx_seq_be = htobe64(rx_seq_to_use);
+
+  // Store in appropriate sequence vectors based on client/server role
   if (is_client_) {
     // CLIENT SIDE HANDLING
-    // Write to client_write_seq_ (client sending direction)
-    seq_num_hton = htobe64(tx_seq_to_use);
-    memcpy(client_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
-
-    // Write to server_write_seq_ (server sending to client direction)
-    seq_num_hton = htobe64(rx_seq_to_use);
-    memcpy(server_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
+    // Client TX = client_write_seq_
+    memcpy(client_write_seq_.data(), &tx_seq_be, sizeof(tx_seq_be));
+    // Client RX = server_write_seq_
+    memcpy(server_write_seq_.data(), &rx_seq_be, sizeof(rx_seq_be));
   } else {
     // SERVER SIDE HANDLING
-    // Write to server_write_seq_ (server sending direction)
-    seq_num_hton = htobe64(tx_seq_to_use);
-    memcpy(server_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
-
-    // Write to client_write_seq_ (client sending to server direction)
-    seq_num_hton = htobe64(rx_seq_to_use);
-    memcpy(client_write_seq_.data(), &seq_num_hton, sizeof(seq_num_hton));
+    // Server TX = server_write_seq_
+    memcpy(server_write_seq_.data(), &tx_seq_be, sizeof(tx_seq_be));
+    // Server RX = client_write_seq_
+    memcpy(client_write_seq_.data(), &rx_seq_be, sizeof(rx_seq_be));
   }
 
   // Verify the sequence numbers were properly stored in big endian

@@ -1,6 +1,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <fstream>
 
 // Standard C/C++ headers available on all platforms
 #include <cstddef>
@@ -1205,366 +1206,290 @@ void KtlsTransportSocket::disableKtls(const std::string& reason) {
 }
 
 bool KtlsTransportSocket::enableKtls() {
+  ENVOY_LOG(info, "Starting kTLS enablement process");
+  
+  // STEP 1: Validate basic preconditions
   if (!callbacks_) {
     ENVOY_LOG(debug, "Cannot enable kTLS: No callbacks available");
     return false;
   }
-
-  // Get the underlying file descriptor
+  
   int fd = callbacks_->ioHandle().fdDoNotUse();
   if (fd < 0) {
     ENVOY_LOG(debug, "Cannot enable kTLS: Invalid file descriptor");
     return false;
   }
-
-  // First, check to see if kTLS ULP (Upper Layer Protocol) is loaded
-  std::string ulp_buf(16, '\0');
-  socklen_t ulp_len = ulp_buf.size();
-  int res = getsockopt(fd, SOL_TCP, TCP_ULP, ulp_buf.data(), &ulp_len);
   
-  // If ULP is already set, check if it's "tls" and if so, we're good
-  if (res == 0) {
-    // We need to resize the buffer to the actual length returned
-    // But we also need to handle any trailing null characters
-    if (ulp_len > 0) {
-      // Trim the string to the actual length (excluding null terminator)
-      ulp_buf.resize(ulp_len);
-      
-      // Further trim any null characters
-      size_t null_pos = ulp_buf.find('\0');
-      if (null_pos != std::string::npos) {
-        ulp_buf.resize(null_pos);
-      }
-    } else {
-      ulp_buf.clear();
-    }
-    
-    ENVOY_LOG(debug, "Current socket ULP status: len={}, value='{}'", ulp_len, ulp_buf);
-    
-    // Only check for existing ULP if the string is not empty
-    if (!ulp_buf.empty()) {
-      if (ulp_buf == "tls") {
-        ENVOY_LOG(debug, "kTLS ULP already enabled for this socket");
-        // Create the KTLS specific connection info
-        auto ssl_connection = transport_socket_->ssl();
-        ktls_info_ = std::make_shared<KtlsSslInfoImpl>(std::move(ssl_connection));
-        return true;
-      } else {
-        ENVOY_LOG(debug, "Socket already has ULP '{}', cannot enable kTLS", ulp_buf);
-        return false;
-      }
-    }
-    
-    // Empty ULP string means no ULP is set, so we can continue with setting up kTLS
-    ENVOY_LOG(debug, "No ULP currently set on socket, proceeding with kTLS setup");
-  } else {
-    // Error getting ULP info
-    ENVOY_LOG(debug, "getsockopt(TCP_ULP) failed: {} (errno={})", Envoy::errorDetails(errno), errno);
-    
-    // This is not a fatal error - many kernels don't implement getting ULP info but do support setting it
-    // So we can still proceed with the attempt to set the ULP
-  }
-
-  // Verify the connection state
+  // STEP 2: Check SSL connection and get the SSL handle
   auto ssl_connection = transport_socket_->ssl();
   if (!ssl_connection) {
-    ENVOY_LOG(warn, "Cannot enable kTLS due to invalid connection state: No SSL connection available");
+    ENVOY_LOG(warn, "Cannot enable kTLS: No SSL connection available");
     return false;
   }
 
   const Tls::ConnectionInfoImplBase* impl_base = 
       dynamic_cast<const Tls::ConnectionInfoImplBase*>(ssl_connection.get());
-  if (!impl_base) {
-    ENVOY_LOG(warn, "Cannot enable kTLS due to invalid connection state: Not a valid SSL connection");
+  if (!impl_base || !impl_base->ssl()) {
+    ENVOY_LOG(warn, "Cannot enable kTLS: Invalid SSL connection state");
     return false;
   }
 
-  SSL* ssl_handle = impl_base ? impl_base->ssl() : nullptr;
-  if (!ssl_handle) {
-    ENVOY_LOG(warn, "Cannot enable kTLS due to invalid connection state: Cannot access SSL handle");
+  SSL* ssl_handle = impl_base->ssl();
+  
+  // STEP 3: Check if handshake is complete and log sequence numbers
+  if (SSL_in_init(ssl_handle) != 0) {
+    ENVOY_LOG(debug, "Cannot enable kTLS: SSL handshake still in progress");
     return false;
   }
-
-  // Capture and log sequence numbers for diagnostics, especially important for Linux 5.15
+  
   uint64_t tx_seq = SSL_get_write_sequence(ssl_handle);
   uint64_t rx_seq = SSL_get_read_sequence(ssl_handle);
-  ENVOY_LOG(debug, "SSL sequence numbers at kTLS enablement attempt - TX: {}, RX: {}", tx_seq, rx_seq);
-
-  // Verify SSL hasn't encountered an error
-  int ssl_err = SSL_get_error(ssl_handle, 0);
-  if (ssl_err != SSL_ERROR_NONE && ssl_err != SSL_ERROR_WANT_READ &&
-      ssl_err != SSL_ERROR_WANT_WRITE && ssl_err != SSL_ERROR_SYSCALL) {
-    ENVOY_LOG(warn, "Cannot enable kTLS due to invalid connection state: SSL in error state: {}", ssl_err);
-    return false;
-  } else if (ssl_err == SSL_ERROR_SYSCALL) {
-    // SSL_ERROR_SYSCALL doesn't necessarily indicate a problem for kTLS
-    // Often happens when checking after handshake but connection is healthy
-    ENVOY_LOG(debug, "Ignoring SSL_ERROR_SYSCALL (5) as it's common during kTLS enablement");
-  }
-
-  // ENHANCED: Check for ALPN protocol which may affect kTLS behavior
-  const char* alpn_selected = nullptr;
-  unsigned int alpn_selected_len = 0;
-  SSL_get0_alpn_selected(ssl_handle, 
-                        reinterpret_cast<const uint8_t**>(&alpn_selected), 
-                        &alpn_selected_len);
-  if (alpn_selected && alpn_selected_len > 0) {
-    std::string alpn_protocol(alpn_selected, alpn_selected_len);
-    ENVOY_LOG(debug, "Connection using ALPN protocol: {}", alpn_protocol);
-  }
-
-  // Force a flush of any pending data in the SSL write buffer
-  ENVOY_LOG(debug, "Flushing any pending data before enabling kTLS");
-  int flush_result = BIO_flush(SSL_get_wbio(ssl_handle));
-  if (flush_result <= 0) {
-    // Check if this is a real error or just an indication that BIO would block
-    if (BIO_should_retry(SSL_get_wbio(ssl_handle))) {
-      ENVOY_LOG(debug, "BIO_flush would block, will retry later");
-      return false;
-    } else {
-      ENVOY_LOG(debug, "BIO_flush failed: {}", ERR_reason_error_string(ERR_get_error()));
-      // Not fatal, continue
-    }
-  }
-
-  // For added safety, verify if any data is pending in the BIO
-  BIO* wbio = SSL_get_wbio(ssl_handle);
-  if (wbio && BIO_ctrl_pending(wbio) > 0) {
-    ENVOY_LOG(
-        warn,
-        "Write BIO still has pending data after flush ({} bytes), deferring kTLS enablement",
-        BIO_ctrl_pending(wbio));
-    return false;
-  }
-
-  // Check state of pending encrypted records which might cause issues for kTLS
-  // Record type 22 (handshake) or 21 (alert) should complete before enabling kTLS
-  int pending = SSL_pending(ssl_handle);
-  if (pending > 0) {
-    ENVOY_LOG(debug, "SSL has {} bytes of pending data, deferring kTLS enablement", pending);
-    return false;
-  }
+  ENVOY_LOG(info, "SSL sequence numbers at kTLS enablement - TX: {}, RX: {}", tx_seq, rx_seq);
   
-  // Check socket buffer status for pending data
-  int socket_pending = 0;
-  
-  // Method 1: Use ioctl with FIONREAD to check for pending data
-  if (platform_util::ioctl_fn(fd, FIONREAD, &socket_pending) == 0 && socket_pending > 0) {
-    ENVOY_LOG(debug, "Socket has {} bytes of pending data via FIONREAD, deferring kTLS enablement", 
-              socket_pending);
-    return false;
-  }
-  
-  // Method 2: Use poll() to check if data is available for reading
-#ifdef __linux__
-  struct pollfd pfd;
-  pfd.fd = fd;
-  pfd.events = POLLIN;
-  pfd.revents = 0;
-  
-  int poll_result = platform_util::poll_fn(&pfd, 1, 0); // Zero timeout for non-blocking check
-  if (poll_result > 0 && (pfd.revents & POLLIN)) {
-    ENVOY_LOG(debug, "Socket has data available for reading per poll(), deferring kTLS enablement");
-    return false;
-  }
-  
-  // Add extra check for SSL handshake state (SSL_in_init is more reliable than SSL_get_state)
-  if (SSL_in_init(ssl_handle) != 0) {
-    ENVOY_LOG(debug, "SSL still in init phase, deferring kTLS enablement");
-    return false;
-  }
-
-  // Check TCP connection state for diagnostics and better decision making
-  struct tcp_info info;
-  socklen_t len = sizeof(info);
-  if (getsockopt(fd, SOL_TCP, TCP_INFO, &info, &len) == 0) {
-    // TCP_INFO contains useful diagnostics about connection quality
-    ENVOY_LOG(debug, "TCP socket details: state={}, rtt={}µs, rttvar={}µs, snd_cwnd={}, rcv_rtt={}µs",
-              info.tcpi_state, info.tcpi_rtt, info.tcpi_rttvar, 
-              info.tcpi_snd_cwnd, info.tcpi_rcv_rtt);
-    
-    // If TCP connection is not established properly, kTLS likely won't work
-    if (info.tcpi_state != TCP_ESTABLISHED) {
-      ENVOY_LOG(debug, "TCP connection not in ESTABLISHED state, deferring kTLS enablement");
-      return false;
-    }
-  }
-#else
-  // On non-Linux platforms, just check if SSL handshake is really done
-  if (SSL_in_init(ssl_handle) != 0) {
-    ENVOY_LOG(debug, "SSL still in init phase, deferring kTLS enablement");
-    return false;
-  }
-#endif
-
-  // Create the KTLS specific connection info
-  auto ktls_info = std::make_shared<KtlsSslInfoImpl>(std::move(ssl_connection));
-  
-  // Enable TLS ULP
-  const char *tls_ulp = "tls";
-  int ulp_result = setsockopt(fd, SOL_TCP, TCP_ULP, tls_ulp, strlen(tls_ulp));
-  if (ulp_result != 0) {
-    int err = errno;
-    if (err == EEXIST) {
-      // ULP already set - this is unusual since our earlier check didn't find it, but not fatal
-      ENVOY_LOG(debug, "kTLS ULP already enabled (EEXIST), continuing");
-      
-      // Let's verify what ULP is actually set
-      std::string ulp_verify(16, '\0');
-      socklen_t verify_len = ulp_verify.size();
-      if (getsockopt(fd, SOL_TCP, TCP_ULP, ulp_verify.data(), &verify_len) == 0) {
-        // Ensure proper null termination
-        if (verify_len > 0) {
-          ulp_verify.resize(verify_len);
-          size_t null_pos = ulp_verify.find('\0');
-          if (null_pos != std::string::npos) {
-            ulp_verify.resize(null_pos);
-          }
-        } else {
-          ulp_verify.clear();
-        }
-        
-        ENVOY_LOG(debug, "Current ULP after EEXIST (len={}): '{}'", verify_len, ulp_verify);
-        
-        // If the ULP is not "tls", this is a real problem
-        if (!ulp_verify.empty() && ulp_verify != "tls") {
-          ENVOY_LOG(warn, "Socket has non-TLS ULP: '{}', cannot enable kTLS", ulp_verify);
-          return false;
-        }
-      }
-    } else {
-      ENVOY_LOG(warn, "Failed to set TLS ULP on fd={}: {} (errno={})", fd, Envoy::errorDetails(err), err);
-      
-      // Special handling for common failure cases
-      if (err == ENOPROTOOPT || err == EOPNOTSUPP) {
-        ENVOY_LOG(warn, "kTLS not supported by this kernel (TCP_ULP not available)");
-        return false;
-      } else if (err == EBUSY) {
-        ENVOY_LOG(warn, "Socket is busy, cannot set TLS ULP");
-        return false;
-      } else if (err == EPERM) {
-        ENVOY_LOG(warn, "Permission denied setting TLS ULP (CAP_NET_ADMIN may be required)");
-        return false;
-      } else if (try_loading_module_) {
-        // Try to load the module
-        ENVOY_LOG(debug, "Attempting to load tls module");
-        int ret = system("modprobe tls >/dev/null 2>&1");
-        if (ret != 0) {
-          ENVOY_LOG(warn, "Failed to load tls module: kernel module not available (ret={})", ret);
-          return false;
-        }
-
-        // Retry setting ULP after loading module
-        ulp_result = setsockopt(fd, SOL_TCP, TCP_ULP, tls_ulp, strlen(tls_ulp));
-        if (ulp_result != 0) {
-          err = errno;
-          ENVOY_LOG(warn, "Failed to set TLS ULP after loading module: {} (errno={})", 
-                    Envoy::errorDetails(err), err);
-          return false;
-        }
-        
-        ENVOY_LOG(info, "Successfully loaded tls module and set ULP");
-      } else {
-        return false;
-      }
-    }
-  } else {
-    ENVOY_LOG(debug, "Successfully set TLS ULP");
-  }
-
-  // Get TLS crypto info
-  tls_crypto_info_t tx_crypto_info = {};
-  tls_crypto_info_t rx_crypto_info = {};
-    
-  if (!ktls_info->getTxCryptoInfo(tx_crypto_info) || !ktls_info->getRxCryptoInfo(rx_crypto_info)) {
-    ENVOY_LOG(warn, "Failed to get TLS crypto info for fd={}", fd);
-    return false;
-  }
-  
-  // Save current sequence numbers for diagnostics
+  // Save sequence numbers for diagnostics
   saved_tx_seq_ = tx_seq;
   saved_rx_seq_ = rx_seq;
-
-  // Enable TX first - some implementations work better with this ordering
-  bool tx_success = false;
-  if (setsockopt(fd, SOL_TLS, TLS_TX, &tx_crypto_info, sizeof(tx_crypto_info)) < 0) {
-    int err = errno;
-    ENVOY_LOG(debug, "Failed to set TLS_TX on fd={}: {} (errno={})", fd, Envoy::errorDetails(err),
-              err);
-
-    // Commonly seen errors and their meaning
-    if (err == EINVAL) {
-      ENVOY_LOG(debug, "Invalid TX parameters - possibly wrong version or cipher type");
-    } else if (err == EBUSY) {
-      ENVOY_LOG(debug, "TX context already exists");
-      // If context already exists, consider this a success
-      tx_success = true;
-    } else if (err == ENOMEM) {
-      ENVOY_LOG(debug, "Not enough memory for TX context");
-    } else if (err == EBADMSG) {
-      ENVOY_LOG(debug, "TX message verification failed");
+  
+  // STEP 4: Ensure no pending data in SSL or socket buffers
+  if (BIO_flush(SSL_get_wbio(ssl_handle)) <= 0) {
+    if (BIO_should_retry(SSL_get_wbio(ssl_handle))) {
+      ENVOY_LOG(debug, "Cannot enable kTLS: BIO_flush would block");
+      return false;
+    }
+    ENVOY_LOG(debug, "BIO_flush error: {}, continuing anyway", 
+              ERR_reason_error_string(ERR_get_error()));
+  }
+  
+  if (BIO_ctrl_pending(SSL_get_wbio(ssl_handle)) > 0) {
+    ENVOY_LOG(warn, "Cannot enable kTLS: Write BIO has pending data ({} bytes)", 
+              BIO_ctrl_pending(SSL_get_wbio(ssl_handle)));
+    return false;
+  }
+  
+  if (SSL_pending(ssl_handle) > 0) {
+    ENVOY_LOG(debug, "Cannot enable kTLS: SSL has {} bytes of pending data", 
+              SSL_pending(ssl_handle));
+    return false;
+  }
+  
+  int socket_pending = 0;
+  if (platform_util::ioctl_fn(fd, FIONREAD, &socket_pending) == 0 && socket_pending > 0) {
+    ENVOY_LOG(debug, "Cannot enable kTLS: Socket has {} bytes pending", socket_pending);
+    return false;
+  }
+  
+  // STEP 5: Create kTLS connection info
+  auto ktls_info = std::make_shared<KtlsSslInfoImpl>(std::move(ssl_connection));
+  
+  // STEP 6: Check if ULP is already set
+  std::string ulp_buf(16, '\0');
+  socklen_t ulp_len = ulp_buf.size();
+  bool ulp_already_set = false;
+  
+  int gso_ret = getsockopt(fd, SOL_TCP, TCP_ULP, ulp_buf.data(), &ulp_len);
+  if (gso_ret == 0 && ulp_len > 0) {
+    // Trim to actual length and handle null characters
+    ulp_buf.resize(ulp_len);
+    size_t null_pos = ulp_buf.find('\0');
+    if (null_pos != std::string::npos) {
+      ulp_buf.resize(null_pos);
+    }
+    
+    ENVOY_LOG(debug, "Current socket ULP: '{}'", ulp_buf);
+    
+    if (ulp_buf == "tls") {
+      ENVOY_LOG(info, "kTLS ULP already enabled for this socket");
+      ulp_already_set = true;
+    } else if (!ulp_buf.empty()) {
+      ENVOY_LOG(warn, "Socket has non-TLS ULP '{}', cannot enable kTLS", ulp_buf);
+      return false;
+    }
+  } else if (gso_ret != 0) {
+    // Not fatal, we'll try to set it below
+    ENVOY_LOG(debug, "Failed to get current ULP: {} (errno={})", 
+              Envoy::errorDetails(errno), errno);
+  }
+  
+  // STEP 7: Set the TLS ULP if not already set
+  if (!ulp_already_set) {
+    // Use static array with trailing null to ensure proper string length
+    static constexpr char TLS_ULP_NAME[] = "tls";
+    
+    // Try setting the ULP with proper length including null
+    int ulp_result = setsockopt(fd, SOL_TCP, TCP_ULP, TLS_ULP_NAME, sizeof(TLS_ULP_NAME) - 1);
+    
+    if (ulp_result != 0) {
+      int err = errno;
+      if (err == EEXIST) {
+        // ULP already exists, this is fine
+        ENVOY_LOG(debug, "kTLS ULP already exists (EEXIST), continuing");
+      } else {
+        ENVOY_LOG(warn, "Failed to set TLS ULP: {} (errno={})", 
+                  Envoy::errorDetails(err), err);
+        
+        // Try to load the module for certain error types
+        if ((err == ENOPROTOOPT || err == EOPNOTSUPP || err == EPERM) && try_loading_module_) {
+          ENVOY_LOG(info, "Attempting to load tls kernel module");
+          int ret = system("modprobe tls >/dev/null 2>&1");
+          if (ret != 0) {
+            ENVOY_LOG(warn, "Failed to load tls module (ret={})", ret);
+            return false;
+          }
+          
+          // Retry setting ULP after loading module
+          ulp_result = setsockopt(fd, SOL_TCP, TCP_ULP, TLS_ULP_NAME, sizeof(TLS_ULP_NAME) - 1);
+          if (ulp_result != 0) {
+            err = errno;
+            ENVOY_LOG(warn, "Failed to set TLS ULP after loading module: {} (errno={})", 
+                      Envoy::errorDetails(err), err);
+            
+            // Special handling for permissions issues
+            if (err == EPERM) {
+              ENVOY_LOG(error, "Permission denied setting TLS ULP even after module load. "
+                           "Ensure process has CAP_NET_ADMIN capability.");
+            }
+            return false;
+          }
+          
+          ENVOY_LOG(info, "Successfully loaded tls module and set ULP");
+        } else {
+          // Special handling for permissions issues
+          if (err == EPERM) {
+            ENVOY_LOG(error, "Permission denied setting TLS ULP. Ensure process has "
+                         "CAP_NET_ADMIN capability or run with sudo.");
+          }
+          return false;
+        }
+      }
     } else {
-      ENVOY_LOG(debug, "Other TX error: {}", Envoy::errorDetails(err));
+      ENVOY_LOG(debug, "Successfully set TLS ULP");
+    }
+    
+    // Verify ULP was set correctly
+    ulp_buf.assign(16, '\0');
+    ulp_len = ulp_buf.size();
+    
+    if (getsockopt(fd, SOL_TCP, TCP_ULP, ulp_buf.data(), &ulp_len) == 0 && ulp_len > 0) {
+      ulp_buf.resize(ulp_len);
+      size_t null_pos = ulp_buf.find('\0');
+      if (null_pos != std::string::npos) {
+        ulp_buf.resize(null_pos);
+      }
+      
+      ENVOY_LOG(debug, "Verified socket ULP after setting: '{}'", ulp_buf);
+      
+      if (ulp_buf != "tls") {
+        ENVOY_LOG(warn, "Expected ULP 'tls' but got '{}' after setting", ulp_buf);
+      }
+    }
+  }
+  
+  // STEP 8: Get crypto info from SSL
+  tls_crypto_info_t tx_crypto_info = {};
+  tls_crypto_info_t rx_crypto_info = {};
+  
+  if (!ktls_info->getTxCryptoInfo(tx_crypto_info)) {
+    ENVOY_LOG(warn, "Failed to get TX crypto info for kTLS");
+    return false;
+  }
+  
+  if (!ktls_info->getRxCryptoInfo(rx_crypto_info)) {
+    ENVOY_LOG(warn, "Failed to get RX crypto info for kTLS");
+    return false;
+  }
+  
+  // STEP 9: Apply TX crypto settings to socket
+  bool tx_success = false;
+  if (setsockopt(fd, SOL_TLS, TLS_TX, &tx_crypto_info, sizeof(tx_crypto_info)) != 0) {
+    int err = errno;
+    if (err == EBUSY) {
+      ENVOY_LOG(debug, "TX crypto context already exists (EBUSY), considering successful");
+      tx_success = true;
+    } else {
+      ENVOY_LOG(warn, "Failed to set TLS_TX crypto: {} (errno={})", 
+                Envoy::errorDetails(err), err);
+                
+      // Special log for common errors
+      if (err == EINVAL) {
+        ENVOY_LOG(warn, "Invalid TX crypto parameters - possibly wrong version or cipher type");
+      } else if (err == ENOMEM) {
+        ENVOY_LOG(warn, "Not enough memory for TX crypto context");
+      } else if (err == EBADMSG) {
+        ENVOY_LOG(warn, "TX crypto message verification failed");
+      } else if (err == EPERM) {
+        ENVOY_LOG(error, "Permission denied setting TX crypto. Ensure process has "
+                      "CAP_NET_ADMIN capability or run with sudo.");
+      }
     }
   } else {
+    ENVOY_LOG(debug, "Successfully set TX crypto parameters");
     tx_success = true;
   }
-
-  // Try to set zerocopy flag if requested (non-fatal if it fails)
+  
+  // STEP 10: Set TX zerocopy if requested and TX was successful
   if (tx_success && enable_tx_zerocopy_) {
     int zerocopy_val = 1;
-    if (setsockopt(fd, SOL_TLS, TLS_TX_ZEROCOPY_RO, &zerocopy_val, sizeof(zerocopy_val)) < 0) {
-      ENVOY_LOG(debug, "Failed to set TLS_TX_ZEROCOPY_RO: {}", Envoy::errorDetails(errno));
-      // This is not fatal, we can continue without zerocopy
+    if (setsockopt(fd, SOL_TLS, TLS_TX_ZEROCOPY_RO, &zerocopy_val, sizeof(zerocopy_val)) != 0) {
+      ENVOY_LOG(debug, "Failed to set TLS_TX_ZEROCOPY_RO: {} (errno={})", 
+                Envoy::errorDetails(errno), errno);
+      // Not fatal, continue
     } else {
       ENVOY_LOG(debug, "Successfully enabled TX zerocopy");
     }
   }
-
-  // Now enable RX
+  
+  // STEP 11: Apply RX crypto settings to socket
   bool rx_success = false;
-  if (setsockopt(fd, SOL_TLS, TLS_RX, &rx_crypto_info, sizeof(rx_crypto_info)) < 0) {
+  if (setsockopt(fd, SOL_TLS, TLS_RX, &rx_crypto_info, sizeof(rx_crypto_info)) != 0) {
     int err = errno;
-    ENVOY_LOG(debug, "Failed to set TLS_RX on fd={}: {} (errno={})", fd, Envoy::errorDetails(err),
-              err);
-
-    // Commonly seen errors and their meaning
-    if (err == EINVAL) {
-      ENVOY_LOG(debug, "Invalid RX parameters - possibly wrong version or cipher type");
-    } else if (err == EBUSY) {
-      ENVOY_LOG(debug, "RX context already exists");
-      // If context already exists, consider this a success
+    if (err == EBUSY) {
+      ENVOY_LOG(debug, "RX crypto context already exists (EBUSY), considering successful");
       rx_success = true;
-    } else if (err == ENOMEM) {
-      ENVOY_LOG(debug, "Not enough memory for RX context");
-    } else if (err == EBADMSG) {
-      ENVOY_LOG(debug, "RX message verification failed");
     } else {
-      ENVOY_LOG(debug, "Other RX error: {}", Envoy::errorDetails(err));
+      ENVOY_LOG(warn, "Failed to set TLS_RX crypto: {} (errno={})", 
+                Envoy::errorDetails(err), err);
+                
+      // Special log for common errors
+      if (err == EINVAL) {
+        ENVOY_LOG(warn, "Invalid RX crypto parameters - possibly wrong version or cipher type");
+      } else if (err == ENOMEM) {
+        ENVOY_LOG(warn, "Not enough memory for RX crypto context");
+      } else if (err == EBADMSG) {
+        ENVOY_LOG(warn, "RX crypto message verification failed");
+      } else if (err == EPERM) {
+        ENVOY_LOG(error, "Permission denied setting RX crypto. Ensure process has "
+                      "CAP_NET_ADMIN capability or run with sudo.");
+      }
     }
   } else {
+    ENVOY_LOG(debug, "Successfully set RX crypto parameters");
     rx_success = true;
   }
-
-  // Try to set no-pad flag if requested (non-fatal if it fails)
+  
+  // STEP 12: Set RX no-padding if requested and RX was successful
   if (rx_success && enable_rx_no_pad_) {
     int no_pad_val = 1;
-    if (setsockopt(fd, SOL_TLS, TLS_RX_EXPECT_NO_PAD, &no_pad_val, sizeof(no_pad_val)) < 0) {
-      ENVOY_LOG(debug, "Failed to set TLS_RX_EXPECT_NO_PAD: {}", Envoy::errorDetails(errno));
-      // This is not fatal, we can continue without no-pad setting
+    if (setsockopt(fd, SOL_TLS, TLS_RX_EXPECT_NO_PAD, &no_pad_val, sizeof(no_pad_val)) != 0) {
+      ENVOY_LOG(debug, "Failed to set TLS_RX_EXPECT_NO_PAD: {} (errno={})", 
+                Envoy::errorDetails(errno), errno);
+      // Not fatal, continue
     } else {
       ENVOY_LOG(debug, "Successfully enabled RX no-padding");
     }
   }
-
-  // If both TX and RX are successfully enabled or if TX is all we need
+  
+  // STEP 13: Determine overall success and complete setup
+  // Some implementations only need TX to work, based on error_handling_mode
   if ((tx_success && rx_success) || (tx_success && error_handling_mode_ == 1)) {
-    ENVOY_LOG(info, "Successfully enabled kTLS with TX={} RX={} zerocopy={} no_pad={}", 
+    ENVOY_LOG(info, "Successfully enabled kTLS with TX={}, RX={}, zerocopy={}, no_pad={}", 
               tx_success, rx_success, enable_tx_zerocopy_, enable_rx_no_pad_);
+    
+    // Store the kTLS info and mark as enabled
     ktls_info_ = ktls_info;
+    ktls_enabled_ = true;
     return true;
   }
-
+  
   ENVOY_LOG(warn, "Failed to fully enable kTLS (TX={}, RX={})", tx_success, rx_success);
   return false;
 }
@@ -1800,177 +1725,300 @@ DownstreamKtlsTransportSocketFactory::createDownstreamTransportSocket() const {
   return ktls_socket;
 }
 
-bool KtlsTransportSocket::canEnableKtls() const {
-  // Return false if we don't have access to the SSL connection
-  if (!transport_socket_ || !transport_socket_->ssl()) {
-    ENVOY_LOG(debug, "Cannot enable kTLS: No SSL connection available");
+bool KtlsTransportSocket::enableKtls() {
+  ENVOY_LOG(info, "Starting kTLS enablement process");
+  
+  // STEP 1: Validate basic preconditions
+  if (!callbacks_) {
+    ENVOY_LOG(debug, "Cannot enable kTLS: No callbacks available");
+    return false;
+  }
+  
+  int fd = callbacks_->ioHandle().fdDoNotUse();
+  if (fd < 0) {
+    ENVOY_LOG(debug, "Cannot enable kTLS: Invalid file descriptor");
+    return false;
+  }
+  
+  // STEP 2: Check SSL connection and get the SSL handle
+  auto ssl_connection = transport_socket_->ssl();
+  if (!ssl_connection) {
+    ENVOY_LOG(warn, "Cannot enable kTLS: No SSL connection available");
     return false;
   }
 
-  // Check for supported cipher suites
-  const std::string cipher = transport_socket_->ssl()->ciphersuiteString();
-  if (cipher.empty()) {
-    ENVOY_LOG(debug, "Cannot enable kTLS: No cipher suite negotiated");
+  const Tls::ConnectionInfoImplBase* impl_base = 
+      dynamic_cast<const Tls::ConnectionInfoImplBase*>(ssl_connection.get());
+  if (!impl_base || !impl_base->ssl()) {
+    ENVOY_LOG(warn, "Cannot enable kTLS: Invalid SSL connection state");
     return false;
   }
 
-  // kTLS supports a limited set of cipher suites
-  // Common supported ciphers: AES-GCM, CHACHA20-POLY1305
-  bool supported_cipher = false;
-  if (cipher.find("AES") != std::string::npos && cipher.find("GCM") != std::string::npos) {
-    supported_cipher = true;
-  } else if (cipher.find("CHACHA20") != std::string::npos) {
-    supported_cipher = true;
-  }
-
-  if (!supported_cipher) {
-    ENVOY_LOG(debug, "Cannot enable kTLS: Unsupported cipher suite {}", cipher);
+  SSL* ssl_handle = impl_base->ssl();
+  
+  // STEP 3: Check if handshake is complete and log sequence numbers
+  if (SSL_in_init(ssl_handle) != 0) {
+    ENVOY_LOG(debug, "Cannot enable kTLS: SSL handshake still in progress");
     return false;
   }
-
-  // Check TLS version (kTLS requires at least TLS 1.2)
-  const std::string version = transport_socket_->ssl()->tlsVersion();
-  if (version.empty()) {
-    ENVOY_LOG(debug, "Cannot enable kTLS: No TLS version negotiated");
-    return false;
-  }
-
-  if (version != "TLSv1.3" && version != "TLSv1.2") {
-    ENVOY_LOG(debug, "Cannot enable kTLS: Unsupported TLS version {}", version);
-    return false;
-  }
-
-  // Check for platform support (this is a minimal implementation)
-#ifndef __linux__
-  ENVOY_LOG(debug, "Cannot enable kTLS: Platform is not Linux");
-  return false;
-#else
-  // Check if kernel has TLS ULP support by checking available ULPs
-  if (callbacks_) {
-    int fd = callbacks_->ioHandle().fdDoNotUse();
-    if (fd < 0) {
-      ENVOY_LOG(debug, "Cannot enable kTLS: Invalid file descriptor");
+  
+  uint64_t tx_seq = SSL_get_write_sequence(ssl_handle);
+  uint64_t rx_seq = SSL_get_read_sequence(ssl_handle);
+  ENVOY_LOG(info, "SSL sequence numbers at kTLS enablement - TX: {}, RX: {}", tx_seq, rx_seq);
+  
+  // Save sequence numbers for diagnostics
+  saved_tx_seq_ = tx_seq;
+  saved_rx_seq_ = rx_seq;
+  
+  // STEP 4: Ensure no pending data in SSL or socket buffers
+  if (BIO_flush(SSL_get_wbio(ssl_handle)) <= 0) {
+    if (BIO_should_retry(SSL_get_wbio(ssl_handle))) {
+      ENVOY_LOG(debug, "Cannot enable kTLS: BIO_flush would block");
       return false;
     }
-    
-    // Check if TCP connection is fully established
-    struct tcp_info info;
-    socklen_t info_len = sizeof(info);
-    if (getsockopt(fd, SOL_TCP, TCP_INFO, &info, &info_len) == 0) {
-      // TCP_ESTABLISHED is 1 on Linux
-      if (info.tcpi_state != TCP_ESTABLISHED) {
-        ENVOY_LOG(debug, "Cannot enable kTLS: TCP connection not established (state={})",
-                  info.tcpi_state);
-        return false;
-      }
-      
-      // Log RTT and other connection quality metrics that might affect kTLS
-      ENVOY_LOG(debug, "TCP connection quality: rtt={}µs, rttvar={}µs", 
-                info.tcpi_rtt, info.tcpi_rttvar);
+    ENVOY_LOG(debug, "BIO_flush error: {}, continuing anyway", 
+              ERR_reason_error_string(ERR_get_error()));
+  }
+  
+  if (BIO_ctrl_pending(SSL_get_wbio(ssl_handle)) > 0) {
+    ENVOY_LOG(warn, "Cannot enable kTLS: Write BIO has pending data ({} bytes)", 
+              BIO_ctrl_pending(SSL_get_wbio(ssl_handle)));
+    return false;
+  }
+  
+  if (SSL_pending(ssl_handle) > 0) {
+    ENVOY_LOG(debug, "Cannot enable kTLS: SSL has {} bytes of pending data", 
+              SSL_pending(ssl_handle));
+    return false;
+  }
+  
+  int socket_pending = 0;
+  if (platform_util::ioctl_fn(fd, FIONREAD, &socket_pending) == 0 && socket_pending > 0) {
+    ENVOY_LOG(debug, "Cannot enable kTLS: Socket has {} bytes pending", socket_pending);
+    return false;
+  }
+  
+  // STEP 5: Create kTLS connection info and extract crypto params
+  auto ktls_info = std::make_shared<KtlsSslInfoImpl>(std::move(ssl_connection));
+  
+  // Explicitly trigger parameter extraction before proceeding
+  // This should populate the crypto info structures
+  if (!ktls_info->extractCryptoParams()) {
+    ENVOY_LOG(warn, "Failed to extract crypto parameters, will retry on next readiness check");
+    return false;
+  }
+  
+  // STEP 6: Check if ULP is already set
+  std::string ulp_buf(16, '\0');
+  socklen_t ulp_len = ulp_buf.size();
+  bool ulp_already_set = false;
+  
+  int gso_ret = getsockopt(fd, SOL_TCP, TCP_ULP, ulp_buf.data(), &ulp_len);
+  if (gso_ret == 0 && ulp_len > 0) {
+    // Trim to actual length and handle null characters
+    ulp_buf.resize(ulp_len);
+    size_t null_pos = ulp_buf.find('\0');
+    if (null_pos != std::string::npos) {
+      ulp_buf.resize(null_pos);
     }
     
-    // Explicitly verify TLS ULP is available on this system
-    char available_ulps[256] = {0};
-    socklen_t ulps_len = sizeof(available_ulps);
-    if (getsockopt(fd, SOL_TCP, TCP_AVAILABLE_ULPS, available_ulps, &ulps_len) == 0) {
-      // Convert available_ulps to a safer string - kernel may not null-terminate properly
-      // Note that TCP_AVAILABLE_ULPS returns a space-separated list of available ULPs
-      std::string ulps_str;
-      if (ulps_len > 0) {
-        // Ensure null-termination for safety
-        available_ulps[static_cast<socklen_t>(std::min<size_t>(ulps_len, sizeof(available_ulps) - 1))] = '\0';
-        ulps_str = available_ulps;
-      }
-      
-      ENVOY_LOG(debug, "Available ULPs (len={}): '{}'", ulps_len, ulps_str);
-      
-      // Check if "tls" is in the list of ULPs
-      if (ulps_str.find("tls") == std::string::npos) {
-        ENVOY_LOG(warn, "kTLS ULP not available on this system, available ULPs: {}", 
-                  ulps_str);
+    ENVOY_LOG(debug, "Current socket ULP: '{}'", ulp_buf);
+    
+    if (ulp_buf == "tls") {
+      ENVOY_LOG(info, "kTLS ULP already enabled for this socket");
+      ulp_already_set = true;
+    } else if (!ulp_buf.empty()) {
+      ENVOY_LOG(warn, "Socket has non-TLS ULP '{}', cannot enable kTLS", ulp_buf);
+      return false;
+    }
+  } else if (gso_ret != 0) {
+    // Not fatal, we'll try to set it below
+    ENVOY_LOG(debug, "Failed to get current ULP: {} (errno={})", 
+              Envoy::errorDetails(errno), errno);
+  }
+  
+  // STEP 7: Set the TLS ULP if not already set
+  if (!ulp_already_set) {
+    // Use static array with trailing null to ensure proper string length
+    static constexpr char TLS_ULP_NAME[] = "tls";
+    
+    // Try setting the ULP with proper length
+    int ulp_result = setsockopt(fd, SOL_TCP, TCP_ULP, TLS_ULP_NAME, strlen(TLS_ULP_NAME));
+    
+    if (ulp_result != 0) {
+      int err = errno;
+      if (err == EEXIST) {
+        // ULP already exists, this is fine
+        ENVOY_LOG(debug, "kTLS ULP already exists (EEXIST), continuing");
+      } else {
+        ENVOY_LOG(warn, "Failed to set TLS ULP: {} (errno={})", 
+                  Envoy::errorDetails(err), err);
         
-        // Try to load the module if allowed
-        if (try_loading_module_) {
-          ENVOY_LOG(debug, "Attempting to load tls module");
+        // Try to load the module for certain error types
+        if ((err == ENOPROTOOPT || err == EOPNOTSUPP || err == EPERM) && try_loading_module_) {
+          ENVOY_LOG(info, "Attempting to load tls kernel module");
           int ret = system("modprobe tls >/dev/null 2>&1");
           if (ret != 0) {
-            ENVOY_LOG(warn, "Failed to load tls module: kernel module not available (ret={})", ret);
+            ENVOY_LOG(warn, "Failed to load tls module (ret={})", ret);
             return false;
           }
           
-          // Check again if ULP is now available
-          ulps_len = sizeof(available_ulps);
-          memset(available_ulps, 0, sizeof(available_ulps));
-          std::string ulps_str_after_load;
-          
-          if (getsockopt(fd, SOL_TCP, TCP_AVAILABLE_ULPS, available_ulps, &ulps_len) == 0) {
-            // Ensure null-termination for safety
-            available_ulps[static_cast<socklen_t>(std::min<size_t>(ulps_len, sizeof(available_ulps) - 1))] = '\0';
-            ulps_str_after_load = available_ulps;
+          // Retry setting ULP after loading module
+          ulp_result = setsockopt(fd, SOL_TCP, TCP_ULP, TLS_ULP_NAME, strlen(TLS_ULP_NAME));
+          if (ulp_result != 0) {
+            err = errno;
+            ENVOY_LOG(warn, "Failed to set TLS ULP after loading module: {} (errno={})", 
+                      Envoy::errorDetails(err), err);
             
-            ENVOY_LOG(debug, "Available ULPs after module load (len={}): '{}'", ulps_len, ulps_str_after_load);
-            
-            if (ulps_str_after_load.find("tls") == std::string::npos) {
-              ENVOY_LOG(warn, "kTLS ULP still not available after module load");
-              return false;
+            // Special handling for permissions issues
+            if (err == EPERM) {
+              ENVOY_LOG(error, "Permission denied setting TLS ULP even after module load. "
+                           "Ensure process has CAP_NET_ADMIN capability.");
             }
-            ENVOY_LOG(info, "Successfully loaded tls kernel module");
+            return false;
           }
+          
+          ENVOY_LOG(info, "Successfully loaded tls module and set ULP");
         } else {
+          // Special handling for permissions issues
+          if (err == EPERM) {
+            ENVOY_LOG(error, "Permission denied setting TLS ULP. Ensure process has "
+                         "CAP_NET_ADMIN capability or run with sudo.");
+          }
           return false;
         }
-      } else {
-        ENVOY_LOG(debug, "kTLS ULP available: {}", ulps_str);
       }
     } else {
-      // Older kernels may not support TCP_AVAILABLE_ULPS, so try direct ULP probe
-      ENVOY_LOG(debug, "TCP_AVAILABLE_ULPS not supported (errno={}), trying direct ULP probe", errno);
-      char tls_ulp[] = "tls";
-      // Just probe ULP capability without actually setting it
-      if (setsockopt(fd, SOL_TCP, TCP_ULP, tls_ulp, 0) != 0 && errno != EEXIST) {
-        if (errno == ENOPROTOOPT || errno == EOPNOTSUPP) {
-          ENVOY_LOG(warn, "kTLS not supported by this kernel (errno={})", errno);
-          return false;
-        }
-        
-        // For other errors, try loading the module if allowed
-        if (try_loading_module_) {
-          ENVOY_LOG(debug, "Attempting to load tls module");
-          int ret = system("modprobe tls >/dev/null 2>&1");
-          if (ret != 0) {
-            ENVOY_LOG(warn, "Failed to load tls module: kernel module not available (ret={})", ret);
-            return false;
-          }
-          
-          // Check again if ULP is now available
-          ulps_len = sizeof(available_ulps);
-          memset(available_ulps, 0, sizeof(available_ulps));
-          std::string ulps_str_after_probe;
-          
-          if (getsockopt(fd, SOL_TCP, TCP_AVAILABLE_ULPS, available_ulps, &ulps_len) == 0) {
-            // Ensure null-termination for safety
-            available_ulps[static_cast<socklen_t>(std::min<size_t>(ulps_len, sizeof(available_ulps) - 1))] = '\0';
-            ulps_str_after_probe = available_ulps;
-            
-            ENVOY_LOG(debug, "Available ULPs after module load (len={}): '{}'", ulps_len, ulps_str_after_probe);
-            
-            if (ulps_str_after_probe.find("tls") == std::string::npos) {
-              ENVOY_LOG(warn, "kTLS ULP still not available after module load");
-              return false;
-            }
-            ENVOY_LOG(info, "Successfully loaded tls kernel module");
-          }
-        } else {
-          return false;
-        }
-      } else {
-        ENVOY_LOG(debug, "Direct ULP probe for 'tls' succeeded");
+      ENVOY_LOG(debug, "Successfully set TLS ULP");
+    }
+    
+    // Verify ULP was set correctly
+    ulp_buf.assign(16, '\0');
+    ulp_len = ulp_buf.size();
+    
+    if (getsockopt(fd, SOL_TCP, TCP_ULP, ulp_buf.data(), &ulp_len) == 0 && ulp_len > 0) {
+      ulp_buf.resize(ulp_len);
+      size_t null_pos = ulp_buf.find('\0');
+      if (null_pos != std::string::npos) {
+        ulp_buf.resize(null_pos);
+      }
+      
+      ENVOY_LOG(debug, "Verified socket ULP after setting: '{}'", ulp_buf);
+      
+      if (ulp_buf != "tls") {
+        ENVOY_LOG(warn, "Expected ULP 'tls' but got '{}' after setting", ulp_buf);
       }
     }
   }
-#endif
-
-  return true;
+  
+  // STEP 8: Get crypto info from SSL
+  tls_crypto_info_t tx_crypto_info = {};
+  tls_crypto_info_t rx_crypto_info = {};
+  
+  if (!ktls_info->getTxCryptoInfo(tx_crypto_info)) {
+    ENVOY_LOG(warn, "Failed to get TX crypto info for kTLS");
+    return false;
+  }
+  
+  if (!ktls_info->getRxCryptoInfo(rx_crypto_info)) {
+    ENVOY_LOG(warn, "Failed to get RX crypto info for kTLS");
+    return false;
+  }
+  
+  // STEP 9: Apply TX crypto settings to socket
+  bool tx_success = false;
+  if (setsockopt(fd, SOL_TLS, TLS_TX, &tx_crypto_info, sizeof(tx_crypto_info)) != 0) {
+    int err = errno;
+    if (err == EBUSY) {
+      ENVOY_LOG(debug, "TX crypto context already exists (EBUSY), considering successful");
+      tx_success = true;
+    } else {
+      ENVOY_LOG(warn, "Failed to set TLS_TX crypto: {} (errno={})", 
+                Envoy::errorDetails(err), err);
+                
+      // Special log for common errors
+      if (err == EINVAL) {
+        ENVOY_LOG(warn, "Invalid TX crypto parameters - possibly wrong version or cipher type");
+      } else if (err == ENOMEM) {
+        ENVOY_LOG(warn, "Not enough memory for TX crypto context");
+      } else if (err == EBADMSG) {
+        ENVOY_LOG(warn, "TX crypto message verification failed");
+      } else if (err == EPERM) {
+        ENVOY_LOG(error, "Permission denied setting TX crypto. Ensure process has "
+                      "CAP_NET_ADMIN capability or run with sudo.");
+      }
+    }
+  } else {
+    ENVOY_LOG(debug, "Successfully set TX crypto parameters");
+    tx_success = true;
+  }
+  
+  // STEP 10: Set TX zerocopy if requested and TX was successful
+  if (tx_success && enable_tx_zerocopy_) {
+    int zerocopy_val = 1;
+    if (setsockopt(fd, SOL_TLS, TLS_TX_ZEROCOPY_RO, &zerocopy_val, sizeof(zerocopy_val)) != 0) {
+      ENVOY_LOG(debug, "Failed to set TLS_TX_ZEROCOPY_RO: {} (errno={})", 
+                Envoy::errorDetails(errno), errno);
+      // Not fatal, continue
+    } else {
+      ENVOY_LOG(debug, "Successfully enabled TX zerocopy");
+    }
+  }
+  
+  // STEP 11: Apply RX crypto settings to socket
+  bool rx_success = false;
+  if (setsockopt(fd, SOL_TLS, TLS_RX, &rx_crypto_info, sizeof(rx_crypto_info)) != 0) {
+    int err = errno;
+    if (err == EBUSY) {
+      ENVOY_LOG(debug, "RX crypto context already exists (EBUSY), considering successful");
+      rx_success = true;
+    } else {
+      ENVOY_LOG(warn, "Failed to set TLS_RX crypto: {} (errno={})", 
+                Envoy::errorDetails(err), err);
+                
+      // Special log for common errors
+      if (err == EINVAL) {
+        ENVOY_LOG(warn, "Invalid RX crypto parameters - possibly wrong version or cipher type");
+      } else if (err == ENOMEM) {
+        ENVOY_LOG(warn, "Not enough memory for RX crypto context");
+      } else if (err == EBADMSG) {
+        ENVOY_LOG(warn, "RX crypto message verification failed");
+      } else if (err == EPERM) {
+        ENVOY_LOG(error, "Permission denied setting RX crypto. Ensure process has "
+                      "CAP_NET_ADMIN capability or run with sudo.");
+      }
+    }
+  } else {
+    ENVOY_LOG(debug, "Successfully set RX crypto parameters");
+    rx_success = true;
+  }
+  
+  // STEP 12: Set RX no-padding if requested and RX was successful
+  if (rx_success && enable_rx_no_pad_) {
+    int no_pad_val = 1;
+    if (setsockopt(fd, SOL_TLS, TLS_RX_EXPECT_NO_PAD, &no_pad_val, sizeof(no_pad_val)) != 0) {
+      ENVOY_LOG(debug, "Failed to set TLS_RX_EXPECT_NO_PAD: {} (errno={})", 
+                Envoy::errorDetails(errno), errno);
+      // Not fatal, continue
+    } else {
+      ENVOY_LOG(debug, "Successfully enabled RX no-padding");
+    }
+  }
+  
+  // STEP 13: Determine overall success and complete setup
+  // Some implementations only need TX to work, based on error_handling_mode
+  if ((tx_success && rx_success) || (tx_success && error_handling_mode_ == 1)) {
+    ENVOY_LOG(info, "Successfully enabled kTLS with TX={}, RX={}, zerocopy={}, no_pad={}", 
+              tx_success, rx_success, enable_tx_zerocopy_, enable_rx_no_pad_);
+    
+    // Store the kTLS info and mark as enabled
+    ktls_info_ = ktls_info;
+    ktls_enabled_ = true;
+    return true;
+  }
+  
+  ENVOY_LOG(warn, "Failed to fully enable kTLS (TX={}, RX={})", tx_success, rx_success);
+  return false;
 }
 
 // Define helper function for ioctl calls
