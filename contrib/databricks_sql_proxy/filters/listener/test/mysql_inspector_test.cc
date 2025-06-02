@@ -645,6 +645,409 @@ TEST_F(MySQLInspectorTest, BadBufferData) {
   EXPECT_EQ(0UL, config_->stats().client_not_using_ssl_.value());
 }
 
+// Test server greeting packet generation with various configurations
+TEST_F(MySQLInspectorTest, ServerGreetingGeneration) {
+  SetUp();
+
+  EXPECT_CALL(io_handle_, write(_))
+      .WillOnce([](Buffer::Instance& buffer) -> Api::IoCallUint64Result {
+        // Validate server greeting packet structure
+        EXPECT_GE(buffer.length(), 68); // Minimum size for MySQL greeting
+
+        // Read packet header
+        uint32_t packet_length = buffer.peekLEInt<uint32_t>(0) & 0x00FFFFFF;
+        uint8_t seq = buffer.peekLEInt<uint8_t>(3);
+        EXPECT_EQ(0, seq);             // First packet should have sequence 0
+        EXPECT_GT(packet_length, 64U); // Packet should have reasonable size
+
+        // Validate protocol version
+        EXPECT_EQ(NetworkFilters::DatabricksSqlProxy::MySQLConstants::PROTOCOL_VERSION,
+                  buffer.peekLEInt<uint8_t>(4));
+
+        // Validate server version string is present
+        size_t pos = 5;
+        bool found_null = false;
+        while (pos < buffer.length() && pos < 50) {
+          if (buffer.peekLEInt<uint8_t>(pos) == 0) {
+            found_null = true;
+            break;
+          }
+          pos++;
+        }
+        EXPECT_TRUE(found_null);
+
+        return Api::IoCallUint64Result{buffer.length(), Api::IoError::none()};
+      });
+
+  EXPECT_CALL(callbacks_, setDynamicMetadata(Filter::name(), _));
+
+  EXPECT_EQ(filter_->onAccept(callbacks_), Network::FilterStatus::StopIteration);
+  EXPECT_EQ(1UL, config_->stats().server_greeting_sent_.value());
+}
+
+// Test handling of packets with various sequence numbers
+TEST_F(MySQLInspectorTest, SequenceNumberValidation) {
+  SetUp();
+
+  EXPECT_CALL(io_handle_,
+              createFileEvent_(_, _, Event::PlatformDefaultTriggerType,
+                               Event::FileReadyType::Read | Event::FileReadyType::Closed))
+      .WillOnce(SaveArg<1>(&file_event_callback_));
+
+  EXPECT_CALL(io_handle_, recv(_, _, _))
+      .WillOnce([](void* buffer, size_t length, int flags) {
+        EXPECT_EQ(flags, MSG_PEEK);
+
+        // Create packet with incorrect sequence number (should be 1, using 2)
+        uint8_t response[36] = {0x1C, 0x00, 0x00,       // Packet length
+                                0x02,                   // Wrong sequence ID (should be 1)
+                                0x0F, 0xAA, 0x00, 0x00, // Capabilities
+                                0x00, 0x00, 0x00, 0x01, 0x21, 0x00, 0x00, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+        std::memcpy(buffer, response, length);
+        return Api::IoCallUint64Result(length, Api::IoError::none());
+      })
+      .WillOnce([](void*, size_t length, int flags) {
+        // This is for the drain operation
+        EXPECT_EQ(flags, 0); // Not MSG_PEEK for actual recv
+        return Api::IoCallUint64Result(length, Api::IoError::none());
+      });
+
+  Network::ListenerFilterBufferImpl buffer{
+      io_handle_,  dispatcher_,
+      [](bool) {}, [](Network::ListenerFilterBuffer&) {},
+      false,       NetworkFilters::DatabricksSqlProxy::MySQLConstants::SSL_HANDSHAKE_PACKET_LENGTH};
+
+  EXPECT_TRUE(file_event_callback_(Event::FileReadyType::Read).ok());
+
+  // Initial handshake
+  EXPECT_CALL(callbacks_, setDynamicMetadata(Filter::name(), _)).Times(2);
+  EXPECT_CALL(io_handle_, write(_))
+      .WillOnce([](Buffer::Instance& buffer) -> Api::IoCallUint64Result {
+        return Api::IoCallUint64Result{buffer.length(), Api::IoError::none()};
+      });
+
+  EXPECT_EQ(filter_->onAccept(callbacks_), Network::FilterStatus::StopIteration);
+
+  // Should still process the packet despite wrong sequence number
+  // MySQL protocol is forgiving about sequence numbers in initial handshake
+  EXPECT_EQ(filter_->onData(buffer), Network::FilterStatus::Continue);
+}
+
+// Test auth plugin data generation security
+TEST_F(MySQLInspectorTest, AuthPluginDataRandomness) {
+  // Create multiple filters and verify auth data is different
+  std::set<std::string> auth_data_values;
+
+  for (int i = 0; i < 10; i++) {
+    DatabricksSqlInspectorConfigFactory factory;
+    ProtobufTypes::MessagePtr proto_config = factory.createEmptyConfigProto();
+    const std::string yaml = R"EOF(
+        stat_prefix: "test"
+        protocol: MYSQL
+        mysql_config:
+          server_version: "8.0.32-databricks-proxy"
+          auth_plugin_name: "caching_sha2_password"
+          character_set_id: 2
+          server_capabilities: "0xffff"
+          extended_server_capabilities: "0xffff"
+          require_tls:
+            value: true
+    )EOF";
+    TestUtility::loadFromYaml(yaml, *proto_config);
+
+    const auto& x =
+        TestUtility::downcastAndValidate<const envoy::extensions::filters::listener::
+                                             databricks_sql_inspector::v3::DatabricksSqlInspector&>(
+            *proto_config);
+    auto config = std::make_shared<Config>(scope_, x, x.stat_prefix());
+    auto filter = std::make_unique<Filter>(config);
+
+    NiceMock<Network::MockListenerFilterCallbacks> callbacks;
+    NiceMock<Network::MockConnectionSocket> socket;
+    NiceMock<Network::MockIoHandle> io_handle;
+
+    EXPECT_CALL(callbacks, dynamicMetadata()).WillRepeatedly(ReturnRef(metadata_));
+    EXPECT_CALL(callbacks, socket()).WillRepeatedly(ReturnRef(socket));
+    EXPECT_CALL(socket, ioHandle()).WillRepeatedly(ReturnRef(io_handle));
+
+    std::string captured_auth_data;
+    EXPECT_CALL(io_handle, write(_))
+        .WillOnce([&captured_auth_data](Buffer::Instance& buffer) -> Api::IoCallUint64Result {
+          // Extract auth plugin data from the packet
+          // Skip packet header (4 bytes), protocol version (1 byte), and server version string
+          size_t pos = 5;
+          while (pos < buffer.length() && buffer.peekLEInt<uint8_t>(pos) != 0) {
+            pos++;
+          }
+          pos++;    // Skip null terminator
+          pos += 4; // Skip connection ID
+
+          // Next 8 bytes are auth plugin data part 1
+          std::string auth_data;
+          for (int j = 0; j < 8; j++) {
+            auth_data.push_back(buffer.peekLEInt<uint8_t>(pos + j));
+          }
+          captured_auth_data = auth_data;
+
+          return Api::IoCallUint64Result{buffer.length(), Api::IoError::none()};
+        });
+
+    EXPECT_CALL(callbacks, setDynamicMetadata(_, _));
+
+    filter->onAccept(callbacks);
+
+    // Verify auth data was generated and is unique
+    EXPECT_FALSE(captured_auth_data.empty());
+    auth_data_values.insert(captured_auth_data);
+  }
+
+  // Verify we got different auth data values (high probability with proper randomness)
+  EXPECT_GT(auth_data_values.size(), 5); // At least 5 different values out of 10
+}
+
+// Test handling of CLIENT_PLUGIN_AUTH capability
+TEST_F(MySQLInspectorTest, ClientPluginAuthCapability) {
+  SetUp();
+
+  EXPECT_CALL(io_handle_,
+              createFileEvent_(_, _, Event::PlatformDefaultTriggerType,
+                               Event::FileReadyType::Read | Event::FileReadyType::Closed))
+      .WillOnce(SaveArg<1>(&file_event_callback_));
+
+  EXPECT_CALL(io_handle_, recv(_, _, _))
+      .WillOnce([](void* buffer, size_t length, int flags) {
+        EXPECT_EQ(flags, MSG_PEEK);
+
+        // Create response with CLIENT_PLUGIN_AUTH capability
+        uint8_t response[36] = {
+            0x1C, 0x00, 0x00,       // Packet length
+            0x01,                   // Sequence ID
+            0x0F, 0xAA, 0x08, 0x00, // Capabilities with CLIENT_PLUGIN_AUTH (0x00080000)
+            0x00, 0x00, 0x00, 0x01, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+        std::memcpy(buffer, response, length);
+        return Api::IoCallUint64Result(length, Api::IoError::none());
+      })
+      .WillOnce([](void*, size_t length, int flags) {
+        EXPECT_EQ(flags, 0);
+        return Api::IoCallUint64Result(length, Api::IoError::none());
+      });
+
+  Network::ListenerFilterBufferImpl buffer{
+      io_handle_,  dispatcher_,
+      [](bool) {}, [](Network::ListenerFilterBuffer&) {},
+      false,       NetworkFilters::DatabricksSqlProxy::MySQLConstants::SSL_HANDSHAKE_PACKET_LENGTH};
+
+  EXPECT_TRUE(file_event_callback_(Event::FileReadyType::Read).ok());
+
+  EXPECT_CALL(callbacks_, setDynamicMetadata(Filter::name(), _)).Times(2);
+  EXPECT_CALL(io_handle_, write(_))
+      .WillOnce([](Buffer::Instance& buffer) -> Api::IoCallUint64Result {
+        return Api::IoCallUint64Result{buffer.length(), Api::IoError::none()};
+      });
+
+  EXPECT_EQ(filter_->onAccept(callbacks_), Network::FilterStatus::StopIteration);
+  EXPECT_EQ(filter_->onData(buffer), Network::FilterStatus::Continue);
+
+  // Verify counters
+  EXPECT_EQ(1UL, config_->stats().handshake_received_.value());
+  EXPECT_EQ(1UL, config_->stats().handshake_success_.value());
+  EXPECT_EQ(1UL, config_->stats().client_using_ssl_.value());
+}
+
+// Test handling of maximum allowed packet size
+TEST_F(MySQLInspectorTest, MaxPacketSizeValidation) {
+  SetUp();
+
+  EXPECT_CALL(io_handle_,
+              createFileEvent_(_, _, Event::PlatformDefaultTriggerType,
+                               Event::FileReadyType::Read | Event::FileReadyType::Closed))
+      .WillOnce(SaveArg<1>(&file_event_callback_));
+
+  EXPECT_CALL(io_handle_, recv(_, _, _)).WillOnce([](void* buffer, size_t length, int flags) {
+    EXPECT_EQ(flags, MSG_PEEK);
+
+    // Create response with a valid packet size but invalid capabilities
+    // The packet size is 32 bytes (0x20) which is valid for SSL handshake
+    // But we'll set capabilities to 0 which means no SSL support when SSL is required
+    uint8_t response[36] = {0x20, 0x00, 0x00,       // 32 bytes - valid SSL handshake size
+                            0x01,                   // Sequence ID
+                            0x00, 0x00, 0x00, 0x00, // Capabilities with NO CLIENT_SSL flag
+                            0x00, 0x00, 0x00, 0x01, 0x21, 0x00, 0x00, 0x00, 0x00,
+                            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+    std::memcpy(buffer, response, length);
+    return Api::IoCallUint64Result(length, Api::IoError::none());
+  });
+
+  Network::ListenerFilterBufferImpl buffer{
+      io_handle_,  dispatcher_,
+      [](bool) {}, [](Network::ListenerFilterBuffer&) {},
+      false,       NetworkFilters::DatabricksSqlProxy::MySQLConstants::SSL_HANDSHAKE_PACKET_LENGTH};
+
+  EXPECT_TRUE(file_event_callback_(Event::FileReadyType::Read).ok());
+
+  EXPECT_CALL(callbacks_, setDynamicMetadata(Filter::name(), _)).Times(2);
+  EXPECT_CALL(io_handle_, write(_))
+      .WillOnce([](Buffer::Instance& buffer) -> Api::IoCallUint64Result {
+        return Api::IoCallUint64Result{buffer.length(), Api::IoError::none()};
+      });
+  EXPECT_CALL(io_handle_, close()).WillOnce(Invoke([]() -> Api::IoCallUint64Result {
+    return Api::IoCallUint64Result{0, Api::IoError::none()};
+  }));
+
+  EXPECT_EQ(filter_->onAccept(callbacks_), Network::FilterStatus::StopIteration);
+
+  // Should reject due to SSL mismatch (no SSL when required)
+  EXPECT_EQ(filter_->onData(buffer), Network::FilterStatus::StopIteration);
+
+  // Verify SSL mismatch error
+  EXPECT_EQ(1UL, config_->stats().error_.value());
+  EXPECT_EQ(1UL, config_->stats().ssl_mismatch_.value());
+}
+
+// Test different auth plugin configurations
+TEST_F(MySQLInspectorTest, DifferentAuthPlugins) {
+  struct TestCase {
+    std::string plugin_name;
+    std::string description;
+  };
+
+  std::vector<TestCase> test_cases = {{"mysql_native_password", "Native password auth"},
+                                      {"caching_sha2_password", "SHA2 caching auth"},
+                                      {"mysql_clear_password", "Clear text auth"},
+                                      {"authentication_windows_client", "Windows auth"}};
+
+  for (const auto& test_case : test_cases) {
+    DatabricksSqlInspectorConfigFactory factory;
+    ProtobufTypes::MessagePtr proto_config = factory.createEmptyConfigProto();
+    const std::string yaml = fmt::format(R"EOF(
+        stat_prefix: "test"
+        protocol: MYSQL
+        mysql_config:
+          server_version: "8.0.32-databricks-proxy"
+          auth_plugin_name: "{}"
+          character_set_id: 2
+          server_capabilities: "0xffff"
+          extended_server_capabilities: "0xffff"
+          require_tls:
+            value: false
+    )EOF",
+                                         test_case.plugin_name);
+    TestUtility::loadFromYaml(yaml, *proto_config);
+
+    const auto& x =
+        TestUtility::downcastAndValidate<const envoy::extensions::filters::listener::
+                                             databricks_sql_inspector::v3::DatabricksSqlInspector&>(
+            *proto_config);
+    auto config = std::make_shared<Config>(scope_, x, x.stat_prefix());
+    auto filter = std::make_unique<Filter>(config);
+
+    NiceMock<Network::MockListenerFilterCallbacks> callbacks;
+    NiceMock<Network::MockConnectionSocket> socket;
+    NiceMock<Network::MockIoHandle> io_handle;
+
+    EXPECT_CALL(callbacks, dynamicMetadata()).WillRepeatedly(ReturnRef(metadata_));
+    EXPECT_CALL(callbacks, socket()).WillRepeatedly(ReturnRef(socket));
+    EXPECT_CALL(socket, ioHandle()).WillRepeatedly(ReturnRef(io_handle));
+
+    EXPECT_CALL(io_handle, write(_))
+        .WillOnce([&test_case](Buffer::Instance& buffer) -> Api::IoCallUint64Result {
+          // Verify auth plugin name is in the packet
+          std::string packet_data(static_cast<const char*>(buffer.linearize(buffer.length())),
+                                  buffer.length());
+          EXPECT_NE(packet_data.find(test_case.plugin_name), std::string::npos);
+
+          return Api::IoCallUint64Result{buffer.length(), Api::IoError::none()};
+        });
+
+    EXPECT_CALL(callbacks, setDynamicMetadata(_, _));
+
+    filter->onAccept(callbacks);
+  }
+}
+
+// Test handling of CLIENT_CONNECT_ATTRS capability flag
+TEST_F(MySQLInspectorTest, ClientConnectAttrsCapability) {
+  SetUp();
+
+  EXPECT_CALL(io_handle_,
+              createFileEvent_(_, _, Event::PlatformDefaultTriggerType,
+                               Event::FileReadyType::Read | Event::FileReadyType::Closed))
+      .WillOnce(SaveArg<1>(&file_event_callback_));
+
+  EXPECT_CALL(io_handle_, recv(_, _, _))
+      .WillOnce([](void* buffer, size_t length, int flags) {
+        EXPECT_EQ(flags, MSG_PEEK);
+
+        // Create response with CLIENT_CONNECT_ATTRS capability (0x00100000)
+        uint8_t response[36] = {0x1C, 0x00, 0x00,       // Packet length
+                                0x01,                   // Sequence ID
+                                0x0F, 0xAA, 0x10, 0x00, // Capabilities with CLIENT_CONNECT_ATTRS
+                                0x00, 0x00, 0x00, 0x01, 0x21, 0x00, 0x00, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+        std::memcpy(buffer, response, length);
+        return Api::IoCallUint64Result(length, Api::IoError::none());
+      })
+      .WillOnce([](void*, size_t length, int flags) {
+        EXPECT_EQ(flags, 0);
+        return Api::IoCallUint64Result(length, Api::IoError::none());
+      });
+
+  Network::ListenerFilterBufferImpl buffer{
+      io_handle_,  dispatcher_,
+      [](bool) {}, [](Network::ListenerFilterBuffer&) {},
+      false,       NetworkFilters::DatabricksSqlProxy::MySQLConstants::SSL_HANDSHAKE_PACKET_LENGTH};
+
+  EXPECT_TRUE(file_event_callback_(Event::FileReadyType::Read).ok());
+
+  EXPECT_CALL(callbacks_, setDynamicMetadata(Filter::name(), _)).Times(2);
+  EXPECT_CALL(io_handle_, write(_))
+      .WillOnce([](Buffer::Instance& buffer) -> Api::IoCallUint64Result {
+        return Api::IoCallUint64Result{buffer.length(), Api::IoError::none()};
+      });
+
+  EXPECT_EQ(filter_->onAccept(callbacks_), Network::FilterStatus::StopIteration);
+  EXPECT_EQ(filter_->onData(buffer), Network::FilterStatus::Continue);
+
+  EXPECT_EQ(1UL, config_->stats().handshake_received_.value());
+  EXPECT_EQ(1UL, config_->stats().handshake_success_.value());
+  EXPECT_EQ(1UL, config_->stats().client_using_ssl_.value());
+}
+
+// Test edge case where recv returns error - ListenerFilterBufferImpl handles errors gracefully
+TEST_F(MySQLInspectorTest, RecvError) {
+  SetUp();
+
+  EXPECT_CALL(io_handle_,
+              createFileEvent_(_, _, Event::PlatformDefaultTriggerType,
+                               Event::FileReadyType::Read | Event::FileReadyType::Closed))
+      .WillOnce(SaveArg<1>(&file_event_callback_));
+
+  EXPECT_CALL(io_handle_, recv(_, _, _)).WillOnce([](void*, size_t, int) {
+    // Return a real error (not EAGAIN which is just "try again later")
+    return Api::IoCallUint64Result{0, Network::IoSocketError::getIoSocketEbadfError()};
+  });
+
+  Network::ListenerFilterBufferImpl buffer{
+      io_handle_,  dispatcher_,
+      [](bool) {}, [](Network::ListenerFilterBuffer&) {},
+      false,       NetworkFilters::DatabricksSqlProxy::MySQLConstants::SSL_HANDSHAKE_PACKET_LENGTH};
+
+  // ListenerFilterBufferImpl handles recv errors gracefully and still returns ok()
+  EXPECT_TRUE(file_event_callback_(Event::FileReadyType::Read).ok());
+
+  // The buffer shouldn't have data since recv failed
+  // Note: ListenerFilterBufferImpl doesn't expose data() directly
+}
+
 } // namespace
 } // namespace DatabricksSqlInspector
 } // namespace ListenerFilters

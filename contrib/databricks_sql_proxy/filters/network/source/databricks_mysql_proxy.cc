@@ -60,22 +60,9 @@ bool MySQLProxy::processClientFirstMessage(Buffer::Instance& data) {
     return false;
   }
 
-  // Check for complete packet (includes header + payload) with overflow protection
-  // SECURITY FIX: Check for potential overflow BEFORE performing the addition
+  // Check for complete packet (includes header + payload)
   const uint32_t min_packet_len =
       NetworkFilters::DatabricksSqlProxy::MySQLConstants::MIN_PACKET_LENGTH;
-  if (packet_length > UINT64_MAX - min_packet_len) {
-    ENVOY_CONN_LOG(error, "mysql_proxy: packet size would cause integer overflow: {} + {}",
-                   read_callbacks_->connection(), packet_length, min_packet_len);
-    config_->stats().malformed_packet_.inc();
-    sendErrorResponseToDownstream(
-        NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_NET_PACKET_TOO_LARGE,
-        NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_CONNECTION_ERROR,
-        "Packet too large.", "Packet size calculation would overflow");
-    closeWithError("Packet size overflow", StreamInfo::CoreResponseFlag::DownstreamProtocolError);
-    return false;
-  }
-
   const uint64_t required_size = static_cast<uint64_t>(packet_length) + min_packet_len;
 
   // Now check the valid computed size against limits
@@ -1398,8 +1385,7 @@ void MySQLProxy::preserveAuthData(Buffer::Instance& new_packet, const AuthData& 
         // Write the actual size and data anyway to preserve the client's intent
         new_packet.writeByte(static_cast<uint8_t>(std::min<size_t>(auth_response.size(), 255)));
         if (!auth_response.empty()) {
-          new_packet.add(auth_response.data(),
-                         std::min<size_t>(auth_response.size(), 255)));
+          new_packet.add(auth_response.data(), std::min<size_t>(auth_response.size(), 255));
         }
       }
     }

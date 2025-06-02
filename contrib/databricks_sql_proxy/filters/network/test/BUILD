@@ -32,6 +32,18 @@ envoy_cc_test(
     ],
 )
 
+envoy_cc_test(
+    name = "mysql_proxy_test",
+    srcs = ["mysql_proxy_test.cc"],
+    deps = [
+        "//contrib/databricks_sql_proxy/filters/helper:mysql_constants_lib",
+        "//contrib/databricks_sql_proxy/filters/helper:mysql_helper_lib",
+        "//contrib/databricks_sql_proxy/filters/network/source:config",
+        "//test/extensions/filters/common/ext_authz:ext_authz_mocks",
+        "//test/mocks/server:factory_context_mocks",
+    ],
+)
+
 envoy_proto_library(
     name = "sync_write_filter_proto",
     srcs = [":sync_write_filter.proto"],
