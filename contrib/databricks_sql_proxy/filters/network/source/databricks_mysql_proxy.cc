@@ -46,7 +46,7 @@ bool MySQLProxy::processClientFirstMessage(Buffer::Instance& data) {
   uint32_t packet_length = data.peekLEInt<uint32_t>(0) & 0x00FFFFFF;
   uint8_t seq = data.peekLEInt<uint8_t>(3);
 
-  // Validate the packet
+  // Validate packet size first to prevent overflow
   if (packet_length > NetworkFilters::DatabricksSqlProxy::MySQLConstants::MAX_PACKET_SIZE) {
     ENVOY_CONN_LOG(error, "mysql_proxy: packet too large: {}", read_callbacks_->connection(),
                    packet_length);
@@ -60,26 +60,26 @@ bool MySQLProxy::processClientFirstMessage(Buffer::Instance& data) {
     return false;
   }
 
-  // Check for complete packet (includes header + payload)
-  const uint64_t required_size =
-      static_cast<uint64_t>(packet_length) +
+  // Check for complete packet (includes header + payload) with overflow protection
+  // SECURITY FIX: Check for potential overflow BEFORE performing the addition
+  const uint32_t min_packet_len =
       NetworkFilters::DatabricksSqlProxy::MySQLConstants::MIN_PACKET_LENGTH;
-  if (required_size > data.length() ||
-      required_size > NetworkFilters::DatabricksSqlProxy::MySQLConstants::MAX_PACKET_SIZE +
-                          NetworkFilters::DatabricksSqlProxy::MySQLConstants::MIN_PACKET_LENGTH) {
-    if (required_size > NetworkFilters::DatabricksSqlProxy::MySQLConstants::MAX_PACKET_SIZE +
-                            NetworkFilters::DatabricksSqlProxy::MySQLConstants::MIN_PACKET_LENGTH) {
-      ENVOY_CONN_LOG(error, "mysql_proxy: packet size overflow: {} + {}",
-                     read_callbacks_->connection(), packet_length,
-                     NetworkFilters::DatabricksSqlProxy::MySQLConstants::MIN_PACKET_LENGTH);
-      config_->stats().malformed_packet_.inc();
-      sendErrorResponseToDownstream(
-          NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_NET_PACKET_TOO_LARGE,
-          NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_CONNECTION_ERROR,
-          "Packet too large.", "Packet size calculation overflow");
-      closeWithError("Packet size overflow", StreamInfo::CoreResponseFlag::DownstreamProtocolError);
-      return false;
-    }
+  if (packet_length > UINT64_MAX - min_packet_len) {
+    ENVOY_CONN_LOG(error, "mysql_proxy: packet size would cause integer overflow: {} + {}",
+                   read_callbacks_->connection(), packet_length, min_packet_len);
+    config_->stats().malformed_packet_.inc();
+    sendErrorResponseToDownstream(
+        NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_NET_PACKET_TOO_LARGE,
+        NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_CONNECTION_ERROR,
+        "Packet too large.", "Packet size calculation would overflow");
+    closeWithError("Packet size overflow", StreamInfo::CoreResponseFlag::DownstreamProtocolError);
+    return false;
+  }
+
+  const uint64_t required_size = static_cast<uint64_t>(packet_length) + min_packet_len;
+
+  // Now check the valid computed size against limits
+  if (required_size > data.length()) {
     ENVOY_CONN_LOG(debug, "mysql_proxy: incomplete packet, waiting for more data",
                    read_callbacks_->connection());
     return false;
@@ -814,36 +814,23 @@ bool MySQLProxy::extractUserDetails(const std::string& username_string,
     return false;
   }
 
-  if (!regex_pattern_->match(username_string)) {
-    ENVOY_CONN_LOG(error, "mysql_proxy: username: '{}' does not match defined RegEx pattern",
-                   read_callbacks_->connection(), username_string);
-    config_->stats().username_extraction_failed_.inc();
-    sendErrorResponseToDownstream(
-        NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_ACCESS_DENIED_ERROR,
-        NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_ACCESS_DENIED,
-        "Access denied for user.", "Invalid username format");
-    return false;
-  }
-
   // Reserve capacity for extracted strings to avoid reallocations
   extracted_username.reserve(username_string.length());
   workspace_id.reserve(32); // Typical workspace ID length
   hostname.reserve(64);     // Typical hostname length
 
-  // Pattern should be something like "^([^@]+)@([^_]+)_(.+)$" as expect it to have 3 things in this
-  // format: username@workspaceId_hostname
   const std::string& pattern = config_->protoConfig().mysql_config().username_pattern();
   re2::RE2 re2_pattern(pattern);
   if (!re2_pattern.ok() || !re2::RE2::FullMatch(username_string, re2_pattern, &extracted_username,
                                                 &workspace_id, &hostname)) {
     ENVOY_CONN_LOG(error,
-                   "mysql_proxy: failed to extract username parts from username string: '{}'",
-                   read_callbacks_->connection(), username_string);
+                   "mysql_proxy: username '{}' does not match pattern '{}' or extraction failed",
+                   read_callbacks_->connection(), username_string, pattern);
     config_->stats().username_extraction_failed_.inc();
     sendErrorResponseToDownstream(
         NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_ACCESS_DENIED_ERROR,
         NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_ACCESS_DENIED,
-        "Access denied for user.", "Invalid username format. Failed to extract username parts");
+        "Access denied for user.", "Invalid username format");
     return false;
   }
 
@@ -1409,11 +1396,10 @@ void MySQLProxy::preserveAuthData(Buffer::Instance& new_packet, const AuthData& 
             read_callbacks_->connection(), auth_response.size(),
             MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH);
         // Write the actual size and data anyway to preserve the client's intent
-        new_packet.writeByte(
-            static_cast<uint8_t>(std::min(auth_response.size(), static_cast<size_t>(255))));
+        new_packet.writeByte(static_cast<uint8_t>(std::min<size_t>(auth_response.size(), 255)));
         if (!auth_response.empty()) {
           new_packet.add(auth_response.data(),
-                         std::min(auth_response.size(), static_cast<size_t>(255)));
+                         std::min<size_t>(auth_response.size(), 255)));
         }
       }
     }
@@ -1442,11 +1428,10 @@ void MySQLProxy::preserveAuthData(Buffer::Instance& new_packet, const AuthData& 
                      read_callbacks_->connection(), auth_response.size());
     }
 
-    uint8_t auth_len =
-        static_cast<uint8_t>(std::min(auth_response.size(), static_cast<size_t>(255)));
+    uint8_t auth_len = static_cast<uint8_t>(std::min<size_t>(auth_response.size(), 255));
     new_packet.writeByte(auth_len);
     if (auth_len > 0) {
-      new_packet.add(auth_response.data(), auth_len);
+      new_packet.add(auth_response.data(), std::min<size_t>(auth_response.size(), 255));
     }
 
     ENVOY_CONN_LOG(debug, "mysql_proxy: wrote auth data with 1-byte length: {}",

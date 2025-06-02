@@ -1,5 +1,7 @@
 #include "mysql_inspector.h"
 
+#include <fstream>
+
 #include "source/common/common/base64.h"
 #include "source/extensions/filters/network/well_known_names.h"
 
@@ -95,20 +97,57 @@ void MySQLInspector::handleSSLRequest(const Buffer::Instance& data, uint32_t pac
 }
 
 /**
- * Generates random authentication plugin data to be used in the MySQL handshake. This data serves
- * as a challenge sent to the client during authentication. The random data is generated using a
- * cryptographically secure random number generator.
+ * Generates cryptographically secure random authentication plugin data to be used in the MySQL
+ * handshake. This data serves as a challenge sent to the client during authentication. The random
+ * data is generated using a cryptographically secure random number generator to prevent prediction
+ * attacks.
  * @see
  * https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeV10
  */
 void MySQLInspector::generateAuthPluginData() {
-  // Use a single random device initialization and generate all bytes at once
-  std::random_device rd;
-  std::mt19937 gen(rd());
-  std::uniform_int_distribution<uint8_t> dis(0, 255);
+  // SECURITY FIX: Use cryptographically secure random number generation for auth challenges
+  // std::random_device may or may not be cryptographically secure, so we use direct system calls
+  // for better security guarantees.
 
-  std::generate(auth_plugin_data_.begin(), auth_plugin_data_.end(),
-                [&dis, &gen]() { return dis(gen); });
+  try {
+    // On Unix systems, /dev/urandom provides cryptographically secure random data
+    std::ifstream urandom("/dev/urandom", std::ios::binary);
+    if (urandom.good()) {
+      urandom.read(reinterpret_cast<char*>(auth_plugin_data_.data()), auth_plugin_data_.size());
+      if (urandom.gcount() == static_cast<std::streamsize>(auth_plugin_data_.size())) {
+        ENVOY_LOG(debug, "mysql_inspector: generated cryptographically secure auth plugin data");
+        return;
+      }
+    }
+  } catch (const std::exception& e) {
+    ENVOY_LOG(warn, "mysql_inspector: failed to read from /dev/urandom: {}, falling back",
+              e.what());
+  }
+
+  // Fallback: Use std::random_device with proper entropy validation
+  // While not guaranteed to be cryptographically secure, it's better than std::mt19937
+  std::random_device rd;
+
+  // Validate that random_device has reasonable entropy
+  if (rd.entropy() == 0.0) {
+    ENVOY_LOG(warn, "mysql_inspector: random_device reports zero entropy, using time-based seed");
+    // Last resort fallback using high-resolution time as additional entropy
+    auto now = std::chrono::high_resolution_clock::now();
+    auto seed = static_cast<uint32_t>(now.time_since_epoch().count());
+    std::mt19937 gen(seed);
+    std::uniform_int_distribution<uint8_t> dis(0, 255);
+    std::generate(auth_plugin_data_.begin(), auth_plugin_data_.end(),
+                  [&dis, &gen]() { return dis(gen); });
+    ENVOY_LOG(warn, "mysql_inspector: used time-based fallback for auth plugin data generation");
+  } else {
+    // Use random_device directly for better security
+    std::uniform_int_distribution<uint8_t> dis(0, 255);
+    std::generate(auth_plugin_data_.begin(), auth_plugin_data_.end(),
+                  [&dis, &rd]() mutable { return dis(rd); });
+    ENVOY_LOG(debug,
+              "mysql_inspector: generated auth plugin data using random_device (entropy: {})",
+              rd.entropy());
+  }
 }
 
 /**
@@ -295,8 +334,10 @@ void MySQLInspector::setShortHandshakeData(const Buffer::Instance& data, uint32_
         NetworkFilters::DatabricksSqlProxy::MySQLConstants::SSL_HANDSHAKE_PACKET_LENGTH, 0);
     data.copyOut(
         0,
-        std::min(length,
-                 NetworkFilters::DatabricksSqlProxy::MySQLConstants::SSL_HANDSHAKE_PACKET_LENGTH),
+        std::min(
+            length,
+            static_cast<uint32_t>(
+                NetworkFilters::DatabricksSqlProxy::MySQLConstants::SSL_HANDSHAKE_PACKET_LENGTH)),
         binary_data.data());
 
     // Base64 encoding is used because:

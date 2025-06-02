@@ -253,7 +253,8 @@ MySQLPacketUtils::extractConnectionAttributes(Buffer::Instance& data, size_t& of
   // Ease debugging by logging the data at the connection attributes position
   if (ENVOY_LOG_CHECK_LEVEL(debug) && offset < data.length()) {
     std::stringstream hex_dump;
-    for (size_t i = offset; i < std::min(offset + 16, data.length()); i++) {
+    for (size_t i = offset; i < std::min(offset + size_t{16}, static_cast<size_t>(data.length()));
+         i++) {
       hex_dump << std::hex << std::setw(2) << std::setfill('0')
                << static_cast<int>(data.peekBEInt<uint8_t>(i)) << " ";
     }
@@ -270,16 +271,33 @@ MySQLPacketUtils::extractConnectionAttributes(Buffer::Instance& data, size_t& of
   ENVOY_LOG(debug, "mysql_proxy: connection attributes total length: {}, bytes_read: {}",
             total_length, bytes_read);
 
+  static constexpr uint64_t MAX_TOTAL_ATTRS_SIZE = 64 * 1024;
+  static constexpr size_t MAX_ATTR_COUNT = 256;
+  static constexpr uint64_t MAX_ATTR_KEY_SIZE = 1024;
+  static constexpr uint64_t MAX_ATTR_VALUE_SIZE = 8192;
+
+  if (total_length > MAX_TOTAL_ATTRS_SIZE) {
+    ENVOY_LOG(error, "mysql_proxy: connection attributes total size too large: {} bytes (max: {})",
+              total_length, MAX_TOTAL_ATTRS_SIZE);
+    return attributes;
+  }
+
   offset += bytes_read;
 
   size_t attrs_end = offset + total_length;
   if (attrs_end > data.length()) {
     ENVOY_LOG(error, "mysql_proxy: connection attributes length exceeds packet bounds");
-    return attributes; // Return empty vector
+    return attributes;
   }
 
   // Read key-value pairs until we reach the end of the attributes section
   while (offset < attrs_end) {
+    if (attributes.size() >= MAX_ATTR_COUNT) {
+      ENVOY_LOG(error, "mysql_proxy: too many connection attributes: {} (max: {})",
+                attributes.size(), MAX_ATTR_COUNT);
+      return attributes;
+    }
+
     // Each key and value is a length-encoded string
     std::string key, value;
 
@@ -288,16 +306,23 @@ MySQLPacketUtils::extractConnectionAttributes(Buffer::Instance& data, size_t& of
     size_t key_len_size = 0;
     if (!MySQLPacketUtils::decodeVariableLengthInteger(data, offset, key_len, key_len_size)) {
       ENVOY_LOG(error, "mysql_proxy: failed to decode connection attribute key length");
-      return attributes; // Return partial vector
+      return attributes;
     }
+
+    // Validate key size to prevent DoS
+    if (key_len > MAX_ATTR_KEY_SIZE) {
+      ENVOY_LOG(error, "mysql_proxy: connection attribute key too large: {} bytes (max: {})",
+                key_len, MAX_ATTR_KEY_SIZE);
+      return attributes;
+    }
+
     offset += key_len_size;
 
     if (offset + key_len > data.length()) {
       ENVOY_LOG(error, "mysql_proxy: connection attribute key length exceeds packet bounds");
-      return attributes; // Return partial vector
+      return attributes;
     }
 
-    // Optimization: Use copyOut to copy key data in one operation
     key.resize(key_len); // Pre-size the string to the exact length
     data.copyOut(offset, key_len, const_cast<char*>(key.data()));
     offset += key_len;
@@ -307,16 +332,22 @@ MySQLPacketUtils::extractConnectionAttributes(Buffer::Instance& data, size_t& of
     size_t value_len_size = 0;
     if (!MySQLPacketUtils::decodeVariableLengthInteger(data, offset, value_len, value_len_size)) {
       ENVOY_LOG(error, "mysql_proxy: failed to decode connection attribute value length");
-      return attributes; // Return partial vector
+      return attributes;
     }
+
+    if (value_len > MAX_ATTR_VALUE_SIZE) {
+      ENVOY_LOG(error, "mysql_proxy: connection attribute value too large: {} bytes (max: {})",
+                value_len, MAX_ATTR_VALUE_SIZE);
+      return attributes;
+    }
+
     offset += value_len_size;
 
     if (offset + value_len > data.length()) {
       ENVOY_LOG(error, "mysql_proxy: connection attribute value length exceeds packet bounds");
-      return attributes; // Return partial vector
+      return attributes;
     }
 
-    // Optimization: Use copyOut to copy value data in one operation
     value.resize(value_len); // Pre-size the string to the exact length
     data.copyOut(offset, value_len, const_cast<char*>(value.data()));
     offset += value_len;
