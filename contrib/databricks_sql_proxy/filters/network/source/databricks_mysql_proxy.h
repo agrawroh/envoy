@@ -56,6 +56,13 @@ public:
   static constexpr uint8_t HANDSHAKE_AFTER_SSL_SEQ_ID = 2;
 
 private:
+  // Authentication data structure to track auth plugin and data
+  struct AuthData {
+    std::string auth_plugin_name;
+    std::vector<uint8_t> auth_response;
+    bool is_native_password{false};
+  };
+
   // Handshake states with clear transitions
   enum class UpstreamHandshakeState {
     Init,                   // Initial state before handshake
@@ -84,6 +91,13 @@ private:
   void buildSslRequestPacket(Buffer::Instance& packet);
   void checkUpstreamHandshakeProgress();
 
+  // Extract auth plugin and data from handshake response
+  bool extractAuthenticationData(Buffer::Instance& data, size_t& current_pos, AuthData& auth_data);
+
+  // Preserve auth data when rebuilding packets
+  void preserveAuthData(Buffer::Instance& new_packet, const AuthData& auth_data,
+                        uint32_t capabilities);
+
   void sendErrorResponseToDownstream(int16_t error_code, absl::string_view sql_state,
                                      absl::string_view error_message,
                                      absl::string_view detail_message) override;
@@ -101,6 +115,7 @@ private:
                              const std::string& instance_url);
   void setRoutingMetadata(const std::string& key,
                           std::shared_ptr<Envoy::StreamInfo::FilterState::Object> value);
+  void setAuthMetadata(const AuthData& auth_data);
 
   // SSL/TLS handshake methods
   void sendSslRequest();
@@ -127,6 +142,7 @@ private:
   std::unique_ptr<Regex::CompiledGoogleReMatcher> regex_pattern_;
   uint32_t handshake_attempts_{0};
   bool connection_closed_{false}; // Guard against multiple close attempts
+  AuthData client_auth_data_;     // Store client authentication data
 };
 
 } // namespace DatabricksSqlProxy

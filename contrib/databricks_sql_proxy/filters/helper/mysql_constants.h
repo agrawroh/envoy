@@ -88,6 +88,10 @@ struct MySQLConstants {
   static constexpr uint8_t DEFAULT_CHARSET_ID = 2;   // UTF-8
   static constexpr size_t MAX_USERNAME_LENGTH = 255; // Maximum MySQL username length
 
+  // Authentication specific constants
+  static constexpr size_t MYSQL_NATIVE_PASSWORD_LENGTH =
+      20; // Fixed length for mysql_native_password response
+
   // Error codes
   // Authentication and permission errors
   static constexpr uint16_t ER_ACCESS_DENIED_ERROR = 1045;   // Access denied for user

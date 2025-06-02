@@ -332,6 +332,64 @@ MySQLPacketUtils::extractConnectionAttributes(Buffer::Instance& data, size_t& of
   return attributes;
 }
 
+/**
+ * Calculate the number of bytes needed to encode a length-encoded integer.
+ * This follows the MySQL protocol specification for length-encoded integers:
+ * - 1 byte for values 0-250
+ * - 3 bytes for values 251-65535 (first byte = 0xFC)
+ * - 4 bytes for values 65536-16777215 (first byte = 0xFD)
+ * - 9 bytes for values 16777216+ (first byte = 0xFE)
+ *
+ * @param value The integer value to encode
+ * @return The number of bytes needed to encode the value
+ */
+size_t MySQLPacketUtils::getLengthEncodedIntegerSize(uint64_t value) {
+  if (value < 251) {
+    return 1; // 1 byte (0-250)
+  } else if (value < 65536) {
+    return 3; // 1 byte prefix (0xFC) + 2 bytes value
+  } else if (value < 16777216) {
+    return 4; // 1 byte prefix (0xFD) + 3 bytes value
+  } else {
+    return 9; // 1 byte prefix (0xFE) + 8 bytes value
+  }
+}
+
+/**
+ * Write a length-encoded integer to a buffer according to MySQL protocol.
+ * Length-encoded integers are used throughout the MySQL protocol for
+ * representing string lengths and other numeric values.
+ *
+ * @param buffer The buffer to write to
+ * @param value The integer value to encode
+ * @return The number of bytes written
+ */
+size_t MySQLPacketUtils::writeLengthEncodedInteger(Buffer::Instance& buffer, uint64_t value) {
+  if (value < 251) {
+    // Format: 1 byte value (0-250)
+    buffer.writeByte(static_cast<uint8_t>(value));
+    return 1;
+  } else if (value < 65536) {
+    // Format: 3 bytes (251-65535): [0xFC][2 byte value in little-endian]
+    buffer.writeByte(0xFC);
+    buffer.writeLEInt<uint16_t>(static_cast<uint16_t>(value));
+    return 3;
+  } else if (value < 16777216) {
+    // Format: 4 bytes (65536-16777215): [0xFD][3 byte value in little-endian]
+    buffer.writeByte(0xFD);
+    // Write 3 bytes in little-endian order
+    buffer.writeByte(value & 0xFF);
+    buffer.writeByte((value >> 8) & 0xFF);
+    buffer.writeByte((value >> 16) & 0xFF);
+    return 4;
+  } else {
+    // Format: 9 bytes (16777216+): [0xFE][8 byte value in little-endian]
+    buffer.writeByte(0xFE);
+    buffer.writeLEInt<uint64_t>(value);
+    return 9;
+  }
+}
+
 } // namespace DatabricksSqlProxy
 } // namespace NetworkFilters
 } // namespace Extensions

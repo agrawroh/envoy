@@ -230,6 +230,35 @@ bool MySQLProxy::parseHandshakeResponse(Buffer::Instance& data) {
     return false;
   }
 
+  // Log client capabilities for debugging
+  ENVOY_CONN_LOG(debug, "mysql_proxy: client capabilities: 0x{:08x}", read_callbacks_->connection(),
+                 client_capabilities_);
+
+  // Log specific capabilities relevant to authentication
+  if (ENVOY_LOG_CHECK_LEVEL(debug)) {
+    if (client_capabilities_ &
+        NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_PLUGIN_AUTH) {
+      ENVOY_CONN_LOG(debug, "mysql_proxy: client supports plugin auth (CLIENT_PLUGIN_AUTH)",
+                     read_callbacks_->connection());
+    }
+    if (client_capabilities_ &
+        NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
+      ENVOY_CONN_LOG(debug,
+                     "mysql_proxy: client supports length-encoded auth data "
+                     "(CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA)",
+                     read_callbacks_->connection());
+    }
+    if (client_capabilities_ &
+        NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_CONNECT_WITH_DB) {
+      ENVOY_CONN_LOG(debug, "mysql_proxy: client specifies database (CLIENT_CONNECT_WITH_DB)",
+                     read_callbacks_->connection());
+    }
+    if (client_capabilities_ & NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_SSL) {
+      ENVOY_CONN_LOG(debug, "mysql_proxy: client supports SSL (CLIENT_SSL)",
+                     read_callbacks_->connection());
+    }
+  }
+
   // Create a modified capabilities flag if needed
   uint32_t modified_caps = client_capabilities_;
   if (config_->enableUpstreamTls() &&
@@ -284,20 +313,22 @@ bool MySQLProxy::parseHandshakeResponse(Buffer::Instance& data) {
   // Move past username (including null terminator)
   size_t current_pos = username_end + 1;
 
-  // Skip auth data
-  if (client_capabilities_ &
-      NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
-    // If CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA is set, auth length is a length-encoded integer
-    uint64_t auth_len;
-    size_t len_bytes;
-    if (MySQLPacketUtils::decodeVariableLengthInteger(data, current_pos, auth_len, len_bytes)) {
-      current_pos += len_bytes + auth_len;
-    }
-  } else if (current_pos < len) {
-    // Otherwise, it's a 1-byte length followed by data of that length
-    uint8_t auth_len = raw[current_pos];
-    current_pos += 1 + auth_len;
+  // Extract authentication data
+  AuthData auth_data;
+  if (!extractAuthenticationData(data, current_pos, auth_data)) {
+    closeWithError("Failed to extract authentication data",
+                   StreamInfo::CoreResponseFlag::DownstreamProtocolError);
+    return false;
   }
+
+  // Store the auth data for later use
+  client_auth_data_ = auth_data;
+
+  // Log auth plugin details for debugging
+  ENVOY_CONN_LOG(debug,
+                 "mysql_proxy: auth plugin '{}' detected, native_password={}, auth_data_size={}",
+                 read_callbacks_->connection(), auth_data.auth_plugin_name,
+                 auth_data.is_native_password ? "true" : "false", auth_data.auth_response.size());
 
   // Extract database name if CLIENT_CONNECT_WITH_DB is set
   std::string database_name;
@@ -313,18 +344,11 @@ bool MySQLProxy::parseHandshakeResponse(Buffer::Instance& data) {
     if (current_pos < len) {
       database_name.assign(reinterpret_cast<const char*>(raw + db_start), current_pos - db_start);
       current_pos++; // Skip null terminator
-    }
-  }
-
-  // Skip auth plugin name if CLIENT_PLUGIN_AUTH is set
-  if (client_capabilities_ &
-      NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_PLUGIN_AUTH) {
-    while (current_pos < len && raw[current_pos] != 0) {
-      current_pos++;
-    }
-
-    if (current_pos < len) {
-      current_pos++; // Skip null terminator
+      ENVOY_CONN_LOG(debug, "mysql_proxy: database name: '{}'", read_callbacks_->connection(),
+                     database_name);
+    } else {
+      ENVOY_CONN_LOG(warn, "mysql_proxy: missing null terminator for database name",
+                     read_callbacks_->connection());
     }
   }
 
@@ -350,12 +374,50 @@ bool MySQLProxy::parseHandshakeResponse(Buffer::Instance& data) {
   new_packet.add(extracted_username);
   new_packet.writeByte(0); // Null terminator
 
-  // 4. Copy remaining packet parts (auth data, database name, plugin name)
-  size_t copy_offset = username_end + 1; // Move past original username and null terminator
+  // 4. Add authentication data with proper preservation
+  preserveAuthData(new_packet, auth_data, modified_caps);
 
-  // Handle DB name and remaining data in one pass
-  if (copy_offset < len) {
-    new_packet.add(raw + copy_offset, len - copy_offset);
+  // 5. Add database name if present
+  if (client_capabilities_ &
+      NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_CONNECT_WITH_DB) {
+    new_packet.add(database_name);
+    new_packet.writeByte(0); // Null terminator
+  }
+
+  // 6. Add auth plugin name if CLIENT_PLUGIN_AUTH is set
+  if (client_capabilities_ &
+      NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_PLUGIN_AUTH) {
+    new_packet.add(auth_data.auth_plugin_name);
+    new_packet.writeByte(0); // Null terminator
+  }
+
+  // 7. Add connection attributes if present
+  if (client_capabilities_ &
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_CONNECT_ATTRS &&
+      !connection_attributes.empty()) {
+
+    // Calculate total length of all attributes
+    size_t total_length = 0;
+    for (const auto& attr : connection_attributes) {
+      // Length of key length + key + value length + value
+      total_length +=
+          MySQLPacketUtils::getLengthEncodedIntegerSize(attr.key.length()) + attr.key.length() +
+          MySQLPacketUtils::getLengthEncodedIntegerSize(attr.value.length()) + attr.value.length();
+    }
+
+    // Write total length as length-encoded integer
+    MySQLPacketUtils::writeLengthEncodedInteger(new_packet, total_length);
+
+    // Write each attribute
+    for (const auto& attr : connection_attributes) {
+      // Write key
+      MySQLPacketUtils::writeLengthEncodedInteger(new_packet, attr.key.length());
+      new_packet.add(attr.key);
+
+      // Write value
+      MySQLPacketUtils::writeLengthEncodedInteger(new_packet, attr.value.length());
+      new_packet.add(attr.value);
+    }
   }
 
   // Store finalized packet
@@ -365,6 +427,7 @@ bool MySQLProxy::parseHandshakeResponse(Buffer::Instance& data) {
 
   // Set metadata and routing info
   setConnectionMetadata(extracted_username, workspace_id, hostname);
+  setAuthMetadata(auth_data);
 
   // Add the database to metadata if it's present
   if (!database_name.empty()) {
@@ -1004,6 +1067,365 @@ std::unique_ptr<Regex::CompiledGoogleReMatcher> MySQLProxy::compileRegexPattern(
   }
 
   return std::move(*matcher);
+}
+
+/**
+ * Extracts authentication data from the client handshake response packet.
+ * This includes authentication plugin name and authentication response data.
+ *
+ * @param data The buffer containing the handshake response
+ * @param current_pos Position in the buffer where auth data starts
+ * @param auth_data Output structure to store extracted auth data
+ * @return true if extraction was successful, false otherwise
+ */
+bool MySQLProxy::extractAuthenticationData(Buffer::Instance& data, size_t& current_pos,
+                                           AuthData& auth_data) {
+  const size_t len = data.length();
+  if (current_pos >= len) {
+    ENVOY_CONN_LOG(error, "mysql_proxy: invalid position for auth data: {} (buffer length: {})",
+                   read_callbacks_->connection(), current_pos, len);
+    config_->stats().malformed_packet_.inc();
+    sendErrorResponseToDownstream(
+        NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_MALFORMED_PACKET,
+        NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_CONNECTION_ERROR,
+        "Malformed packet.", "Invalid auth data position");
+    return false;
+  }
+
+  const uint8_t* raw = static_cast<const uint8_t*>(data.linearize(len));
+  if (!raw) {
+    ENVOY_CONN_LOG(error, "mysql_proxy: failed to linearize buffer for auth data",
+                   read_callbacks_->connection());
+    config_->stats().malformed_packet_.inc();
+    sendErrorResponseToDownstream(
+        NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_INTERNAL_ERROR,
+        NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_INTERNAL_ERROR,
+        "Internal server error.", "Failed to process authentication data");
+    return false;
+  }
+
+  // Extract auth data response
+  if (client_capabilities_ &
+      NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
+    // If CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA is set, auth length is a length-encoded integer
+    uint64_t auth_len;
+    size_t len_bytes;
+    if (!MySQLPacketUtils::decodeVariableLengthInteger(data, current_pos, auth_len, len_bytes)) {
+      ENVOY_CONN_LOG(error, "mysql_proxy: failed to decode auth data length",
+                     read_callbacks_->connection());
+      config_->stats().malformed_packet_.inc();
+      sendErrorResponseToDownstream(
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_MALFORMED_PACKET,
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_CONNECTION_ERROR,
+          "Malformed packet.", "Invalid auth data length encoding");
+      return false;
+    }
+
+    // Validate auth data length
+    if (current_pos + len_bytes + auth_len > len) {
+      ENVOY_CONN_LOG(error,
+                     "mysql_proxy: auth data length exceeds packet bounds (pos: {}, len_bytes: {}, "
+                     "auth_len: {}, buffer_len: {})",
+                     read_callbacks_->connection(), current_pos, len_bytes, auth_len, len);
+      config_->stats().malformed_packet_.inc();
+      sendErrorResponseToDownstream(
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_MALFORMED_PACKET,
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_CONNECTION_ERROR,
+          "Malformed packet.", "Auth data exceeds packet bounds");
+      return false;
+    }
+
+    // Enforce a reasonable maximum size for auth data to prevent memory issues
+    static constexpr uint64_t MAX_AUTH_DATA_LENGTH = 1024 * 64; // 64KB should be more than enough
+    if (auth_len > MAX_AUTH_DATA_LENGTH) {
+      ENVOY_CONN_LOG(error, "mysql_proxy: auth data length too large: {}",
+                     read_callbacks_->connection(), auth_len);
+      config_->stats().oversized_packet_.inc();
+      sendErrorResponseToDownstream(
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_NET_PACKET_TOO_LARGE,
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_CONNECTION_ERROR,
+          "Auth data too large.", "Maximum allowed auth data size exceeded");
+      return false;
+    }
+
+    // Skip length bytes
+    current_pos += len_bytes;
+
+    // Extract the auth data
+    try {
+      auth_data.auth_response.resize(auth_len);
+      if (auth_len > 0) {
+        memcpy(auth_data.auth_response.data(), raw + current_pos, auth_len);
+      }
+      current_pos += auth_len;
+    } catch (const std::bad_alloc& e) {
+      ENVOY_CONN_LOG(error, "mysql_proxy: memory allocation failed for auth data: {}",
+                     read_callbacks_->connection(), e.what());
+      config_->stats().errors_.inc();
+      sendErrorResponseToDownstream(
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_OUT_OF_RESOURCES,
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_INTERNAL_ERROR,
+          "Out of memory.", "Failed to allocate memory for auth data");
+      return false;
+    }
+  } else {
+    // Otherwise, it's a 1-byte length followed by data of that length
+    if (current_pos >= len) {
+      ENVOY_CONN_LOG(error, "mysql_proxy: missing auth data length byte",
+                     read_callbacks_->connection());
+      config_->stats().malformed_packet_.inc();
+      sendErrorResponseToDownstream(
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_MALFORMED_PACKET,
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_CONNECTION_ERROR,
+          "Malformed packet.", "Missing auth data length");
+      return false;
+    }
+
+    uint8_t auth_len = raw[current_pos++];
+
+    // Validate auth data length
+    if (current_pos + auth_len > len) {
+      ENVOY_CONN_LOG(error,
+                     "mysql_proxy: auth data length exceeds packet bounds (pos: {}, auth_len: {}, "
+                     "buffer_len: {})",
+                     read_callbacks_->connection(), current_pos, auth_len, len);
+      config_->stats().malformed_packet_.inc();
+      sendErrorResponseToDownstream(
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_MALFORMED_PACKET,
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_CONNECTION_ERROR,
+          "Malformed packet.", "Auth data exceeds packet bounds");
+      return false;
+    }
+
+    // Extract the auth data
+    try {
+      auth_data.auth_response.resize(auth_len);
+      if (auth_len > 0) {
+        memcpy(auth_data.auth_response.data(), raw + current_pos, auth_len);
+      }
+      current_pos += auth_len;
+    } catch (const std::bad_alloc& e) {
+      ENVOY_CONN_LOG(error, "mysql_proxy: memory allocation failed for auth data: {}",
+                     read_callbacks_->connection(), e.what());
+      config_->stats().errors_.inc();
+      sendErrorResponseToDownstream(
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_OUT_OF_RESOURCES,
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_INTERNAL_ERROR,
+          "Out of memory.", "Failed to allocate memory for auth data");
+      return false;
+    }
+  }
+
+  // Skip database name if present (we'll handle it in the main parsing function)
+  if (client_capabilities_ &
+      NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_CONNECT_WITH_DB) {
+    while (current_pos < len && raw[current_pos] != 0) {
+      current_pos++;
+    }
+    if (current_pos < len) {
+      current_pos++; // Skip null terminator
+    }
+  }
+
+  // Extract auth plugin name if CLIENT_PLUGIN_AUTH is set
+  if (client_capabilities_ &
+      NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_PLUGIN_AUTH) {
+    size_t plugin_start = current_pos;
+    while (current_pos < len && raw[current_pos] != 0) {
+      current_pos++;
+    }
+
+    if (current_pos >= len) {
+      ENVOY_CONN_LOG(error, "mysql_proxy: missing null terminator for auth plugin name",
+                     read_callbacks_->connection());
+      config_->stats().malformed_packet_.inc();
+      sendErrorResponseToDownstream(
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_MALFORMED_PACKET,
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_CONNECTION_ERROR,
+          "Malformed packet.", "Missing auth plugin name terminator");
+      return false;
+    }
+
+    try {
+      auth_data.auth_plugin_name.assign(reinterpret_cast<const char*>(raw + plugin_start),
+                                        current_pos - plugin_start);
+      current_pos++; // Skip null terminator
+
+      // Check if this is mysql_native_password
+      auth_data.is_native_password = (auth_data.auth_plugin_name == "mysql_native_password");
+
+      ENVOY_CONN_LOG(debug, "mysql_proxy: auth plugin: '{}', is_native_password: {}",
+                     read_callbacks_->connection(), auth_data.auth_plugin_name,
+                     auth_data.is_native_password ? "true" : "false");
+    } catch (const std::exception& e) {
+      ENVOY_CONN_LOG(error, "mysql_proxy: error processing auth plugin name: {}",
+                     read_callbacks_->connection(), e.what());
+      config_->stats().errors_.inc();
+      sendErrorResponseToDownstream(
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_INTERNAL_ERROR,
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_INTERNAL_ERROR,
+          "Internal error.", "Failed to process auth plugin name");
+      return false;
+    }
+  } else {
+    // If no plugin specified, default to mysql_native_password per MySQL protocol
+    auth_data.auth_plugin_name = "mysql_native_password";
+    auth_data.is_native_password = true;
+
+    ENVOY_CONN_LOG(debug,
+                   "mysql_proxy: no auth plugin specified, defaulting to mysql_native_password",
+                   read_callbacks_->connection());
+  }
+
+  return true;
+}
+
+/**
+ * Adds authentication data to the packet being built.
+ * This properly formats the authentication data according to the client capabilities
+ * and ensures compatibility with different auth plugins.
+ *
+ * @param new_packet The packet buffer being constructed
+ * @param auth_data The authentication data to add
+ * @param capabilities The client capabilities
+ */
+void MySQLProxy::preserveAuthData(Buffer::Instance& new_packet, const AuthData& auth_data,
+                                  uint32_t capabilities) {
+  const auto& auth_response = auth_data.auth_response;
+
+  // Special handling for mysql_native_password which has fixed 20-byte length in protocol
+  // See:
+  // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_authentication_methods_native_password_authentication.html
+  if (auth_data.is_native_password) {
+    ENVOY_CONN_LOG(debug, "mysql_proxy: handling mysql_native_password auth data",
+                   read_callbacks_->connection());
+
+    if (capabilities &
+        NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
+      // When using length-encoded client data with mysql_native_password
+      MySQLPacketUtils::writeLengthEncodedInteger(new_packet, auth_response.size());
+      if (!auth_response.empty()) {
+        new_packet.add(auth_response.data(), auth_response.size());
+      }
+    } else {
+      // For mysql_native_password without CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA,
+      // the auth data is always 20 bytes or 0 bytes (empty password)
+      if (auth_response.empty()) {
+        // Empty password case
+        new_packet.writeByte(0);
+      } else {
+        // Standard case - write fixed length
+        new_packet.writeByte(MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH); // Always 20 bytes for
+                                                                            // mysql_native_password
+        if (auth_response.size() < MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH) {
+          // If response is smaller than 20 bytes, pad with zeros
+          new_packet.add(auth_response.data(), auth_response.size());
+
+          // Use static zero buffer instead of allocating a vector for padding
+          // This is more efficient for small, fixed-size padding
+          static constexpr uint8_t zero_padding[MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH] = {0};
+          const size_t padding_size =
+              MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH - auth_response.size();
+          new_packet.add(zero_padding, padding_size);
+
+          ENVOY_CONN_LOG(debug, "mysql_proxy: padded auth data from {} to {} bytes",
+                         read_callbacks_->connection(), auth_response.size(),
+                         MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH);
+        } else if (auth_response.size() > MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH) {
+          // If larger, truncate to 20 bytes
+          new_packet.add(auth_response.data(), MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH);
+          ENVOY_CONN_LOG(warn, "mysql_proxy: truncated auth data from {} to {} bytes",
+                         read_callbacks_->connection(), auth_response.size(),
+                         MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH);
+        } else {
+          // Exactly 20 bytes
+          new_packet.add(auth_response.data(), auth_response.size());
+        }
+      }
+    }
+
+    ENVOY_CONN_LOG(debug, "mysql_proxy: wrote mysql_native_password auth data",
+                   read_callbacks_->connection());
+    return;
+  }
+
+  // For other auth plugins, use standard logic
+  // Add auth response data according to capability flags
+  if (capabilities &
+      NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
+    // Write auth data as length-encoded string
+    MySQLPacketUtils::writeLengthEncodedInteger(new_packet, auth_response.size());
+    if (!auth_response.empty()) {
+      new_packet.add(auth_response.data(), auth_response.size());
+    }
+
+    ENVOY_CONN_LOG(debug, "mysql_proxy: wrote auth data as length-encoded string (length: {})",
+                   read_callbacks_->connection(), auth_response.size());
+  } else {
+    // Write auth data as 1-byte length followed by data
+    if (auth_response.size() > 255) {
+      ENVOY_CONN_LOG(warn, "mysql_proxy: auth response truncated from {} to 255 bytes",
+                     read_callbacks_->connection(), auth_response.size());
+    }
+
+    uint8_t auth_len =
+        static_cast<uint8_t>(std::min(auth_response.size(), static_cast<size_t>(255)));
+    new_packet.writeByte(auth_len);
+    if (auth_len > 0) {
+      new_packet.add(auth_response.data(), auth_len);
+    }
+
+    ENVOY_CONN_LOG(debug, "mysql_proxy: wrote auth data with 1-byte length: {}",
+                   read_callbacks_->connection(), auth_len);
+  }
+}
+
+/**
+ * Stores authentication metadata in the connection's stream info.
+ * This makes auth plugin information available to other filters and for logging.
+ *
+ * @param auth_data The authentication data to store in metadata
+ */
+void MySQLProxy::setAuthMetadata(const AuthData& auth_data) {
+  auto& stream_info = read_callbacks_->connection().streamInfo();
+  const auto& existing_metadata = stream_info.dynamicMetadata().filter_metadata();
+
+  // Create a new metadata struct
+  ProtobufWkt::Struct metadata;
+
+  // Copy existing metadata if it exists
+  auto it = existing_metadata.find(NetworkFilterNames::get().DatabricksSqlProxy);
+  if (it != existing_metadata.end()) {
+    metadata = it->second;
+  }
+
+  // Create auth data struct
+  ProtobufWkt::Struct auth_data_struct;
+  (*auth_data_struct.mutable_fields())[CommonConstants::AUTH_PLUGIN_KEY].set_string_value(
+      auth_data.auth_plugin_name);
+
+  // Convert binary auth response to Base64 for storage in metadata
+  if (!auth_data.auth_response.empty()) {
+    const std::string auth_response_b64 =
+        Base64::encode(reinterpret_cast<const char*>(auth_data.auth_response.data()),
+                       auth_data.auth_response.size());
+    (*auth_data_struct.mutable_fields())[CommonConstants::AUTH_RESPONSE_B64_KEY].set_string_value(
+        auth_response_b64);
+  }
+
+  (*auth_data_struct.mutable_fields())[CommonConstants::IS_NATIVE_PASSWORD_KEY].set_bool_value(
+      auth_data.is_native_password);
+
+  // Add auth data to metadata
+  (*metadata.mutable_fields())[CommonConstants::AUTH_DATA_KEY].mutable_struct_value()->CopyFrom(
+      auth_data_struct);
+
+  // Set the updated metadata
+  stream_info.setDynamicMetadata(NetworkFilterNames::get().DatabricksSqlProxy, metadata);
+
+  ENVOY_CONN_LOG(debug, "mysql_proxy: stored auth metadata: plugin='{}', is_native={}",
+                 read_callbacks_->connection(), auth_data.auth_plugin_name,
+                 auth_data.is_native_password ? "true" : "false");
 }
 
 } // namespace DatabricksSqlProxy

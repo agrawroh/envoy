@@ -118,6 +118,23 @@ public:
                                           uint64_t& value, size_t& bytes_read);
 
   /**
+   * Calculate the number of bytes needed to encode a length-encoded integer.
+   *
+   * @param value The integer value to encode
+   * @return The number of bytes needed to encode the value
+   */
+  static size_t getLengthEncodedIntegerSize(uint64_t value);
+
+  /**
+   * Write a length-encoded integer to a buffer.
+   *
+   * @param buffer The buffer to write to
+   * @param value The integer value to encode
+   * @return The number of bytes written
+   */
+  static size_t writeLengthEncodedInteger(Buffer::Instance& buffer, uint64_t value);
+
+  /**
    * Extracts client capabilities from a MySQL packet.
    *
    * @param data Buffer containing the packet data

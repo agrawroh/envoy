@@ -41,7 +41,8 @@ static inline const absl::flat_hash_map<CommonErrors, ErrorInfo> PostgresCommonE
     {CommonErrors::ExtAuthzFailed,
      {static_cast<int16_t>(PostgresConstants::PostgresErrorCode::FATAL), "28000",
       "External authorization failed.",
-      "This could be due to paused instances, disabling readable secondaries, IP ACLs or private link configuration."}},
+      "This could be due to paused instances, disabling readable secondaries, IP ACLs or private "
+      "link configuration."}},
     // XX000 = internal_error code.
     {CommonErrors::InvalidUpstreamHandshakeState,
      {static_cast<int16_t>(PostgresConstants::PostgresErrorCode::FATAL),

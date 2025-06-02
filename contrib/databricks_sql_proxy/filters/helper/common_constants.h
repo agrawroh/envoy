@@ -40,6 +40,12 @@ public:
   static inline constexpr absl::string_view DYNAMIC_FORWARD_PROXY_KEY{"DYNAMIC_FORWARD_PROXY"};
   static inline constexpr absl::string_view REASON_PHRASE_KEY{"reason_phrase"};
 
+  // Authentication-related keys
+  static inline constexpr absl::string_view AUTH_DATA_KEY{"auth_data"};
+  static inline constexpr absl::string_view AUTH_PLUGIN_KEY{"auth_plugin"};
+  static inline constexpr absl::string_view AUTH_RESPONSE_B64_KEY{"auth_response_b64"};
+  static inline constexpr absl::string_view IS_NATIVE_PASSWORD_KEY{"is_native_password"};
+
   // Databricks SQL Inspector Filter Name
   static inline constexpr absl::string_view DATABRICKS_SQL_INSPECTOR_FILTER_NAMESPACE{
       "envoy.filters.listener.databricks_sql_proxy"};
