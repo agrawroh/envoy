@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/logger.h"
 
@@ -22,6 +24,16 @@ public:
       : config_(config), parent_(parent), regex_pattern_(compileRegexPattern()) {
     if (!config_->protoConfig().has_mysql_config()) {
       throw EnvoyException("MySQL configuration required");
+    }
+  }
+
+  ~MySQLProxy() override {
+    // Clean up timer resources
+    if (upstream_handshake_timer_) {
+      upstream_handshake_timer_->disableTimer();
+    }
+    if (error_response_timer_) {
+      error_response_timer_->disableTimer();
     }
   }
 
@@ -141,8 +153,9 @@ private:
   Event::TimerPtr upstream_handshake_timer_;
   std::unique_ptr<Regex::CompiledGoogleReMatcher> regex_pattern_;
   uint32_t handshake_attempts_{0};
-  bool connection_closed_{false}; // Guard against multiple close attempts
-  AuthData client_auth_data_;     // Store client authentication data
+  std::atomic<bool> connection_closed_{false}; // Guard against multiple close attempts
+  AuthData client_auth_data_;                  // Store client authentication data
+  Event::TimerPtr error_response_timer_;       // Timer for delayed error response
 };
 
 } // namespace DatabricksSqlProxy

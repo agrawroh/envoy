@@ -1,6 +1,7 @@
 #include "databricks_mysql_proxy.h"
 
 #include "source/common/common/base64.h"
+#include "source/common/common/safe_memcpy.h"
 #include "source/common/network/upstream_server_name.h"
 #include "source/common/protobuf/utility.h"
 #include "source/common/router/string_accessor_impl.h"
@@ -60,8 +61,25 @@ bool MySQLProxy::processClientFirstMessage(Buffer::Instance& data) {
   }
 
   // Check for complete packet (includes header + payload)
-  if (data.length() <
-      packet_length + NetworkFilters::DatabricksSqlProxy::MySQLConstants::MIN_PACKET_LENGTH) {
+  const uint64_t required_size =
+      static_cast<uint64_t>(packet_length) +
+      NetworkFilters::DatabricksSqlProxy::MySQLConstants::MIN_PACKET_LENGTH;
+  if (required_size > data.length() ||
+      required_size > NetworkFilters::DatabricksSqlProxy::MySQLConstants::MAX_PACKET_SIZE +
+                          NetworkFilters::DatabricksSqlProxy::MySQLConstants::MIN_PACKET_LENGTH) {
+    if (required_size > NetworkFilters::DatabricksSqlProxy::MySQLConstants::MAX_PACKET_SIZE +
+                            NetworkFilters::DatabricksSqlProxy::MySQLConstants::MIN_PACKET_LENGTH) {
+      ENVOY_CONN_LOG(error, "mysql_proxy: packet size overflow: {} + {}",
+                     read_callbacks_->connection(), packet_length,
+                     NetworkFilters::DatabricksSqlProxy::MySQLConstants::MIN_PACKET_LENGTH);
+      config_->stats().malformed_packet_.inc();
+      sendErrorResponseToDownstream(
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_NET_PACKET_TOO_LARGE,
+          NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_CONNECTION_ERROR,
+          "Packet too large.", "Packet size calculation overflow");
+      closeWithError("Packet size overflow", StreamInfo::CoreResponseFlag::DownstreamProtocolError);
+      return false;
+    }
     ENVOY_CONN_LOG(debug, "mysql_proxy: incomplete packet, waiting for more data",
                    read_callbacks_->connection());
     return false;
@@ -69,6 +87,9 @@ bool MySQLProxy::processClientFirstMessage(Buffer::Instance& data) {
 
   // Dump packet data for debugging if debug logging is enabled
   MySQLPacketUtils::debugPacket(data, data.length());
+
+  // Store the raw sequence number for later validation
+  const uint8_t raw_seq = seq;
 
   // This will drain the header from the copied packet
   uint32_t payload_length;
@@ -80,6 +101,20 @@ bool MySQLProxy::processClientFirstMessage(Buffer::Instance& data) {
         NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_CONNECTION_ERROR,
         "Malformed packet.", "Invalid packet structure");
     closeWithError("Malformed MySQL packet", StreamInfo::CoreResponseFlag::DownstreamProtocolError);
+    return false;
+  }
+
+  // Verify sequence numbers match
+  if (sequence != raw_seq) {
+    ENVOY_CONN_LOG(error, "mysql_proxy: sequence number mismatch after decode: {} vs {}",
+                   read_callbacks_->connection(), raw_seq, sequence);
+    config_->stats().protocol_violation_.inc();
+    sendErrorResponseToDownstream(
+        NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_HANDSHAKE_ERROR,
+        NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_HANDSHAKE_ERROR,
+        "Protocol violation.", "Sequence number mismatch");
+    closeWithError("Sequence number mismatch",
+                   StreamInfo::CoreResponseFlag::DownstreamProtocolError);
     return false;
   }
 
@@ -261,12 +296,21 @@ bool MySQLProxy::parseHandshakeResponse(Buffer::Instance& data) {
 
   // Create a modified capabilities flag if needed
   uint32_t modified_caps = client_capabilities_;
-  if (config_->enableUpstreamTls() &&
-      !(modified_caps & NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_SSL)) {
-    ENVOY_CONN_LOG(debug, "mysql_proxy: adding CLIENT_SSL capability flag (0x{:08x} -> 0x{:08x})",
+  if (config_->enableUpstreamTls()) {
+    // Only add SSL capability if upstream requires TLS and client doesn't already have it
+    if (!(modified_caps & NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_SSL)) {
+      ENVOY_CONN_LOG(debug, "mysql_proxy: adding CLIENT_SSL capability flag (0x{:08x} -> 0x{:08x})",
+                     read_callbacks_->connection(), modified_caps,
+                     modified_caps |
+                         NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_SSL);
+      modified_caps |= NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_SSL;
+    }
+  } else if (modified_caps & NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_SSL) {
+    // If upstream doesn't support TLS but client requested it, we need to remove the flag
+    ENVOY_CONN_LOG(debug, "mysql_proxy: removing CLIENT_SSL capability flag (0x{:08x} -> 0x{:08x})",
                    read_callbacks_->connection(), modified_caps,
-                   modified_caps | NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_SSL);
-    modified_caps |= NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_SSL;
+                   modified_caps & ~NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_SSL);
+    modified_caps &= ~NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_SSL;
   }
 
   // Skip capabilities (4 bytes), max packet size (4 bytes), charset (1 byte),
@@ -356,6 +400,8 @@ bool MySQLProxy::parseHandshakeResponse(Buffer::Instance& data) {
   std::vector<MySQLPacketUtils::MySQLConnectionAttribute> connection_attributes;
   if (client_capabilities_ &
       NetworkFilters::DatabricksSqlProxy::MySQLConstants::CLIENT_CONNECT_ATTRS) {
+    // Reserve capacity based on typical number of attributes to avoid reallocations
+    connection_attributes.reserve(8);
     connection_attributes =
         MySQLPacketUtils::extractConnectionAttributes(data, current_pos, client_capabilities_);
   }
@@ -779,6 +825,11 @@ bool MySQLProxy::extractUserDetails(const std::string& username_string,
     return false;
   }
 
+  // Reserve capacity for extracted strings to avoid reallocations
+  extracted_username.reserve(username_string.length());
+  workspace_id.reserve(32); // Typical workspace ID length
+  hostname.reserve(64);     // Typical hostname length
+
   // Pattern should be something like "^([^@]+)@([^_]+)_(.+)$" as expect it to have 3 things in this
   // format: username@workspaceId_hostname
   const std::string& pattern = config_->protoConfig().mysql_config().username_pattern();
@@ -974,16 +1025,14 @@ void MySQLProxy::sendErrorResponseToDownstream(int16_t error_code, absl::string_
     // client to process the error. If we don't do this then clients fail to drain the data from the
     // socket and the connection is closed before the clients get a chance to process the error
     // message.
-    read_callbacks_->connection()
-        .dispatcher()
-        .createTimer([this]() {
-          if (!connection_closed_) {
-            connection_closed_ = true; // Mark as closed to prevent multiple errors
-            // Use FlushWrite to ensure the error message is sent before closing the connection
-            read_callbacks_->connection().close(Network::ConnectionCloseType::FlushWrite);
-          }
-        })
-        ->enableTimer(std::chrono::milliseconds(25));
+    error_response_timer_ = read_callbacks_->connection().dispatcher().createTimer([this]() {
+      if (!connection_closed_) {
+        connection_closed_ = true; // Mark as closed to prevent multiple errors
+        // Use FlushWrite to ensure the error message is sent before closing the connection
+        read_callbacks_->connection().close(Network::ConnectionCloseType::FlushWrite);
+      }
+    });
+    error_response_timer_->enableTimer(std::chrono::milliseconds(25));
   } else {
     ENVOY_CONN_LOG(error, "mysql_proxy: cannot send error, write callbacks not initialized",
                    read_callbacks_->connection());
@@ -1155,7 +1204,17 @@ bool MySQLProxy::extractAuthenticationData(Buffer::Instance& data, size_t& curre
     try {
       auth_data.auth_response.resize(auth_len);
       if (auth_len > 0) {
-        memcpy(auth_data.auth_response.data(), raw + current_pos, auth_len);
+        if (current_pos + auth_len > len) {
+          ENVOY_CONN_LOG(error, "mysql_proxy: auth data would read past buffer bounds",
+                         read_callbacks_->connection());
+          config_->stats().malformed_packet_.inc();
+          sendErrorResponseToDownstream(
+              NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_MALFORMED_PACKET,
+              NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_CONNECTION_ERROR,
+              "Malformed packet.", "Auth data extends beyond packet bounds");
+          return false;
+        }
+        data.copyOut(current_pos, auth_len, auth_data.auth_response.data());
       }
       current_pos += auth_len;
     } catch (const std::bad_alloc& e) {
@@ -1201,7 +1260,20 @@ bool MySQLProxy::extractAuthenticationData(Buffer::Instance& data, size_t& curre
     try {
       auth_data.auth_response.resize(auth_len);
       if (auth_len > 0) {
-        memcpy(auth_data.auth_response.data(), raw + current_pos, auth_len);
+        // Replace undefined safeMemcpy with proper bounds-checked copying
+        // Ensure we don't read past the buffer
+        if (current_pos + auth_len > len) {
+          ENVOY_CONN_LOG(error, "mysql_proxy: auth data would read past buffer bounds",
+                         read_callbacks_->connection());
+          config_->stats().malformed_packet_.inc();
+          sendErrorResponseToDownstream(
+              NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_MALFORMED_PACKET,
+              NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_CONNECTION_ERROR,
+              "Malformed packet.", "Auth data extends beyond packet bounds");
+          return false;
+        }
+        // Use Buffer::copyOut which is the preferred method in Envoy
+        data.copyOut(current_pos, auth_len, auth_data.auth_response.data());
       }
       current_pos += auth_len;
     } catch (const std::bad_alloc& e) {
@@ -1250,6 +1322,18 @@ bool MySQLProxy::extractAuthenticationData(Buffer::Instance& data, size_t& curre
       auth_data.auth_plugin_name.assign(reinterpret_cast<const char*>(raw + plugin_start),
                                         current_pos - plugin_start);
       current_pos++; // Skip null terminator
+
+      // Validate auth plugin name length - MySQL plugin names should be reasonable
+      if (auth_data.auth_plugin_name.length() > 64) {
+        ENVOY_CONN_LOG(error, "mysql_proxy: auth plugin name too long: {} bytes",
+                       read_callbacks_->connection(), auth_data.auth_plugin_name.length());
+        config_->stats().malformed_packet_.inc();
+        sendErrorResponseToDownstream(
+            NetworkFilters::DatabricksSqlProxy::MySQLConstants::ER_MALFORMED_PACKET,
+            NetworkFilters::DatabricksSqlProxy::MySQLConstants::SQL_STATE_CONNECTION_ERROR,
+            "Malformed packet.", "Auth plugin name too long");
+        return false;
+      }
 
       // Check if this is mysql_native_password
       auth_data.is_native_password = (auth_data.auth_plugin_name == "mysql_native_password");
@@ -1311,35 +1395,25 @@ void MySQLProxy::preserveAuthData(Buffer::Instance& new_packet, const AuthData& 
       // For mysql_native_password without CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA,
       // the auth data is always 20 bytes or 0 bytes (empty password)
       if (auth_response.empty()) {
-        // Empty password case
+        // Empty password case - write 0 length
         new_packet.writeByte(0);
+      } else if (auth_response.size() == MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH) {
+        // Standard case - write length byte followed by 20 bytes
+        new_packet.writeByte(MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH);
+        new_packet.add(auth_response.data(), MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH);
       } else {
-        // Standard case - write fixed length
-        new_packet.writeByte(MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH); // Always 20 bytes for
-                                                                            // mysql_native_password
-        if (auth_response.size() < MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH) {
-          // If response is smaller than 20 bytes, pad with zeros
-          new_packet.add(auth_response.data(), auth_response.size());
-
-          // Use static zero buffer instead of allocating a vector for padding
-          // This is more efficient for small, fixed-size padding
-          static constexpr uint8_t zero_padding[MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH] = {0};
-          const size_t padding_size =
-              MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH - auth_response.size();
-          new_packet.add(zero_padding, padding_size);
-
-          ENVOY_CONN_LOG(debug, "mysql_proxy: padded auth data from {} to {} bytes",
-                         read_callbacks_->connection(), auth_response.size(),
-                         MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH);
-        } else if (auth_response.size() > MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH) {
-          // If larger, truncate to 20 bytes
-          new_packet.add(auth_response.data(), MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH);
-          ENVOY_CONN_LOG(warn, "mysql_proxy: truncated auth data from {} to {} bytes",
-                         read_callbacks_->connection(), auth_response.size(),
-                         MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH);
-        } else {
-          // Exactly 20 bytes
-          new_packet.add(auth_response.data(), auth_response.size());
+        // Non-standard size - this is an error for mysql_native_password
+        ENVOY_CONN_LOG(
+            error,
+            "mysql_proxy: invalid mysql_native_password auth response size: {} (expected 0 or {})",
+            read_callbacks_->connection(), auth_response.size(),
+            MySQLConstants::MYSQL_NATIVE_PASSWORD_LENGTH);
+        // Write the actual size and data anyway to preserve the client's intent
+        new_packet.writeByte(
+            static_cast<uint8_t>(std::min(auth_response.size(), static_cast<size_t>(255))));
+        if (!auth_response.empty()) {
+          new_packet.add(auth_response.data(),
+                         std::min(auth_response.size(), static_cast<size_t>(255)));
         }
       }
     }

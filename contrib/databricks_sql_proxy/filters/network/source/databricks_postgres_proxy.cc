@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "source/common/common/random_generator.h"
+#include "source/common/protobuf/protobuf.h"
 #include "source/extensions/filters/network/well_known_names.h"
 
 #include "contrib/common/sqlutils/source/sqlutils.h"
@@ -303,14 +304,12 @@ void PostgresProxy::onUpstreamConnected() {
 }
 
 void PostgresProxy::sendPostgresCancelRequestToUpstream() {
-  ::google::protobuf::Map<std::string, ::google::protobuf::Value>* dynamic_metadata =
-      read_callbacks_->connection()
-          .streamInfo()
-          .dynamicMetadata()
-          .mutable_filter_metadata()
-          ->at(NetworkFilterNames::get().DatabricksSqlProxy)
-          .mutable_fields();
-  ;
+  auto* dynamic_metadata = read_callbacks_->connection()
+                               .streamInfo()
+                               .dynamicMetadata()
+                               .mutable_filter_metadata()
+                               ->at(NetworkFilterNames::get().DatabricksSqlProxy)
+                               .mutable_fields();
   uint32_t process_id =
       dynamic_metadata->at(CommonConstants::CANCELLATION_PROCESS_ID_KEY).number_value();
   uint32_t secret_key =
