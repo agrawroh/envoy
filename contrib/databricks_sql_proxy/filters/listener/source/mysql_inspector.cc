@@ -174,6 +174,14 @@ void MySQLInspector::sendInitialHandshake() {
   // Generate random auth plugin data for authentication
   generateAuthPluginData();
 
+  // Store scramble in metadata for later use by the network filter
+  std::string scramble_b64 = Base64::encode(reinterpret_cast<const char*>(auth_plugin_data_.data()),
+                                            auth_plugin_data_.size());
+
+  ProtobufWkt::Struct metadata;
+  (*metadata.mutable_fields())["auth_scramble"].set_string_value(scramble_b64);
+  cb_->setDynamicMetadata(Filter::name(), metadata);
+
   // Protocol version (1 byte)
   packet.writeByte(NetworkFilters::DatabricksSqlProxy::MySQLConstants::PROTOCOL_VERSION);
 

@@ -42,3 +42,14 @@ envoy_cc_library(
         "//source/common/buffer:buffer_lib",
     ],
 )
+
+envoy_cc_library(
+    name = "mysql_auth_helper_lib",
+    srcs = ["mysql_auth_helper.cc"],
+    hdrs = ["mysql_auth_helper.h"],
+    deps = [
+        "//source/common/buffer:buffer_lib",
+        "//source/common/common:logger_lib",
+        "@boringssl//:ssl",
+    ],
+)

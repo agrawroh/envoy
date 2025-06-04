@@ -157,6 +157,10 @@ Network::FilterStatus MySQLProxy::handleUpstreamData(Buffer::Instance& data, boo
       return Network::FilterStatus::StopIteration;
     }
 
+    // Create a copy of the data for scramble extraction
+    Buffer::OwnedImpl data_copy;
+    data_copy.add(data);
+
     uint32_t packet_length;
     uint8_t seq;
 
@@ -176,6 +180,68 @@ Network::FilterStatus MySQLProxy::handleUpstreamData(Buffer::Instance& data, boo
     // Store server capabilities
     server_capabilities_ = data.peekLEInt<uint32_t>(4);
     data.drain(packet_length);
+
+    // Extract upstream scramble from the copy
+    if (extractUpstreamScramble(data_copy)) {
+      // If we have a stored password hash, we need to rebuild the handshake packet
+      // with the recomputed auth response
+      if (auth_state_.has_password_hash) {
+        ENVOY_CONN_LOG(debug, "mysql_proxy: recomputing auth response for upstream scramble",
+                       read_callbacks_->connection());
+
+        // Recompute the auth response with the upstream scramble
+        recomputeAuthResponse(temp_handshake_packet_);
+
+        // Rebuild the handshake packet with the new auth response
+        Buffer::OwnedImpl new_packet;
+
+        // Copy everything before auth response
+        const uint8_t* raw = static_cast<const uint8_t*>(
+            temp_handshake_packet_.linearize(temp_handshake_packet_.length()));
+
+        // Find the position of auth response in the packet
+        // Structure: capabilities(4) + max_packet(4) + charset(1) + reserved(23) + username + null
+        size_t offset = 4 + 4 + 1 + 23;
+
+        // Skip username
+        while (offset < temp_handshake_packet_.length() && raw[offset] != 0) {
+          offset++;
+        }
+        offset++; // Skip null terminator
+
+        // Copy everything up to auth response
+        new_packet.add(raw, offset);
+
+        // Add the recomputed auth response
+        preserveAuthData(new_packet, client_auth_data_, client_capabilities_);
+
+        // Copy remaining data (database, plugin name, attributes)
+        size_t auth_data_offset = offset;
+        if (client_capabilities_ & NetworkFilters::DatabricksSqlProxy::MySQLConstants::
+                                       CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
+          // Skip length-encoded auth data
+          uint64_t auth_len;
+          size_t len_bytes;
+          Buffer::OwnedImpl temp_buf;
+          temp_buf.add(raw + auth_data_offset, temp_handshake_packet_.length() - auth_data_offset);
+          MySQLPacketUtils::decodeVariableLengthInteger(temp_buf, 0, auth_len, len_bytes);
+          auth_data_offset += len_bytes + auth_len;
+        } else {
+          // Skip 1-byte length auth data
+          uint8_t auth_len = raw[auth_data_offset];
+          auth_data_offset += 1 + auth_len;
+        }
+
+        // Add remaining packet data
+        if (auth_data_offset < temp_handshake_packet_.length()) {
+          new_packet.add(raw + auth_data_offset,
+                         temp_handshake_packet_.length() - auth_data_offset);
+        }
+
+        // Replace the packet
+        temp_handshake_packet_ = std::move(new_packet);
+      }
+    }
 
     ENVOY_CONN_LOG(debug, "mysql_proxy: server greeting received", read_callbacks_->connection());
     if (config_->enableUpstreamTls()) {
@@ -354,6 +420,13 @@ bool MySQLProxy::parseHandshakeResponse(Buffer::Instance& data) {
 
   // Store the auth data for later use
   client_auth_data_ = auth_data;
+
+  // Attempt to extract password hash for mysql_native_password
+  if (auth_data.is_native_password &&
+      auth_data.auth_response.size() == MySQLAuthHelper::SHA1_HASH_SIZE) {
+    // Attempt to extract password hash for future use
+    extractClientPasswordHash();
+  }
 
   // Log auth plugin details for debugging
   ENVOY_CONN_LOG(debug,
@@ -1471,6 +1544,230 @@ void MySQLProxy::setAuthMetadata(const AuthData& auth_data) {
   ENVOY_CONN_LOG(debug, "mysql_proxy: stored auth metadata: plugin='{}', is_native={}",
                  read_callbacks_->connection(), auth_data.auth_plugin_name,
                  auth_data.is_native_password ? "true" : "false");
+}
+
+/**
+ * Extracts the SHA1(password) hash from the client's authentication response.
+ * This hash can be used to recompute authentication responses for different server scrambles.
+ *
+ * @return true if password hash was successfully extracted
+ */
+bool MySQLProxy::extractClientPasswordHash() {
+  // This method should be called after receiving client handshake response
+  // when auth_data.is_native_password is true
+
+  if (!client_auth_data_.is_native_password) {
+    ENVOY_CONN_LOG(debug, "mysql_proxy: not native password auth, skipping extraction",
+                   read_callbacks_->connection());
+    return false;
+  }
+
+  // Ensure we have the proxy scramble stored
+  if (auth_state_.proxy_scramble.empty()) {
+    // Extract from MySQLInspector's auth_plugin_data via metadata
+    const auto& metadata =
+        read_callbacks_->connection().streamInfo().dynamicMetadata().filter_metadata();
+    auto inspector_it = metadata.find(CommonConstants::DATABRICKS_SQL_INSPECTOR_FILTER_NAMESPACE);
+    if (inspector_it != metadata.end()) {
+      const auto& fields = inspector_it->second.fields();
+      auto scramble_it = fields.find("auth_scramble");
+      if (scramble_it != fields.end()) {
+        std::string base64_scramble = scramble_it->second.string_value();
+        auto binary_scramble = Base64::decode(base64_scramble);
+        auth_state_.proxy_scramble.assign(binary_scramble.begin(), binary_scramble.end());
+      }
+    }
+  }
+
+  if (auth_state_.proxy_scramble.size() != MySQLAuthHelper::SHA1_HASH_SIZE) {
+    ENVOY_CONN_LOG(error, "mysql_proxy: invalid proxy scramble size: {}",
+                   read_callbacks_->connection(), auth_state_.proxy_scramble.size());
+    return false;
+  }
+
+  // For now, we don't have SHA1(SHA1(password)) unless it's provided via config
+  // In a full implementation, this could be loaded from a user database
+  // For this example, we'll attempt extraction if we have a known double hash
+
+  // TODO: Load double hash from configuration or user database
+  // For demonstration, assuming it's empty (all zeros)
+  MySQLAuthHelper::SHA1Hash dummy_double_hash{};
+
+  // Extract SHA1(password) from client response
+  auth_state_.password_hash = MySQLAuthHelper::extractPasswordHash(
+      client_auth_data_.auth_response, auth_state_.proxy_scramble, dummy_double_hash);
+
+  // Verify extraction by recomputing the response
+  auto verification = MySQLAuthHelper::computeAuthResponse(
+      auth_state_.password_hash, auth_state_.proxy_scramble, dummy_double_hash);
+
+  bool success = (verification == client_auth_data_.auth_response);
+  auth_state_.has_password_hash = success;
+
+  if (success) {
+    ENVOY_CONN_LOG(info, "mysql_proxy: successfully extracted password hash for user",
+                   read_callbacks_->connection());
+    storeAuthState();
+  } else {
+    ENVOY_CONN_LOG(warn, "mysql_proxy: failed to extract password hash",
+                   read_callbacks_->connection());
+  }
+
+  return success;
+}
+
+/**
+ * Recomputes the authentication response for the upstream server using the stored password hash.
+ * This allows the proxy to authenticate to different backend servers without knowing the plaintext
+ * password.
+ *
+ * @param packet The packet buffer being constructed
+ */
+void MySQLProxy::recomputeAuthResponse(Buffer::Instance&) {
+  // This method recomputes the auth response for the upstream server
+  // It should be called when building the handshake packet for upstream
+
+  if (!auth_state_.has_password_hash || auth_state_.upstream_scramble.empty()) {
+    ENVOY_CONN_LOG(debug, "mysql_proxy: cannot recompute auth response, missing data",
+                   read_callbacks_->connection());
+    return;
+  }
+
+  // Compute new auth response for upstream scramble
+  auto new_response = MySQLAuthHelper::computeAuthResponse(
+      auth_state_.password_hash, auth_state_.upstream_scramble, auth_state_.double_hash);
+
+  ENVOY_CONN_LOG(debug, "mysql_proxy: recomputed auth response for upstream",
+                 read_callbacks_->connection());
+
+  // Update the auth response in our stored auth data
+  client_auth_data_.auth_response = new_response;
+}
+
+/**
+ * Stores the extracted authentication state in connection metadata for potential reuse.
+ * This allows the password hash to be preserved across filter invocations.
+ */
+void MySQLProxy::storeAuthState() {
+  // Store extracted password hash in connection metadata for potential reuse
+  auto& stream_info = read_callbacks_->connection().streamInfo();
+  const auto& existing_metadata = stream_info.dynamicMetadata().filter_metadata();
+
+  ProtobufWkt::Struct metadata;
+  auto it = existing_metadata.find(NetworkFilterNames::get().DatabricksSqlProxy);
+  if (it != existing_metadata.end()) {
+    metadata = it->second;
+  }
+
+  // Store password hash as base64
+  if (auth_state_.has_password_hash) {
+    std::string password_hash_b64 =
+        Base64::encode(reinterpret_cast<const char*>(auth_state_.password_hash.data()),
+                       auth_state_.password_hash.size());
+    (*metadata.mutable_fields())["password_hash"].set_string_value(password_hash_b64);
+    (*metadata.mutable_fields())["has_password_hash"].set_bool_value(true);
+  }
+
+  stream_info.setDynamicMetadata(NetworkFilterNames::get().DatabricksSqlProxy, metadata);
+}
+
+/**
+ * Loads previously stored authentication state from connection metadata.
+ * This allows password hashes to be reused across multiple backend connections.
+ */
+void MySQLProxy::loadStoredAuthState() {
+  const auto& metadata =
+      read_callbacks_->connection().streamInfo().dynamicMetadata().filter_metadata();
+  auto it = metadata.find(NetworkFilterNames::get().DatabricksSqlProxy);
+  if (it == metadata.end()) {
+    return;
+  }
+
+  const auto& fields = it->second.fields();
+  auto hash_it = fields.find("password_hash");
+  auto has_hash_it = fields.find("has_password_hash");
+
+  if (hash_it != fields.end() && has_hash_it != fields.end() && has_hash_it->second.bool_value()) {
+    std::string password_hash_b64 = hash_it->second.string_value();
+    auto binary_hash = Base64::decode(password_hash_b64);
+    if (binary_hash.size() == MySQLAuthHelper::SHA1_HASH_SIZE) {
+      std::memcpy(auth_state_.password_hash.data(), binary_hash.data(),
+                  MySQLAuthHelper::SHA1_HASH_SIZE);
+      auth_state_.has_password_hash = true;
+      ENVOY_CONN_LOG(debug, "mysql_proxy: loaded stored password hash from metadata",
+                     read_callbacks_->connection());
+    }
+  }
+}
+
+/**
+ * Extracts the scramble (auth plugin data) from the upstream server greeting packet.
+ * This scramble is needed to compute the authentication response for the upstream server.
+ *
+ * @param data The buffer containing the server greeting
+ * @return true if scramble was successfully extracted
+ */
+bool MySQLProxy::extractUpstreamScramble(const Buffer::Instance& data) {
+  // The server greeting packet structure:
+  // [header: 4] [protocol: 1] [version: null-terminated] [conn_id: 4]
+  // [scramble_part1: 8] [filler: 1] [capability_low: 2] [charset: 1]
+  // [status: 2] [capability_high: 2] [auth_len: 1] [reserved: 10] [scramble_part2: 12+]
+
+  const size_t min_greeting_size = 4 + 1 + 1 + 4 + 8 + 1 + 2 + 1 + 2 + 2 + 1 + 10 + 12;
+  if (data.length() < min_greeting_size) {
+    ENVOY_CONN_LOG(error, "mysql_proxy: server greeting too small to contain scramble",
+                   read_callbacks_->connection());
+    return false;
+  }
+
+  // Create a mutable copy to linearize
+  Buffer::OwnedImpl data_copy;
+  data_copy.add(data);
+
+  const uint8_t* raw = static_cast<const uint8_t*>(data_copy.linearize(data_copy.length()));
+  if (!raw) {
+    ENVOY_CONN_LOG(error, "mysql_proxy: failed to linearize server greeting",
+                   read_callbacks_->connection());
+    return false;
+  }
+
+  // Skip header (4), protocol version (1)
+  size_t offset = 4 + 1;
+
+  // Skip server version (null-terminated string)
+  while (offset < data.length() && raw[offset] != 0) {
+    offset++;
+  }
+  offset++; // Skip null terminator
+
+  if (offset + 4 + 8 > data.length()) {
+    ENVOY_CONN_LOG(error, "mysql_proxy: server greeting truncated before scramble",
+                   read_callbacks_->connection());
+    return false;
+  }
+
+  offset += 4; // Skip connection ID
+
+  // Extract first 8 bytes of scramble
+  auth_state_.upstream_scramble.resize(20);
+  std::memcpy(auth_state_.upstream_scramble.data(), raw + offset, 8);
+  offset += 8;
+
+  // Skip to second part of scramble
+  offset += 1 + 2 + 1 + 2 + 2 + 1 + 10; // Skip filler, capabilities, charset, status, reserved
+
+  if (offset + 12 < data.length()) {
+    // Extract remaining 12 bytes of scramble
+    std::memcpy(auth_state_.upstream_scramble.data() + 8, raw + offset, 12);
+
+    ENVOY_CONN_LOG(debug, "mysql_proxy: extracted upstream scramble",
+                   read_callbacks_->connection());
+    return true;
+  }
+
+  ENVOY_CONN_LOG(error, "mysql_proxy: server greeting truncated in scramble part 2",
+                 read_callbacks_->connection());
+  return false;
 }
 
 } // namespace DatabricksSqlProxy

@@ -5,6 +5,7 @@
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/logger.h"
 
+#include "contrib/databricks_sql_proxy/filters/helper/mysql_auth_helper.h"
 #include "contrib/databricks_sql_proxy/filters/helper/mysql_constants.h"
 #include "contrib/databricks_sql_proxy/filters/helper/mysql_packet_utils.h"
 #include "contrib/databricks_sql_proxy/filters/network/source/databricks_sql_proxy.h"
@@ -75,6 +76,15 @@ private:
     bool is_native_password{false};
   };
 
+  // Authentication state for mysql_native_password handling
+  struct AuthState {
+    MySQLAuthHelper::SHA1Hash password_hash{}; // SHA1(password) extracted from client
+    MySQLAuthHelper::SHA1Hash double_hash{};   // SHA1(SHA1(password)) if known
+    std::vector<uint8_t> proxy_scramble;       // Scramble sent by proxy to client
+    std::vector<uint8_t> upstream_scramble;    // Scramble received from upstream
+    bool has_password_hash{false};             // Whether we successfully extracted the hash
+  };
+
   // Handshake states with clear transitions
   enum class UpstreamHandshakeState {
     Init,                   // Initial state before handshake
@@ -109,6 +119,13 @@ private:
   // Preserve auth data when rebuilding packets
   void preserveAuthData(Buffer::Instance& new_packet, const AuthData& auth_data,
                         uint32_t capabilities);
+
+  // New methods for authentication handling
+  bool extractClientPasswordHash();
+  void recomputeAuthResponse(Buffer::Instance& packet);
+  void storeAuthState();
+  void loadStoredAuthState();
+  bool extractUpstreamScramble(const Buffer::Instance& data);
 
   void sendErrorResponseToDownstream(int16_t error_code, absl::string_view sql_state,
                                      absl::string_view error_message,
@@ -156,6 +173,7 @@ private:
   std::atomic<bool> connection_closed_{false}; // Guard against multiple close attempts
   AuthData client_auth_data_;                  // Store client authentication data
   Event::TimerPtr error_response_timer_;       // Timer for delayed error response
+  AuthState auth_state_;                       // Authentication state for mysql_native_password
 };
 
 } // namespace DatabricksSqlProxy

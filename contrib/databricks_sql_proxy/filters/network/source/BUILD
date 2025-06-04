@@ -26,6 +26,7 @@ envoy_cc_library(
     deps = [
         "//contrib/common/sqlutils/source:sqlutils_lib",
         "//contrib/databricks_sql_proxy/filters/helper:common_constants_lib",
+        "//contrib/databricks_sql_proxy/filters/helper:mysql_auth_helper_lib",
         "//contrib/databricks_sql_proxy/filters/helper:mysql_constants_lib",
         "//contrib/databricks_sql_proxy/filters/helper:mysql_helper_lib",
         "//contrib/databricks_sql_proxy/filters/helper:postgres_constants_lib",
