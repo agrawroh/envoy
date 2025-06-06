@@ -1,0 +1,67 @@
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
+
+static_resources:
+  listeners:
+  - name: reverse_connection_listener
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 10000
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.reverse_connection
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.reverse_connection.v3.ReverseConnection
+          stat_prefix: reverse_connection_downstream
+          cluster_name: upstream_service
+          connection_timeout:
+            seconds: 30
+          debug_logging: true
+          enable_http_pooling: true         # Level 2: HTTP Connection Pooling (Active)
+          socket_handoff_config:            # Level 3: Socket Handoff Optimization (ENABLED!)
+            enable_socket_handoff: true     # 🚀 ACTIVATE MAXIMUM PERFORMANCE
+            max_connections_per_cluster: 20 # Pool size for burst handling
+            min_connections_per_cluster: 5  # Always-ready connections
+            connection_idle_timeout: 600s   # 10 minutes idle timeout
+            connection_max_lifetime: 7200s  # 2 hours max lifetime
+            enable_preconnect: true         # Proactive connection creation
+            preconnect_ratio: 0.8           # Pre-establish 80% of max connections
+
+  clusters:
+  - name: upstream_service
+    type: STATIC
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: upstream_service
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 7070
+    # Socket handoff integration for maximum performance
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:              # Explicit HTTP/1.1 for socket handoff optimization
+          http_protocol_options: {}         # HTTP/1.1 protocol options
+        common_http_protocol_options:
+          max_connection_duration: 7200s    # Align with socket handoff max lifetime
+    # Enable socket handoff optimization for this cluster
+    upstream_connection_options:
+      tcp_keepalive:
+        keepalive_interval: 25
+        keepalive_probes: 15
+        keepalive_time: 25
+    #  socket_options:
+    #  - level: 6      # IPPROTO_TCP
+    #    name: 1       # TCP_NODELAY
+    #    int_value: 1  # Enable for performance
+
+# Reverse connection downstream: accepts reverse connections
+# and uses our single-byte trigger mechanism to manage connection pooling

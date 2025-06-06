@@ -229,6 +229,8 @@ EXTENSIONS = {
     "envoy.filters.network.wasm":                                 "//source/extensions/filters/network/wasm:config",
     "envoy.filters.network.zookeeper_proxy":                      "//source/extensions/filters/network/zookeeper_proxy:config",
     "envoy.filters.network.generic_proxy":                        "//source/extensions/filters/network/generic_proxy:config",
+    "envoy.filters.network.reverse_connection":                   "//source/extensions/filters/network/reverse_connection:config",
+    "reverse_connection.terminal":                                 "//source/extensions/network/socket_interface/reverse_connection:reverse_connection_terminal_filter_config_lib",
 
     #
     # UDP filters
