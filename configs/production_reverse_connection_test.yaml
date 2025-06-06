@@ -1,0 +1,126 @@
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
+
+static_resources:
+  listeners:
+  # Production reverse connection listener with enhanced configuration
+  - name: production_reverse_connection_listener
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 10000
+    # Enable socket options for performance
+    socket_options:
+    - level: 6     # IPPROTO_TCP
+      name: 1      # TCP_NODELAY
+      int_value: 1
+    - level: 1     # SOL_SOCKET
+      name: 2      # SO_REUSEADDR
+      int_value: 1
+    filter_chains:
+    - filters:
+      # Main reverse connection filter for HTTP traffic handling
+      - name: envoy.filters.network.reverse_connection
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.reverse_connection.v3.ReverseConnectionConfig
+          enabled: true
+          cluster_name: upstream_service
+          max_connections_per_cluster: 50
+          connection_timeout_seconds: 30
+          debug_logging: true
+      
+      # Terminal filter for connection handoff (commented out for now)
+      # - name: envoy.extensions.network.socket_interface.reverse_connection.terminal
+      #   typed_config:
+      #     "@type": type.googleapis.com/envoy.extensions.filters.network.reverse_connection.v3.ReverseConnectionConfig
+      #     enabled: true
+      #     cluster_name: upstream_service
+
+  # HTTP listener for testing reverse tunnel functionality
+  - name: http_test_listener
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 8080
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: reverse_tunnel_http
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: tunnel_service
+              domains: ["*"]
+              routes:
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: backend_service
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+  # Upstream service cluster (for reverse connections)
+  - name: upstream_service
+    type: STATIC
+    lb_policy: ROUND_ROBIN
+    # Performance optimizations
+    upstream_connection_options:
+      tcp_keepalive:
+        keepalive_probes: 3
+        keepalive_time: 30
+        keepalive_interval: 5
+    load_assignment:
+      cluster_name: upstream_service
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 8090
+
+  # Backend service cluster (for actual HTTP requests)
+  - name: backend_service
+    type: STATIC
+    lb_policy: ROUND_ROBIN
+    # Connection pooling optimizations
+    circuit_breakers:
+      thresholds:
+      - priority: DEFAULT
+        max_connections: 100
+        max_requests: 1000
+        max_retries: 3
+    load_assignment:
+      cluster_name: backend_service
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 8081
+
+# Production reverse connection downstream configuration
+# Features:
+# 1. High-performance socket options (TCP_NODELAY, SO_REUSEADDR)
+# 2. Optimized connection pooling (50 connections per cluster)
+# 3. Circuit breaker protection for backend services
+# 4. TCP keepalive for connection health monitoring
+# 5. Comprehensive logging for troubleshooting
+#
+# Architecture:
+# Client → :10000 (Reverse Connection Filter) → Reverse Tunnel → Upstream → :8081 (Backend)
+#
+# This configuration demonstrates:
+# - Single-byte trigger mechanism for connection acceptance
+# - Thread-safe connection pooling with proper mutex usage
+# - Integration with Envoy's cluster management system
+# - Performance optimizations for production workloads 
