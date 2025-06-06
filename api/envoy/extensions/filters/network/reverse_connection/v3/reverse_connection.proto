@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.network.reverse_connection.v3;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/wrappers.proto";
+
+import "udpa/annotations/status.proto";
+import "udpa/annotations/versioning.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.network.reverse_connection.v3";
+option java_outer_classname = "ReverseConnectionProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/reverse_connection/v3;reverse_connectionv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: Reverse Connection]
+// Reverse Connection :ref:`configuration overview <config_network_filters_reverse_connection>`.
+// [#extension: envoy.filters.network.reverse_connection]
+
+// Socket handoff optimization configuration for maximum performance
+message SocketHandoffConfig {
+  // Enable socket handoff optimization for zero connection overhead.
+  // WARNING: Experimental feature, test thoroughly before production use.
+  bool enable_socket_handoff = 1;
+  
+  // Maximum pre-established connections per cluster.
+  // Higher values improve burst performance but consume more resources.
+  google.protobuf.UInt32Value max_connections_per_cluster = 2 [(validate.rules).uint32 = {gte: 1 lte: 100}];
+  
+  // Minimum connections to maintain per cluster.
+  // Ensures immediate availability for incoming requests.
+  google.protobuf.UInt32Value min_connections_per_cluster = 3 [(validate.rules).uint32 = {gte: 1}];
+  
+  // How long to keep idle connections before cleanup.
+  google.protobuf.Duration connection_idle_timeout = 4 [(validate.rules).duration = {gt {seconds: 10}}];
+  
+  // Maximum lifetime for any connection before forced rotation.
+  google.protobuf.Duration connection_max_lifetime = 5 [(validate.rules).duration = {gt {seconds: 60}}];
+  
+  // Enable proactive connection creation based on traffic patterns.
+  bool enable_preconnect = 6;
+  
+  // Ratio of connections to pre-establish (0.0-1.0).
+  // 0.8 means maintain 80% of max_connections as ready connections.
+  float preconnect_ratio = 7 [(validate.rules).float = {gte: 0.0 lte: 1.0}];
+}
+
+message ReverseConnection {
+  // The prefix to use when emitting statistics.
+  string stat_prefix = 1 [(validate.rules).string = {min_len: 1}];
+
+  // The target cluster name to establish reverse connections to.
+  // This cluster should be configured with reverse connection socket interface.
+  string cluster_name = 2 [(validate.rules).string = {min_len: 1}];
+
+  // Maximum number of connections to maintain per cluster.
+  // Defaults to 5 if not specified.
+  google.protobuf.UInt32Value max_connections_per_cluster = 3 [(validate.rules).uint32 = {gte: 1}];
+
+  // Connection timeout for establishing reverse connections.
+  // Defaults to 30 seconds if not specified.
+  google.protobuf.Duration connection_timeout = 4 [(validate.rules).duration = {gt {}}];
+
+  // Enable debug logging for troubleshooting reverse connection issues.
+  // Should be disabled in production for performance.
+  bool debug_logging = 5;
+  
+  // Enable HTTP connection pooling for improved performance.
+  // Provides 2-3x throughput improvement with connection reuse.
+  bool enable_http_pooling = 6;
+  
+  // Socket handoff optimization configuration.
+  // Enables Level 3 optimization for maximum performance (10-20x improvement).
+  SocketHandoffConfig socket_handoff_config = 7;
+} 

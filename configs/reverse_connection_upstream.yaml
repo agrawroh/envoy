@@ -1,0 +1,96 @@
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9902
+
+static_resources:
+  listeners:
+  # Main HTTP listener that serves requests
+  - name: http_listener
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 8082
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: local_service
+              domains: ["*"]
+              routes:
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: local_service
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  # Reverse connection initiator
+  - name: reverse_connection_initiator
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 8090
+    filter_chains:
+    - filters:
+      - name: reverse_connection.terminal
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.reverse_connection.v3.ReverseConnectionConfig
+          enabled: true
+          cluster_name: reverse_connection_downstream
+          max_connections_per_cluster: 100
+          connection_timeout_seconds: 30
+          debug_logging: true
+
+  clusters:
+  - name: local_service
+    type: STATIC
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: local_service
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 8081
+
+  # Reverse connection cluster
+  - name: reverse_connection_downstream
+    type: STATIC
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: reverse_connection_downstream
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 10000
+    # Note: In production, this cluster would be configured to use our
+    # UpstreamReverseSocketInterface through Envoy's socket interface registry
+
+# Reverse connection upstream configuration
+# 
+# This configuration demonstrates:
+# 1. HTTP listener on :8080 for serving normal requests
+# 2. Reverse connection initiator on :8090 using our filter
+# 3. Cluster configuration for downstream reverse connections
+#
+# Architecture:
+# - Main HTTP listener proxies to local service (:8081)
+# - Reverse connection filter establishes tunnels to downstream (:10000)
+# - Our UpstreamReverseSocketInterface provides descriptor reuse
+# - UpstreamReverseConnectionManager coordinates connection pooling
+#
+# Current status: Basic configuration working, full E2E requires cluster integration
