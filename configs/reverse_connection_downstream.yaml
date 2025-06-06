@@ -1,0 +1,41 @@
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
+
+static_resources:
+  listeners:
+  - name: reverse_connection_listener
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 10000
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.reverse_connection
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.reverse_connection.v3.ReverseConnection
+          stat_prefix: reverse_connection_downstream
+          cluster_name: upstream_service
+          max_connections_per_cluster: 100
+          connection_timeout:
+            seconds: 30
+          debug_logging: true
+
+  clusters:
+  - name: upstream_service
+    type: STATIC
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: upstream_service
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 8080
+
+# Reverse connection downstream: accepts reverse connections
+# and uses our single-byte trigger mechanism to manage connection pooling

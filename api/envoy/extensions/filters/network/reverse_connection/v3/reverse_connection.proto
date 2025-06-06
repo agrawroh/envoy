@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.network.reverse_connection.v3;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/wrappers.proto";
+
+import "udpa/annotations/status.proto";
+import "udpa/annotations/versioning.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.network.reverse_connection.v3";
+option java_outer_classname = "ReverseConnectionProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/reverse_connection/v3;reverse_connectionv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: Reverse Connection]
+// Reverse Connection :ref:`configuration overview <config_network_filters_reverse_connection>`.
+// [#extension: envoy.filters.network.reverse_connection]
+
+message ReverseConnection {
+  // The prefix to use when emitting statistics.
+  string stat_prefix = 1 [(validate.rules).string = {min_len: 1}];
+
+  // The target cluster name to establish reverse connections to.
+  // This cluster should be configured with reverse connection socket interface.
+  string cluster_name = 2 [(validate.rules).string = {min_len: 1}];
+
+  // Maximum number of connections to maintain per cluster.
+  // Defaults to 5 if not specified.
+  google.protobuf.UInt32Value max_connections_per_cluster = 3 [(validate.rules).uint32 = {gte: 1}];
+
+  // Connection timeout for establishing reverse connections.
+  // Defaults to 30 seconds if not specified.
+  google.protobuf.Duration connection_timeout = 4 [(validate.rules).duration = {gt {}}];
+
+  // Enable debug logging for troubleshooting reverse connection issues.
+  // Should be disabled in production for performance.
+  bool debug_logging = 5;
+} 

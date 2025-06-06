@@ -63,6 +63,8 @@ public:
   const std::string NetworkExternalProcessor = "envoy.filters.network.ext_proc";
   // Network match delegate filter
   const std::string NetworkMatchDelegate = "envoy.filters.network.match_delegate";
+  // Reverse connection filter
+  const std::string ReverseConnection = "envoy.filters.network.reverse_connection";
 };
 
 using NetworkFilterNames = ConstSingleton<NetworkFilterNameValues>;

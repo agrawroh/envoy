@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.network.reverse_connection.v3;
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.network.reverse_connection.v3";
+option java_outer_classname = "ReverseConnectionProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/reverse_connection/v3;reverse_connectionv3";
+
+// Configuration for the reverse connection terminal filter
+message ReverseConnectionConfig {
+  // Whether to enable reverse connection mode for this filter
+  bool enabled = 1;
+
+  // Cluster name for upstream connections (for terminal filter)
+  string cluster_name = 2;
+
+  // Maximum number of reverse connections to pool per cluster
+  uint32 max_connections_per_cluster = 3;
+
+  // Connection timeout in seconds
+  uint32 connection_timeout_seconds = 4;
+
+  // Enable debug logging
+  bool debug_logging = 5;
+}
+
+// Configuration for reverse connection socket interface
+message ReverseConnectionSocketConfig {
+  // Source cluster name for this socket interface
+  string source_cluster = 1;
+
+  // Remote clusters this interface can connect to
+  repeated string remote_clusters = 2;
+
+  // Maximum file descriptors this interface can handle
+  uint32 max_file_descriptors = 3;
+
+  // Enable single-byte trigger mechanism for connection signaling
+  bool enable_trigger_pipe = 4;
+}

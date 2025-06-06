@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.listener.reverse_connection.v3;
+
+import "google/protobuf/duration.proto";
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.listener.reverse_connection.v3";
+option java_outer_classname = "ReverseConnectionProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/reverse_connection/v3;reverse_connectionv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: Reverse Connection Listener Filter]
+// Reverse connection listener filter configuration.
+
+// Configuration for reverse connection clusters
+message ReverseConnectionCluster {
+  // Name of the target cluster for reverse connections
+  string cluster_name = 1 [(validate.rules).string = {min_len: 1}];
+  
+  // Number of reverse connections to maintain for this cluster
+  uint32 reverse_connection_count = 2 [(validate.rules).uint32 = {gte: 1}];
+  
+  // Maximum retry attempts for failed connections
+  uint32 max_retry_attempts = 3 [(validate.rules).uint32 = {gte: 1}];
+  
+  // Connection timeout for establishing reverse connections
+  google.protobuf.Duration connection_timeout = 4 [(validate.rules).duration = {gte: {seconds: 1}}];
+}
+
+// Configuration for reverse connection keepalive
+message ReverseConnectionKeepalive {
+  // Interval between keepalive pings
+  google.protobuf.Duration keepalive_interval = 1 [(validate.rules).duration = {gte: {seconds: 1}}];
+  
+  // Timeout for keepalive response
+  google.protobuf.Duration keepalive_timeout = 2 [(validate.rules).duration = {gte: {seconds: 1}}];
+  
+  // Number of failed keepalives before marking connection as dead
+  uint32 max_failures = 3 [(validate.rules).uint32 = {gte: 1}];
+}
+
+// Configuration for the reverse connection listener filter
+message ReverseConnection {
+  // List of target clusters for reverse connections
+  repeated ReverseConnectionCluster clusters = 1 [(validate.rules).repeated = {min_items: 1}];
+  
+  // Keepalive configuration
+  ReverseConnectionKeepalive keepalive = 2;
+  
+  // Whether to bind to port (should be false for reverse connections)
+  bool bind_to_port = 3;
+  
+  // Connection establishment retry policy
+  google.protobuf.Duration retry_backoff_base = 4 [(validate.rules).duration = {gte: {seconds: 1}}];
+  
+  // Maximum retry backoff duration
+  google.protobuf.Duration retry_backoff_max = 5 [(validate.rules).duration = {gte: {seconds: 1}}];
+} 
