@@ -23,6 +23,7 @@
 #include "source/common/quic/envoy_quic_dispatcher.h"
 #include "source/common/quic/envoy_quic_packet_writer.h"
 #include "source/common/quic/envoy_quic_proof_source.h"
+#include "source/common/quic/envoy_quic_server_proof_verifier.h"
 #include "source/common/quic/envoy_quic_utils.h"
 #include "source/common/quic/quic_network_connection.h"
 #include "source/common/runtime/runtime_features.h"
@@ -65,12 +66,19 @@ ActiveQuicListener::ActiveQuicListener(
 
   quic::QuicRandom* const random = quic::QuicRandom::GetInstance();
   random->RandBytes(random_seed_, sizeof(random_seed_));
+
+  // Proof verifier used by QUICHE for client certificate validation when a
+  // filter chain has `require_client_certificate` set.
+  auto proof_verifier = std::make_unique<EnvoyQuicServerProofVerifier>(
+      listen_socket_, listener_config.filterChainManager(), dispatcher.timeSource());
+  server_proof_verifier_ = proof_verifier.get();
+
   crypto_config_ = std::make_unique<quic::QuicCryptoServerConfig>(
       absl::string_view(reinterpret_cast<char*>(random_seed_), sizeof(random_seed_)),
       quic::QuicRandom::GetInstance(),
       proof_source_factory.createQuicProofSource(
           listen_socket_, listener_config.filterChainManager(), stats_, dispatcher.timeSource()),
-      quic::KeyExchangeSource::Default());
+      quic::KeyExchangeSource::Default(), std::move(proof_verifier));
   auto connection_helper = std::make_unique<EnvoyQuicConnectionHelper>(dispatcher_);
   crypto_config_->AddDefaultConfig(random, connection_helper->GetClock(),
                                    quic::QuicCryptoServerConfig::ConfigOptions());
@@ -262,6 +270,7 @@ void ActiveQuicListener::updateListenerConfig(Network::ListenerConfig& config) {
   config_ = &config;
   dynamic_cast<EnvoyQuicProofSource*>(crypto_config_->proof_source())
       ->updateFilterChainManager(config.filterChainManager());
+  server_proof_verifier_->updateFilterChainManager(config.filterChainManager());
   quic_dispatcher_->updateListenerConfig(config);
 }
 

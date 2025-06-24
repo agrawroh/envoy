@@ -4,14 +4,93 @@
 
 #include "envoy/extensions/transport_sockets/quic/v3/quic_transport.pb.validate.h"
 
+#include "source/common/common/logger.h"
 #include "source/common/quic/envoy_quic_proof_verifier.h"
 #include "source/common/quic/envoy_quic_utils.h"
+#include "source/common/tls/client_context_impl.h"
 #include "source/common/tls/context_config_impl.h"
 
 #include "quiche/quic/core/crypto/quic_client_session_cache.h"
 
 namespace Envoy {
 namespace Quic {
+
+namespace {
+
+// Converts an X509 to PEM and appends it to `chain`.
+absl::Status appendCertAsPem(X509* cert, std::vector<std::string>& chain) {
+  const bssl::UniquePtr<BIO> bio(BIO_new(BIO_s_mem()));
+  if (bio == nullptr || PEM_write_bio_X509(bio.get(), cert) != 1) {
+    return absl::InvalidArgumentError("failed to PEM-encode QUIC client certificate.");
+  }
+  BUF_MEM* buf_mem = nullptr;
+  if (BIO_get_mem_ptr(bio.get(), &buf_mem) != 1) {
+    return absl::InvalidArgumentError("failed to read PEM-encoded QUIC client certificate.");
+  }
+  std::string cert_str(buf_mem->data, buf_mem->length);
+  std::istringstream pem_stream(cert_str);
+  auto pem_result = quic::ReadNextPemMessage(&pem_stream);
+  if (pem_result.status != quic::PemReadResult::Status::kOk) {
+    return absl::InvalidArgumentError("failed to parse PEM-encoded QUIC client certificate.");
+  }
+  chain.push_back(std::move(pem_result.contents));
+  return absl::OkStatus();
+}
+
+// Installs the leaf certificate, intermediate chain, and private key from
+// the first configured TLS context onto `quic_ssl_ctx` in the CRYPTO_BUFFER
+// form expected by QUICHE.
+absl::Status initializeQuicClientCertAndKey(SSL_CTX* quic_ssl_ctx,
+                                            const std::vector<Ssl::TlsContext>& tls_contexts) {
+  if (tls_contexts.empty()) {
+    return absl::OkStatus();
+  }
+  const auto& first_ctx = tls_contexts[0];
+  if (first_ctx.cert_chain_ == nullptr) {
+    return absl::OkStatus();
+  }
+
+  std::vector<std::string> chain;
+  RETURN_IF_NOT_OK(appendCertAsPem(first_ctx.cert_chain_.get(), chain));
+
+  STACK_OF(X509)* chain_stack = nullptr;
+  if (SSL_CTX_get0_chain_certs(first_ctx.ssl_ctx_.get(), &chain_stack) == 1 &&
+      chain_stack != nullptr) {
+    for (size_t i = 0; i < sk_X509_num(chain_stack); ++i) {
+      RETURN_IF_NOT_OK(appendCertAsPem(sk_X509_value(chain_stack, i), chain));
+    }
+  }
+  if (chain.empty()) {
+    return absl::OkStatus();
+  }
+
+  bssl::UniquePtr<STACK_OF(CRYPTO_BUFFER)> cert_chain_stack(sk_CRYPTO_BUFFER_new_null());
+  if (cert_chain_stack == nullptr) {
+    return absl::InvalidArgumentError("failed to allocate QUIC client certificate stack.");
+  }
+  for (const std::string& cert_data : chain) {
+    bssl::UniquePtr<CRYPTO_BUFFER> cert_buffer(CRYPTO_BUFFER_new(
+        reinterpret_cast<const uint8_t*>(cert_data.data()), cert_data.size(), nullptr));
+    if (cert_buffer == nullptr ||
+        !bssl::PushToStack(cert_chain_stack.get(), std::move(cert_buffer))) {
+      return absl::InvalidArgumentError("failed to allocate QUIC client certificate buffer.");
+    }
+  }
+
+  const size_t cert_count = sk_CRYPTO_BUFFER_num(cert_chain_stack.get());
+  std::vector<CRYPTO_BUFFER*> cert_array(cert_count);
+  for (size_t i = 0; i < cert_count; ++i) {
+    cert_array[i] = sk_CRYPTO_BUFFER_value(cert_chain_stack.get(), i);
+  }
+  if (SSL_CTX_set_chain_and_key(quic_ssl_ctx, cert_array.data(), cert_count,
+                                SSL_CTX_get0_privatekey(first_ctx.ssl_ctx_.get()),
+                                nullptr) != 1) {
+    return absl::InvalidArgumentError("failed to set QUIC client certificate chain.");
+  }
+  return absl::OkStatus();
+}
+
+} // namespace
 
 absl::StatusOr<std::unique_ptr<QuicClientTransportSocketFactory>>
 QuicClientTransportSocketFactory::create(
@@ -91,7 +170,23 @@ std::shared_ptr<quic::QuicCryptoClientConfig> QuicClientTransportSocketFactory::
         std::make_unique<Quic::EnvoyQuicProofVerifier>(std::move(context), accept_untrusted),
         std::make_unique<quic::QuicClientSessionCache>());
 
-    registerCertCompression(tls_config.crypto_config_->ssl_ctx());
+    SSL_CTX* quic_ssl_ctx = tls_config.crypto_config_->ssl_ctx();
+    registerCertCompression(quic_ssl_ctx);
+
+    // Install client certificates onto the QUIC SSL_CTX so the upstream peer
+    // can authenticate this client when mTLS is required.
+    if (clientContextConfig() && !clientContextConfig()->tlsCertificates().empty()) {
+      auto client_context_impl =
+          std::dynamic_pointer_cast<Extensions::TransportSockets::Tls::ClientContextImpl>(
+              tls_config.client_context_);
+      if (client_context_impl != nullptr) {
+        const absl::Status status =
+            initializeQuicClientCertAndKey(quic_ssl_ctx, client_context_impl->getTlsContexts());
+        if (!status.ok()) {
+          ENVOY_LOG(warn, "Failed to initialize QUIC client certificates: {}", status.message());
+        }
+      }
+    }
   }
   // Return the latest crypto config.
   return tls_config.crypto_config_;
