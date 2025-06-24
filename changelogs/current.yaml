@@ -2,6 +2,13 @@ date: Pending
 
 behavior_changes:
 # *Changes that are expected to cause an incompatibility if applicable; deployment changes are likely required*
+- area: quic
+  change: |
+    QUIC downstream listeners with ``require_client_certificate: true`` now require an explicit
+    ``validation_context.trusted_ca`` and reject ``trust_chain_verification: ACCEPT_UNTRUSTED``.
+    Configurations missing a trust anchor or set to ``ACCEPT_UNTRUSTED`` previously failed at
+    startup with ``TLS Client Authentication is not supported over QUIC`` (the entire feature
+    was rejected). They now fail with a more specific error pointing at the missing trust anchor.
 
 minor_behavior_changes:
 # *Changes that may cause incompatibilities for some users, but should not for most*
@@ -136,6 +143,17 @@ new_features:
     This enables faster reconnection across server instances by allowing clients to resume TLS sessions
     without full handshakes. The feature is disabled by default and can be enabled by setting runtime guard
     ``envoy.reloadable_features.quic_session_ticket_support`` to ``true``.
+- area: quic
+  change: |
+    Added support for client certificate authentication (mTLS) on QUIC downstream listeners. When
+    ``require_client_certificate`` is set with a configured ``validation_context.trusted_ca``, the
+    QUIC server validates the client certificate during the TLS handshake. 0-RTT is automatically
+    disabled on filter chains that require a client certificate. The feature can be disabled by
+    setting runtime guard ``envoy.reloadable_features.quic_mtls_server_enabled`` to ``false``,
+    which restores the previous "not supported" startup error for new listeners and rejects new
+    handshakes on already-loaded listeners. Listeners that route filter chains by SNI or peer
+    address must use the same trust anchor across all chains because QUICHE does not pass the
+    client's SNI to ``ProofVerifier::VerifyCertChain``.
 - area: composite
   change: |
     Added support for the
