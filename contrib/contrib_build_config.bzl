@@ -14,6 +14,7 @@ CONTRIB_EXTENSIONS = {
     "envoy.filters.http.dynamo":                                "//contrib/dynamo/filters/http/source:config",
     "envoy.filters.http.golang":                                "//contrib/golang/filters/http/source:config",
     "envoy.filters.http.language":                              "//contrib/language/filters/http/source:config_lib",
+    "envoy.filters.http.reverse_conn": "//contrib/reverse_connection/filters/http/source:config",
     "envoy.filters.http.squash":                                "//contrib/squash/filters/http/source:config",
     "envoy.filters.http.sxg":                                   "//contrib/sxg/filters/http/source:config",
 
@@ -28,6 +29,14 @@ CONTRIB_EXTENSIONS = {
     "envoy.filters.network.postgres_proxy":                     "//contrib/postgres_proxy/filters/network/source:config",
     "envoy.filters.network.rocketmq_proxy":                     "//contrib/rocketmq_proxy/filters/network/source:config",
     "envoy.filters.network.golang":                             "//contrib/golang/filters/network/source:config",
+
+    #
+    # Reverse Connection
+    #
+    "envoy.bootstrap.reverse_connection.downstream_reverse_connection_socket_interface": "//contrib/reverse_connection/bootstrap/source:downstream_reverse_socket_interface_lib",
+    "envoy.bootstrap.reverse_connection.upstream_reverse_connection_socket_interface": "//contrib/reverse_connection/bootstrap/source:upstream_reverse_socket_interface_lib",
+    "envoy.filters.listener.reverse_connection":                "//contrib/reverse_connection/filters/listener/source:config",
+    "envoy.clusters.reverse_connection": "//contrib/reverse_connection/clusters/source:reverse_connection_lib",
 
     #
     # Sip proxy
