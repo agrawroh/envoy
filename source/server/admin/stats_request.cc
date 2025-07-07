@@ -51,7 +51,7 @@ Http::Code StatsRequest::start(Http::ResponseHeaderMap& response_headers) {
 #endif
   case StatsFormat::Prometheus:
     // TODO(#16139): once Prometheus shares this algorithm here, this becomes a legitimate choice.
-    IS_ENVOY_BUG("reached Prometheus case in switch unexpectedly");
+    ENVOY_LOG(error, "Prometheus format is not supported in this context. Use /stats/prometheus endpoint instead.");
     return Http::Code::BadRequest;
   }
 

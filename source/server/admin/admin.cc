@@ -95,10 +95,16 @@ Http::HeaderValidatorFactoryPtr createHeaderValidatorFactory(
   config.mutable_typed_config()->PackFrom(uhv_config);
 
   auto* factory = Envoy::Config::Utility::getFactory<Http::HeaderValidatorFactoryConfig>(config);
-  ENVOY_BUG(factory != nullptr, "Default UHV is not linked into binary.");
+  if (factory == nullptr) {
+    ENVOY_LOG(error, "Default UHV is not linked into binary.");
+    return header_validator_factory;
+  }
 
   header_validator_factory = factory->createFromProto(config.typed_config(), context);
-  ENVOY_BUG(header_validator_factory != nullptr, "Unable to create default UHV.");
+  if (header_validator_factory == nullptr) {
+    ENVOY_LOG(error, "Unable to create default UHV.");
+    return header_validator_factory;
+  }
 #endif
   return header_validator_factory;
 }

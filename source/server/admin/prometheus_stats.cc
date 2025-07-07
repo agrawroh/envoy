@@ -393,7 +393,9 @@ uint64_t PrometheusStatsFormatter::statsAsPrometheus(
   // "Detailed" and "Disjoint" don't make sense for prometheus histogram semantics
   case Utility::HistogramBucketsMode::Detailed:
   case Utility::HistogramBucketsMode::Disjoint:
-    IS_ENVOY_BUG("unsupported prometheus histogram bucket mode");
+    ENVOY_LOG(error, "Unsupported prometheus histogram bucket mode: {}. Use 'cumulative' or 'summary' instead.", 
+              static_cast<int>(params.histogram_buckets_mode_));
+    // Skip processing histograms for unsupported modes
     break;
   }
 
