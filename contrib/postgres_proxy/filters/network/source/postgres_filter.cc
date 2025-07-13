@@ -7,6 +7,7 @@
 #include "source/common/common/assert.h"
 #include "source/extensions/filters/network/well_known_names.h"
 
+#include "contrib/postgres_inspector/postgres_inspector_metadata.h"
 #include "contrib/postgres_proxy/filters/network/source/postgres_decoder.h"
 
 namespace Envoy {
@@ -18,8 +19,27 @@ PostgresFilterConfig::PostgresFilterConfig(const PostgresFilterConfigOptions& co
                                            Stats::Scope& scope)
     : enable_sql_parsing_(config_options.enable_sql_parsing_),
       terminate_ssl_(config_options.terminate_ssl_), upstream_ssl_(config_options.upstream_ssl_),
-      downstream_ssl_(config_options.downstream_ssl_), scope_{scope},
+      downstream_ssl_(config_options.downstream_ssl_),
+      ssl_response_override_(config_options.ssl_response_override_),
+      force_upstream_renegotiation_(config_options.force_upstream_renegotiation_),
+      ssl_handshake_timeout_ms_(config_options.ssl_handshake_timeout_ms_),
+      downstream_ssl_options_(config_options.downstream_ssl_options_),
+      upstream_ssl_options_(config_options.upstream_ssl_options_), scope_{scope},
       stats_{generateStats(config_options.stats_prefix_, scope)} {}
+
+envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::SSLMode
+PostgresFilterConfig::getEffectiveDownstreamSSLMode() const {
+  // SSL mode is always determined by the base downstream_ssl field
+  // downstream_ssl_options only provides additional configuration
+  return downstream_ssl_;
+}
+
+envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::SSLMode
+PostgresFilterConfig::getEffectiveUpstreamSSLMode() const {
+  // SSL mode is always determined by the base upstream_ssl field
+  // upstream_ssl_options only provides additional configuration
+  return upstream_ssl_;
+}
 
 PostgresFilter::PostgresFilter(PostgresFilterConfigSharedPtr config) : config_{config} {
   if (!decoder_) {
@@ -32,8 +52,7 @@ PostgresFilter::PostgresFilter(PostgresFilterConfigSharedPtr config) : config_{c
 
 // Network::ReadFilter
 Network::FilterStatus PostgresFilter::onData(Buffer::Instance& data, bool) {
-  ENVOY_CONN_LOG(trace, "postgres_proxy: got {} bytes", read_callbacks_->connection(),
-                 data.length());
+  ENVOY_CONN_LOG(trace, "received {} bytes", read_callbacks_->connection(), data.length());
 
   // Frontend Buffer
   frontend_buffer_.add(data);
@@ -206,50 +225,121 @@ void PostgresFilter::processQuery(const std::string& sql) {
   }
 }
 
-bool PostgresFilter::onSSLRequest() {
-  if (config_->downstream_ssl_ ==
-          envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::DISABLE &&
-      !config_->terminate_ssl_) {
-    // Signal to the decoder to continue.
-    return true;
-  }
-  // Send single bytes 'S' to indicate switch to TLS.
-  // Refer to official documentation for protocol details:
-  // https://www.postgresql.org/docs/current/protocol-flow.html
-  Buffer::OwnedImpl buf;
-  buf.add("S");
-  // Add callback to be notified when the reply message has been
-  // transmitted.
-  read_callbacks_->connection().addBytesSentCallback([=, this](uint64_t bytes) -> bool {
-    // Wait until 'S' has been transmitted.
-    if (bytes >= 1) {
-      if (!read_callbacks_->connection().startSecureTransport()) {
-        ENVOY_CONN_LOG(
-            info, "postgres_proxy: cannot enable downstream secure transport. Check configuration.",
-            read_callbacks_->connection());
-        read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
-      } else {
-        // Unsubscribe the callback.
-        config_->stats_.sessions_terminated_ssl_.inc();
-        ENVOY_CONN_LOG(trace, "postgres_proxy: enabled SSL termination.",
-                       read_callbacks_->connection());
-        switched_to_tls_ = true;
-        // Switch to TLS has been completed.
-        // Signal to the decoder to stop processing the current message (SSLRequest).
-        // Because Envoy terminates SSL, the message was consumed and should not be
-        // passed to other filters in the chain.
-        return false;
-      }
-    }
-    return true;
-  });
-  write_callbacks_->injectWriteDataToFilterChain(buf, false);
+bool PostgresFilter::checkInspectorSSLMetadata() const {
+  // Check for typed metadata set by postgres_inspector.
+  const auto& filter_state = read_callbacks_->connection().streamInfo().filterState();
 
-  return false;
+  if (!filter_state->hasDataWithName(PostgresInspectorMetadata::filterStateKey())) {
+    ENVOY_CONN_LOG(debug, "no inspector metadata found", read_callbacks_->connection());
+    return false;
+  }
+
+  const auto* metadata = filter_state->getDataReadOnly<PostgresInspectorMetadata>(
+      PostgresInspectorMetadata::filterStateKey());
+
+  if (metadata == nullptr) {
+    ENVOY_CONN_LOG(debug, "inspector metadata not accessible", read_callbacks_->connection());
+    return false;
+  }
+
+  bool ssl_requested = metadata->sslRequested();
+  ENVOY_CONN_LOG(debug, "inspector metadata indicates SSL requested: {}",
+                 read_callbacks_->connection(), ssl_requested);
+  return ssl_requested;
 }
 
+std::string PostgresFilter::getSSLResponse() const {
+  // Check for custom SSL response in downstream config options
+  if (config_->downstream_ssl_options_.has_value() &&
+      !config_->downstream_ssl_options_->ssl_response_override().empty()) {
+    return config_->downstream_ssl_options_->ssl_response_override();
+  }
+
+  // Check for custom SSL response in basic config
+  if (!config_->ssl_response_override_.empty()) {
+    return config_->ssl_response_override_;
+  }
+
+  // Default PostgreSQL SSL support response
+  return "S";
+}
+
+bool PostgresFilter::handleSSLRequestWithMetadata() {
+  const auto effective_downstream_ssl = config_->getEffectiveDownstreamSSLMode();
+
+  // If SSL is disabled and we're not terminating SSL, pass through
+  if (effective_downstream_ssl ==
+          envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::DISABLE &&
+      !config_->terminate_ssl_) {
+
+    // Check inspector metadata
+    bool ssl_detected = checkInspectorSSLMetadata();
+    ENVOY_CONN_LOG(debug, "inspector detected SSL: {}, but downstream SSL disabled",
+                   read_callbacks_->connection(), ssl_detected);
+
+    return true; // Signal to decoder to continue
+  }
+
+  // Enhanced SSL handling with inspector metadata consideration
+  bool should_terminate_ssl = false;
+
+  // Always attempt to use inspector metadata if available
+  bool ssl_detected = checkInspectorSSLMetadata();
+
+  if (ssl_detected) {
+    should_terminate_ssl =
+        (effective_downstream_ssl ==
+             envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::REQUIRE ||
+         effective_downstream_ssl ==
+             envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::ALLOW);
+    ENVOY_CONN_LOG(info, "inspector detected SSL request, terminating: {}",
+                   read_callbacks_->connection(), should_terminate_ssl);
+  } else {
+    // If inspector metadata is not available, use original logic
+    should_terminate_ssl = true;
+    ENVOY_CONN_LOG(debug, "inspector metadata not available, using default SSL handling",
+                   read_callbacks_->connection());
+  }
+
+  if (should_terminate_ssl) {
+    // Send SSL support response
+    std::string ssl_response = getSSLResponse();
+    Buffer::OwnedImpl buf;
+    buf.add(ssl_response);
+
+    ENVOY_CONN_LOG(debug, "sending SSL response: '{}'", read_callbacks_->connection(),
+                   ssl_response);
+
+    // Add callback to be notified when the reply message has been transmitted
+    read_callbacks_->connection().addBytesSentCallback([=, this](uint64_t bytes) -> bool {
+      if (bytes >= ssl_response.length()) {
+        if (!read_callbacks_->connection().startSecureTransport()) {
+          ENVOY_CONN_LOG(info, "cannot enable downstream secure transport, check configuration",
+                         read_callbacks_->connection());
+          read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
+        } else {
+          config_->stats_.sessions_terminated_ssl_.inc();
+          ENVOY_CONN_LOG(info, "successfully enabled SSL termination",
+                         read_callbacks_->connection());
+          switched_to_tls_ = true;
+        }
+        return false; // Unsubscribe callback
+      }
+      return true;
+    });
+
+    write_callbacks_->injectWriteDataToFilterChain(buf, false);
+    return false; // Stop processing this message
+  }
+
+  return true; // Continue processing
+}
+
+bool PostgresFilter::onSSLRequest() { return handleSSLRequestWithMetadata(); }
+
 bool PostgresFilter::shouldEncryptUpstream() const {
-  return (config_->upstream_ssl_ ==
+  const auto effective_upstream_ssl = config_->getEffectiveUpstreamSSLMode();
+  return (effective_upstream_ssl ==
           envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::REQUIRE);
 }
 
@@ -259,28 +349,41 @@ void PostgresFilter::sendUpstream(Buffer::Instance& data) {
 
 bool PostgresFilter::encryptUpstream(bool upstream_agreed, Buffer::Instance& data) {
   bool encrypted = false;
+  const auto effective_upstream_ssl = config_->getEffectiveUpstreamSSLMode();
+
   RELEASE_ASSERT(
-      config_->upstream_ssl_ !=
+      effective_upstream_ssl !=
           envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::DISABLE,
       "encryptUpstream should not be called when upstream SSL is disabled.");
+
   if (!upstream_agreed) {
     ENVOY_CONN_LOG(info,
                    "postgres_proxy: upstream server rejected request to establish SSL connection. "
                    "Terminating.",
                    read_callbacks_->connection());
     read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
-
     config_->stats_.sessions_upstream_ssl_failed_.inc();
   } else {
-    // Try to switch upstream connection to use a secure channel.
+    // Check if forced renegotiation is configured
+    bool force_renegotiation = config_->force_upstream_renegotiation_;
+    if (config_->upstream_ssl_options_.has_value()) {
+      force_renegotiation = config_->upstream_ssl_options_->force_upstream_renegotiation();
+    }
+
+    ENVOY_CONN_LOG(debug,
+                   "postgres_proxy: Starting upstream SSL negotiation, force_renegotiation: {}",
+                   read_callbacks_->connection(), force_renegotiation);
+
+    // Try to switch upstream connection to use a secure channel
     if (read_callbacks_->startUpstreamSecureTransport()) {
       config_->stats_.sessions_upstream_ssl_success_.inc();
       read_callbacks_->injectReadDataToFilterChain(data, false);
       encrypted = true;
-      ENVOY_CONN_LOG(trace, "postgres_proxy: upstream SSL enabled.", read_callbacks_->connection());
+      ENVOY_CONN_LOG(info, "postgres_proxy: Successfully enabled upstream SSL",
+                     read_callbacks_->connection());
     } else {
       ENVOY_CONN_LOG(info,
-                     "postgres_proxy: cannot enable upstream secure transport. Check "
+                     "postgres_proxy: Cannot enable upstream secure transport. Check "
                      "configuration. Terminating.",
                      read_callbacks_->connection());
       read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
@@ -292,10 +395,23 @@ bool PostgresFilter::encryptUpstream(bool upstream_agreed, Buffer::Instance& dat
 }
 
 void PostgresFilter::verifyDownstreamSSL() {
-  if (config_->downstream_ssl_ ==
+  const auto effective_downstream_ssl = config_->getEffectiveDownstreamSSLMode();
+
+  if (effective_downstream_ssl ==
           envoy::extensions::filters::network::postgres_proxy::v3alpha::PostgresProxy::REQUIRE &&
       (!switched_to_tls_)) {
-    ENVOY_LOG(debug, "postgres_proxy: closing connection because downstream ssl is required but "
+
+    // Check inspector metadata
+    bool ssl_detected = checkInspectorSSLMetadata();
+    ENVOY_CONN_LOG(debug, "SSL required but not established, inspector detected SSL: {}",
+                   read_callbacks_->connection(), ssl_detected);
+
+    // If inspector detected SSL request but we haven't switched to TLS, this is an error
+    if (ssl_detected) {
+      ENVOY_LOG(warn, "SSL was requested per inspector metadata but TLS not established");
+    }
+
+    ENVOY_LOG(debug, "postgres_proxy: Closing connection because downstream SSL is required but "
                      "downstream client did not start SSL handshake.");
     closeConn();
   }

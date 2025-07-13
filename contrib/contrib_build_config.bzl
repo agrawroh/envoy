@@ -17,6 +17,13 @@ CONTRIB_EXTENSIONS = {
     "envoy.filters.http.sxg":                                   "//contrib/sxg/filters/http/source:config",
 
     #
+    # Listener filters
+    #
+
+    # PostgreSQL protocol inspector filter
+    "envoy.filters.listener.postgres_inspector":                "//contrib/postgres_inspector:config",
+
+    #
     # Network filters
     #
 
