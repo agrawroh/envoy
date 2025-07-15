@@ -99,7 +99,8 @@ class ReverseTunnelInitiator;
 
 /**
  * RCConnectionWrapper manages the lifecycle of a ClientConnectionPtr for reverse connections.
- * It handles connection callbacks, sends the handshake request, and processes the response.
+ * It handles connection callbacks, sends the HTTP handshake request, and processes the response.
+ * This class uses HTTP requests with protobuf payloads for robust handshake communication.
  */
 class RCConnectionWrapper : public Network::ConnectionCallbacks,
                             public Event::DeferredDeletable,
@@ -118,11 +119,14 @@ public:
   void onEvent(Network::ConnectionEvent event) override;
   void onAboveWriteBufferHighWatermark() override {}
   void onBelowWriteBufferLowWatermark() override {}
-  // Initiate the reverse connection handshake.
+  
+  // Initiate the reverse connection handshake using HTTP requests with protobuf payloads.
   std::string connect(const std::string& src_tenant_id, const std::string& src_cluster_id,
                       const std::string& src_node_id);
-  // Process the handshake response.
+  
+  // Handle handshake response parsing
   void onData(const std::string& error);
+  
   // Clean up on failure. Use graceful shutdown.
   void onFailure() {
     ENVOY_LOG(debug,
@@ -289,6 +293,7 @@ private:
   Network::ClientConnectionPtr connection_;
   Upstream::HostDescriptionConstSharedPtr host_;
 };
+
 void RCConnectionWrapper::onEvent(Network::ConnectionEvent event) {
   if (event == Network::ConnectionEvent::RemoteClose) {
     if (!connection_) {
@@ -313,60 +318,72 @@ std::string RCConnectionWrapper::connect(const std::string& src_tenant_id,
   ENVOY_LOG(debug, "RCConnectionWrapper: connection: {}, adding connection callbacks",
             connection_->id());
   connection_->addConnectionCallbacks(*this);
-  // Add read filter to handle response.
-  ENVOY_LOG(debug, "RCConnectionWrapper: connection: {}, adding read filter", connection_->id());
-  connection_->addReadFilter(Network::ReadFilterSharedPtr{new ConnReadFilter(this)});
   connection_->connect();
 
-  ENVOY_LOG(debug,
-            "RCConnectionWrapper: connection: {}, sending reverse connection creation "
-            "request through TCP",
-            connection_->id());
-  envoy::extensions::filters::http::reverse_conn::v3::ReverseConnHandshakeArg arg;
-  arg.set_tenant_uuid(src_tenant_id);
-  arg.set_cluster_uuid(src_cluster_id);
-  arg.set_node_uuid(src_node_id);
-  ENVOY_LOG(debug,
-            "RCConnectionWrapper: Creating protobuf with tenant='{}', cluster='{}', node='{}'",
-            src_tenant_id, src_cluster_id, src_node_id);
-  std::string body = arg.SerializeAsString();
-  ENVOY_LOG(debug, "RCConnectionWrapper: Serialized protobuf body length: {}, debug: '{}'",
-            body.length(), arg.DebugString());
-  std::string host_value;
-  const auto& remote_address = connection_->connectionInfoProvider().remoteAddress();
-  if (remote_address->type() == Network::Address::Type::EnvoyInternal) {
-    const auto& internal_address =
-        std::dynamic_pointer_cast<const Network::Address::EnvoyInternalInstance>(remote_address);
-    ENVOY_LOG(debug,
-              "RCConnectionWrapper: connection: {}, remote address is internal "
-              "listener {}, using endpoint ID in host header",
-              connection_->id(), internal_address->envoyInternalAddress()->addressId());
-    host_value = internal_address->envoyInternalAddress()->endpointId();
-  } else {
-    host_value = remote_address->asString();
-    ENVOY_LOG(debug,
-              "RCConnectionWrapper: connection: {}, remote address is external, "
-              "using address as host header",
-              connection_->id());
-  }
-  // Build HTTP request with protobuf body.
-  Buffer::OwnedImpl reverse_connection_request(
-      fmt::format("POST /reverse_connections/request HTTP/1.1\r\n"
-                  "Host: {}\r\n"
-                  "Accept: */*\r\n"
-                  "Content-length: {}\r\n"
-                  "\r\n{}",
-                  host_value, body.length(), body));
-  ENVOY_LOG(debug, "RCConnectionWrapper: connection: {}, writing request to connection: {}",
-            connection_->id(), reverse_connection_request.toString());
-  // Send reverse connection request over TCP connection.
-  connection_->write(reverse_connection_request, false);
+  ENVOY_LOG(info,
+            "RCConnectionWrapper: connection: {}, initiating HTTP handshake "
+            "for tenant='{}', cluster='{}', node='{}'",
+            connection_->id(), src_tenant_id, src_cluster_id, src_node_id);
 
-  return connection_->connectionInfoProvider().localAddress()->asString();
+  // Get the connection key for tracking
+  const std::string connection_key =
+      connection_->connectionInfoProvider().localAddress()->asString();
+
+  // Create protobuf request message using the existing message type
+  envoy::extensions::filters::http::reverse_conn::v3::ReverseConnHandshakeArg request;
+  request.set_tenant_uuid(src_tenant_id);
+  request.set_cluster_uuid(src_cluster_id);
+  request.set_node_uuid(src_node_id);
+
+  // Serialize the protobuf message
+  std::string request_body = request.SerializeAsString();
+  
+  ENVOY_LOG(debug, "Created protobuf request - tenant='{}', cluster='{}', node='{}', body_size={}",
+            src_tenant_id, src_cluster_id, src_node_id, request_body.size());
+
+  // Create HTTP request
+  std::string http_request = fmt::format(
+      "POST /reverse_connections/request HTTP/1.1\r\n"
+      "Host: {}\r\n"
+      "Content-Type: application/octet-stream\r\n"
+      "Content-Length: {}\r\n"
+      "Connection: close\r\n"
+      "\r\n"
+      "{}",
+      connection_->connectionInfoProvider().remoteAddress()->asString(),
+      request_body.size(),
+      request_body);
+
+  ENVOY_LOG(debug, "Sending HTTP handshake request (size: {} bytes)", http_request.size());
+
+  // Send the HTTP request over the TCP connection using the socket's write method
+  Buffer::OwnedImpl buffer(http_request);
+  Api::IoCallUint64Result result = connection_->getSocket()->ioHandle().write(buffer);
+
+  if (!result.ok()) {
+    ENVOY_LOG(error, "Failed to send HTTP handshake request: {}", result.err_->getErrorDetails());
+    onFailure();
+    return "";
+  }
+
+  ENVOY_LOG(debug, "Successfully sent HTTP handshake request ({} bytes written)", result.return_value_);
+
+  // Install read filter to handle the response
+  connection_->addReadFilter(std::make_shared<ConnReadFilter>(this));
+
+  return connection_key;
 }
 
 void RCConnectionWrapper::onData(const std::string& error) {
-  parent_.onConnectionDone(error, this, false);
+  if (!error.empty()) {
+    ENVOY_LOG(error, "Reverse connection handshake failed: {}", error);
+    // Notify parent of handshake failure
+    parent_.onConnectionDone(error, this, true);
+  } else {
+    ENVOY_LOG(info, "Reverse connection handshake succeeded");
+    // Notify parent of handshake success
+    parent_.onConnectionDone("", this, false);
+  }
 }
 
 ReverseConnectionIOHandle::ReverseConnectionIOHandle(os_fd_t fd,
@@ -396,12 +413,8 @@ ReverseConnectionIOHandle::~ReverseConnectionIOHandle() {
 void ReverseConnectionIOHandle::cleanup() {
   ENVOY_LOG(debug, "Starting cleanup of reverse connection resources");
 
-  // CRITICAL: Clean up trigger mechanism FIRST to prevent use-after-free
-  if (trigger_mechanism_) {
-    ENVOY_LOG(debug, "Cleaning up trigger mechanism during cleanup");
-    trigger_mechanism_.reset();
-    ENVOY_LOG(debug, "Trigger mechanism cleaned up during cleanup");
-  }
+  // CRITICAL: Clean up pipe trigger mechanism FIRST to prevent use-after-free
+  cleanupPipeTrigger();
 
   // Cancel the retry timer safely.
   if (rev_conn_retry_timer_) {
@@ -510,24 +523,23 @@ Api::SysCallIntResult ReverseConnectionIOHandle::listen(int backlog) {
             config_.remote_clusters.size());
 
   if (!listening_initiated_) {
-    // Create trigger mechanism on worker thread where TLS is available
-    if (!trigger_mechanism_) {
-      createTriggerMechanism();
-      if (!trigger_mechanism_) {
+    // Create pipe trigger mechanism on worker thread where TLS is available
+    if (!isPipeTriggerReady()) {
+      if (!initializePipeTrigger()) {
         ENVOY_LOG(error,
-                  "Failed to create trigger mechanism - cannot proceed with reverse connections");
+                  "Failed to create pipe trigger mechanism - cannot proceed with reverse connections");
         return Api::SysCallIntResult{-1, ENODEV};
       }
 
-      // CRITICAL: Replace the monitored FD with trigger mechanism's FD
+      // CRITICAL: Replace the monitored FD with pipe read FD
       // This must happen before any event registration
-      int trigger_fd = trigger_mechanism_->getMonitorFd();
+      int trigger_fd = getPipeMonitorFd();
       if (trigger_fd != -1) {
-        ENVOY_LOG(info, "Replacing monitored FD from {} to trigger FD {}", fd_, trigger_fd);
+        ENVOY_LOG(info, "Replacing monitored FD from {} to pipe read FD {}", fd_, trigger_fd);
         fd_ = trigger_fd;
       } else {
         ENVOY_LOG(warn,
-                  "Trigger mechanism does not provide a monitor FD - using original socket FD");
+                  "Pipe trigger mechanism does not provide a monitor FD - using original socket FD");
       }
     }
 
@@ -564,15 +576,15 @@ Api::SysCallIntResult ReverseConnectionIOHandle::listen(int backlog) {
 
 Envoy::Network::IoHandlePtr ReverseConnectionIOHandle::accept(struct sockaddr* addr,
                                                               socklen_t* addrlen) {
-  // Trigger mechanism is created lazily in listen() - if not ready, no connections available
-  if (!isTriggerReady()) {
-    ENVOY_LOG(debug, "ReverseConnectionIOHandle::accept() - trigger mechanism not ready");
+  // Pipe trigger mechanism is created lazily in listen() - if not ready, no connections available
+  if (!isPipeTriggerReady()) {
+    ENVOY_LOG(debug, "ReverseConnectionIOHandle::accept() - pipe trigger mechanism not ready");
     return nullptr;
   }
 
-  ENVOY_LOG(debug, "ReverseConnectionIOHandle::accept() - checking trigger mechanism");
+  ENVOY_LOG(debug, "ReverseConnectionIOHandle::accept() - checking pipe trigger mechanism");
   try {
-    if (trigger_mechanism_->wait()) {
+    if (waitForPipeTrigger()) {
       ENVOY_LOG(debug,
                 "ReverseConnectionIOHandle::accept() - received trigger, processing connection");
       // When a connection is established, a byte is written to the trigger_pipe_write_fd_ and the
@@ -690,10 +702,10 @@ Api::IoCallUint64Result ReverseConnectionIOHandle::close() {
     original_socket_fd_ = -1;
   }
 
-  // CRITICAL: If we're using trigger mechanism FD, don't let IoSocketHandleImpl close it
-  // because the trigger mechanism destructor will handle it
-  if (trigger_mechanism_ && trigger_mechanism_->getMonitorFd() == fd_) {
-    ENVOY_LOG(debug, "Skipping close of trigger FD {} - will be handled by trigger mechanism", fd_);
+  // CRITICAL: If we're using pipe trigger FD, don't let IoSocketHandleImpl close it
+  // because cleanupPipeTrigger() will handle it
+  if (isPipeTriggerReady() && getPipeMonitorFd() == fd_) {
+    ENVOY_LOG(debug, "Skipping close of pipe trigger FD {} - will be handled by cleanupPipeTrigger()", fd_);
     // Reset fd_ to prevent double-close
     fd_ = -1;
   }
@@ -708,7 +720,7 @@ void ReverseConnectionIOHandle::onEvent(Network::ConnectionEvent event) {
 }
 
 bool ReverseConnectionIOHandle::isTriggerReady() const {
-  bool ready = trigger_mechanism_ != nullptr;
+  bool ready = isPipeTriggerReady();
   ENVOY_LOG(debug, "isTriggerReady() returning: {}", ready);
   return ready;
 }
@@ -1325,38 +1337,107 @@ bool ReverseConnectionIOHandle::initiateOneReverseConnection(const std::string& 
   }
 }
 
-// Cross-platform trigger mechanism used to wake up accept() when a connection is established.
-void ReverseConnectionIOHandle::createTriggerMechanism() {
-  ENVOY_LOG(debug, "Creating cross-platform trigger mechanism");
+// Pipe trigger mechanism implementation - inlined for simplicity
+bool ReverseConnectionIOHandle::initializePipeTrigger() {
+  ENVOY_LOG(debug, "Creating pipe trigger mechanism");
 
   // Check if TLS is available before proceeding
   if (!isThreadLocalDispatcherAvailable()) {
-    ENVOY_LOG(error, "Cannot create trigger mechanism - thread-local dispatcher not available");
-    return;
+    ENVOY_LOG(error, "Cannot create pipe trigger mechanism - thread-local dispatcher not available");
+    return false;
   }
 
-  // Create the optimal trigger mechanism for the current platform
-  trigger_mechanism_ = TriggerMechanism::create();
-
-  if (!trigger_mechanism_) {
-    ENVOY_LOG(error, "Failed to create trigger mechanism");
-    return;
+  // Create pipe
+  int pipe_fds[2];
+  if (::pipe(pipe_fds) == -1) {
+    ENVOY_LOG(error, "Failed to create pipe: {}", strerror(errno));
+    return false;
   }
 
-  try {
-    // Initialize with thread-local dispatcher
-    if (!trigger_mechanism_->initialize(getThreadLocalDispatcher())) {
-      ENVOY_LOG(error, "Failed to initialize trigger mechanism");
-      trigger_mechanism_.reset();
-      return;
+  trigger_pipe_read_fd_ = pipe_fds[0];
+  trigger_pipe_write_fd_ = pipe_fds[1];
+
+  // Make both ends non-blocking for optimal performance
+  int flags = ::fcntl(trigger_pipe_read_fd_, F_GETFL, 0);
+  if (flags != -1) {
+    ::fcntl(trigger_pipe_read_fd_, F_SETFL, flags | O_NONBLOCK);
+  }
+
+  flags = ::fcntl(trigger_pipe_write_fd_, F_GETFL, 0);
+  if (flags != -1) {
+    ::fcntl(trigger_pipe_write_fd_, F_SETFL, flags | O_NONBLOCK);
+  }
+
+  ENVOY_LOG(info, "Created pipe trigger mechanism with read FD: {}, write FD: {}", 
+            trigger_pipe_read_fd_, trigger_pipe_write_fd_);
+  return true;
+}
+
+void ReverseConnectionIOHandle::cleanupPipeTrigger() {
+  ENVOY_LOG(debug, "Cleaning up pipe trigger mechanism - read FD: {}, write FD: {}", 
+            trigger_pipe_read_fd_, trigger_pipe_write_fd_);
+  
+  if (trigger_pipe_read_fd_ != -1) {
+    ::close(trigger_pipe_read_fd_);
+    trigger_pipe_read_fd_ = -1;
+  }
+  if (trigger_pipe_write_fd_ != -1) {
+    ::close(trigger_pipe_write_fd_);
+    trigger_pipe_write_fd_ = -1;
+  }
+  
+  ENVOY_LOG(debug, "Pipe trigger mechanism cleanup complete");
+}
+
+bool ReverseConnectionIOHandle::triggerPipe() {
+  if (trigger_pipe_write_fd_ == -1) {
+    ENVOY_LOG(error, "pipe not initialized");
+    return false;
+  }
+
+  // Write single byte to pipe to trigger it
+  char trigger_byte = 1;
+  ssize_t result = ::write(trigger_pipe_write_fd_, &trigger_byte, 1);
+  if (result != 1) {
+    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+      ENVOY_LOG(error, "Failed to write to pipe: {}", strerror(errno));
+      return false;
     }
-
-    ENVOY_LOG(info, "Created trigger mechanism: {} with monitor FD: {}",
-              trigger_mechanism_->getType(), trigger_mechanism_->getMonitorFd());
-  } catch (const std::exception& e) {
-    ENVOY_LOG(error, "Exception creating trigger mechanism: {}", e.what());
-    trigger_mechanism_.reset();
+    // EAGAIN means pipe buffer is full, which is fine for trigger purposes
+    ENVOY_LOG(debug, "Pipe buffer full but trigger still effective");
   }
+
+  ENVOY_LOG(debug, "Successfully triggered pipe - wrote {} byte(s)", result > 0 ? result : 0);
+  return true;
+}
+
+bool ReverseConnectionIOHandle::waitForPipeTrigger() {
+  if (trigger_pipe_read_fd_ == -1) {
+    ENVOY_LOG(debug, "pipe wait called but read FD not initialized");
+    return false;
+  }
+
+  // Read from pipe to check if triggered - this also clears the trigger
+  char buffer[64]; // Read multiple bytes if available
+  ssize_t result = ::read(trigger_pipe_read_fd_, buffer, sizeof(buffer));
+  if (result > 0) {
+    ENVOY_LOG(debug, "pipe triggered - read {} bytes", result);
+    return true;
+  }
+
+  if (result == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+    ENVOY_LOG(error, "Failed to read from pipe: {}", strerror(errno));
+  }
+
+  return false;
+}
+
+bool ReverseConnectionIOHandle::isPipeTriggerReady() const {
+  return trigger_pipe_read_fd_ != -1 && trigger_pipe_write_fd_ != -1;
+}
+
+int ReverseConnectionIOHandle::getPipeMonitorFd() const {
+  return trigger_pipe_read_fd_;
 }
 
 void ReverseConnectionIOHandle::onConnectionDone(const std::string& error,
@@ -1473,11 +1554,11 @@ void ReverseConnectionIOHandle::onConnectionDone(const std::string& error,
                   "Triggering accept mechanism for reverse connection from host {} of cluster {}",
                   host_address, cluster_name);
         try {
-          if (trigger_mechanism_->trigger()) {
+          if (triggerPipe()) {
             ENVOY_LOG(info,
                       "Successfully triggered accept() for reverse connection from host {} "
-                      "of cluster {} - trigger FD: {}",
-                      host_address, cluster_name, trigger_mechanism_->getMonitorFd());
+                      "of cluster {} - pipe read FD: {}",
+                      host_address, cluster_name, getPipeMonitorFd());
           } else {
             ENVOY_LOG(error, "Failed to trigger accept mechanism for host {} of cluster {}",
                       host_address, cluster_name);

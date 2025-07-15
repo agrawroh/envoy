@@ -39,7 +39,7 @@ class BackendHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(json.dumps(response, indent=2).encode())
 
 if __name__ == "__main__":
-    PORT = 7070
+    PORT = 8081
     with socketserver.TCPServer(("", PORT), BackendHandler) as httpd:
         print(f"Backend service running on port {PORT}")
         print(f"Visit http://localhost:{PORT}/on_prem_service to test")

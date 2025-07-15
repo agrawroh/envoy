@@ -32,29 +32,24 @@ envoy_cc_extension(
     ],
 )
 
-envoy_cc_extension(
-    name = "trigger_mechanism_lib",
-    srcs = ["trigger_mechanism.cc"],
-    hdrs = ["trigger_mechanism.h"],
-    visibility = ["//visibility:public"],
-    deps = [
-        "//envoy/event:dispatcher_interface",
-        "//envoy/event:file_event_interface",
-        "//source/common/common:assert_lib",
-        "//source/common/common:logger_lib",
-    ],
-)
+
 
 envoy_cc_extension(
     name = "reverse_tunnel_initiator_lib",
-    srcs = ["reverse_tunnel_initiator.cc"],
-    hdrs = ["reverse_tunnel_initiator.h"],
+    srcs = [
+        "reverse_tunnel_initiator.cc",
+        "grpc_reverse_tunnel_client.cc",
+    ],
+    hdrs = [
+        "reverse_tunnel_initiator.h",
+        "grpc_reverse_tunnel_client.h",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         ":reverse_connection_address_lib",
         ":reverse_connection_resolver_lib",
-        ":trigger_mechanism_lib",
         "//envoy/api:io_error_interface",
+        "//envoy/grpc:async_client_interface",
         "//envoy/network:address_interface",
         "//envoy/network:io_handle_interface",
         "//envoy/network:socket_interface",
@@ -62,9 +57,11 @@ envoy_cc_extension(
         "//envoy/server:bootstrap_extension_config_interface",
         "//envoy/stats:stats_interface",
         "//envoy/stats:stats_macros",
+        "//envoy/tracing:trace_driver_interface",
         "//envoy/upstream:cluster_manager_interface",
         "//source/common/buffer:buffer_lib",
         "//source/common/common:logger_lib",
+        "//source/common/grpc:typed_async_client_lib",
         "//source/common/http:headers_lib",
         "//source/common/network:address_lib",
         "//source/common/network:default_socket_interface_lib",
@@ -74,6 +71,7 @@ envoy_cc_extension(
         "//source/common/upstream:load_balancer_context_base_lib",
         "@envoy_api//envoy/extensions/bootstrap/reverse_connection_socket_interface/v3:pkg_cc_proto",
         "@envoy_api//envoy/extensions/filters/http/reverse_conn/v3:pkg_cc_proto",
+        "@envoy_api//envoy/service/reverse_tunnel/v3:pkg_cc_proto",
     ],
     alwayslink = 1,
 )

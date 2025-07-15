@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package envoy.extensions.bootstrap.reverse_connection_socket_interface.v3;
 
+import "envoy/service/reverse_tunnel/v3/reverse_tunnel_handshake.proto";
+
 import "udpa/annotations/status.proto";
 import "validate/validate.proto";
 
@@ -16,7 +18,19 @@ option (udpa.annotations.file_status).work_in_progress = true;
 // [#extension: envoy.bootstrap.reverse_connection.upstream_reverse_connection_socket_interface]
 
 // Configuration for the upstream reverse connection socket interface.
+// This interface accepts reverse connections from downstream Envoys and provides
+// them as socket connections for upstream requests.
 message UpstreamReverseConnectionSocketInterface {
   // Stat prefix to be used for upstream reverse connection socket interface stats.
   string stat_prefix = 1;
+  
+  // Optional: gRPC service configuration for reverse tunnel handshake.
+  // When specified, the acceptor will expose a gRPC service for tunnel establishment
+  // instead of relying on HTTP-based handshake protocols.
+  envoy.service.reverse_tunnel.v3.ReverseTunnelGrpcConfig grpc_service_config = 2;
+  
+  // Optional: Legacy HTTP-based handshake support.
+  // When grpc_service_config is not specified, the acceptor will fall back to
+  // HTTP-based handshake processing for backward compatibility.
+  bool enable_legacy_http_handshake = 3;
 } 

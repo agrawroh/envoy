@@ -27,7 +27,6 @@
 #include "source/common/network/io_socket_handle_impl.h"
 #include "source/common/network/socket_interface.h"
 #include "source/common/upstream/load_balancer_context_base.h"
-#include "source/extensions/bootstrap/reverse_tunnel/trigger_mechanism.h"
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
@@ -291,6 +290,12 @@ public:
   void onDownstreamConnectionClosed(const std::string& connection_key);
 
   /**
+   * Get reference to the cluster manager.
+   * @return reference to the cluster manager
+   */
+  Upstream::ClusterManager& getClusterManager() { return cluster_manager_; }
+
+  /**
    * Increment the gauge for a specific connection state.
    * @param cluster_stats pointer to cluster-level stats
    * @param host_stats pointer to host-level stats
@@ -360,6 +365,42 @@ private:
    */
   void cleanup();
 
+  // Pipe trigger mechanism helpers
+  /**
+   * Initialize the pipe trigger mechanism for waking up accept().
+   * @return true if successful, false otherwise
+   */
+  bool initializePipeTrigger();
+
+  /**
+   * Clean up pipe trigger mechanism resources.
+   */
+  void cleanupPipeTrigger();
+
+  /**
+   * Trigger the pipe to wake up accept().
+   * @return true if successful, false otherwise
+   */
+  bool triggerPipe();
+
+  /**
+   * Check if pipe was triggered (non-blocking) and consume trigger data.
+   * @return true if triggered, false if no trigger pending
+   */
+  bool waitForPipeTrigger();
+
+  /**
+   * Check if pipe trigger mechanism is ready for use.
+   * @return true if initialized and ready
+   */
+  bool isPipeTriggerReady() const;
+
+  /**
+   * Get the pipe read file descriptor for event loop monitoring.
+   * @return file descriptor, or -1 if not initialized
+   */
+  int getPipeMonitorFd() const;
+
   // Host/cluster mapping management
   /**
    * Update cluster -> host mappings from the cluster manager. Called before connection initiation
@@ -410,12 +451,10 @@ private:
   // Mapping from wrapper to host. This designates the number of successful connections to a host.
   std::unordered_map<RCConnectionWrapper*, std::string> conn_wrapper_to_host_map_;
 
-  // Cross-platform trigger mechanism to wake up accept() when a connection is established.
-  // This replaces the legacy pipe-based approach with optimal implementations for each platform:
-  // - macOS: kqueue EVFILT_USER (no file descriptor overhead)
-  // - Linux: eventfd (single FD, 64-bit counter)
-  // - Other Unix: pipe (fallback for compatibility)
-  std::unique_ptr<TriggerMechanism> trigger_mechanism_;
+  // Simple pipe-based trigger mechanism to wake up accept() when a connection is established.
+  // Inlined directly for simplicity and reduced test coverage requirements.
+  int trigger_pipe_read_fd_{-1};
+  int trigger_pipe_write_fd_{-1};
 
   // Connection management : We store the established connections in a queue
   // and pop the last established connection when data is read on trigger_pipe_read_fd_
