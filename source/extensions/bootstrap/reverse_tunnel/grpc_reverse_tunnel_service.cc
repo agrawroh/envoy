@@ -21,7 +21,7 @@ namespace ReverseConnection {
 
 GrpcReverseTunnelService::GrpcReverseTunnelService(ReverseTunnelAcceptorExtension& acceptor_extension)
     : acceptor_extension_(acceptor_extension) {
-  ENVOY_LOG(info, "Created gRPC reverse tunnel handshake service");
+  ENVOY_LOG(info, "Created gRPC reverse tunnel handshake service.");
 }
 
 grpc::Status GrpcReverseTunnelService::EstablishTunnel(
@@ -37,7 +37,7 @@ grpc::Status GrpcReverseTunnelService::EstablishTunnel(
 
   // Validate the request
   if (!validateTunnelRequest(*request)) {
-    ENVOY_LOG(error, "Invalid tunnel establishment request");
+    ENVOY_LOG(error, "Invalid tunnel establishment request.");
     stats_.failed_handshakes++;
     
     response->set_status(envoy::service::reverse_tunnel::v3::REJECTED);
@@ -96,7 +96,7 @@ bool GrpcReverseTunnelService::validateTunnelRequest(
 
   // Validate required initiator identity
   if (!request.has_initiator()) {
-    ENVOY_LOG(error, "Tunnel request missing initiator identity");
+    ENVOY_LOG(error, "Tunnel request missing initiator identity.");
     return false;
   }
 
@@ -106,7 +106,7 @@ bool GrpcReverseTunnelService::validateTunnelRequest(
   if (initiator.tenant_id().empty() || initiator.cluster_id().empty() || 
       initiator.node_id().empty()) {
     ENVOY_LOG(error, "Tunnel request has empty required identity fields: tenant='{}', "
-                     "cluster='{}', node='{}'",
+                     "cluster='{}', node='{}'.",
               initiator.tenant_id(), initiator.cluster_id(), initiator.node_id());
     return false;
   }
@@ -114,7 +114,7 @@ bool GrpcReverseTunnelService::validateTunnelRequest(
   // Validate identity field lengths
   if (initiator.tenant_id().length() > 128 || initiator.cluster_id().length() > 128 ||
       initiator.node_id().length() > 128) {
-    ENVOY_LOG(error, "Tunnel request has identity fields exceeding maximum length");
+    ENVOY_LOG(error, "Tunnel request has identity fields exceeding maximum length.");
     return false;
   }
 
@@ -139,7 +139,7 @@ bool GrpcReverseTunnelService::validateTunnelRequest(
     }
   }
 
-  ENVOY_LOG(debug, "Tunnel request validation successful");
+  ENVOY_LOG(debug, "Tunnel request validation successful.");
   return true;
 }
 
@@ -153,7 +153,7 @@ GrpcReverseTunnelService::processTunnelRequest(
   // Extract the underlying TCP connection
   Network::Connection* tcp_connection = extractTcpConnection(context);
   if (!tcp_connection) {
-    ENVOY_LOG(error, "Failed to extract TCP connection from gRPC context");
+    ENVOY_LOG(error, "Failed to extract TCP connection from gRPC context.");
     response.set_status(envoy::service::reverse_tunnel::v3::INTERNAL_ERROR);
     response.set_status_message("Failed to access underlying TCP connection");
     return response;
@@ -161,7 +161,7 @@ GrpcReverseTunnelService::processTunnelRequest(
 
   // Register the tunnel connection with the acceptor
   if (!registerTunnelConnection(tcp_connection, request)) {
-    ENVOY_LOG(error, "Failed to register tunnel connection with acceptor");
+    ENVOY_LOG(error, "Failed to register tunnel connection with acceptor.");
     response.set_status(envoy::service::reverse_tunnel::v3::INTERNAL_ERROR);
     response.set_status_message("Failed to register tunnel connection");
     return response;
@@ -274,7 +274,7 @@ GrpcReverseTunnelService::authenticateRequest(
   // Check for token-based authentication
   if (request.has_auth() && !request.auth().auth_token().empty()) {
     // In a real implementation, validate the auth token
-    ENVOY_LOG(debug, "Token-based authentication attempted");
+    ENVOY_LOG(debug, "Token-based authentication attempted.");
     // For demo purposes, accept any non-empty token
     return {true, envoy::service::reverse_tunnel::v3::ACCEPTED, ""};
   }
@@ -336,7 +336,7 @@ Network::Connection* GrpcReverseTunnelService::extractTcpConnection(grpc::Server
   // we would need to access the underlying Envoy connection through the gRPC context
   // For now, we'll return nullptr and handle this in the integration layer
   
-  ENVOY_LOG(debug, "Extracting TCP connection from gRPC context (simplified implementation)");
+  ENVOY_LOG(debug, "Extracting TCP connection from gRPC context (simplified implementation).");
   
   // TODO: Implement proper Envoy-specific connection extraction
   // This would involve accessing Envoy's gRPC server implementation details
@@ -350,7 +350,7 @@ bool GrpcReverseTunnelService::registerTunnelConnection(
     const envoy::service::reverse_tunnel::v3::EstablishTunnelRequest& request) {
 
   if (!connection) {
-    ENVOY_LOG(error, "Cannot register null connection");
+    ENVOY_LOG(error, "Cannot register null connection.");
     return false;
   }
 
@@ -366,7 +366,7 @@ bool GrpcReverseTunnelService::registerTunnelConnection(
     // Get the thread-local socket manager from the acceptor extension
     auto* local_registry = acceptor_extension_.getLocalRegistry();
     if (!local_registry || !local_registry->socketManager()) {
-      ENVOY_LOG(error, "Failed to get socket manager from acceptor extension");
+      ENVOY_LOG(error, "Failed to get socket manager from acceptor extension.");
       return false;
     }
 
@@ -400,14 +400,14 @@ bool GrpcReverseTunnelService::registerTunnelConnection(
 std::unique_ptr<GrpcReverseTunnelService> 
 GrpcReverseTunnelServiceFactory::createService(ReverseTunnelAcceptorExtension& acceptor_extension) {
   
-  ENVOY_LOG(info, "Creating gRPC reverse tunnel service");
+  ENVOY_LOG(info, "Creating gRPC reverse tunnel service.");
   return std::make_unique<GrpcReverseTunnelService>(acceptor_extension);
 }
 
 bool GrpcReverseTunnelServiceFactory::registerService(grpc::Server& grpc_server,
                                                       std::unique_ptr<GrpcReverseTunnelService> service) {
   
-  ENVOY_LOG(info, "Registering gRPC reverse tunnel service with server");
+  ENVOY_LOG(info, "Registering gRPC reverse tunnel service with server.");
   
   // Register the service with the gRPC server
   grpc_server.RegisterService(service.get());
@@ -415,7 +415,7 @@ bool GrpcReverseTunnelServiceFactory::registerService(grpc::Server& grpc_server,
   // Note: In a real implementation, we'd need to manage the service lifetime properly
   // This is a simplified version for demonstration purposes
   
-  ENVOY_LOG(info, "Successfully registered gRPC reverse tunnel service");
+  ENVOY_LOG(info, "Successfully registered gRPC reverse tunnel service.");
   return true;
 }
 

@@ -120,7 +120,7 @@ ReverseTunnelAcceptor::socket(Envoy::Network::Socket::Type socket_type,
     }
   }
 
-  ENVOY_LOG(debug, "No available reverse connection, falling back to standard socket");
+  ENVOY_LOG(debug, "No available reverse connection, falling back to standard socket.");
   return Network::socketInterface(
              "envoy.extensions.network.socket_interface.default_socket_interface")
       ->socket(socket_type, addr, options);
@@ -142,7 +142,7 @@ UpstreamSocketThreadLocal* ReverseTunnelAcceptor::getLocalRegistry() const {
 // BootstrapExtensionFactory
 Server::BootstrapExtensionPtr ReverseTunnelAcceptor::createBootstrapExtension(
     const Protobuf::Message& config, Server::Configuration::ServerFactoryContext& context) {
-  ENVOY_LOG(debug, "ReverseTunnelAcceptor::createBootstrapExtension()");
+  ENVOY_LOG(debug, "ReverseTunnelAcceptor::createBootstrapExtension().");
   // Cast the config to the proper type
   const auto& message = MessageUtil::downcastAndValidate<
       const envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::
@@ -182,9 +182,9 @@ void ReverseTunnelAcceptorExtension::onServerInitialized() {
 
 // Get thread local registry for the current thread
 UpstreamSocketThreadLocal* ReverseTunnelAcceptorExtension::getLocalRegistry() const {
-  ENVOY_LOG(debug, "ReverseTunnelAcceptorExtension::getLocalRegistry()");
+  ENVOY_LOG(debug, "ReverseTunnelAcceptorExtension::getLocalRegistry().");
   if (!tls_slot_) {
-    ENVOY_LOG(debug, "ReverseTunnelAcceptorExtension::getLocalRegistry() - no thread local slot");
+    ENVOY_LOG(debug, "ReverseTunnelAcceptorExtension::getLocalRegistry() - no thread local slot.");
     return nullptr;
   }
 
@@ -200,19 +200,19 @@ ReverseTunnelAcceptorExtension::getAggregatedConnectionStats() {
   absl::flat_hash_map<std::string, size_t> aggregated_stats;
 
   if (!tls_slot_) {
-    ENVOY_LOG(debug, "No TLS slot available for connection stats aggregation");
+    ENVOY_LOG(debug, "No TLS slot available for connection stats aggregation.");
     return aggregated_stats;
   }
 
   // Get stats from current thread only - cross-thread aggregation in HTTP handler causes deadlock
-  if (auto opt = tls_slot_->get(); opt.has_value() && opt->socketManager()) {
-    auto thread_stats = opt->socketManager()->getConnectionStats();
+  if (auto opt = tls_slot_->get(); opt.has_value() && opt.value().get().socketManager()) {
+    auto thread_stats = opt.value().get().socketManager()->getConnectionStats();
     for (const auto& stat : thread_stats) {
       aggregated_stats[stat.first] = stat.second;
     }
-    ENVOY_LOG(debug, "Got connection stats from current thread: {} nodes", aggregated_stats.size());
+    ENVOY_LOG(debug, "Got connection stats from current thread: {} nodes.", aggregated_stats.size());
   } else {
-    ENVOY_LOG(debug, "No socket manager available on current thread");
+    ENVOY_LOG(debug, "No socket manager available on current thread.");
   }
 
   return aggregated_stats;
@@ -223,19 +223,19 @@ ReverseTunnelAcceptorExtension::getAggregatedSocketCountMap() {
   absl::flat_hash_map<std::string, size_t> aggregated_stats;
 
   if (!tls_slot_) {
-    ENVOY_LOG(debug, "No TLS slot available for socket count aggregation");
+    ENVOY_LOG(debug, "No TLS slot available for socket count aggregation.");
     return aggregated_stats;
   }
 
   // Get stats from current thread only - cross-thread aggregation in HTTP handler causes deadlock
-  if (auto opt = tls_slot_->get(); opt.has_value() && opt->socketManager()) {
-    auto thread_stats = opt->socketManager()->getSocketCountMap();
+  if (auto opt = tls_slot_->get(); opt.has_value() && opt.value().get().socketManager()) {
+    auto thread_stats = opt.value().get().socketManager()->getSocketCountMap();
     for (const auto& stat : thread_stats) {
       aggregated_stats[stat.first] = stat.second;
     }
-    ENVOY_LOG(debug, "Got socket count from current thread: {} clusters", aggregated_stats.size());
+    ENVOY_LOG(debug, "Got socket count from current thread: {} clusters.", aggregated_stats.size());
   } else {
-    ENVOY_LOG(debug, "No socket manager available on current thread");
+    ENVOY_LOG(debug, "No socket manager available on current thread.");
   }
 
   return aggregated_stats;
@@ -247,7 +247,7 @@ void ReverseTunnelAcceptorExtension::getMultiTenantConnectionStats(
         callback) {
 
   if (!tls_slot_) {
-    ENVOY_LOG(warn, "No TLS slot available for multi-tenant connection aggregation");
+    ENVOY_LOG(warn, "No TLS slot available for multi-tenant connection aggregation.");
     callback({}, {});
     return;
   }
@@ -263,9 +263,9 @@ void ReverseTunnelAcceptorExtension::getMultiTenantConnectionStats(
         std::vector<std::string> thread_connected;
         std::vector<std::string> thread_accepted;
 
-        if (tls_instance.has_value() && tls_instance->socketManager()) {
+        if (tls_instance.has_value() && tls_instance.value().get().socketManager()) {
           // Collect connection stats from this thread
-          auto connection_stats = tls_instance->socketManager()->getConnectionStats();
+          auto connection_stats = tls_instance.value().get().socketManager()->getConnectionStats();
           for (const auto& [node_id, count] : connection_stats) {
             if (count > 0) {
               thread_connected.push_back(node_id);
@@ -274,7 +274,7 @@ void ReverseTunnelAcceptorExtension::getMultiTenantConnectionStats(
           }
 
           // Collect accepted connections from this thread
-          auto socket_count_map = tls_instance->socketManager()->getSocketCountMap();
+          auto socket_count_map = tls_instance.value().get().socketManager()->getSocketCountMap();
           for (const auto& [cluster_id, count] : socket_count_map) {
             if (count > 0) {
               thread_accepted.push_back(cluster_id);
@@ -331,7 +331,7 @@ void ReverseTunnelAcceptorExtension::getMultiTenantConnectionStats(
 std::pair<std::vector<std::string>, std::vector<std::string>>
 ReverseTunnelAcceptorExtension::getConnectionStatsSync(std::chrono::milliseconds /* timeout_ms */) {
 
-  ENVOY_LOG(debug, "getConnectionStatsSync: using stats-based approach for production reliability");
+  ENVOY_LOG(debug, "getConnectionStatsSync: using stats-based approach for production reliability.");
 
   // Use Envoy's stats system for reliable cross-thread aggregation
   auto connection_stats = getMultiTenantConnectionStatsViaStats();
@@ -431,7 +431,7 @@ UpstreamSocketManager::UpstreamSocketManager(Event::Dispatcher& dispatcher, Stat
                                              ReverseTunnelAcceptorExtension* extension)
     : dispatcher_(dispatcher), random_generator_(std::make_unique<Random::RandomGeneratorImpl>()),
       usm_scope_(scope.createScope("upstream_socket_manager.")), extension_(extension) {
-  ENVOY_LOG(debug, "UpstreamSocketManager: creating UpstreamSocketManager with stats integration");
+  ENVOY_LOG(debug, "UpstreamSocketManager: creating UpstreamSocketManager with stats integration.");
   ping_timer_ = dispatcher_.createTimer([this]() { pingConnections(); });
 }
 
@@ -630,7 +630,7 @@ bool UpstreamSocketManager::deleteStatsByCluster(const std::string& cluster_id) 
   return true;
 }
 
-absl::flat_hash_map<std::string, size_t> UpstreamSocketManager::getConnectionStats() {
+absl::flat_hash_map<std::string, size_t> UpstreamSocketManager::getConnectionStats() const {
   absl::flat_hash_map<std::string, size_t> node_stats;
   for (const auto& node_entry : accepted_reverse_connections_) {
     const std::string& node_id = node_entry.first;
@@ -644,7 +644,7 @@ absl::flat_hash_map<std::string, size_t> UpstreamSocketManager::getConnectionSta
   return node_stats;
 }
 
-absl::flat_hash_map<std::string, size_t> UpstreamSocketManager::getSocketCountMap() {
+absl::flat_hash_map<std::string, size_t> UpstreamSocketManager::getSocketCountMap() const {
   absl::flat_hash_map<std::string, size_t> cluster_stats;
   for (const auto& cluster_entry : cluster_to_node_map_) {
     const std::string& cluster_id = cluster_entry.first;
@@ -810,7 +810,7 @@ void UpstreamSocketManager::onPingResponse(Network::IoHandle& io_handle) {
 
   Buffer::OwnedImpl buffer;
   const auto ping_size = ::Envoy::ReverseConnection::ReverseConnectionUtility::PING_MESSAGE.size();
-  Api::IoCallUint64Result result = io_handle.read(buffer, absl::make_optional(ping_size));
+  Api::IoCallUint64Result result = io_handle.read(buffer, std::make_optional(ping_size));
   if (!result.ok()) {
     ENVOY_LOG(debug, "UpstreamSocketManager: Read error on FD: {}: error - {}", fd,
               result.err_->getErrorDetails());
@@ -876,7 +876,7 @@ void UpstreamSocketManager::pingConnections(const std::string& node_id) {
 }
 
 void UpstreamSocketManager::pingConnections() {
-  ENVOY_LOG(trace, "UpstreamSocketManager: Pinging connections");
+  ENVOY_LOG(trace, "UpstreamSocketManager: Pinging connections.");
   for (auto& itr : accepted_reverse_connections_) {
     pingConnections(itr.first);
   }
@@ -912,11 +912,11 @@ USMStats* UpstreamSocketManager::getStatsByCluster(const std::string& cluster_id
 }
 
 UpstreamSocketManager::~UpstreamSocketManager() {
-  ENVOY_LOG(debug, "UpstreamSocketManager destructor called");
+  ENVOY_LOG(debug, "UpstreamSocketManager destructor called.");
 
   // Clean up all active file events and timers first
   for (auto& [fd, event] : fd_to_event_map_) {
-    ENVOY_LOG(debug, "UpstreamSocketManager: cleaning up file event for FD: {}", fd);
+    ENVOY_LOG(debug, "UpstreamSocketManager: cleaning up file event for FD: {}.", fd);
     event.reset(); // This will cancel the file event
   }
   fd_to_event_map_.clear();

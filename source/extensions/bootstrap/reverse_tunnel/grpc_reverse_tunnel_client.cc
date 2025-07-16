@@ -34,7 +34,7 @@ GrpcReverseTunnelClient::GrpcReverseTunnelClient(
   
   // Create gRPC client immediately
   if (!createGrpcClient()) {
-    ENVOY_LOG(error, "Failed to create gRPC client for reverse tunnel handshake");
+    ENVOY_LOG(error, "Failed to create gRPC client for reverse tunnel handshake.");
     throw EnvoyException("Failed to create gRPC client for reverse tunnel handshake");
   }
 }
@@ -48,7 +48,7 @@ bool GrpcReverseTunnelClient::createGrpcClient() {
   try {
     // Verify cluster exists in cluster manager
     if (!config_.has_grpc_service() || !config_.grpc_service().has_envoy_grpc()) {
-      ENVOY_LOG(error, "Invalid gRPC service configuration - missing envoy_grpc configuration");
+      ENVOY_LOG(error, "Invalid gRPC service configuration - missing envoy_grpc configuration.");
       return false;
     }
 
@@ -96,7 +96,7 @@ bool GrpcReverseTunnelClient::initiateHandshake(
     const absl::optional<google::protobuf::Struct>& metadata, Tracing::Span& span) {
 
   if (current_request_) {
-    ENVOY_LOG(warn, "Handshake already in progress - cancelling previous request");
+    ENVOY_LOG(warn, "Handshake already in progress - cancelling previous request.");
     cancel();
   }
 
@@ -122,7 +122,7 @@ bool GrpcReverseTunnelClient::initiateHandshake(
     current_request_ = client_->send(*service_method_, request, *this, span, options);
 
     if (!current_request_) {
-      ENVOY_LOG(error, "Failed to send gRPC handshake request");
+      ENVOY_LOG(error, "Failed to send gRPC handshake request.");
       callbacks_.onHandshakeFailure(Grpc::Status::WellKnownGrpcStatus::Internal,
                                     "Failed to send gRPC request");
       return false;
@@ -153,7 +153,7 @@ void GrpcReverseTunnelClient::onCreateInitialMetadata(Http::RequestHeaderMap& me
   metadata.addCopy(Http::LowerCaseString("x-handshake-version"), "grpc-v1");
   metadata.addCopy(Http::LowerCaseString("x-reverse-tunnel-handshake"), "true");
   
-  ENVOY_LOG(debug, "Added initial metadata for gRPC handshake request");
+  ENVOY_LOG(debug, "Added initial metadata for gRPC handshake request.");
 }
 
 envoy::service::reverse_tunnel::v3::EstablishTunnelRequest
