@@ -139,60 +139,41 @@ UpstreamSocketThreadLocal* ReverseTunnelAcceptor::getLocalRegistry() const {
   return nullptr;
 }
 
-// BootstrapExtensionFactory
-Server::BootstrapExtensionPtr ReverseTunnelAcceptor::createBootstrapExtension(
-    const Protobuf::Message& config, Server::Configuration::ServerFactoryContext& context) {
-  ENVOY_LOG(debug, "ReverseTunnelAcceptor::createBootstrapExtension().");
-  // Cast the config to the proper type
-  const auto& message = MessageUtil::downcastAndValidate<
-      const envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::
-          UpstreamReverseConnectionSocketInterface&>(config, context.messageValidationVisitor());
-
-  // Set the context for this socket interface instance
-  context_ = &context;
-
-  // Return a SocketInterfaceExtension that wraps this socket interface
-  // The onServerInitialized() will be called automatically by the BootstrapExtension lifecycle
-  return std::make_unique<ReverseTunnelAcceptorExtension>(*this, context, message);
-}
-
-ProtobufTypes::MessagePtr ReverseTunnelAcceptor::createEmptyConfigProto() {
-  return std::make_unique<envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::
-                              UpstreamReverseConnectionSocketInterface>();
-}
+// Factory implementation moved to ReverseTunnelAcceptorFactory class
 
 // ReverseTunnelAcceptorExtension implementation
 void ReverseTunnelAcceptorExtension::onServerInitialized() {
   ENVOY_LOG(debug,
-            "ReverseTunnelAcceptorExtension::onServerInitialized - creating thread local slot");
+            "ReverseTunnelAcceptorExtension::onServerInitialized - creating thread local slot with enhanced safety");
 
   // Set the extension reference in the socket interface
   if (socket_interface_) {
     socket_interface_->extension_ = this;
   }
 
-  // Create thread local slot to store dispatcher and socket manager for each worker thread
-  tls_slot_ = ThreadLocal::TypedSlot<UpstreamSocketThreadLocal>::makeUnique(context_.threadLocal());
+  // Create thread local slot using the enhanced factory utilities for better error handling
+  tls_slot_ = ReverseConnectionFactoryUtils::createThreadLocalSlot<UpstreamSocketThreadLocal>(
+      context_.threadLocal(), "ReverseTunnelAcceptorExtension");
+
+  if (!tls_slot_) {
+    ENVOY_LOG(error, "Failed to create thread-local slot for ReverseTunnelAcceptorExtension");
+    return;
+  }
 
   // Set up the thread local dispatcher and socket manager for each worker thread
   tls_slot_->set([this](Event::Dispatcher& dispatcher) {
     return std::make_shared<UpstreamSocketThreadLocal>(dispatcher, context_.scope(), this);
   });
+  
+  ENVOY_LOG(debug, "ReverseTunnelAcceptorExtension thread-local setup completed successfully");
 }
 
 // Get thread local registry for the current thread
 UpstreamSocketThreadLocal* ReverseTunnelAcceptorExtension::getLocalRegistry() const {
-  ENVOY_LOG(debug, "ReverseTunnelAcceptorExtension::getLocalRegistry().");
-  if (!tls_slot_) {
-    ENVOY_LOG(debug, "ReverseTunnelAcceptorExtension::getLocalRegistry() - no thread local slot.");
-    return nullptr;
-  }
-
-  if (auto opt = tls_slot_->get(); opt.has_value()) {
-    return opt.operator->();
-  }
-
-  return nullptr;
+  ENVOY_LOG(debug, "ReverseTunnelAcceptorExtension::getLocalRegistry() - using enhanced thread safety.");
+  
+  // Use the enhanced factory utilities for safe thread-local access
+  return ReverseConnectionFactoryUtils::safeGetThreadLocal(tls_slot_, "ReverseTunnelAcceptorExtension");
 }
 
 absl::flat_hash_map<std::string, size_t>
@@ -205,8 +186,8 @@ ReverseTunnelAcceptorExtension::getAggregatedConnectionStats() {
   }
 
   // Get stats from current thread only - cross-thread aggregation in HTTP handler causes deadlock
-  if (auto opt = tls_slot_->get(); opt.has_value() && opt->socketManager()) {
-    auto thread_stats = opt->socketManager()->getConnectionStats();
+  if (auto opt = tls_slot_->get(); opt.has_value() && opt.value().get().socketManager()) {
+    auto thread_stats = opt.value().get().socketManager()->getConnectionStats();
     for (const auto& stat : thread_stats) {
       aggregated_stats[stat.first] = stat.second;
     }
@@ -228,8 +209,8 @@ ReverseTunnelAcceptorExtension::getAggregatedSocketCountMap() {
   }
 
   // Get stats from current thread only - cross-thread aggregation in HTTP handler causes deadlock
-  if (auto opt = tls_slot_->get(); opt.has_value() && opt->socketManager()) {
-    auto thread_stats = opt->socketManager()->getSocketCountMap();
+  if (auto opt = tls_slot_->get(); opt.has_value() && opt.value().get().socketManager()) {
+    auto thread_stats = opt.value().get().socketManager()->getSocketCountMap();
     for (const auto& stat : thread_stats) {
       aggregated_stats[stat.first] = stat.second;
     }
@@ -263,9 +244,9 @@ void ReverseTunnelAcceptorExtension::getMultiTenantConnectionStats(
         std::vector<std::string> thread_connected;
         std::vector<std::string> thread_accepted;
 
-        if (tls_instance.has_value() && tls_instance->socketManager()) {
+        if (tls_instance.has_value() && tls_instance.value().get().socketManager()) {
           // Collect connection stats from this thread
-          auto connection_stats = tls_instance->socketManager()->getConnectionStats();
+          auto connection_stats = tls_instance.value().get().socketManager()->getConnectionStats();
           for (const auto& [node_id, count] : connection_stats) {
             if (count > 0) {
               thread_connected.push_back(node_id);
@@ -274,7 +255,7 @@ void ReverseTunnelAcceptorExtension::getMultiTenantConnectionStats(
           }
 
           // Collect accepted connections from this thread
-          auto socket_count_map = tls_instance->socketManager()->getSocketCountMap();
+          auto socket_count_map = tls_instance.value().get().socketManager()->getSocketCountMap();
           for (const auto& [cluster_id, count] : socket_count_map) {
             if (count > 0) {
               thread_accepted.push_back(cluster_id);
@@ -288,7 +269,7 @@ void ReverseTunnelAcceptorExtension::getMultiTenantConnectionStats(
 
           // Merge connection stats
           for (const auto& [node_id, count] : thread_stats) {
-            aggregation_state->connection_stats[node_id] += count;
+            aggregation_state->connection_stats.emplace(node_id, 0).first->second += count;
           }
 
           // Merge connected nodes (de-duplicate)
@@ -373,7 +354,7 @@ ReverseTunnelAcceptorExtension::getMultiTenantConnectionStatsViaStats() {
   Stats::IterateFn<Stats::Gauge> gauge_callback =
       [&stats_map](const Stats::RefcountPtr<Stats::Gauge>& gauge) -> bool {
     if (gauge->name().find("reverse_connections.") == 0 && gauge->used()) {
-      stats_map[gauge->name()] = gauge->value();
+      stats_map.emplace(gauge->name(), gauge->value());
     }
     return true; // Continue iteration
   };
@@ -504,16 +485,16 @@ void UpstreamSocketManager::addConnectionSocket(const std::string& node_id,
   }
 
   // onPingResponse() expects a ping reply on the socket.
-  fd_to_event_map_[fd] = dispatcher_.createFileEvent(
+  fd_to_event_map_.emplace(fd, dispatcher_.createFileEvent(
       fd,
       [this, &socket_ref](uint32_t events) {
         ASSERT(events == Event::FileReadyType::Read);
         onPingResponse(socket_ref->ioHandle());
         return absl::OkStatus();
       },
-      Event::FileTriggerType::Edge, Event::FileReadyType::Read);
+      Event::FileTriggerType::Edge, Event::FileReadyType::Read));
 
-  fd_to_timer_map_[fd] = dispatcher_.createTimer([this, fd]() { markSocketDead(fd); });
+  fd_to_timer_map_.emplace(fd, dispatcher_.createTimer([this, fd]() { markSocketDead(fd); }));
 
   // Initiate ping keepalives on the socket.
   tryEnablePingTimer(std::chrono::seconds(ping_interval.count()));
@@ -636,7 +617,7 @@ absl::flat_hash_map<std::string, size_t> UpstreamSocketManager::getConnectionSta
     const std::string& node_id = node_entry.first;
     size_t connection_count = node_entry.second.size();
     if (connection_count > 0) {
-      node_stats[node_id] = connection_count;
+      node_stats.emplace(node_id, connection_count);
     }
   }
   ENVOY_LOG(debug, "UpstreamSocketManager::getConnectionStats returning {} nodes",
@@ -659,7 +640,7 @@ absl::flat_hash_map<std::string, size_t> UpstreamSocketManager::getSocketCountMa
     }
 
     if (total_connections > 0) {
-      cluster_stats[cluster_id] = total_connections;
+      cluster_stats.emplace(cluster_id, total_connections);
     }
   }
   ENVOY_LOG(debug, "UpstreamSocketManager::getSocketCountMap returning {} clusters",
@@ -810,7 +791,7 @@ void UpstreamSocketManager::onPingResponse(Network::IoHandle& io_handle) {
 
   Buffer::OwnedImpl buffer;
   const auto ping_size = ::Envoy::ReverseConnection::ReverseConnectionUtility::PING_MESSAGE.size();
-  Api::IoCallUint64Result result = io_handle.read(buffer, absl::make_optional(ping_size));
+  Api::IoCallUint64Result result = io_handle.read(buffer, std::make_optional(ping_size));
   if (!result.ok()) {
     ENVOY_LOG(debug, "UpstreamSocketManager: Read error on FD: {}: error - {}", fd,
               result.err_->getErrorDetails());
@@ -837,7 +818,10 @@ void UpstreamSocketManager::onPingResponse(Network::IoHandle& io_handle) {
     return;
   }
   ENVOY_LOG(trace, "UpstreamSocketManager: FD: {}: received ping response", fd);
-  fd_to_timer_map_[fd]->disableTimer();
+  auto timer_it = fd_to_timer_map_.find(fd);
+  if (timer_it != fd_to_timer_map_.end()) {
+    timer_it->second->disableTimer();
+  }
 }
 
 void UpstreamSocketManager::pingConnections(const std::string& node_id) {
@@ -849,7 +833,10 @@ void UpstreamSocketManager::pingConnections(const std::string& node_id) {
     auto buffer = ::Envoy::ReverseConnection::ReverseConnectionUtility::createPingResponse();
 
     auto ping_response_timeout = ping_interval_ / 2;
-    fd_to_timer_map_[fd]->enableTimer(ping_response_timeout);
+    auto timer_it = fd_to_timer_map_.find(fd);
+    if (timer_it != fd_to_timer_map_.end()) {
+      timer_it->second->enableTimer(ping_response_timeout);
+    }
     while (buffer->length() > 0) {
       Api::IoCallUint64Result result = itr->get()->ioHandle().write(*buffer);
       ENVOY_LOG(trace,
@@ -892,12 +879,12 @@ ReverseConnectionAcceptorStats* UpstreamSocketManager::getStatsByNode(const std:
 
   ENVOY_LOG(debug, "UpstreamSocketManager: Creating new stats for node: {}", node_id);
   const std::string& final_prefix = "node." + node_id;
-  acceptor_node_stats_map_[node_id] = std::make_unique<ReverseConnectionAcceptorStats>(
+  auto result = acceptor_node_stats_map_.emplace(node_id, std::make_unique<ReverseConnectionAcceptorStats>(
       ReverseConnectionAcceptorStats{ALL_REVERSE_CONNECTION_ACCEPTOR_STATS(
           POOL_COUNTER_PREFIX(*usm_scope_, final_prefix),
           POOL_GAUGE_PREFIX(*usm_scope_, final_prefix),
-          POOL_HISTOGRAM_PREFIX(*usm_scope_, final_prefix))});
-  return acceptor_node_stats_map_[node_id].get();
+          POOL_HISTOGRAM_PREFIX(*usm_scope_, final_prefix))}));
+  return result.first->second.get();
 }
 
 ReverseConnectionAcceptorStats* UpstreamSocketManager::getStatsByCluster(const std::string& cluster_id) {
@@ -909,12 +896,12 @@ ReverseConnectionAcceptorStats* UpstreamSocketManager::getStatsByCluster(const s
 
   ENVOY_LOG(debug, "UpstreamSocketManager: Creating new stats for cluster: {}", cluster_id);
   const std::string& final_prefix = "cluster." + cluster_id;
-  acceptor_cluster_stats_map_[cluster_id] = std::make_unique<ReverseConnectionAcceptorStats>(
+  auto result = acceptor_cluster_stats_map_.emplace(cluster_id, std::make_unique<ReverseConnectionAcceptorStats>(
       ReverseConnectionAcceptorStats{ALL_REVERSE_CONNECTION_ACCEPTOR_STATS(
           POOL_COUNTER_PREFIX(*usm_scope_, final_prefix),
           POOL_GAUGE_PREFIX(*usm_scope_, final_prefix),
-          POOL_HISTOGRAM_PREFIX(*usm_scope_, final_prefix))});
-  return acceptor_cluster_stats_map_[cluster_id].get();
+          POOL_HISTOGRAM_PREFIX(*usm_scope_, final_prefix))}));
+  return result.first->second.get();
 }
 
 UpstreamSocketManager::~UpstreamSocketManager() {
@@ -951,7 +938,23 @@ UpstreamSocketManager::~UpstreamSocketManager() {
   }
 }
 
-REGISTER_FACTORY(ReverseTunnelAcceptor, Server::Configuration::BootstrapExtensionFactory);
+// ReverseTunnelAcceptorFactory implementation
+Server::BootstrapExtensionPtr ReverseTunnelAcceptorFactory::createBootstrapExtensionTyped(
+    const envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::UpstreamReverseConnectionSocketInterface& proto_config,
+    Server::Configuration::ServerFactoryContext& context) {
+  ENVOY_LOG(debug, "ReverseTunnelAcceptorFactory::createBootstrapExtensionTyped().");
+  
+  // Create a socket interface instance (this is needed for the extension)
+  auto socket_interface = std::make_unique<ReverseTunnelAcceptor>(context);
+  
+  // Create the bootstrap extension using the new factory pattern
+  auto extension = std::make_unique<ReverseTunnelAcceptorExtension>(*socket_interface, context, proto_config);
+  
+  ENVOY_LOG(debug, "Created ReverseTunnelAcceptorExtension with factory-based approach.");
+  return extension;
+}
+
+REGISTER_FACTORY(ReverseTunnelAcceptorFactory, Server::Configuration::BootstrapExtensionFactory);
 
 } // namespace ReverseConnection
 } // namespace Bootstrap

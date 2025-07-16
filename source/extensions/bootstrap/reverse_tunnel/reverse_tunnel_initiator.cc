@@ -1630,30 +1630,30 @@ DownstreamSocketThreadLocal* ReverseTunnelInitiator::getLocalRegistry() const {
 // ReverseTunnelInitiatorExtension implementation
 void ReverseTunnelInitiatorExtension::onServerInitialized() {
   ENVOY_LOG(debug, "ReverseTunnelInitiatorExtension::onServerInitialized - creating "
-                   "thread local slot");
+                   "thread local slot with enhanced safety");
 
-  // Create thread local slot to store dispatcher for each worker thread
-  tls_slot_ =
-      ThreadLocal::TypedSlot<DownstreamSocketThreadLocal>::makeUnique(context_.threadLocal());
+  // Create thread local slot using the enhanced factory utilities for better error handling
+  tls_slot_ = ReverseConnectionFactoryUtils::createThreadLocalSlot<DownstreamSocketThreadLocal>(
+      context_.threadLocal(), "ReverseTunnelInitiatorExtension");
+
+  if (!tls_slot_) {
+    ENVOY_LOG(error, "Failed to create thread-local slot for ReverseTunnelInitiatorExtension");
+    return;
+  }
 
   // Set up the thread local dispatcher for each worker thread
   tls_slot_->set([this](Event::Dispatcher& dispatcher) {
     return std::make_shared<DownstreamSocketThreadLocal>(dispatcher, context_.scope());
   });
+  
+  ENVOY_LOG(debug, "ReverseTunnelInitiatorExtension thread-local setup completed successfully");
 }
 
 DownstreamSocketThreadLocal* ReverseTunnelInitiatorExtension::getLocalRegistry() const {
-  ENVOY_LOG(debug, "ReverseTunnelInitiatorExtension::getLocalRegistry().");
-  if (!tls_slot_) {
-    ENVOY_LOG(debug, "ReverseTunnelInitiatorExtension::getLocalRegistry() - no thread local slot.");
-    return nullptr;
-  }
-
-  if (auto opt = tls_slot_->get(); opt.has_value()) {
-    return &opt.value().get();
-  }
-
-  return nullptr;
+  ENVOY_LOG(debug, "ReverseTunnelInitiatorExtension::getLocalRegistry() - using enhanced thread safety.");
+  
+  // Use the enhanced factory utilities for safe thread-local access
+  return ReverseConnectionFactoryUtils::safeGetThreadLocal(tls_slot_, "ReverseTunnelInitiatorExtension");
 }
 
 Envoy::Network::IoHandlePtr
@@ -1761,23 +1761,7 @@ bool ReverseTunnelInitiator::ipFamilySupported(int domain) {
   return domain == AF_INET || domain == AF_INET6;
 }
 
-Server::BootstrapExtensionPtr ReverseTunnelInitiator::createBootstrapExtension(
-    const Protobuf::Message& config, Server::Configuration::ServerFactoryContext& context) {
-  ENVOY_LOG(debug, "ReverseTunnelInitiator::createBootstrapExtension().");
-  const auto& message = MessageUtil::downcastAndValidate<
-      const envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::
-          DownstreamReverseConnectionSocketInterface&>(config, context.messageValidationVisitor());
-  context_ = &context;
-  // Create the bootstrap extension and store reference to it
-  auto extension = std::make_unique<ReverseTunnelInitiatorExtension>(context, message);
-  extension_ = extension.get();
-  return extension;
-}
-
-ProtobufTypes::MessagePtr ReverseTunnelInitiator::createEmptyConfigProto() {
-  return std::make_unique<envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::
-                              DownstreamReverseConnectionSocketInterface>();
-}
+// Factory implementation moved to ReverseTunnelInitiatorFactory class
 
 // ReverseTunnelInitiatorExtension constructor implementation
 ReverseTunnelInitiatorExtension::ReverseTunnelInitiatorExtension(
@@ -1788,7 +1772,20 @@ ReverseTunnelInitiatorExtension::ReverseTunnelInitiatorExtension(
   ENVOY_LOG(debug, "Created ReverseTunnelInitiatorExtension.");
 }
 
-REGISTER_FACTORY(ReverseTunnelInitiator, Server::Configuration::BootstrapExtensionFactory);
+// ReverseTunnelInitiatorFactory implementation
+Server::BootstrapExtensionPtr ReverseTunnelInitiatorFactory::createBootstrapExtensionTyped(
+    const envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::DownstreamReverseConnectionSocketInterface& proto_config,
+    Server::Configuration::ServerFactoryContext& context) {
+  ENVOY_LOG(debug, "ReverseTunnelInitiatorFactory::createBootstrapExtensionTyped().");
+  
+  // Create the bootstrap extension using the new factory pattern
+  auto extension = std::make_unique<ReverseTunnelInitiatorExtension>(context, proto_config);
+  
+  ENVOY_LOG(debug, "Created ReverseTunnelInitiatorExtension with factory-based approach.");
+  return extension;
+}
+
+REGISTER_FACTORY(ReverseTunnelInitiatorFactory, Server::Configuration::BootstrapExtensionFactory);
 
 size_t ReverseTunnelInitiator::getConnectionCount(const std::string& target) const {
   // For the downstream (initiator) side, we need to check the number of active connections

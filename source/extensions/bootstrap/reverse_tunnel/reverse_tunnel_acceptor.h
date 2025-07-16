@@ -21,6 +21,7 @@
 #include "source/common/common/random_generator.h"
 #include "source/common/network/io_socket_handle_impl.h"
 #include "source/common/network/socket_interface.h"
+#include "source/extensions/bootstrap/reverse_tunnel/factory_base.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -511,7 +512,28 @@ private:
   ReverseTunnelAcceptorExtension* extension_;
 };
 
-DECLARE_FACTORY(ReverseTunnelAcceptor);
+/**
+ * Factory for creating ReverseTunnelAcceptor bootstrap extensions.
+ * Uses the new factory base pattern for better consistency with Envoy conventions.
+ */
+class ReverseTunnelAcceptorFactory 
+    : public ReverseConnectionBootstrapFactoryBase<
+          envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::UpstreamReverseConnectionSocketInterface,
+          ReverseTunnelAcceptorExtension>,
+      public Logger::Loggable<Logger::Id::config> {
+public:
+  ReverseTunnelAcceptorFactory() 
+      : ReverseConnectionBootstrapFactoryBase(
+            "envoy.bootstrap.reverse_connection.upstream_reverse_connection_socket_interface") {}
+
+private:
+  Server::BootstrapExtensionPtr
+  createBootstrapExtensionTyped(
+      const envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::UpstreamReverseConnectionSocketInterface& proto_config,
+      Server::Configuration::ServerFactoryContext& context) override;
+};
+
+DECLARE_FACTORY(ReverseTunnelAcceptorFactory);
 
 } // namespace ReverseConnection
 } // namespace Bootstrap

@@ -43,6 +43,7 @@ envoy_cc_extension(
     hdrs = [
         "reverse_tunnel_initiator.h",
         "grpc_reverse_tunnel_client.h",
+        "factory_base.h",
     ],
     visibility = ["//visibility:public"],
     deps = [
@@ -79,7 +80,10 @@ envoy_cc_extension(
 envoy_cc_extension(
     name = "reverse_tunnel_acceptor_lib",
     srcs = ["reverse_tunnel_acceptor.cc"],
-    hdrs = ["reverse_tunnel_acceptor.h"],
+    hdrs = [
+        "reverse_tunnel_acceptor.h",
+        "factory_base.h",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         "//envoy/common:random_generator_interface",

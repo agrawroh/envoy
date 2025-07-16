@@ -24,6 +24,7 @@
 #include "source/common/network/io_socket_handle_impl.h"
 #include "source/common/network/socket_interface.h"
 #include "source/common/upstream/load_balancer_context_base.h"
+#include "source/extensions/bootstrap/reverse_tunnel/factory_base.h"
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
@@ -580,15 +581,7 @@ public:
                                 Envoy::Network::Address::IpVersion version,
                                 const ReverseConnectionSocketConfig& config) const;
 
-  // Server::Configuration::BootstrapExtensionFactory
-  Server::BootstrapExtensionPtr
-  createBootstrapExtension(const Protobuf::Message& config,
-                           Server::Configuration::ServerFactoryContext& context) override;
-
-  ProtobufTypes::MessagePtr createEmptyConfigProto() override;
-  std::string name() const override {
-    return "envoy.bootstrap.reverse_connection.downstream_reverse_connection_socket_interface";
-  }
+  // Socket interface functionality only - factory methods moved to ReverseTunnelInitiatorFactory
 
   /**
    * Get the number of established reverse connections to a specific target (cluster or node).
@@ -634,7 +627,28 @@ private:
   ThreadLocal::TypedSlotPtr<DownstreamSocketThreadLocal> tls_slot_;
 };
 
-DECLARE_FACTORY(ReverseTunnelInitiator);
+/**
+ * Factory for creating ReverseTunnelInitiator bootstrap extensions.
+ * Uses the new factory base pattern for better consistency with Envoy conventions.
+ */
+class ReverseTunnelInitiatorFactory 
+    : public ReverseConnectionBootstrapFactoryBase<
+          envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::DownstreamReverseConnectionSocketInterface,
+          ReverseTunnelInitiatorExtension>,
+      public Logger::Loggable<Logger::Id::config> {
+public:
+  ReverseTunnelInitiatorFactory() 
+      : ReverseConnectionBootstrapFactoryBase(
+            "envoy.bootstrap.reverse_connection.downstream_reverse_connection_socket_interface") {}
+
+private:
+  Server::BootstrapExtensionPtr
+  createBootstrapExtensionTyped(
+      const envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::DownstreamReverseConnectionSocketInterface& proto_config,
+      Server::Configuration::ServerFactoryContext& context) override;
+};
+
+DECLARE_FACTORY(ReverseTunnelInitiatorFactory);
 
 /**
  * Custom load balancer context for reverse connections. This class enables the
