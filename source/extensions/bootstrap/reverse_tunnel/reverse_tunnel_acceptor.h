@@ -228,7 +228,7 @@ public:
   ReverseTunnelAcceptorExtension* extension_{nullptr};
 
 private:
-  Server::Configuration::ServerFactoryContext* context_;
+  Server::Configuration::ServerFactoryContext* context_ ABSL_ATTRIBUTE_UNUSED;
 };
 
 /**

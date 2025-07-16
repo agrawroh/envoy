@@ -70,6 +70,26 @@ ReverseTunnelAcceptor::ReverseTunnelAcceptor(Server::Configuration::ServerFactor
   ENVOY_LOG(debug, "Created ReverseTunnelAcceptor.");
 }
 
+// Implement missing virtual methods
+ProtobufTypes::MessagePtr ReverseTunnelAcceptor::createEmptyConfigProto() {
+  return std::make_unique<envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::UpstreamReverseConnectionSocketInterface>();
+}
+
+Server::BootstrapExtensionPtr ReverseTunnelAcceptor::createBootstrapExtension(
+    const Protobuf::Message& config, Server::Configuration::ServerFactoryContext& context) {
+  const auto& typed_config = MessageUtil::downcastAndValidate<
+      const envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::UpstreamReverseConnectionSocketInterface&>(
+      config, context.messageValidationVisitor());
+  
+  // Create a socket interface instance
+  auto socket_interface = std::make_unique<ReverseTunnelAcceptor>(context);
+  
+  // Create the bootstrap extension
+  auto extension = std::make_unique<ReverseTunnelAcceptorExtension>(*socket_interface, context, typed_config);
+  
+  return extension;
+}
+
 Envoy::Network::IoHandlePtr
 ReverseTunnelAcceptor::socket(Envoy::Network::Socket::Type socket_type,
                               Envoy::Network::Address::Type addr_type,
@@ -186,12 +206,17 @@ ReverseTunnelAcceptorExtension::getAggregatedConnectionStats() {
   }
 
   // Get stats from current thread only - cross-thread aggregation in HTTP handler causes deadlock
-  if (auto opt = tls_slot_->get(); opt.has_value() && opt.value().get().socketManager()) {
-    auto thread_stats = opt.value().get().socketManager()->getConnectionStats();
-    for (const auto& stat : thread_stats) {
-      aggregated_stats[stat.first] = stat.second;
+  if (auto opt = tls_slot_->get(); opt.has_value()) {
+    auto& tls_obj = opt.value().get();
+    if (tls_obj.socketManager()) {
+      auto thread_stats = tls_obj.socketManager()->getConnectionStats();
+      for (const auto& stat : thread_stats) {
+        aggregated_stats[stat.first] = stat.second;
+      }
+      ENVOY_LOG(debug, "Got connection stats from current thread: {} nodes.", aggregated_stats.size());
+    } else {
+      ENVOY_LOG(debug, "No socket manager available on current thread.");
     }
-    ENVOY_LOG(debug, "Got connection stats from current thread: {} nodes.", aggregated_stats.size());
   } else {
     ENVOY_LOG(debug, "No socket manager available on current thread.");
   }
@@ -209,12 +234,17 @@ ReverseTunnelAcceptorExtension::getAggregatedSocketCountMap() {
   }
 
   // Get stats from current thread only - cross-thread aggregation in HTTP handler causes deadlock
-  if (auto opt = tls_slot_->get(); opt.has_value() && opt.value().get().socketManager()) {
-    auto thread_stats = opt.value().get().socketManager()->getSocketCountMap();
-    for (const auto& stat : thread_stats) {
-      aggregated_stats[stat.first] = stat.second;
+  if (auto opt = tls_slot_->get(); opt.has_value()) {
+    auto& tls_obj = opt.value().get();
+    if (tls_obj.socketManager()) {
+      auto thread_stats = tls_obj.socketManager()->getSocketCountMap();
+      for (const auto& stat : thread_stats) {
+        aggregated_stats[stat.first] = stat.second;
+      }
+      ENVOY_LOG(debug, "Got socket count from current thread: {} clusters.", aggregated_stats.size());
+    } else {
+      ENVOY_LOG(debug, "No socket manager available on current thread.");
     }
-    ENVOY_LOG(debug, "Got socket count from current thread: {} clusters.", aggregated_stats.size());
   } else {
     ENVOY_LOG(debug, "No socket manager available on current thread.");
   }
@@ -244,9 +274,11 @@ void ReverseTunnelAcceptorExtension::getMultiTenantConnectionStats(
         std::vector<std::string> thread_connected;
         std::vector<std::string> thread_accepted;
 
-        if (tls_instance.has_value() && tls_instance.value().get().socketManager()) {
-          // Collect connection stats from this thread
-          auto connection_stats = tls_instance.value().get().socketManager()->getConnectionStats();
+        if (tls_instance.has_value()) {
+          auto& tls_obj = tls_instance.value().get();
+          if (tls_obj.socketManager()) {
+            // Collect connection stats from this thread
+            auto connection_stats = tls_obj.socketManager()->getConnectionStats();
           for (const auto& [node_id, count] : connection_stats) {
             if (count > 0) {
               thread_connected.push_back(node_id);
@@ -254,11 +286,12 @@ void ReverseTunnelAcceptorExtension::getMultiTenantConnectionStats(
             }
           }
 
-          // Collect accepted connections from this thread
-          auto socket_count_map = tls_instance.value().get().socketManager()->getSocketCountMap();
-          for (const auto& [cluster_id, count] : socket_count_map) {
-            if (count > 0) {
-              thread_accepted.push_back(cluster_id);
+            // Collect accepted connections from this thread
+            auto socket_count_map = tls_obj.socketManager()->getSocketCountMap();
+            for (const auto& [cluster_id, count] : socket_count_map) {
+              if (count > 0) {
+                thread_accepted.push_back(cluster_id);
+              }
             }
           }
         }
@@ -470,8 +503,9 @@ void UpstreamSocketManager::addConnectionSocket(const std::string& node_id,
 
   // If local envoy is responding to reverse connections, add the socket to
   // accepted_reverse_connections_. Thereafter, initiate ping keepalives on the socket.
-  accepted_reverse_connections_[node_id].push_back(std::move(socket));
-  Network::ConnectionSocketPtr& socket_ref = accepted_reverse_connections_[node_id].back();
+  auto& connection_list = accepted_reverse_connections_[node_id];
+  connection_list.push_back(std::move(socket));
+  Network::ConnectionSocketPtr& socket_ref = connection_list.back();
 
   ENVOY_LOG(debug, "UpstreamSocketManager: mapping fd {} to node '{}'", fd, node_id);
   fd_to_node_map_[fd] = node_id;
@@ -625,6 +659,10 @@ absl::flat_hash_map<std::string, size_t> UpstreamSocketManager::getConnectionSta
   return node_stats;
 }
 
+absl::flat_hash_map<std::string, size_t> UpstreamSocketManager::getConnectionStats() {
+  return const_cast<const UpstreamSocketManager*>(this)->getConnectionStats();
+}
+
 absl::flat_hash_map<std::string, size_t> UpstreamSocketManager::getSocketCountMap() const {
   absl::flat_hash_map<std::string, size_t> cluster_stats;
   for (const auto& cluster_entry : cluster_to_node_map_) {
@@ -648,6 +686,10 @@ absl::flat_hash_map<std::string, size_t> UpstreamSocketManager::getSocketCountMa
   return cluster_stats;
 }
 
+absl::flat_hash_map<std::string, size_t> UpstreamSocketManager::getSocketCountMap() {
+  return const_cast<const UpstreamSocketManager*>(this)->getSocketCountMap();
+}
+
 void UpstreamSocketManager::markSocketDead(const int fd) {
   ENVOY_LOG(debug, "UpstreamSocketManager: markSocketDead called for fd {}", fd);
 
@@ -660,14 +702,16 @@ void UpstreamSocketManager::markSocketDead(const int fd) {
   const std::string node_id = node_it->second; // Make a COPY, not a reference
   ENVOY_LOG(debug, "UpstreamSocketManager: found node '{}' for fd {}", node_id, fd);
 
-  std::string cluster_id = (node_to_cluster_map_.find(node_id) != node_to_cluster_map_.end())
-                               ? node_to_cluster_map_[node_id]
-                               : "";
+  std::string cluster_id;
+  auto cluster_it = node_to_cluster_map_.find(node_id);
+  if (cluster_it != node_to_cluster_map_.end()) {
+    cluster_id = cluster_it->second;
+  }
   fd_to_node_map_.erase(fd); // Now it's safe to erase since node_id is a copy
 
   // Check if this is a used connection by looking for node_id in accepted_reverse_connections_
-  auto& sockets = accepted_reverse_connections_[node_id];
-  if (sockets.empty()) {
+  auto sockets_it = accepted_reverse_connections_.find(node_id);
+  if (sockets_it == accepted_reverse_connections_.end() || sockets_it->second.empty()) {
     // This is a used connection (not in the idle pool)
     ENVOY_LOG(debug, "UpstreamSocketManager: Marking used socket dead. node: {} cluster: {} FD: {}",
               node_id, cluster_id, fd);
@@ -689,6 +733,7 @@ void UpstreamSocketManager::markSocketDead(const int fd) {
   }
 
   // This is an idle connection, find and remove it from the pool
+  auto& sockets = sockets_it->second;
   bool socket_found = false;
   for (auto itr = sockets.begin(); itr != sockets.end(); itr++) {
     if (fd == itr->get()->ioHandle().fdDoNotUse()) {
@@ -752,10 +797,9 @@ void UpstreamSocketManager::tryEnablePingTimer(const std::chrono::seconds& ping_
 
 void UpstreamSocketManager::cleanStaleNodeEntry(const std::string& node_id) {
   // Clean the given node-id, if there are no active sockets.
-  if (accepted_reverse_connections_.find(node_id) != accepted_reverse_connections_.end() &&
-      accepted_reverse_connections_[node_id].size() > 0) {
-    ENVOY_LOG(debug, "Found {} active sockets for node: {}",
-              accepted_reverse_connections_[node_id].size(), node_id);
+  auto conn_it = accepted_reverse_connections_.find(node_id);
+  if (conn_it != accepted_reverse_connections_.end() && conn_it->second.size() > 0) {
+    ENVOY_LOG(debug, "Found {} active sockets for node: {}", conn_it->second.size(), node_id);
     return;
   }
   ENVOY_LOG(debug, "UpstreamSocketManager: Cleaning stale node entry for node: {}", node_id);
@@ -763,12 +807,12 @@ void UpstreamSocketManager::cleanStaleNodeEntry(const std::string& node_id) {
   // Check if given node-id, is present in node_to_cluster_map_. If present,
   // fetch the corresponding cluster-id. Use cluster-id and node-id to delete entry
   // from cluster_to_node_map_ and node_to_cluster_map_ respectively.
-  const auto& node_itr = node_to_cluster_map_.find(node_id);
+  auto node_itr = node_to_cluster_map_.find(node_id);
   if (node_itr != node_to_cluster_map_.end()) {
-    const auto& cluster_itr = cluster_to_node_map_.find(node_itr->second);
+    auto cluster_itr = cluster_to_node_map_.find(node_itr->second);
     if (cluster_itr != cluster_to_node_map_.end()) {
-      const auto& node_entry_itr =
-          find(cluster_itr->second.begin(), cluster_itr->second.end(), node_id);
+      auto node_entry_itr = 
+          std::find(cluster_itr->second.begin(), cluster_itr->second.end(), node_id);
 
       if (node_entry_itr != cluster_itr->second.end()) {
         ENVOY_LOG(debug, "UpstreamSocketManager:Removing stale node {} from cluster {}", node_id,
@@ -791,7 +835,7 @@ void UpstreamSocketManager::onPingResponse(Network::IoHandle& io_handle) {
 
   Buffer::OwnedImpl buffer;
   const auto ping_size = ::Envoy::ReverseConnection::ReverseConnectionUtility::PING_MESSAGE.size();
-  Api::IoCallUint64Result result = io_handle.read(buffer, std::make_optional(ping_size));
+  Api::IoCallUint64Result result = io_handle.read(buffer, std::optional<uint64_t>(ping_size));
   if (!result.ok()) {
     ENVOY_LOG(debug, "UpstreamSocketManager: Read error on FD: {}: error - {}", fd,
               result.err_->getErrorDetails());
@@ -826,7 +870,12 @@ void UpstreamSocketManager::onPingResponse(Network::IoHandle& io_handle) {
 
 void UpstreamSocketManager::pingConnections(const std::string& node_id) {
   ENVOY_LOG(debug, "UpstreamSocketManager: Pinging connections for node: {}", node_id);
-  auto& sockets = accepted_reverse_connections_[node_id];
+  auto sockets_it = accepted_reverse_connections_.find(node_id);
+  if (sockets_it == accepted_reverse_connections_.end()) {
+    ENVOY_LOG(debug, "UpstreamSocketManager: No sockets found for node: {}", node_id);
+    return;
+  }
+  auto& sockets = sockets_it->second;
   ENVOY_LOG(debug, "UpstreamSocketManager: node:{} Number of sockets:{}", node_id, sockets.size());
   for (auto itr = sockets.begin(); itr != sockets.end(); itr++) {
     int fd = itr->get()->ioHandle().fdDoNotUse();
