@@ -189,7 +189,7 @@ UpstreamSocketThreadLocal* ReverseTunnelAcceptorExtension::getLocalRegistry() co
   }
 
   if (auto opt = tls_slot_->get(); opt.has_value()) {
-    return &opt.value().get();
+    return opt.operator->();
   }
 
   return nullptr;
@@ -205,8 +205,8 @@ ReverseTunnelAcceptorExtension::getAggregatedConnectionStats() {
   }
 
   // Get stats from current thread only - cross-thread aggregation in HTTP handler causes deadlock
-  if (auto opt = tls_slot_->get(); opt.has_value() && opt.value().get().socketManager()) {
-    auto thread_stats = opt.value().get().socketManager()->getConnectionStats();
+  if (auto opt = tls_slot_->get(); opt.has_value() && opt->socketManager()) {
+    auto thread_stats = opt->socketManager()->getConnectionStats();
     for (const auto& stat : thread_stats) {
       aggregated_stats[stat.first] = stat.second;
     }
@@ -228,8 +228,8 @@ ReverseTunnelAcceptorExtension::getAggregatedSocketCountMap() {
   }
 
   // Get stats from current thread only - cross-thread aggregation in HTTP handler causes deadlock
-  if (auto opt = tls_slot_->get(); opt.has_value() && opt.value().get().socketManager()) {
-    auto thread_stats = opt.value().get().socketManager()->getSocketCountMap();
+  if (auto opt = tls_slot_->get(); opt.has_value() && opt->socketManager()) {
+    auto thread_stats = opt->socketManager()->getSocketCountMap();
     for (const auto& stat : thread_stats) {
       aggregated_stats[stat.first] = stat.second;
     }
@@ -263,9 +263,9 @@ void ReverseTunnelAcceptorExtension::getMultiTenantConnectionStats(
         std::vector<std::string> thread_connected;
         std::vector<std::string> thread_accepted;
 
-        if (tls_instance.has_value() && tls_instance.value().get().socketManager()) {
+        if (tls_instance.has_value() && tls_instance->socketManager()) {
           // Collect connection stats from this thread
-          auto connection_stats = tls_instance.value().get().socketManager()->getConnectionStats();
+          auto connection_stats = tls_instance->socketManager()->getConnectionStats();
           for (const auto& [node_id, count] : connection_stats) {
             if (count > 0) {
               thread_connected.push_back(node_id);
@@ -274,7 +274,7 @@ void ReverseTunnelAcceptorExtension::getMultiTenantConnectionStats(
           }
 
           // Collect accepted connections from this thread
-          auto socket_count_map = tls_instance.value().get().socketManager()->getSocketCountMap();
+          auto socket_count_map = tls_instance->socketManager()->getSocketCountMap();
           for (const auto& [cluster_id, count] : socket_count_map) {
             if (count > 0) {
               thread_accepted.push_back(cluster_id);
@@ -452,7 +452,7 @@ void UpstreamSocketManager::addConnectionSocket(const std::string& node_id,
             node_id, cluster_id);
 
   // Update stats for the node
-  USMStats* node_stats = this->getStatsByNode(node_id);
+  ReverseConnectionAcceptorStats* node_stats = this->getStatsByNode(node_id);
   node_stats->reverse_conn_cx_total_.inc();
   node_stats->reverse_conn_cx_idle_.inc();
   ENVOY_LOG(debug, "UpstreamSocketManager: reverse conn count for node:{} idle: {} total:{}",
@@ -479,7 +479,7 @@ void UpstreamSocketManager::addConnectionSocket(const std::string& node_id,
     ENVOY_LOG(debug, "UpstreamSocketManager: cluster_to_node_map_ size: {}",
               cluster_to_node_map_.size());
     // Update stats for the cluster
-    USMStats* cluster_stats = this->getStatsByCluster(cluster_id);
+    ReverseConnectionAcceptorStats* cluster_stats = this->getStatsByCluster(cluster_id);
     cluster_stats->reverse_conn_cx_total_.inc();
     cluster_stats->reverse_conn_cx_idle_.inc();
   } else {
@@ -577,12 +577,12 @@ UpstreamSocketManager::getConnectionSocket(const std::string& key) {
   cleanStaleNodeEntry(node_id);
 
   // Update stats
-  USMStats* node_stats = this->getStatsByNode(node_id);
+  ReverseConnectionAcceptorStats* node_stats = this->getStatsByNode(node_id);
   node_stats->reverse_conn_cx_idle_.dec();
   node_stats->reverse_conn_cx_used_.inc();
 
   if (!actual_cluster_id.empty()) {
-    USMStats* cluster_stats = this->getStatsByCluster(actual_cluster_id);
+    ReverseConnectionAcceptorStats* cluster_stats = this->getStatsByCluster(actual_cluster_id);
     cluster_stats->reverse_conn_cx_idle_.dec();
     cluster_stats->reverse_conn_cx_used_.inc();
   }
@@ -591,7 +591,7 @@ UpstreamSocketManager::getConnectionSocket(const std::string& key) {
 }
 
 size_t UpstreamSocketManager::getNumberOfSocketsByCluster(const std::string& cluster_id) {
-  USMStats* stats = this->getStatsByCluster(cluster_id);
+  ReverseConnectionAcceptorStats* stats = this->getStatsByCluster(cluster_id);
   if (!stats) {
     ENVOY_LOG(error, "UpstreamSocketManager: No stats available for cluster: {}", cluster_id);
     return 0;
@@ -602,7 +602,7 @@ size_t UpstreamSocketManager::getNumberOfSocketsByCluster(const std::string& clu
 }
 
 size_t UpstreamSocketManager::getNumberOfSocketsByNode(const std::string& node_id) {
-  USMStats* stats = this->getStatsByNode(node_id);
+  ReverseConnectionAcceptorStats* stats = this->getStatsByNode(node_id);
   if (!stats) {
     ENVOY_LOG(error, "UpstreamSocketManager: No stats available for node: {}", node_id);
     return 0;
@@ -613,20 +613,20 @@ size_t UpstreamSocketManager::getNumberOfSocketsByNode(const std::string& node_i
 }
 
 bool UpstreamSocketManager::deleteStatsByNode(const std::string& node_id) {
-  const auto& iter = usm_node_stats_map_.find(node_id);
-  if (iter == usm_node_stats_map_.end()) {
+  const auto& iter = acceptor_node_stats_map_.find(node_id);
+  if (iter == acceptor_node_stats_map_.end()) {
     return false;
   }
-  usm_node_stats_map_.erase(iter);
+  acceptor_node_stats_map_.erase(iter);
   return true;
 }
 
 bool UpstreamSocketManager::deleteStatsByCluster(const std::string& cluster_id) {
-  const auto& iter = usm_cluster_stats_map_.find(cluster_id);
-  if (iter == usm_cluster_stats_map_.end()) {
+  const auto& iter = acceptor_cluster_stats_map_.find(cluster_id);
+  if (iter == acceptor_cluster_stats_map_.end()) {
     return false;
   }
-  usm_cluster_stats_map_.erase(iter);
+  acceptor_cluster_stats_map_.erase(iter);
   return true;
 }
 
@@ -699,7 +699,7 @@ void UpstreamSocketManager::markSocketDead(const int fd) {
                 node_id, cluster_id);
     }
 
-    USMStats* stats = this->getStatsByNode(node_id);
+    ReverseConnectionAcceptorStats* stats = this->getStatsByNode(node_id);
     if (stats) {
       stats->reverse_conn_cx_used_.dec();
       stats->reverse_conn_cx_total_.dec();
@@ -721,14 +721,14 @@ void UpstreamSocketManager::markSocketDead(const int fd) {
       fd_to_timer_map_.erase(fd);
 
       // Update stats
-      USMStats* node_stats = this->getStatsByNode(node_id);
+      ReverseConnectionAcceptorStats* node_stats = this->getStatsByNode(node_id);
       if (node_stats) {
         node_stats->reverse_conn_cx_idle_.dec();
         node_stats->reverse_conn_cx_total_.dec();
       }
 
       if (!cluster_id.empty()) {
-        USMStats* cluster_stats = this->getStatsByCluster(cluster_id);
+        ReverseConnectionAcceptorStats* cluster_stats = this->getStatsByCluster(cluster_id);
         if (cluster_stats) {
           cluster_stats->reverse_conn_cx_idle_.dec();
           cluster_stats->reverse_conn_cx_total_.dec();
@@ -810,7 +810,7 @@ void UpstreamSocketManager::onPingResponse(Network::IoHandle& io_handle) {
 
   Buffer::OwnedImpl buffer;
   const auto ping_size = ::Envoy::ReverseConnection::ReverseConnectionUtility::PING_MESSAGE.size();
-  Api::IoCallUint64Result result = io_handle.read(buffer, std::make_optional(ping_size));
+  Api::IoCallUint64Result result = io_handle.read(buffer, absl::make_optional(ping_size));
   if (!result.ok()) {
     ENVOY_LOG(debug, "UpstreamSocketManager: Read error on FD: {}: error - {}", fd,
               result.err_->getErrorDetails());
@@ -883,32 +883,38 @@ void UpstreamSocketManager::pingConnections() {
   ping_timer_->enableTimer(ping_interval_);
 }
 
-USMStats* UpstreamSocketManager::getStatsByNode(const std::string& node_id) {
-  auto iter = usm_node_stats_map_.find(node_id);
-  if (iter != usm_node_stats_map_.end()) {
-    USMStats* stats = iter->second.get();
+ReverseConnectionAcceptorStats* UpstreamSocketManager::getStatsByNode(const std::string& node_id) {
+  auto iter = acceptor_node_stats_map_.find(node_id);
+  if (iter != acceptor_node_stats_map_.end()) {
+    ReverseConnectionAcceptorStats* stats = iter->second.get();
     return stats;
   }
 
   ENVOY_LOG(debug, "UpstreamSocketManager: Creating new stats for node: {}", node_id);
   const std::string& final_prefix = "node." + node_id;
-  usm_node_stats_map_[node_id] = std::make_unique<USMStats>(
-      USMStats{ALL_USM_STATS(POOL_GAUGE_PREFIX(*usm_scope_, final_prefix))});
-  return usm_node_stats_map_[node_id].get();
+  acceptor_node_stats_map_[node_id] = std::make_unique<ReverseConnectionAcceptorStats>(
+      ReverseConnectionAcceptorStats{ALL_REVERSE_CONNECTION_ACCEPTOR_STATS(
+          POOL_COUNTER_PREFIX(*usm_scope_, final_prefix),
+          POOL_GAUGE_PREFIX(*usm_scope_, final_prefix),
+          POOL_HISTOGRAM_PREFIX(*usm_scope_, final_prefix))});
+  return acceptor_node_stats_map_[node_id].get();
 }
 
-USMStats* UpstreamSocketManager::getStatsByCluster(const std::string& cluster_id) {
-  auto iter = usm_cluster_stats_map_.find(cluster_id);
-  if (iter != usm_cluster_stats_map_.end()) {
-    USMStats* stats = iter->second.get();
+ReverseConnectionAcceptorStats* UpstreamSocketManager::getStatsByCluster(const std::string& cluster_id) {
+  auto iter = acceptor_cluster_stats_map_.find(cluster_id);
+  if (iter != acceptor_cluster_stats_map_.end()) {
+    ReverseConnectionAcceptorStats* stats = iter->second.get();
     return stats;
   }
 
   ENVOY_LOG(debug, "UpstreamSocketManager: Creating new stats for cluster: {}", cluster_id);
   const std::string& final_prefix = "cluster." + cluster_id;
-  usm_cluster_stats_map_[cluster_id] = std::make_unique<USMStats>(
-      USMStats{ALL_USM_STATS(POOL_GAUGE_PREFIX(*usm_scope_, final_prefix))});
-  return usm_cluster_stats_map_[cluster_id].get();
+  acceptor_cluster_stats_map_[cluster_id] = std::make_unique<ReverseConnectionAcceptorStats>(
+      ReverseConnectionAcceptorStats{ALL_REVERSE_CONNECTION_ACCEPTOR_STATS(
+          POOL_COUNTER_PREFIX(*usm_scope_, final_prefix),
+          POOL_GAUGE_PREFIX(*usm_scope_, final_prefix),
+          POOL_HISTOGRAM_PREFIX(*usm_scope_, final_prefix))});
+  return acceptor_cluster_stats_map_[cluster_id].get();
 }
 
 UpstreamSocketManager::~UpstreamSocketManager() {

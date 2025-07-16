@@ -11,6 +11,7 @@
 #include "source/common/grpc/common.h"
 #include "source/common/singleton/const_singleton.h"
 
+#include "absl/status/status.h"
 #include "grpc++/grpc++.h"
 
 namespace Envoy {
@@ -54,9 +55,9 @@ private:
   /**
    * Validate the tunnel establishment request.
    * @param request the request to validate
-   * @return true if request is valid, false otherwise
+   * @return absl::OkStatus() if request is valid, error status with details otherwise
    */
-  bool validateTunnelRequest(const envoy::service::reverse_tunnel::v3::EstablishTunnelRequest& request);
+  absl::Status validateTunnelRequest(const envoy::service::reverse_tunnel::v3::EstablishTunnelRequest& request);
 
   /**
    * Process the authenticated tunnel request and establish the reverse connection.

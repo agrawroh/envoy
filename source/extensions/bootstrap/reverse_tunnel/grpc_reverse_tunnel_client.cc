@@ -33,9 +33,9 @@ GrpcReverseTunnelClient::GrpcReverseTunnelClient(
   ENVOY_LOG(debug, "Created GrpcReverseTunnelClient with correlation ID: {}", correlation_id_);
   
   // Create gRPC client immediately
-  if (!createGrpcClient()) {
-    ENVOY_LOG(error, "Failed to create gRPC client for reverse tunnel handshake.");
-    throw EnvoyException("Failed to create gRPC client for reverse tunnel handshake");
+  if (auto status = createGrpcClient(); !status.ok()) {
+    ENVOY_LOG(error, "Failed to create gRPC client for reverse tunnel handshake: {}", status.message());
+    throw EnvoyException(fmt::format("Failed to create gRPC client for reverse tunnel handshake: {}", status.message()));
   }
 }
 
@@ -44,19 +44,17 @@ GrpcReverseTunnelClient::~GrpcReverseTunnelClient() {
   cancel();
 }
 
-bool GrpcReverseTunnelClient::createGrpcClient() {
+absl::Status GrpcReverseTunnelClient::createGrpcClient() {
   try {
     // Verify cluster exists in cluster manager
     if (!config_.has_grpc_service() || !config_.grpc_service().has_envoy_grpc()) {
-      ENVOY_LOG(error, "Invalid gRPC service configuration - missing envoy_grpc configuration.");
-      return false;
+      return absl::InvalidArgumentError("Invalid gRPC service configuration - missing envoy_grpc configuration");
     }
 
     const std::string& cluster_name = config_.grpc_service().envoy_grpc().cluster_name();
     auto thread_local_cluster = cluster_manager_.getThreadLocalCluster(cluster_name);
     if (!thread_local_cluster) {
-      ENVOY_LOG(error, "Cluster '{}' not found for gRPC reverse tunnel handshake", cluster_name);
-      return false;
+      return absl::NotFoundError(fmt::format("Cluster '{}' not found for gRPC reverse tunnel handshake", cluster_name));
     }
 
     // Create raw gRPC client
@@ -66,16 +64,14 @@ bool GrpcReverseTunnelClient::createGrpcClient() {
                                                   false); // skip_cluster_check = false
 
     if (!result.ok()) {
-      ENVOY_LOG(error, "Failed to create gRPC async client for cluster '{}': {}", 
-                cluster_name, result.status().message());
-      return false;
+      return absl::InternalError(fmt::format("Failed to create gRPC async client for cluster '{}': {}", 
+                                             cluster_name, result.status().message()));
     }
 
     auto raw_client = result.value();
     
     if (!raw_client) {
-      ENVOY_LOG(error, "Failed to create gRPC async client for cluster '{}'", cluster_name);
-      return false;
+      return absl::InternalError(fmt::format("Failed to create gRPC async client for cluster '{}'", cluster_name));
     }
 
     // Create typed client from raw client
@@ -83,11 +79,10 @@ bool GrpcReverseTunnelClient::createGrpcClient() {
                                 envoy::service::reverse_tunnel::v3::EstablishTunnelResponse>(raw_client);
 
     ENVOY_LOG(debug, "Successfully created gRPC client for cluster '{}'", cluster_name);
-    return true;
+    return absl::OkStatus();
 
   } catch (const std::exception& e) {
-    ENVOY_LOG(error, "Exception creating gRPC client: {}", e.what());
-    return false;
+    return absl::InternalError(fmt::format("Exception creating gRPC client: {}", e.what()));
   }
 }
 

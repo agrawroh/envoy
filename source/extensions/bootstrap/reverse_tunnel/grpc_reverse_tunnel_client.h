@@ -13,6 +13,7 @@
 #include "source/common/grpc/typed_async_client.h"
 #include "source/common/protobuf/protobuf.h"
 
+#include "absl/status/status.h"
 #include "absl/types/optional.h"
 
 namespace Envoy {
@@ -106,9 +107,9 @@ public:
 private:
   /**
    * Create the gRPC async client.
-   * @return true if client creation was successful, false otherwise
+   * @return absl::OkStatus() if client creation was successful, error status otherwise
    */
-  bool createGrpcClient();
+  absl::Status createGrpcClient();
 
   /**
    * Build the handshake request.

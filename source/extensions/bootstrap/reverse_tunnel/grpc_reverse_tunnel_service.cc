@@ -36,12 +36,12 @@ grpc::Status GrpcReverseTunnelService::EstablishTunnel(
             request->initiator().node_id());
 
   // Validate the request
-  if (!validateTunnelRequest(*request)) {
-    ENVOY_LOG(error, "Invalid tunnel establishment request.");
+  if (auto validation_status = validateTunnelRequest(*request); !validation_status.ok()) {
+    ENVOY_LOG(error, "Invalid tunnel establishment request: {}", validation_status.message());
     stats_.failed_handshakes++;
     
     response->set_status(envoy::service::reverse_tunnel::v3::REJECTED);
-    response->set_status_message("Invalid request: required fields missing or malformed");
+    response->set_status_message(validation_status.message());
     return grpc::Status::OK; // Return OK with error status in response
   }
 
@@ -91,13 +91,12 @@ grpc::Status GrpcReverseTunnelService::EstablishTunnel(
   return grpc::Status::OK;
 }
 
-bool GrpcReverseTunnelService::validateTunnelRequest(
+absl::Status GrpcReverseTunnelService::validateTunnelRequest(
     const envoy::service::reverse_tunnel::v3::EstablishTunnelRequest& request) {
 
   // Validate required initiator identity
   if (!request.has_initiator()) {
-    ENVOY_LOG(error, "Tunnel request missing initiator identity.");
-    return false;
+    return absl::InvalidArgumentError("Tunnel request missing initiator identity");
   }
 
   const auto& initiator = request.initiator();
@@ -105,17 +104,17 @@ bool GrpcReverseTunnelService::validateTunnelRequest(
   // Validate required identity fields
   if (initiator.tenant_id().empty() || initiator.cluster_id().empty() || 
       initiator.node_id().empty()) {
-    ENVOY_LOG(error, "Tunnel request has empty required identity fields: tenant='{}', "
-                     "cluster='{}', node='{}'.",
-              initiator.tenant_id(), initiator.cluster_id(), initiator.node_id());
-    return false;
+    return absl::InvalidArgumentError(fmt::format(
+        "Tunnel request has empty required identity fields: tenant='{}', cluster='{}', node='{}'",
+        initiator.tenant_id(), initiator.cluster_id(), initiator.node_id()));
   }
 
   // Validate identity field lengths
   if (initiator.tenant_id().length() > 128 || initiator.cluster_id().length() > 128 ||
       initiator.node_id().length() > 128) {
-    ENVOY_LOG(error, "Tunnel request has identity fields exceeding maximum length.");
-    return false;
+    return absl::InvalidArgumentError(fmt::format(
+        "Tunnel request has identity fields exceeding maximum length: tenant={}, cluster={}, node={}",
+        initiator.tenant_id().length(), initiator.cluster_id().length(), initiator.node_id().length()));
   }
 
   // Validate tunnel configuration if present
@@ -125,22 +124,22 @@ bool GrpcReverseTunnelService::validateTunnelRequest(
     if (config.has_ping_interval()) {
       auto ping_seconds = config.ping_interval().seconds();
       if (ping_seconds < 1 || ping_seconds > 3600) {
-        ENVOY_LOG(error, "Invalid ping interval in tunnel request: {} seconds", ping_seconds);
-        return false;
+        return absl::InvalidArgumentError(fmt::format(
+            "Invalid ping interval in tunnel request: {} seconds (must be 1-3600)", ping_seconds));
       }
     }
 
     if (config.has_max_idle_time()) {
       auto idle_seconds = config.max_idle_time().seconds();
       if (idle_seconds < 30 || idle_seconds > 86400) { // 30 seconds to 24 hours
-        ENVOY_LOG(error, "Invalid max idle time in tunnel request: {} seconds", idle_seconds);
-        return false;
+        return absl::InvalidArgumentError(fmt::format(
+            "Invalid max idle time in tunnel request: {} seconds (must be 30-86400)", idle_seconds));
       }
     }
   }
 
   ENVOY_LOG(debug, "Tunnel request validation successful.");
-  return true;
+  return absl::OkStatus();
 }
 
 envoy::service::reverse_tunnel::v3::EstablishTunnelResponse

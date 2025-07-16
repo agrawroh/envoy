@@ -27,6 +27,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
 
 namespace Envoy {
@@ -53,18 +54,24 @@ static constexpr uint32_t kDefaultConnectionTimeoutMs = 10000;    // 10 seconds.
 
 /**
  * All reverse connection downstream stats. @see stats_macros.h
+ * These stats track the performance and health of outgoing reverse connections
+ * from the initiator (on-premises) to the acceptor (cloud).
  */
-#define ALL_REVERSE_CONNECTION_DOWNSTREAM_STATS(COUNTER, GAUGE)                                   \
+#define ALL_REVERSE_CONNECTION_DOWNSTREAM_STATS(COUNTER, GAUGE, HISTOGRAM)                        \
   COUNTER(reverse_conn_connect_attempts)                                                          \
   COUNTER(reverse_conn_connect_failures)                                                          \
   COUNTER(reverse_conn_handshake_failures)                                                        \
   COUNTER(reverse_conn_timeout_failures)                                                          \
+  COUNTER(reverse_conn_retries)                                                                   \
   GAUGE(reverse_conn_connecting, Accumulate)                                                      \
   GAUGE(reverse_conn_connected, Accumulate)                                                       \
   GAUGE(reverse_conn_failed, Accumulate)                                                          \
   GAUGE(reverse_conn_recovered, Accumulate)                                                       \
   GAUGE(reverse_conn_backoff, Accumulate)                                                         \
-  GAUGE(reverse_conn_cannot_connect, Accumulate)
+  GAUGE(reverse_conn_cannot_connect, Accumulate)                                                  \
+  HISTOGRAM(reverse_conn_establishment_time, Milliseconds)                                        \
+  HISTOGRAM(reverse_conn_handshake_time, Milliseconds)                                            \
+  HISTOGRAM(reverse_conn_retry_backoff_time, Milliseconds)
 
 /**
  * Connection state tracking for reverse connections.
@@ -82,7 +89,7 @@ enum class ReverseConnectionState {
  * Struct definition for all reverse connection downstream stats. @see stats_macros.h
  */
 struct ReverseConnectionDownstreamStats {
-  ALL_REVERSE_CONNECTION_DOWNSTREAM_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT)
+  ALL_REVERSE_CONNECTION_DOWNSTREAM_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT, GENERATE_HISTOGRAM_STRUCT)
 };
 
 using ReverseConnectionDownstreamStatsPtr = std::unique_ptr<ReverseConnectionDownstreamStats>;
@@ -380,9 +387,9 @@ private:
   // Pipe trigger mechanism helpers
   /**
    * Initialize the pipe trigger mechanism for waking up accept().
-   * @return true if successful, false otherwise
+   * @return absl::OkStatus() if successful, error status otherwise
    */
-  bool initializePipeTrigger();
+  absl::Status initializePipeTrigger();
 
   /**
    * Clean up pipe trigger mechanism resources.

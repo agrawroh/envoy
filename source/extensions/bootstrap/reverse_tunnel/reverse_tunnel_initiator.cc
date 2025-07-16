@@ -523,9 +523,10 @@ Api::SysCallIntResult ReverseConnectionIOHandle::listen(int backlog) {
   if (!listening_initiated_) {
     // Create pipe trigger mechanism on worker thread where TLS is available
     if (!isPipeTriggerReady()) {
-      if (!initializePipeTrigger()) {
+      if (auto status = initializePipeTrigger(); !status.ok()) {
         ENVOY_LOG(error,
-                  "Failed to create pipe trigger mechanism - cannot proceed with reverse connections");
+                  "Failed to create pipe trigger mechanism - cannot proceed with reverse connections: {}",
+                  status.message());
         return Api::SysCallIntResult{-1, ENODEV};
       }
 
@@ -1035,7 +1036,8 @@ ReverseConnectionIOHandle::getStatsByCluster(const std::string& cluster_name) {
   cluster_stats_map_[cluster_name] = std::make_unique<ReverseConnectionDownstreamStats>(
       ReverseConnectionDownstreamStats{ALL_REVERSE_CONNECTION_DOWNSTREAM_STATS(
           POOL_COUNTER_PREFIX(*reverse_conn_scope_, cluster_name),
-          POOL_GAUGE_PREFIX(*reverse_conn_scope_, cluster_name))});
+          POOL_GAUGE_PREFIX(*reverse_conn_scope_, cluster_name),
+          POOL_HISTOGRAM_PREFIX(*reverse_conn_scope_, cluster_name))});
   return cluster_stats_map_[cluster_name].get();
 }
 
@@ -1054,7 +1056,8 @@ ReverseConnectionIOHandle::getStatsByHost(const std::string& host_address,
   host_stats_map_[host_key] = std::make_unique<ReverseConnectionDownstreamStats>(
       ReverseConnectionDownstreamStats{ALL_REVERSE_CONNECTION_DOWNSTREAM_STATS(
           POOL_COUNTER_PREFIX(*reverse_conn_scope_, host_key),
-          POOL_GAUGE_PREFIX(*reverse_conn_scope_, host_key))});
+          POOL_GAUGE_PREFIX(*reverse_conn_scope_, host_key),
+          POOL_HISTOGRAM_PREFIX(*reverse_conn_scope_, host_key))});
   return host_stats_map_[host_key].get();
 }
 
@@ -1338,20 +1341,18 @@ bool ReverseConnectionIOHandle::initiateOneReverseConnection(const std::string& 
 }
 
 // Pipe trigger mechanism implementation - inlined for simplicity
-bool ReverseConnectionIOHandle::initializePipeTrigger() {
+absl::Status ReverseConnectionIOHandle::initializePipeTrigger() {
   ENVOY_LOG(debug, "Creating pipe trigger mechanism.");
 
   // Check if TLS is available before proceeding
   if (!isThreadLocalDispatcherAvailable()) {
-    ENVOY_LOG(error, "Cannot create pipe trigger mechanism - thread-local dispatcher not available.");
-    return false;
+    return absl::FailedPreconditionError("Cannot create pipe trigger mechanism - thread-local dispatcher not available");
   }
 
   // Create pipe
   int pipe_fds[2];
   if (::pipe(pipe_fds) == -1) {
-    ENVOY_LOG(error, "Failed to create pipe: {}.", strerror(errno));
-    return false;
+    return absl::InternalError(fmt::format("Failed to create pipe: {}", strerror(errno)));
   }
 
   trigger_pipe_read_fd_ = pipe_fds[0];
@@ -1359,18 +1360,24 @@ bool ReverseConnectionIOHandle::initializePipeTrigger() {
 
   // Make both ends non-blocking for optimal performance
   int flags = ::fcntl(trigger_pipe_read_fd_, F_GETFL, 0);
-  if (flags != -1) {
-    ::fcntl(trigger_pipe_read_fd_, F_SETFL, flags | O_NONBLOCK);
+  if (flags == -1) {
+    return absl::InternalError(fmt::format("Failed to get pipe read flags: {}", strerror(errno)));
+  }
+  if (::fcntl(trigger_pipe_read_fd_, F_SETFL, flags | O_NONBLOCK) == -1) {
+    return absl::InternalError(fmt::format("Failed to set pipe read non-blocking: {}", strerror(errno)));
   }
 
   flags = ::fcntl(trigger_pipe_write_fd_, F_GETFL, 0);
-  if (flags != -1) {
-    ::fcntl(trigger_pipe_write_fd_, F_SETFL, flags | O_NONBLOCK);
+  if (flags == -1) {
+    return absl::InternalError(fmt::format("Failed to get pipe write flags: {}", strerror(errno)));
+  }
+  if (::fcntl(trigger_pipe_write_fd_, F_SETFL, flags | O_NONBLOCK) == -1) {
+    return absl::InternalError(fmt::format("Failed to set pipe write non-blocking: {}", strerror(errno)));
   }
 
   ENVOY_LOG(info, "Created pipe trigger mechanism with read FD: {}, write FD: {}", 
             trigger_pipe_read_fd_, trigger_pipe_write_fd_);
-  return true;
+  return absl::OkStatus();
 }
 
 void ReverseConnectionIOHandle::cleanupPipeTrigger() {

@@ -33,22 +33,31 @@ class ReverseTunnelAcceptorExtension;
 class UpstreamSocketManager;
 
 /**
- * All UpstreamSocketManager stats. @see stats_macros.h
- * This encompasses the stats for all accepted reverse connections by the responder envoy.
+ * All reverse connection acceptor stats. @see stats_macros.h
+ * These stats track the performance and health of incoming reverse connections
+ * from the initiator (on-premises) to the acceptor (cloud).
  */
-#define ALL_USM_STATS(GAUGE)                                                                       \
-  GAUGE(reverse_conn_cx_idle, NeverImport)                                                         \
-  GAUGE(reverse_conn_cx_used, NeverImport)                                                         \
-  GAUGE(reverse_conn_cx_total, NeverImport)
+#define ALL_REVERSE_CONNECTION_ACCEPTOR_STATS(COUNTER, GAUGE, HISTOGRAM)                          \
+  COUNTER(reverse_conn_cx_accepted)                                                               \
+  COUNTER(reverse_conn_cx_rejected)                                                               \
+  COUNTER(reverse_conn_cx_auth_failures)                                                          \
+  COUNTER(reverse_conn_ping_timeouts)                                                             \
+  COUNTER(reverse_conn_ping_responses)                                                            \
+  GAUGE(reverse_conn_cx_idle, NeverImport)                                                        \
+  GAUGE(reverse_conn_cx_used, NeverImport)                                                        \
+  GAUGE(reverse_conn_cx_total, NeverImport)                                                       \
+  HISTOGRAM(reverse_conn_accept_time, Milliseconds)                                               \
+  HISTOGRAM(reverse_conn_ping_response_time, Milliseconds)                                        \
+  HISTOGRAM(reverse_conn_idle_duration, Milliseconds)
 
 /**
- * Struct definition for all UpstreamSocketManager stats. @see stats_macros.h
+ * Struct definition for all reverse connection acceptor stats. @see stats_macros.h
  */
-struct USMStats {
-  ALL_USM_STATS(GENERATE_GAUGE_STRUCT)
+struct ReverseConnectionAcceptorStats {
+  ALL_REVERSE_CONNECTION_ACCEPTOR_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT, GENERATE_HISTOGRAM_STRUCT)
 };
 
-using USMStatsPtr = std::unique_ptr<USMStats>;
+using ReverseConnectionAcceptorStatsPtr = std::unique_ptr<ReverseConnectionAcceptorStats>;
 
 /**
  * Custom IoHandle for upstream reverse connections that properly owns a ConnectionSocket.
@@ -434,14 +443,14 @@ public:
    * @param node_id the node ID to get stats for.
    * @return pointer to the node stats.
    */
-  USMStats* getStatsByNode(const std::string& node_id);
+  ReverseConnectionAcceptorStats* getStatsByNode(const std::string& node_id);
 
   /**
    * Get or create stats for a specific cluster.
    * @param cluster_id the cluster ID to get stats for.
    * @return pointer to the cluster stats.
    */
-  USMStats* getStatsByCluster(const std::string& cluster_id);
+  ReverseConnectionAcceptorStats* getStatsByCluster(const std::string& cluster_id);
 
   /**
    * Delete stats for a specific node.
@@ -485,13 +494,13 @@ private:
   absl::flat_hash_map<int, Event::FileEventPtr> fd_to_event_map_;
   absl::flat_hash_map<int, Event::TimerPtr> fd_to_timer_map_;
 
-  // A map of the remote node ID -> USMStatsPtr, used to log accepted
+  // A map of the remote node ID -> ReverseConnectionAcceptorStatsPtr, used to log accepted
   // reverse conn stats for every initiator node, by the local envoy as responder.
-  absl::flat_hash_map<std::string, USMStatsPtr> usm_node_stats_map_;
+  absl::flat_hash_map<std::string, ReverseConnectionAcceptorStatsPtr> acceptor_node_stats_map_;
 
-  // A map of the remote cluster ID -> USMStatsPtr, used to log accepted
+  // A map of the remote cluster ID -> ReverseConnectionAcceptorStatsPtr, used to log accepted
   // reverse conn stats for every initiator cluster, by the local envoy as responder.
-  absl::flat_hash_map<std::string, USMStatsPtr> usm_cluster_stats_map_;
+  absl::flat_hash_map<std::string, ReverseConnectionAcceptorStatsPtr> acceptor_cluster_stats_map_;
 
   // The scope for UpstreamSocketManager stats.
   Stats::ScopeSharedPtr usm_scope_;
