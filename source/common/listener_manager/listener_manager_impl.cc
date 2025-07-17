@@ -21,10 +21,13 @@
 #include "source/common/network/filter_matcher.h"
 #include "source/common/network/io_socket_handle_impl.h"
 #include "source/common/network/listen_socket_impl.h"
+#include "source/common/network/socket_interface.h"
 #include "source/common/network/socket_option_factory.h"
 #include "source/common/network/utility.h"
 #include "source/common/protobuf/utility.h"
 
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/blocking_counter.h"
 
 #if defined(ENVOY_ENABLE_QUIC)
@@ -316,6 +319,21 @@ absl::StatusOr<Network::SocketSharedPtr> ProdListenerComponentFactory::createLis
   ASSERT(socket_type == Network::Socket::Type::Stream ||
          socket_type == Network::Socket::Type::Datagram);
 
+  // Addresses with the "rc://" prefix are reverse connection addresses.
+  std::string logical_name = address->logicalName();
+  if (absl::StartsWith(logical_name, "rc://")) {
+    // Use the address's socket interface for reverse connections. If the
+    // reverse connection socket interface is not registered, the default
+    // socket interface is returned by socketInterface().
+    ENVOY_LOG(debug, "Creating reverse connection socket for logical name: {}", logical_name);
+    const auto& socket_interface = address->socketInterface();
+    auto io_handle = socket_interface.socket(socket_type, address, creation_options);
+    if (!io_handle) {
+      return absl::InternalError("Failed to create reverse connection socket");
+    }
+    return std::make_shared<Network::TcpListenSocket>(std::move(io_handle), address, options);
+  }
+
   // First we try to get the socket from our parent if applicable in each case below.
   if (address->type() == Network::Address::Type::Pipe) {
     if (socket_type != Network::Socket::Type::Stream) {
@@ -401,6 +419,7 @@ ListenerManagerImpl::ListenerManagerImpl(Instance& server,
   for (uint32_t i = 0; i < server.options().concurrency(); i++) {
     workers_.emplace_back(worker_factory.createWorker(
         i, server.overloadManager(), server.nullOverloadManager(), absl::StrCat("worker_", i)));
+    ENVOY_LOG(debug, "Starting worker {}", i);
   }
 }
 

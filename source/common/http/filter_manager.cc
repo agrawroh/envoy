@@ -84,6 +84,12 @@ void ActiveStreamFilterBase::commonContinue() {
     }
   }
 
+  if (!canContinue()) {
+    ENVOY_STREAM_LOG(trace, "cannot continue filter chain: filter={}", *this,
+                     static_cast<const void*>(this));
+    return;
+  }
+
   // Make sure that we handle the zero byte data frame case. We make no effort to optimize this
   // case in terms of merging it into a header only request/response. This could be done in the
   // future.
@@ -92,7 +98,19 @@ void ActiveStreamFilterBase::commonContinue() {
     doHeaders(observedEndStream() && !bufferedData() && !hasTrailers());
   }
 
+  if (!canContinue()) {
+    ENVOY_STREAM_LOG(trace, "cannot continue filter chain: filter={}", *this,
+                     static_cast<const void*>(this));
+    return;
+  }
+
   doMetadata();
+
+  if (!canContinue()) {
+    ENVOY_STREAM_LOG(trace, "cannot continue filter chain: filter={}", *this,
+                     static_cast<const void*>(this));
+    return;
+  }
 
   // It is possible for trailers to be added during doData(). doData() itself handles continuation
   // of trailers for the non-continuation case. Thus, we must keep track of whether we had
@@ -101,6 +119,12 @@ void ActiveStreamFilterBase::commonContinue() {
   const bool had_trailers_before_data = hasTrailers();
   if (bufferedData()) {
     doData(observedEndStream() && !had_trailers_before_data);
+  }
+
+  if (!canContinue()) {
+    ENVOY_STREAM_LOG(trace, "cannot continue filter chain: filter={}", *this,
+                     static_cast<const void*>(this));
+    return;
   }
 
   if (had_trailers_before_data) {
@@ -446,6 +470,10 @@ void ActiveStreamDecoderFilter::modifyDecodingBuffer(
     std::function<void(Buffer::Instance&)> callback) {
   ASSERT(parent_.state_.latest_data_decoding_filter_ == this);
   callback(*parent_.buffered_request_data_.get());
+}
+
+void ActiveStreamDecoderFilter::setReverseConnForceLocalReply(bool value) {
+  parent_.setReverseConnForceLocalReply(value);
 }
 
 void ActiveStreamDecoderFilter::sendLocalReply(
@@ -1002,10 +1030,15 @@ void DownstreamFilterManager::sendLocalReply(
       // route refreshment in the response filter chain.
       cb->route(nullptr);
     }
-
-    // We only prepare a local reply to execute later if we're actively
-    // invoking filters to avoid re-entrant in filters.
-    if (state_.filter_call_state_ & FilterCallState::IsDecodingMask) {
+    // We only prepare a local reply to execute later if we're actively invoking filters to avoid
+    // re-entrant in filters.
+    //
+    // For reverse connections (where upstream initiates the connection to downstream), we need to
+    // send local replies immediately rather than queuing them. This ensures proper handling of the
+    // reversed connection flow and prevents potential issues with connection state and filter chain
+    // processing.
+    if (!reverse_conn_force_local_reply_ &&
+        (state_.filter_call_state_ & FilterCallState::IsDecodingMask)) {
       prepareLocalReplyViaFilterChain(is_grpc_request, code, body, modify_headers, is_head_request,
                                       grpc_status, details);
     } else {
