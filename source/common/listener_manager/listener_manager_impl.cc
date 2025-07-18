@@ -319,27 +319,22 @@ absl::StatusOr<Network::SocketSharedPtr> ProdListenerComponentFactory::createLis
   ASSERT(socket_type == Network::Socket::Type::Stream ||
          socket_type == Network::Socket::Type::Datagram);
 
-  // Check logicalName() for reverse connection addresses
-  std::string logical_name = address->logicalName();
-  if (absl::StartsWith(logical_name, "rc://")) {
-    // Try to get a registered reverse connection socket interface
-    ENVOY_LOG(debug, "Creating reverse connection socket for logical name: {}", logical_name);
-    auto* socket_interface = Network::socketInterface(
-        "envoy.bootstrap.reverse_connection.downstream_reverse_connection_socket_interface");
-    if (socket_interface) {
-      ENVOY_LOG(debug, "Creating reverse connection socket for logical name: {}", logical_name);
-      auto io_handle = socket_interface->socket(socket_type, address, creation_options);
-      if (!io_handle) {
-        return absl::InvalidArgumentError("Failed to create reverse connection socket");
-      }
-      return std::make_shared<Network::TcpListenSocket>(std::move(io_handle), address, options);
-    } else {
-      ENVOY_LOG(warn, "Reverse connection address detected but socket interface not registered: {}",
-                logical_name);
-      return absl::InvalidArgumentError("Reverse connection socket interface not available");
+  // Use the address's socket interface to handle custom address types.
+  const Network::SocketInterface& socket_interface = address->socketInterface();
+
+  // Check if this is a custom socket interface and not the default one.
+  const Network::SocketInterface& default_interface = Network::SocketInterfaceSingleton::get();
+  if (&socket_interface != &default_interface) {
+    ENVOY_LOG(debug, "creating socket using custom interface for address: {}",
+              address->logicalName());
+    auto io_handle = socket_interface.socket(socket_type, address, creation_options);
+    if (!io_handle) {
+      return absl::InvalidArgumentError("failed to create socket using custom interface");
     }
+    return std::make_shared<Network::TcpListenSocket>(std::move(io_handle), address, options);
   }
 
+  // Continue with standard socket creation for regular addresses
   // First we try to get the socket from our parent if applicable in each case below.
   if (address->type() == Network::Address::Type::Pipe) {
     if (socket_type != Network::Socket::Type::Stream) {
@@ -425,7 +420,7 @@ ListenerManagerImpl::ListenerManagerImpl(Instance& server,
   for (uint32_t i = 0; i < server.options().concurrency(); i++) {
     workers_.emplace_back(worker_factory.createWorker(
         i, server.overloadManager(), server.nullOverloadManager(), absl::StrCat("worker_", i)));
-    ENVOY_LOG(debug, "Starting worker {}", i);
+    ENVOY_LOG(debug, "starting worker {}", i);
   }
 }
 

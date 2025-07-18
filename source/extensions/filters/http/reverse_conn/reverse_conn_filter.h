@@ -59,7 +59,8 @@ static const char DOUBLE_CRLF[] = "\r\n\r\n";
 
 /**
  * Enhanced reverse connection filter with gRPC support.
- * This filter handles both legacy HTTP requests and modern gRPC requests for reverse tunnel handshakes.
+ * This filter handles both legacy HTTP requests and modern gRPC requests for reverse tunnel
+ * handshakes.
  */
 class ReverseConnFilter : Logger::Loggable<Logger::Id::filter>, public Http::StreamDecoderFilter {
 public:
@@ -90,12 +91,13 @@ public:
 private:
   // Check if request is a gRPC reverse tunnel request
   bool isGrpcReverseTunnelRequest(const Http::RequestHeaderMap& headers);
-  
+
   // Process gRPC request body and handle the tunnel establishment
   Http::FilterDataStatus processGrpcRequest();
-  
+
   // Send gRPC response with proper framing and headers
-  void sendGrpcResponse(const envoy::service::reverse_tunnel::v3::EstablishTunnelResponse& response);
+  void
+  sendGrpcResponse(const envoy::service::reverse_tunnel::v3::EstablishTunnelResponse& response);
 
   void saveDownstreamConnection(Network::Connection& downstream_connection,
                                 const std::string& node_id, const std::string& cluster_id);

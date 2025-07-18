@@ -81,7 +81,7 @@ public:
   /**
    * Initiate the reverse tunnel handshake.
    * @param tenant_id the tenant identifier
-   * @param cluster_id the cluster identifier  
+   * @param cluster_id the cluster identifier
    * @param node_id the node identifier
    * @param metadata optional custom metadata
    * @param span the tracing span for request tracking
@@ -99,8 +99,9 @@ public:
 
   // Grpc::AsyncRequestCallbacks implementation
   void onCreateInitialMetadata(Http::RequestHeaderMap& metadata) override;
-  void onSuccess(std::unique_ptr<envoy::service::reverse_tunnel::v3::EstablishTunnelResponse>&& response,
-                 Tracing::Span& span) override;
+  void
+  onSuccess(std::unique_ptr<envoy::service::reverse_tunnel::v3::EstablishTunnelResponse>&& response,
+            Tracing::Span& span) override;
   void onFailure(Grpc::Status::GrpcStatus status, const std::string& message,
                  Tracing::Span& span) override;
 
@@ -127,12 +128,13 @@ private:
   Upstream::ClusterManager& cluster_manager_;
   const envoy::service::reverse_tunnel::v3::ReverseTunnelGrpcConfig config_;
   GrpcReverseTunnelCallbacks& callbacks_;
-  
+
   Grpc::AsyncClient<envoy::service::reverse_tunnel::v3::EstablishTunnelRequest,
-                    envoy::service::reverse_tunnel::v3::EstablishTunnelResponse> client_;
+                    envoy::service::reverse_tunnel::v3::EstablishTunnelResponse>
+      client_;
   const Protobuf::MethodDescriptor* service_method_;
   Grpc::AsyncRequest* current_request_{nullptr};
-  
+
   std::string correlation_id_;
   std::chrono::steady_clock::time_point handshake_start_time_;
 };
@@ -140,4 +142,4 @@ private:
 } // namespace ReverseConnection
 } // namespace Bootstrap
 } // namespace Extensions
-} // namespace Envoy 
+} // namespace Envoy

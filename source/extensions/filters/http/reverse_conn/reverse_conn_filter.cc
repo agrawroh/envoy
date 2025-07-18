@@ -22,7 +22,7 @@ namespace ReverseConn {
 const std::string ReverseConnFilter::reverse_connections_path = "/reverse_connections";
 const std::string ReverseConnFilter::reverse_connections_request_path =
     "/reverse_connections/request";
-const std::string ReverseConnFilter::grpc_service_path = 
+const std::string ReverseConnFilter::grpc_service_path =
     "/envoy.service.reverse_tunnel.v3.ReverseTunnelHandshakeService/EstablishTunnel";
 const std::string ReverseConnFilter::node_id_param = "node_id";
 const std::string ReverseConnFilter::cluster_id_param = "cluster_id";
@@ -365,17 +365,17 @@ Http::FilterHeadersStatus ReverseConnFilter::decodeHeaders(Http::RequestHeaderMa
     ENVOY_STREAM_LOG(info, "Handling gRPC reverse tunnel handshake request", *decoder_callbacks_);
     request_headers_ = &request_headers;
     is_accept_request_ = true; // Reuse this flag for gRPC requests
-    
+
     // Read content length for gRPC request
     const auto content_length_header = request_headers.getContentLengthValue();
     if (!content_length_header.empty()) {
       expected_proto_size_ = static_cast<uint32_t>(std::stoi(std::string(content_length_header)));
-      ENVOY_STREAM_LOG(info, "Expecting gRPC request with {} bytes", *decoder_callbacks_, 
+      ENVOY_STREAM_LOG(info, "Expecting gRPC request with {} bytes", *decoder_callbacks_,
                        expected_proto_size_);
     } else {
       expected_proto_size_ = 0; // Will handle streaming
     }
-    
+
     return Http::FilterHeadersStatus::StopIteration;
   }
 
@@ -425,7 +425,7 @@ bool ReverseConnFilter::isGrpcReverseTunnelRequest(const Http::RequestHeaderMap&
   if (content_type != "application/grpc") {
     return false;
   }
-  
+
   // Check for gRPC reverse tunnel service path
   const absl::string_view request_path = headers.Path()->value().getStringView();
   return request_path == grpc_service_path;
@@ -478,29 +478,31 @@ Http::FilterDataStatus ReverseConnFilter::processGrpcRequest() {
     // Parse gRPC request from buffer
     envoy::service::reverse_tunnel::v3::EstablishTunnelRequest grpc_request;
     const std::string request_body = accept_rev_conn_proto_.toString();
-    
+
     // For gRPC over HTTP/2, we need to handle the gRPC frame format
     // Skip the first 5 bytes (compression flag + message length)
     if (request_body.length() >= 5) {
       const std::string grpc_message = request_body.substr(5);
       if (!grpc_request.ParseFromString(grpc_message)) {
         ENVOY_STREAM_LOG(error, "Failed to parse gRPC request from body", *decoder_callbacks_);
-        decoder_callbacks_->sendLocalReply(Http::Code::BadRequest,
-                                           "Invalid gRPC request format", nullptr, absl::nullopt, "");
+        decoder_callbacks_->sendLocalReply(Http::Code::BadRequest, "Invalid gRPC request format",
+                                           nullptr, absl::nullopt, "");
         return Http::FilterDataStatus::StopIterationNoBuffer;
       }
     } else {
-      ENVOY_STREAM_LOG(error, "gRPC request too short: {} bytes", *decoder_callbacks_, request_body.length());
-      decoder_callbacks_->sendLocalReply(Http::Code::BadRequest,
-                                         "gRPC request too short", nullptr, absl::nullopt, "");
+      ENVOY_STREAM_LOG(error, "gRPC request too short: {} bytes", *decoder_callbacks_,
+                       request_body.length());
+      decoder_callbacks_->sendLocalReply(Http::Code::BadRequest, "gRPC request too short", nullptr,
+                                         absl::nullopt, "");
       return Http::FilterDataStatus::StopIterationNoBuffer;
     }
 
-    ENVOY_STREAM_LOG(debug, "Parsed gRPC request: {}", *decoder_callbacks_, grpc_request.DebugString());
+    ENVOY_STREAM_LOG(debug, "Parsed gRPC request: {}", *decoder_callbacks_,
+                     grpc_request.DebugString());
 
     // Process the gRPC request directly (without standalone service)
     envoy::service::reverse_tunnel::v3::EstablishTunnelResponse grpc_response;
-    
+
     // Validate the request
     const auto& initiator = grpc_request.initiator();
     if (initiator.node_id().empty() || initiator.cluster_id().empty()) {
@@ -510,66 +512,66 @@ Http::FilterDataStatus ReverseConnFilter::processGrpcRequest() {
       // Accept the tunnel request
       grpc_response.set_status(envoy::service::reverse_tunnel::v3::TunnelStatus::ACCEPTED);
       grpc_response.set_status_message("Tunnel established successfully");
-      
+
       ENVOY_STREAM_LOG(info, "Accepting gRPC reverse tunnel for node='{}', cluster='{}'",
                        *decoder_callbacks_, initiator.node_id(), initiator.cluster_id());
     }
 
-    ENVOY_STREAM_LOG(info, "gRPC EstablishTunnel processed: {}", *decoder_callbacks_, 
+    ENVOY_STREAM_LOG(info, "gRPC EstablishTunnel processed: {}", *decoder_callbacks_,
                      grpc_response.DebugString());
 
     // Send gRPC response
     sendGrpcResponse(grpc_response);
-    
+
     // Handle connection acceptance if successful
     if (grpc_response.status() == envoy::service::reverse_tunnel::v3::TunnelStatus::ACCEPTED) {
       Network::Connection* connection =
           &const_cast<Network::Connection&>(*decoder_callbacks_->connection());
-      
+
       ENVOY_STREAM_LOG(info, "Saving downstream connection for gRPC request", *decoder_callbacks_);
-      
+
       saveDownstreamConnection(*connection, initiator.node_id(), initiator.cluster_id());
       connection->setSocketReused(true);
       connection->close(Network::ConnectionCloseType::NoFlush, "accepted_reverse_conn_grpc");
     }
 
     return Http::FilterDataStatus::StopIterationNoBuffer;
-    
+
   } catch (const std::exception& e) {
     ENVOY_STREAM_LOG(error, "Exception processing gRPC request: {}", *decoder_callbacks_, e.what());
-    decoder_callbacks_->sendLocalReply(Http::Code::InternalServerError,
-                                       "Internal server error", nullptr, absl::nullopt, "");
+    decoder_callbacks_->sendLocalReply(Http::Code::InternalServerError, "Internal server error",
+                                       nullptr, absl::nullopt, "");
     return Http::FilterDataStatus::StopIterationNoBuffer;
   }
 }
 
-void ReverseConnFilter::sendGrpcResponse(const envoy::service::reverse_tunnel::v3::EstablishTunnelResponse& response) {
+void ReverseConnFilter::sendGrpcResponse(
+    const envoy::service::reverse_tunnel::v3::EstablishTunnelResponse& response) {
   // Serialize the gRPC response
   std::string response_body = response.SerializeAsString();
-  
+
   // Add gRPC frame header (compression flag + message length)
   std::string grpc_frame;
   grpc_frame.reserve(5 + response_body.size());
   grpc_frame.append(1, 0); // No compression
-  
+
   // Message length in big-endian format
   uint32_t msg_len = htonl(response_body.size());
   grpc_frame.append(reinterpret_cast<const char*>(&msg_len), 4);
   grpc_frame.append(response_body);
-  
-  ENVOY_STREAM_LOG(info, "Sending gRPC response: {} total bytes", *decoder_callbacks_, grpc_frame.size());
-  
+
+  ENVOY_STREAM_LOG(info, "Sending gRPC response: {} total bytes", *decoder_callbacks_,
+                   grpc_frame.size());
+
   // Send gRPC response with proper headers
   decoder_callbacks_->sendLocalReply(
-      Http::Code::OK, 
-      grpc_frame,
+      Http::Code::OK, grpc_frame,
       [](Http::ResponseHeaderMap& headers) {
         headers.setContentType("application/grpc");
         headers.addCopy(Http::LowerCaseString("grpc-status"), "0"); // OK
         headers.addCopy(Http::LowerCaseString("grpc-message"), "");
       },
-      absl::nullopt, 
-      "");
+      absl::nullopt, "");
 }
 
 Http::FilterTrailersStatus ReverseConnFilter::decodeTrailers(Http::RequestTrailerMap&) {

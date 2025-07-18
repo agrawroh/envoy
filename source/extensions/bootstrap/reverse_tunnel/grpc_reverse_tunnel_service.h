@@ -27,7 +27,7 @@ class ReverseTunnelAcceptorExtension;
  * This class implements the ReverseTunnelHandshakeService and handles
  * EstablishTunnel requests from reverse connection initiators.
  */
-class GrpcReverseTunnelService final 
+class GrpcReverseTunnelService final
     : public envoy::service::reverse_tunnel::v3::ReverseTunnelHandshakeService::Service,
       public Logger::Loggable<Logger::Id::connection> {
 public:
@@ -47,9 +47,10 @@ public:
    * @param response the tunnel establishment response
    * @return gRPC status indicating success or failure
    */
-  grpc::Status EstablishTunnel(grpc::ServerContext* context,
-                               const envoy::service::reverse_tunnel::v3::EstablishTunnelRequest* request,
-                               envoy::service::reverse_tunnel::v3::EstablishTunnelResponse* response) override;
+  grpc::Status
+  EstablishTunnel(grpc::ServerContext* context,
+                  const envoy::service::reverse_tunnel::v3::EstablishTunnelRequest* request,
+                  envoy::service::reverse_tunnel::v3::EstablishTunnelResponse* response) override;
 
 private:
   /**
@@ -57,7 +58,8 @@ private:
    * @param request the request to validate
    * @return absl::OkStatus() if request is valid, error status with details otherwise
    */
-  absl::Status validateTunnelRequest(const envoy::service::reverse_tunnel::v3::EstablishTunnelRequest& request);
+  absl::Status
+  validateTunnelRequest(const envoy::service::reverse_tunnel::v3::EstablishTunnelRequest& request);
 
   /**
    * Process the authenticated tunnel request and establish the reverse connection.
@@ -92,8 +94,8 @@ private:
    * @param request the original tunnel request
    * @return accepted tunnel configuration
    */
-  envoy::service::reverse_tunnel::v3::TunnelConfiguration
-  createAcceptedConfiguration(const envoy::service::reverse_tunnel::v3::EstablishTunnelRequest& request);
+  envoy::service::reverse_tunnel::v3::TunnelConfiguration createAcceptedConfiguration(
+      const envoy::service::reverse_tunnel::v3::EstablishTunnelRequest& request);
 
   /**
    * Extract the underlying TCP connection from the gRPC context.
@@ -109,8 +111,9 @@ private:
    * @param request the tunnel establishment request
    * @return true if connection was successfully registered, false otherwise
    */
-  bool registerTunnelConnection(Network::Connection* connection,
-                                const envoy::service::reverse_tunnel::v3::EstablishTunnelRequest& request);
+  bool registerTunnelConnection(
+      Network::Connection* connection,
+      const envoy::service::reverse_tunnel::v3::EstablishTunnelRequest& request);
 
   // Reference to the acceptor extension for connection management
   ReverseTunnelAcceptorExtension& acceptor_extension_;
@@ -138,7 +141,7 @@ public:
    * @param acceptor_extension reference to the acceptor extension
    * @return unique pointer to the created service
    */
-  static std::unique_ptr<GrpcReverseTunnelService> 
+  static std::unique_ptr<GrpcReverseTunnelService>
   createService(ReverseTunnelAcceptorExtension& acceptor_extension);
 
   /**
@@ -154,4 +157,4 @@ public:
 } // namespace ReverseConnection
 } // namespace Bootstrap
 } // namespace Extensions
-} // namespace Envoy 
+} // namespace Envoy

@@ -18,15 +18,16 @@ namespace ReverseConnection {
  *   ExtensionImpl: The actual bootstrap extension implementation class
  */
 template <class ConfigProto, class ExtensionImpl>
-class ReverseConnectionBootstrapFactoryBase : public Server::Configuration::BootstrapExtensionFactory {
+class ReverseConnectionBootstrapFactoryBase
+    : public Server::Configuration::BootstrapExtensionFactory {
 public:
   // Server::Configuration::BootstrapExtensionFactory implementation
   Server::BootstrapExtensionPtr
   createBootstrapExtension(const Protobuf::Message& config,
                            Server::Configuration::ServerFactoryContext& context) override {
-    return createBootstrapExtensionTyped(
-        MessageUtil::downcastAndValidate<const ConfigProto&>(config, context.messageValidationVisitor()),
-        context);
+    return createBootstrapExtensionTyped(MessageUtil::downcastAndValidate<const ConfigProto&>(
+                                             config, context.messageValidationVisitor()),
+                                         context);
   }
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
@@ -67,13 +68,13 @@ public:
    * Validate thread-local slot availability before using it.
    * Follows Envoy's patterns for safe TLS access.
    * @param tls_slot the thread-local slot to validate
-   * @param extension_name name of the extension for error messages  
+   * @param extension_name name of the extension for error messages
    * @return true if the slot is safe to use, false otherwise
    */
-  template<typename TlsType>
-  static bool validateThreadLocalSlot(
-      const std::unique_ptr<ThreadLocal::TypedSlot<TlsType>>& tls_slot,
-      const std::string& /* extension_name */) {
+  template <typename TlsType>
+  static bool
+  validateThreadLocalSlot(const std::unique_ptr<ThreadLocal::TypedSlot<TlsType>>& tls_slot,
+                          const std::string& /* extension_name */) {
     return tls_slot != nullptr;
   }
 
@@ -83,10 +84,10 @@ public:
    * @param extension_name name of the extension for error messages
    * @return pointer to the thread-local object, or nullptr if not available
    */
-  template<typename TlsType>
-  static TlsType* safeGetThreadLocal(
-      const std::unique_ptr<ThreadLocal::TypedSlot<TlsType>>& tls_slot,
-      const std::string& extension_name) {
+  template <typename TlsType>
+  static TlsType*
+  safeGetThreadLocal(const std::unique_ptr<ThreadLocal::TypedSlot<TlsType>>& tls_slot,
+                     const std::string& extension_name) {
     if (!validateThreadLocalSlot(tls_slot, extension_name)) {
       return nullptr;
     }
@@ -98,7 +99,7 @@ public:
     } catch (const std::exception&) {
       // Exception during TLS access - return nullptr for safety
     }
-    
+
     return nullptr;
   }
 
@@ -108,7 +109,7 @@ public:
    * @param extension_name name of the extension for logging
    * @return unique pointer to the created slot, or nullptr on failure
    */
-  template<typename TlsType>
+  template <typename TlsType>
   static std::unique_ptr<ThreadLocal::TypedSlot<TlsType>>
   createThreadLocalSlot(ThreadLocal::SlotAllocator& thread_local_manager,
                         const std::string& /* extension_name */) {
@@ -124,4 +125,4 @@ public:
 } // namespace ReverseConnection
 } // namespace Bootstrap
 } // namespace Extensions
-} // namespace Envoy 
+} // namespace Envoy

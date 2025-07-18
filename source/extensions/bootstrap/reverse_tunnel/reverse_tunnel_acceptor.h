@@ -38,24 +38,25 @@ class UpstreamSocketManager;
  * These stats track the performance and health of incoming reverse connections
  * from the initiator (on-premises) to the acceptor (cloud).
  */
-#define ALL_REVERSE_CONNECTION_ACCEPTOR_STATS(COUNTER, GAUGE, HISTOGRAM)                          \
-  COUNTER(reverse_conn_cx_accepted)                                                               \
-  COUNTER(reverse_conn_cx_rejected)                                                               \
-  COUNTER(reverse_conn_cx_auth_failures)                                                          \
-  COUNTER(reverse_conn_ping_timeouts)                                                             \
-  COUNTER(reverse_conn_ping_responses)                                                            \
-  GAUGE(reverse_conn_cx_idle, NeverImport)                                                        \
-  GAUGE(reverse_conn_cx_used, NeverImport)                                                        \
-  GAUGE(reverse_conn_cx_total, NeverImport)                                                       \
-  HISTOGRAM(reverse_conn_accept_time, Milliseconds)                                               \
-  HISTOGRAM(reverse_conn_ping_response_time, Milliseconds)                                        \
+#define ALL_REVERSE_CONNECTION_ACCEPTOR_STATS(COUNTER, GAUGE, HISTOGRAM)                           \
+  COUNTER(reverse_conn_cx_accepted)                                                                \
+  COUNTER(reverse_conn_cx_rejected)                                                                \
+  COUNTER(reverse_conn_cx_auth_failures)                                                           \
+  COUNTER(reverse_conn_ping_timeouts)                                                              \
+  COUNTER(reverse_conn_ping_responses)                                                             \
+  GAUGE(reverse_conn_cx_idle, NeverImport)                                                         \
+  GAUGE(reverse_conn_cx_used, NeverImport)                                                         \
+  GAUGE(reverse_conn_cx_total, NeverImport)                                                        \
+  HISTOGRAM(reverse_conn_accept_time, Milliseconds)                                                \
+  HISTOGRAM(reverse_conn_ping_response_time, Milliseconds)                                         \
   HISTOGRAM(reverse_conn_idle_duration, Milliseconds)
 
 /**
  * Struct definition for all reverse connection acceptor stats. @see stats_macros.h
  */
 struct ReverseConnectionAcceptorStats {
-  ALL_REVERSE_CONNECTION_ACCEPTOR_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT, GENERATE_HISTOGRAM_STRUCT)
+  ALL_REVERSE_CONNECTION_ACCEPTOR_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT,
+                                        GENERATE_HISTOGRAM_STRUCT)
 };
 
 using ReverseConnectionAcceptorStatsPtr = std::unique_ptr<ReverseConnectionAcceptorStats>;
@@ -516,20 +517,21 @@ private:
  * Factory for creating ReverseTunnelAcceptor bootstrap extensions.
  * Uses the new factory base pattern for better consistency with Envoy conventions.
  */
-class ReverseTunnelAcceptorFactory 
+class ReverseTunnelAcceptorFactory
     : public ReverseConnectionBootstrapFactoryBase<
-          envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::UpstreamReverseConnectionSocketInterface,
+          envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::
+              UpstreamReverseConnectionSocketInterface,
           ReverseTunnelAcceptorExtension>,
       public Logger::Loggable<Logger::Id::config> {
 public:
-  ReverseTunnelAcceptorFactory() 
+  ReverseTunnelAcceptorFactory()
       : ReverseConnectionBootstrapFactoryBase(
             "envoy.bootstrap.reverse_connection.upstream_reverse_connection_socket_interface") {}
 
 private:
-  Server::BootstrapExtensionPtr
-  createBootstrapExtensionTyped(
-      const envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::UpstreamReverseConnectionSocketInterface& proto_config,
+  Server::BootstrapExtensionPtr createBootstrapExtensionTyped(
+      const envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::
+          UpstreamReverseConnectionSocketInterface& proto_config,
       Server::Configuration::ServerFactoryContext& context) override;
 };
 

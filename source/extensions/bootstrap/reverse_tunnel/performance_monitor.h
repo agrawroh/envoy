@@ -22,34 +22,35 @@ namespace ReverseConnection {
  * Performance metrics for reverse tunnel operations.
  * Provides comprehensive monitoring and analysis of reverse connection performance.
  */
-#define ALL_REVERSE_TUNNEL_PERFORMANCE_STATS(COUNTER, GAUGE, HISTOGRAM)                          \
-  COUNTER(connection_attempts)                                                                   \
-  COUNTER(connection_successes)                                                                  \
-  COUNTER(connection_failures)                                                                   \
-  COUNTER(handshake_attempts)                                                                    \
-  COUNTER(handshake_successes)                                                                   \
-  COUNTER(handshake_failures)                                                                    \
-  COUNTER(tunnel_establishes)                                                                    \
-  COUNTER(tunnel_closures)                                                                       \
-  COUNTER(ping_requests)                                                                         \
-  COUNTER(ping_responses)                                                                        \
-  COUNTER(ping_timeouts)                                                                         \
-  GAUGE(active_connections, Accumulate)                                                          \
-  GAUGE(active_tunnels, Accumulate)                                                              \
-  GAUGE(queued_connections, Accumulate)                                                          \
-  GAUGE(memory_usage_bytes, Accumulate)                                                          \
-  HISTOGRAM(connection_establishment_time, Milliseconds)                                         \
-  HISTOGRAM(handshake_duration, Milliseconds)                                                    \
-  HISTOGRAM(tunnel_lifetime, Seconds)                                                            \
-  HISTOGRAM(ping_response_time, Milliseconds)                                                    \
-  HISTOGRAM(throughput_bytes_per_second, Units)                                                  \
+#define ALL_REVERSE_TUNNEL_PERFORMANCE_STATS(COUNTER, GAUGE, HISTOGRAM)                            \
+  COUNTER(connection_attempts)                                                                     \
+  COUNTER(connection_successes)                                                                    \
+  COUNTER(connection_failures)                                                                     \
+  COUNTER(handshake_attempts)                                                                      \
+  COUNTER(handshake_successes)                                                                     \
+  COUNTER(handshake_failures)                                                                      \
+  COUNTER(tunnel_establishes)                                                                      \
+  COUNTER(tunnel_closures)                                                                         \
+  COUNTER(ping_requests)                                                                           \
+  COUNTER(ping_responses)                                                                          \
+  COUNTER(ping_timeouts)                                                                           \
+  GAUGE(active_connections, Accumulate)                                                            \
+  GAUGE(active_tunnels, Accumulate)                                                                \
+  GAUGE(queued_connections, Accumulate)                                                            \
+  GAUGE(memory_usage_bytes, Accumulate)                                                            \
+  HISTOGRAM(connection_establishment_time, Milliseconds)                                           \
+  HISTOGRAM(handshake_duration, Milliseconds)                                                      \
+  HISTOGRAM(tunnel_lifetime, Seconds)                                                              \
+  HISTOGRAM(ping_response_time, Milliseconds)                                                      \
+  HISTOGRAM(throughput_bytes_per_second, Units)                                                    \
   HISTOGRAM(queue_depth, Units)
 
 /**
  * Struct definition for reverse tunnel performance stats.
  */
 struct ReverseTunnelPerformanceStats {
-  ALL_REVERSE_TUNNEL_PERFORMANCE_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT, GENERATE_HISTOGRAM_STRUCT)
+  ALL_REVERSE_TUNNEL_PERFORMANCE_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT,
+                                       GENERATE_HISTOGRAM_STRUCT)
 };
 
 using ReverseTunnelPerformanceStatsPtr = std::unique_ptr<ReverseTunnelPerformanceStats>;
@@ -274,12 +275,12 @@ private:
 
   // Performance thresholds
   struct PerformanceThresholds {
-    std::chrono::milliseconds max_connection_time{10000};      // 10 seconds
-    std::chrono::milliseconds max_handshake_time{5000};        // 5 seconds
-    std::chrono::milliseconds max_ping_response_time{1000};    // 1 second
-    double min_success_rate{0.95};                             // 95%
-    uint32_t max_queue_depth{100};                             // 100 connections
-    uint64_t max_memory_usage{100 * 1024 * 1024};             // 100MB
+    std::chrono::milliseconds max_connection_time{10000};   // 10 seconds
+    std::chrono::milliseconds max_handshake_time{5000};     // 5 seconds
+    std::chrono::milliseconds max_ping_response_time{1000}; // 1 second
+    double min_success_rate{0.95};                          // 95%
+    uint32_t max_queue_depth{100};                          // 100 connections
+    uint64_t max_memory_usage{100 * 1024 * 1024};           // 100MB
   } thresholds_;
 
   // Performance tracking
@@ -314,8 +315,8 @@ public:
    * @param monitor the performance monitor to analyze
    * @return optimization recommendations
    */
-  static std::string generateOptimizationRecommendations(
-      const ReverseTunnelPerformanceMonitor& monitor);
+  static std::string
+  generateOptimizationRecommendations(const ReverseTunnelPerformanceMonitor& monitor);
 
   /**
    * Predict capacity requirements based on current metrics.
@@ -324,10 +325,10 @@ public:
    * @return capacity planning report
    */
   static std::string predictCapacityRequirements(const ReverseTunnelPerformanceMonitor& monitor,
-                                                  double growth_factor = 1.5);
+                                                 double growth_factor = 1.5);
 };
 
 } // namespace ReverseConnection
 } // namespace Bootstrap
 } // namespace Extensions
-} // namespace Envoy 
+} // namespace Envoy

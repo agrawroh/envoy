@@ -47,10 +47,10 @@ static constexpr absl::string_view kCrlf = "\r\n";
 static constexpr absl::string_view kDoubleCrlf = "\r\n\r\n";
 
 // Connection timing constants.
-static constexpr uint32_t kDefaultReconnectIntervalMs = 5000;   // 5 seconds.
+static constexpr uint32_t kDefaultReconnectIntervalMs = 5000; // 5 seconds.
 static constexpr uint32_t kDefaultMaxReconnectAttempts = 10;
-static constexpr uint32_t kDefaultHealthCheckIntervalMs = 30000;  // 30 seconds.
-static constexpr uint32_t kDefaultConnectionTimeoutMs = 10000;    // 10 seconds.
+static constexpr uint32_t kDefaultHealthCheckIntervalMs = 30000; // 30 seconds.
+static constexpr uint32_t kDefaultConnectionTimeoutMs = 10000;   // 10 seconds.
 } // namespace
 
 /**
@@ -58,20 +58,20 @@ static constexpr uint32_t kDefaultConnectionTimeoutMs = 10000;    // 10 seconds.
  * These stats track the performance and health of outgoing reverse connections
  * from the initiator (on-premises) to the acceptor (cloud).
  */
-#define ALL_REVERSE_CONNECTION_DOWNSTREAM_STATS(COUNTER, GAUGE, HISTOGRAM)                        \
-  COUNTER(reverse_conn_connect_attempts)                                                          \
-  COUNTER(reverse_conn_connect_failures)                                                          \
-  COUNTER(reverse_conn_handshake_failures)                                                        \
-  COUNTER(reverse_conn_timeout_failures)                                                          \
-  COUNTER(reverse_conn_retries)                                                                   \
-  GAUGE(reverse_conn_connecting, Accumulate)                                                      \
-  GAUGE(reverse_conn_connected, Accumulate)                                                       \
-  GAUGE(reverse_conn_failed, Accumulate)                                                          \
-  GAUGE(reverse_conn_recovered, Accumulate)                                                       \
-  GAUGE(reverse_conn_backoff, Accumulate)                                                         \
-  GAUGE(reverse_conn_cannot_connect, Accumulate)                                                  \
-  HISTOGRAM(reverse_conn_establishment_time, Milliseconds)                                        \
-  HISTOGRAM(reverse_conn_handshake_time, Milliseconds)                                            \
+#define ALL_REVERSE_CONNECTION_DOWNSTREAM_STATS(COUNTER, GAUGE, HISTOGRAM)                         \
+  COUNTER(reverse_conn_connect_attempts)                                                           \
+  COUNTER(reverse_conn_connect_failures)                                                           \
+  COUNTER(reverse_conn_handshake_failures)                                                         \
+  COUNTER(reverse_conn_timeout_failures)                                                           \
+  COUNTER(reverse_conn_retries)                                                                    \
+  GAUGE(reverse_conn_connecting, Accumulate)                                                       \
+  GAUGE(reverse_conn_connected, Accumulate)                                                        \
+  GAUGE(reverse_conn_failed, Accumulate)                                                           \
+  GAUGE(reverse_conn_recovered, Accumulate)                                                        \
+  GAUGE(reverse_conn_backoff, Accumulate)                                                          \
+  GAUGE(reverse_conn_cannot_connect, Accumulate)                                                   \
+  HISTOGRAM(reverse_conn_establishment_time, Milliseconds)                                         \
+  HISTOGRAM(reverse_conn_handshake_time, Milliseconds)                                             \
   HISTOGRAM(reverse_conn_retry_backoff_time, Milliseconds)
 
 /**
@@ -90,7 +90,8 @@ enum class ReverseConnectionState {
  * Struct definition for all reverse connection downstream stats. @see stats_macros.h
  */
 struct ReverseConnectionDownstreamStats {
-  ALL_REVERSE_CONNECTION_DOWNSTREAM_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT, GENERATE_HISTOGRAM_STRUCT)
+  ALL_REVERSE_CONNECTION_DOWNSTREAM_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT,
+                                          GENERATE_HISTOGRAM_STRUCT)
 };
 
 using ReverseConnectionDownstreamStatsPtr = std::unique_ptr<ReverseConnectionDownstreamStats>;
@@ -108,7 +109,7 @@ struct RemoteClusterConnectionConfig {
   bool enable_health_check;          // Whether to enable health checks for this cluster.
 
   RemoteClusterConnectionConfig(const std::string& name, uint32_t count,
-                                uint32_t reconnect_ms = kDefaultReconnectIntervalMs, 
+                                uint32_t reconnect_ms = kDefaultReconnectIntervalMs,
                                 uint32_t max_attempts = kDefaultMaxReconnectAttempts,
                                 bool health_check = true)
       : cluster_name(name), reverse_connection_count(count), reconnect_interval_ms(reconnect_ms),
@@ -130,7 +131,7 @@ struct ReverseConnectionSocketConfig {
   bool enable_circuit_breaker;       // Whether to enable circuit breaker functionality.
 
   ReverseConnectionSocketConfig()
-      : health_check_interval_ms(kDefaultHealthCheckIntervalMs), 
+      : health_check_interval_ms(kDefaultHealthCheckIntervalMs),
         connection_timeout_ms(kDefaultConnectionTimeoutMs), enable_metrics(true),
         enable_circuit_breaker(true) {}
 };
@@ -631,20 +632,21 @@ private:
  * Factory for creating ReverseTunnelInitiator bootstrap extensions.
  * Uses the new factory base pattern for better consistency with Envoy conventions.
  */
-class ReverseTunnelInitiatorFactory 
+class ReverseTunnelInitiatorFactory
     : public ReverseConnectionBootstrapFactoryBase<
-          envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::DownstreamReverseConnectionSocketInterface,
+          envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::
+              DownstreamReverseConnectionSocketInterface,
           ReverseTunnelInitiatorExtension>,
       public Logger::Loggable<Logger::Id::config> {
 public:
-  ReverseTunnelInitiatorFactory() 
+  ReverseTunnelInitiatorFactory()
       : ReverseConnectionBootstrapFactoryBase(
             "envoy.bootstrap.reverse_connection.downstream_reverse_connection_socket_interface") {}
 
 private:
-  Server::BootstrapExtensionPtr
-  createBootstrapExtensionTyped(
-      const envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::DownstreamReverseConnectionSocketInterface& proto_config,
+  Server::BootstrapExtensionPtr createBootstrapExtensionTyped(
+      const envoy::extensions::bootstrap::reverse_connection_socket_interface::v3::
+          DownstreamReverseConnectionSocketInterface& proto_config,
       Server::Configuration::ServerFactoryContext& context) override;
 };
 

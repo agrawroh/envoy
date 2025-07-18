@@ -24,18 +24,21 @@ GrpcReverseTunnelClient::GrpcReverseTunnelClient(
     : cluster_manager_(cluster_manager), config_(config), callbacks_(callbacks),
       service_method_(Protobuf::DescriptorPool::generated_pool()->FindMethodByName(
           "envoy.service.reverse_tunnel.v3.ReverseTunnelHandshakeService.EstablishTunnel")) {
-  
+
   // Generate unique correlation ID for this handshake session
-  correlation_id_ = absl::StrCat("handshake_", std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                   std::chrono::steady_clock::now().time_since_epoch())
-                                                   .count());
-  
+  correlation_id_ =
+      absl::StrCat("handshake_", std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+
   ENVOY_LOG(debug, "Created GrpcReverseTunnelClient with correlation ID: {}", correlation_id_);
-  
+
   // Create gRPC client immediately
   if (auto status = createGrpcClient(); !status.ok()) {
-    ENVOY_LOG(error, "Failed to create gRPC client for reverse tunnel handshake: {}", status.message());
-    throw EnvoyException(fmt::format("Failed to create gRPC client for reverse tunnel handshake: {}", status.message()));
+    ENVOY_LOG(error, "Failed to create gRPC client for reverse tunnel handshake: {}",
+              status.message());
+    throw EnvoyException(fmt::format(
+        "Failed to create gRPC client for reverse tunnel handshake: {}", status.message()));
   }
 }
 
@@ -48,35 +51,39 @@ absl::Status GrpcReverseTunnelClient::createGrpcClient() {
   try {
     // Verify cluster exists in cluster manager
     if (!config_.has_grpc_service() || !config_.grpc_service().has_envoy_grpc()) {
-      return absl::InvalidArgumentError("Invalid gRPC service configuration - missing envoy_grpc configuration");
+      return absl::InvalidArgumentError(
+          "Invalid gRPC service configuration - missing envoy_grpc configuration");
     }
 
     const std::string& cluster_name = config_.grpc_service().envoy_grpc().cluster_name();
     auto thread_local_cluster = cluster_manager_.getThreadLocalCluster(cluster_name);
     if (!thread_local_cluster) {
-      return absl::NotFoundError(fmt::format("Cluster '{}' not found for gRPC reverse tunnel handshake", cluster_name));
+      return absl::NotFoundError(
+          fmt::format("Cluster '{}' not found for gRPC reverse tunnel handshake", cluster_name));
     }
 
     // Create raw gRPC client
-    auto result = cluster_manager_.grpcAsyncClientManager()
-                       .getOrCreateRawAsyncClient(config_.grpc_service(), 
-                                                  thread_local_cluster->info()->statsScope(),
-                                                  false); // skip_cluster_check = false
+    auto result = cluster_manager_.grpcAsyncClientManager().getOrCreateRawAsyncClient(
+        config_.grpc_service(), thread_local_cluster->info()->statsScope(),
+        false); // skip_cluster_check = false
 
     if (!result.ok()) {
-      return absl::InternalError(fmt::format("Failed to create gRPC async client for cluster '{}': {}", 
-                                             cluster_name, result.status().message()));
+      return absl::InternalError(
+          fmt::format("Failed to create gRPC async client for cluster '{}': {}", cluster_name,
+                      result.status().message()));
     }
 
     auto raw_client = result.value();
-    
+
     if (!raw_client) {
-      return absl::InternalError(fmt::format("Failed to create gRPC async client for cluster '{}'", cluster_name));
+      return absl::InternalError(
+          fmt::format("Failed to create gRPC async client for cluster '{}'", cluster_name));
     }
 
     // Create typed client from raw client
-    client_ = Grpc::AsyncClient<envoy::service::reverse_tunnel::v3::EstablishTunnelRequest,
-                                envoy::service::reverse_tunnel::v3::EstablishTunnelResponse>(raw_client);
+    client_ =
+        Grpc::AsyncClient<envoy::service::reverse_tunnel::v3::EstablishTunnelRequest,
+                          envoy::service::reverse_tunnel::v3::EstablishTunnelResponse>(raw_client);
 
     ENVOY_LOG(debug, "Successfully created gRPC client for cluster '{}'", cluster_name);
     return absl::OkStatus();
@@ -101,18 +108,19 @@ bool GrpcReverseTunnelClient::initiateHandshake(
   try {
     // Build the handshake request
     auto request = buildHandshakeRequest(tenant_id, cluster_id, node_id, metadata);
-    
+
     // Record handshake start time for metrics
     handshake_start_time_ = std::chrono::steady_clock::now();
 
-    ENVOY_LOG(info, "Initiating gRPC reverse tunnel handshake: tenant='{}', cluster='{}', node='{}', correlation='{}'",
+    ENVOY_LOG(info,
+              "Initiating gRPC reverse tunnel handshake: tenant='{}', cluster='{}', node='{}', "
+              "correlation='{}'",
               tenant_id, cluster_id, node_id, correlation_id_);
 
     // Create gRPC request with timeout options
     Http::AsyncClient::RequestOptions options;
-    options.setTimeout(std::chrono::milliseconds(
-        config_.handshake_timeout().seconds() * 1000 + 
-        config_.handshake_timeout().nanos() / 1000000));
+    options.setTimeout(std::chrono::milliseconds(config_.handshake_timeout().seconds() * 1000 +
+                                                 config_.handshake_timeout().nanos() / 1000000));
 
     current_request_ = client_->send(*service_method_, request, *this, span, options);
 
@@ -123,7 +131,8 @@ bool GrpcReverseTunnelClient::initiateHandshake(
       return false;
     }
 
-    ENVOY_LOG(debug, "gRPC handshake request sent successfully with correlation ID: {}", correlation_id_);
+    ENVOY_LOG(debug, "gRPC handshake request sent successfully with correlation ID: {}",
+              correlation_id_);
     return true;
 
   } catch (const std::exception& e) {
@@ -147,7 +156,7 @@ void GrpcReverseTunnelClient::onCreateInitialMetadata(Http::RequestHeaderMap& me
   metadata.addCopy(Http::LowerCaseString("x-correlation-id"), correlation_id_);
   metadata.addCopy(Http::LowerCaseString("x-handshake-version"), "grpc-v1");
   metadata.addCopy(Http::LowerCaseString("x-reverse-tunnel-handshake"), "true");
-  
+
   ENVOY_LOG(debug, "Added initial metadata for gRPC handshake request.");
 }
 
@@ -171,13 +180,13 @@ GrpcReverseTunnelClient::buildHandshakeRequest(
 
   // Set tunnel configuration with reasonable defaults
   auto* tunnel_config = request.mutable_tunnel_config();
-  tunnel_config->mutable_ping_interval()->set_seconds(30); // 30 second ping interval
+  tunnel_config->mutable_ping_interval()->set_seconds(30);  // 30 second ping interval
   tunnel_config->mutable_max_idle_time()->set_seconds(300); // 5 minute idle timeout
 
-  // Set QoS configuration for production reliability  
+  // Set QoS configuration for production reliability
   auto* qos = tunnel_config->mutable_qos();
   qos->mutable_max_bandwidth_bps()->set_value(10485760); // 10MB/s default
-  qos->mutable_priority_level()->set_value(5); // Medium priority
+  qos->mutable_priority_level()->set_value(5);           // Medium priority
   qos->set_reliability(envoy::service::reverse_tunnel::v3::ReliabilityLevel::HIGH);
 
   // Set authentication
@@ -200,23 +209,25 @@ void GrpcReverseTunnelClient::onSuccess(
 
   // Calculate handshake duration for metrics
   auto handshake_duration = std::chrono::steady_clock::now() - handshake_start_time_;
-  auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(handshake_duration).count();
+  auto duration_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(handshake_duration).count();
 
   ENVOY_LOG(info, "gRPC handshake completed successfully in {}ms, correlation: {}, status: {}",
-            duration_ms, correlation_id_, 
+            duration_ms, correlation_id_,
             envoy::service::reverse_tunnel::v3::TunnelStatus_Name(response->status()));
 
   // Add success span attributes
   span.setTag("handshake.correlation_id", correlation_id_);
   span.setTag("handshake.duration_ms", std::to_string(duration_ms));
-  span.setTag("handshake.status", envoy::service::reverse_tunnel::v3::TunnelStatus_Name(response->status()));
+  span.setTag("handshake.status",
+              envoy::service::reverse_tunnel::v3::TunnelStatus_Name(response->status()));
 
   // Clear current request
   current_request_ = nullptr;
 
   // Validate response status
   if (response->status() != envoy::service::reverse_tunnel::v3::TunnelStatus::ACCEPTED) {
-    const std::string error_msg = 
+    const std::string error_msg =
         absl::StrCat("Handshake rejected by server: ", response->status_message());
     ENVOY_LOG(error, "{}", error_msg);
     callbacks_.onHandshakeFailure(Grpc::Status::WellKnownGrpcStatus::PermissionDenied, error_msg);
@@ -232,7 +243,8 @@ void GrpcReverseTunnelClient::onFailure(Grpc::Status::GrpcStatus status, const s
 
   // Calculate handshake duration for metrics
   auto handshake_duration = std::chrono::steady_clock::now() - handshake_start_time_;
-  auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(handshake_duration).count();
+  auto duration_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(handshake_duration).count();
 
   ENVOY_LOG(error, "gRPC handshake failed after {}ms, correlation: {}, status: {}, message: '{}'",
             duration_ms, correlation_id_, static_cast<int>(status), message);
@@ -253,4 +265,4 @@ void GrpcReverseTunnelClient::onFailure(Grpc::Status::GrpcStatus status, const s
 } // namespace ReverseConnection
 } // namespace Bootstrap
 } // namespace Extensions
-} // namespace Envoy 
+} // namespace Envoy

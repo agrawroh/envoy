@@ -27,11 +27,11 @@ class ReverseTunnelInitiatorExtension;
  * Health status enumeration for reverse tunnel components.
  */
 enum class HealthStatus {
-  Healthy,          // Component is functioning normally
-  Degraded,         // Component is functioning but with reduced performance
-  Unhealthy,        // Component has issues that need attention
-  Critical,         // Component is failing and requires immediate action
-  Unknown           // Health status cannot be determined
+  Healthy,   // Component is functioning normally
+  Degraded,  // Component is functioning but with reduced performance
+  Unhealthy, // Component has issues that need attention
+  Critical,  // Component is failing and requires immediate action
+  Unknown    // Health status cannot be determined
 };
 
 /**
@@ -50,13 +50,13 @@ struct HealthCheckResult {
  * Health check configuration for reverse tunnel monitoring.
  */
 struct HealthCheckConfig {
-  std::chrono::seconds check_interval{30};           // How often to perform health checks
-  std::chrono::seconds timeout{5};                   // Timeout for individual health checks
-  uint32_t consecutive_failures_threshold{3};        // Number of failures before marking unhealthy
-  uint32_t consecutive_successes_threshold{2};       // Number of successes to mark healthy again
-  bool enable_deep_checks{true};                     // Enable comprehensive health checks
-  bool enable_connectivity_checks{true};             // Enable connectivity verification
-  bool enable_performance_checks{true};              // Enable performance monitoring
+  std::chrono::seconds check_interval{30};     // How often to perform health checks
+  std::chrono::seconds timeout{5};             // Timeout for individual health checks
+  uint32_t consecutive_failures_threshold{3};  // Number of failures before marking unhealthy
+  uint32_t consecutive_successes_threshold{2}; // Number of successes to mark healthy again
+  bool enable_deep_checks{true};               // Enable comprehensive health checks
+  bool enable_connectivity_checks{true};       // Enable connectivity verification
+  bool enable_performance_checks{true};        // Enable performance monitoring
 };
 
 /**
@@ -123,7 +123,8 @@ private:
    * @param metrics current performance metrics
    * @return health status based on performance
    */
-  HealthStatus evaluatePerformanceMetrics(const absl::flat_hash_map<std::string, std::string>& metrics);
+  HealthStatus
+  evaluatePerformanceMetrics(const absl::flat_hash_map<std::string, std::string>& metrics);
 
   /**
    * Check for resource leaks or excessive usage.
@@ -306,19 +307,21 @@ private:
   void updateHealthMetrics(const std::vector<HealthCheckResult>& results);
 
   HealthCheckConfig config_;
-  
+
   // Component health checkers
-  absl::flat_hash_map<std::string, std::unique_ptr<ReverseTunnelAcceptorHealthChecker>> acceptor_checkers_;
-  absl::flat_hash_map<std::string, std::unique_ptr<ReverseTunnelInitiatorHealthChecker>> initiator_checkers_;
-  
+  absl::flat_hash_map<std::string, std::unique_ptr<ReverseTunnelAcceptorHealthChecker>>
+      acceptor_checkers_;
+  absl::flat_hash_map<std::string, std::unique_ptr<ReverseTunnelInitiatorHealthChecker>>
+      initiator_checkers_;
+
   // Health tracking
   absl::flat_hash_map<std::string, HealthCheckResult> last_results_;
   HealthStatus overall_health_{HealthStatus::Unknown};
-  
+
   // Automatic health checking
   bool automatic_checking_enabled_{false};
   std::unique_ptr<Event::Timer> health_check_timer_;
-  
+
   // Thread safety
   mutable absl::Mutex health_mutex_;
 };
@@ -347,7 +350,7 @@ public:
    * @param result health check result
    * @return HTTP response headers and body
    */
-  static std::pair<Http::ResponseHeaderMapPtr, std::string> 
+  static std::pair<Http::ResponseHeaderMapPtr, std::string>
   createHealthCheckResponse(const HealthCheckResult& result);
 
   /**
@@ -381,4 +384,4 @@ public:
 } // namespace ReverseConnection
 } // namespace Bootstrap
 } // namespace Extensions
-} // namespace Envoy 
+} // namespace Envoy
