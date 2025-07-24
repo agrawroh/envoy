@@ -26,6 +26,8 @@
 #include "source/common/network/utility.h"
 #include "source/common/protobuf/utility.h"
 
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/blocking_counter.h"
 
 #if defined(ENVOY_ENABLE_QUIC)
