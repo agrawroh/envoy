@@ -180,24 +180,63 @@ bool HeaderMatcher::matches(const Network::Connection&,
   return header_->matchesHeaders(headers);
 }
 
+IPMatcher::IPMatcher(const envoy::config::core::v3::CidrRange& range, Type type) : type_(type) {
+  // Convert single range to LC Trie for consistency.
+  Protobuf::RepeatedPtrField<envoy::config::core::v3::CidrRange> ranges;
+  *ranges.Add() = range;
+
+  auto lc_trie_result = Network::Address::LcTrieIpList::create(ranges);
+  if (!lc_trie_result.ok()) {
+    throwEnvoyExceptionOrPanic(fmt::format("Failed to create LcTrieIpList for IP range: {}",
+                                           lc_trie_result.status().message()));
+  }
+  lc_trie_ip_list_ = std::move(lc_trie_result.value());
+}
+
+// static
+absl::StatusOr<std::unique_ptr<IPMatcher>>
+IPMatcher::create(const Protobuf::RepeatedPtrField<envoy::config::core::v3::CidrRange>& ranges,
+                  Type type) {
+  if (ranges.empty()) {
+    return absl::InvalidArgumentError("Empty IP range list provided");
+  }
+
+  // Use LC Trie for optimal performance in all cases.
+  auto lc_trie_result = Network::Address::LcTrieIpList::create(ranges);
+  if (!lc_trie_result.ok()) {
+    return lc_trie_result.status();
+  }
+
+  return std::unique_ptr<IPMatcher>(new IPMatcher(std::move(lc_trie_result.value()), type));
+}
+
+IPMatcher::IPMatcher(std::unique_ptr<Network::Address::LcTrieIpList> lc_trie_ip_list, Type type)
+    : lc_trie_ip_list_(std::move(lc_trie_ip_list)), type_(type) {}
+
 bool IPMatcher::matches(const Network::Connection& connection, const Envoy::Http::RequestHeaderMap&,
                         const StreamInfo::StreamInfo& info) const {
-  Envoy::Network::Address::InstanceConstSharedPtr ip;
+  const auto ip = extractIpAddress(connection, info);
+  if (!ip) {
+    return false;
+  }
+
+  return lc_trie_ip_list_->contains(*ip);
+}
+
+Network::Address::InstanceConstSharedPtr
+IPMatcher::extractIpAddress(const Network::Connection& connection,
+                            const StreamInfo::StreamInfo& info) const {
   switch (type_) {
   case ConnectionRemote:
-    ip = connection.connectionInfoProvider().remoteAddress();
-    break;
+    return connection.connectionInfoProvider().remoteAddress();
   case DownstreamLocal:
-    ip = info.downstreamAddressProvider().localAddress();
-    break;
+    return info.downstreamAddressProvider().localAddress();
   case DownstreamDirectRemote:
-    ip = info.downstreamAddressProvider().directRemoteAddress();
-    break;
+    return info.downstreamAddressProvider().directRemoteAddress();
   case DownstreamRemote:
-    ip = info.downstreamAddressProvider().remoteAddress();
-    break;
+    return info.downstreamAddressProvider().remoteAddress();
   }
-  return range_.isInRange(*ip.get());
+  return nullptr;
 }
 
 bool PortMatcher::matches(const Network::Connection&, const Envoy::Http::RequestHeaderMap&,

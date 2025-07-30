@@ -64,6 +64,19 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "lc_trie_ip_list_lib",
+    srcs = ["lc_trie_ip_list.cc"],
+    hdrs = ["lc_trie_ip_list.h"],
+    deps = [
+        ":cidr_range_lib",
+        ":lc_trie_lib",
+        ":utility_lib",
+        "//envoy/network:address_interface",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+envoy_cc_library(
     name = "connection_balancer_lib",
     srcs = ["connection_balancer_impl.cc"],
     hdrs = ["connection_balancer_impl.h"],
