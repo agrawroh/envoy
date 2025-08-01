@@ -85,5 +85,11 @@ new_features:
     Added ``virtualHost()`` to the Stream handle API, allowing Lua scripts to retrieve virtual host information. So far, the only method
     implemented is ``metadata()``, allowing Lua scripts to access virtual host metadata scoped to the specific filter name. See
     :ref:`Virtual host object API <config_http_filters_lua_virtual_host_wrapper>` for more details.
+- area: CEL
+  change: |
+    Added configuration options for CEL evaluator to control string conversion, concatenation, and string extension function behavior.
+    The new ``envoy.bootstrap.cel`` bootstrap extension allows enabling CEL string functions such as ``replace()`` and ``split()``.
+    See :ref:`CelEvaluatorConfig <envoy_v3_api_msg_extensions.bootstrap.cel.CelEvaluatorConfig>` for configuration details.
+    This partially addresses GitHub issue #39307.
 
 deprecated:
