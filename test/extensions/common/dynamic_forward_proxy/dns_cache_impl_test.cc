@@ -2378,6 +2378,178 @@ TEST_F(DnsCacheImplTest, IterateHostMap) {
   }
 }
 
+// Test DNS resolver selection logic.
+class DnsCacheResolverSelectionTest : public testing::Test {};
+
+// Test that DFP falls back to bootstrap DNS config when no custom DNS config is specified.
+// This matches the behavior of CDS clusters and ensures DFP gets settings like udp_max_queries.
+TEST_F(DnsCacheResolverSelectionTest, FallbackToBootstrapConfig) {
+  // Create a simple test to ensure the new code path doesn't crash and creates a cache.
+  NiceMock<Server::Configuration::MockGenericFactoryContext> context;
+  std::shared_ptr<Network::MockDnsResolver> resolver{std::make_shared<Network::MockDnsResolver>()};
+
+  // Setup DFP config with NO custom DNS settings to trigger bootstrap fallback.
+  envoy::extensions::common::dynamic_forward_proxy::v3::DnsCacheConfig config;
+  config.set_name("test_cache");
+
+  NiceMock<Network::MockDnsResolverFactory> dns_resolver_factory;
+  Registry::InjectFactory<Network::DnsResolverFactory> registered_dns_factory(dns_resolver_factory);
+  EXPECT_CALL(dns_resolver_factory, createDnsResolver(_, _, _)).WillOnce(Return(resolver));
+
+  // DFP should successfully create a cache using bootstrap fallback.
+  std::shared_ptr<DnsCacheImpl> dns_cache =
+      DnsCacheImpl::createDnsCacheImpl(context, config).value();
+  ASSERT_NE(dns_cache, nullptr);
+}
+
+// Test that DFP uses its own typed_dns_resolver_config when provided.
+TEST_F(DnsCacheResolverSelectionTest, UseCustomTypedDnsResolverConfig) {
+  NiceMock<Server::Configuration::MockGenericFactoryContext> context;
+  std::shared_ptr<Network::MockDnsResolver> resolver{std::make_shared<Network::MockDnsResolver>()};
+
+  // Setup bootstrap with different DNS config.
+  envoy::extensions::network::dns_resolver::cares::v3::CaresDnsResolverConfig bootstrap_cares;
+  bootstrap_cares.mutable_udp_max_queries()->set_value(500); // Different value.
+  context.server_context_.bootstrap_.mutable_typed_dns_resolver_config()
+      ->mutable_typed_config()
+      ->PackFrom(bootstrap_cares);
+  context.server_context_.bootstrap_.mutable_typed_dns_resolver_config()->set_name(
+      std::string(Network::CaresDnsResolver));
+
+  // Setup DFP config with custom typed_dns_resolver_config.
+  envoy::extensions::common::dynamic_forward_proxy::v3::DnsCacheConfig config;
+  config.set_name("test_cache");
+  envoy::extensions::network::dns_resolver::cares::v3::CaresDnsResolverConfig dfp_cares;
+  dfp_cares.mutable_udp_max_queries()->set_value(2000); // DFP-specific value.
+  dfp_cares.mutable_query_tries()->set_value(8);
+  config.mutable_typed_dns_resolver_config()->mutable_typed_config()->PackFrom(dfp_cares);
+  config.mutable_typed_dns_resolver_config()->set_name(std::string(Network::CaresDnsResolver));
+
+  // The expected config should match the DFP config, NOT the bootstrap config.
+  envoy::config::core::v3::TypedExtensionConfig expected_typed_dns_resolver_config;
+  expected_typed_dns_resolver_config.mutable_typed_config()->PackFrom(dfp_cares);
+  expected_typed_dns_resolver_config.set_name(std::string(Network::CaresDnsResolver));
+
+  NiceMock<Network::MockDnsResolverFactory> dns_resolver_factory;
+  Registry::InjectFactory<Network::DnsResolverFactory> registered_dns_factory(dns_resolver_factory);
+  EXPECT_CALL(dns_resolver_factory,
+              createDnsResolver(_, _, ProtoEq(expected_typed_dns_resolver_config)))
+      .WillOnce(Return(resolver));
+
+  std::shared_ptr<DnsCacheImpl> dns_cache =
+      DnsCacheImpl::createDnsCacheImpl(context, config).value();
+}
+
+// Test that DFP uses its own dns_resolution_config when provided.
+TEST_F(DnsCacheResolverSelectionTest, UseCustomDnsResolutionConfig) {
+  NiceMock<Server::Configuration::MockGenericFactoryContext> context;
+  std::shared_ptr<Network::MockDnsResolver> resolver{std::make_shared<Network::MockDnsResolver>()};
+
+  // Setup bootstrap with different DNS config.
+  envoy::extensions::network::dns_resolver::cares::v3::CaresDnsResolverConfig bootstrap_cares;
+  bootstrap_cares.mutable_udp_max_queries()->set_value(500);
+  context.server_context_.bootstrap_.mutable_typed_dns_resolver_config()
+      ->mutable_typed_config()
+      ->PackFrom(bootstrap_cares);
+  context.server_context_.bootstrap_.mutable_typed_dns_resolver_config()->set_name(
+      std::string(Network::CaresDnsResolver));
+
+  // Setup DFP config with dns_resolution_config.
+  envoy::extensions::common::dynamic_forward_proxy::v3::DnsCacheConfig config;
+  config.set_name("test_cache");
+  envoy::config::core::v3::Address resolvers;
+  Network::Utility::addressToProtobufAddress(Network::Address::Ipv4Instance("8.8.8.8", 53),
+                                             resolvers);
+  config.mutable_dns_resolution_config()->add_resolvers()->MergeFrom(resolvers);
+  config.mutable_dns_resolution_config()
+      ->mutable_dns_resolver_options()
+      ->set_use_tcp_for_dns_lookups(true);
+
+  // Expected config should be created from DFP dns_resolution_config.
+  envoy::config::core::v3::TypedExtensionConfig expected_typed_dns_resolver_config;
+  envoy::extensions::network::dns_resolver::cares::v3::CaresDnsResolverConfig expected_cares;
+  expected_cares.add_resolvers()->MergeFrom(resolvers);
+  expected_cares.mutable_dns_resolver_options()->set_use_tcp_for_dns_lookups(true);
+  expected_typed_dns_resolver_config.mutable_typed_config()->PackFrom(expected_cares);
+  expected_typed_dns_resolver_config.set_name(std::string(Network::CaresDnsResolver));
+
+  NiceMock<Network::MockDnsResolverFactory> dns_resolver_factory;
+  Registry::InjectFactory<Network::DnsResolverFactory> registered_dns_factory(dns_resolver_factory);
+  EXPECT_CALL(dns_resolver_factory,
+              createDnsResolver(_, _, ProtoEq(expected_typed_dns_resolver_config)))
+      .WillOnce(Return(resolver));
+
+  std::shared_ptr<DnsCacheImpl> dns_cache =
+      DnsCacheImpl::createDnsCacheImpl(context, config).value();
+}
+
+// Test that DFP uses custom config when use_tcp_for_dns_lookups is set.
+TEST_F(DnsCacheResolverSelectionTest, UseCustomConfigWithTcpFlag) {
+  NiceMock<Server::Configuration::MockGenericFactoryContext> context;
+  std::shared_ptr<Network::MockDnsResolver> resolver{std::make_shared<Network::MockDnsResolver>()};
+
+  // Setup bootstrap with different DNS config.
+  envoy::extensions::network::dns_resolver::cares::v3::CaresDnsResolverConfig bootstrap_cares;
+  bootstrap_cares.mutable_udp_max_queries()->set_value(500);
+  bootstrap_cares.mutable_dns_resolver_options()->set_use_tcp_for_dns_lookups(
+      false); // Different value.
+  context.server_context_.bootstrap_.mutable_typed_dns_resolver_config()
+      ->mutable_typed_config()
+      ->PackFrom(bootstrap_cares);
+  context.server_context_.bootstrap_.mutable_typed_dns_resolver_config()->set_name(
+      std::string(Network::CaresDnsResolver));
+
+  // Setup DFP config with use_tcp_for_dns_lookups set.
+  envoy::extensions::common::dynamic_forward_proxy::v3::DnsCacheConfig config;
+  config.set_name("test_cache");
+  config.set_use_tcp_for_dns_lookups(true); // This should trigger custom config usage.
+
+  // Expected config should be created from DFP config with TCP flag.
+  envoy::config::core::v3::TypedExtensionConfig expected_typed_dns_resolver_config;
+  envoy::extensions::network::dns_resolver::cares::v3::CaresDnsResolverConfig expected_cares;
+  expected_cares.mutable_dns_resolver_options()->set_use_tcp_for_dns_lookups(true);
+  expected_typed_dns_resolver_config.mutable_typed_config()->PackFrom(expected_cares);
+  expected_typed_dns_resolver_config.set_name(std::string(Network::CaresDnsResolver));
+
+  NiceMock<Network::MockDnsResolverFactory> dns_resolver_factory;
+  Registry::InjectFactory<Network::DnsResolverFactory> registered_dns_factory(dns_resolver_factory);
+  EXPECT_CALL(dns_resolver_factory,
+              createDnsResolver(_, _, ProtoEq(expected_typed_dns_resolver_config)))
+      .WillOnce(Return(resolver));
+
+  std::shared_ptr<DnsCacheImpl> dns_cache =
+      DnsCacheImpl::createDnsCacheImpl(context, config).value();
+}
+
+// Test that DFP creates default DNS resolver when no bootstrap config is provided.
+TEST_F(DnsCacheResolverSelectionTest, UseDefaultConfigWhenNoBootstrap) {
+  NiceMock<Server::Configuration::MockGenericFactoryContext> context;
+  std::shared_ptr<Network::MockDnsResolver> resolver{std::make_shared<Network::MockDnsResolver>()};
+
+  // Setup bootstrap with NO DNS config.
+  // context.server_context_.bootstrap_ is already empty by default.
+
+  // Setup DFP config with NO custom DNS settings.
+  envoy::extensions::common::dynamic_forward_proxy::v3::DnsCacheConfig config;
+  config.set_name("test_cache");
+
+  // Expected config should be default c-ares config (created from empty bootstrap).
+  envoy::config::core::v3::TypedExtensionConfig expected_typed_dns_resolver_config;
+  envoy::extensions::network::dns_resolver::cares::v3::CaresDnsResolverConfig expected_cares;
+  // Default c-ares config is empty.
+  expected_typed_dns_resolver_config.mutable_typed_config()->PackFrom(expected_cares);
+  expected_typed_dns_resolver_config.set_name(std::string(Network::CaresDnsResolver));
+
+  NiceMock<Network::MockDnsResolverFactory> dns_resolver_factory;
+  Registry::InjectFactory<Network::DnsResolverFactory> registered_dns_factory(dns_resolver_factory);
+  EXPECT_CALL(dns_resolver_factory,
+              createDnsResolver(_, _, ProtoEq(expected_typed_dns_resolver_config)))
+      .WillOnce(Return(resolver));
+
+  std::shared_ptr<DnsCacheImpl> dns_cache =
+      DnsCacheImpl::createDnsCacheImpl(context, config).value();
+}
+
 } // namespace
 } // namespace DynamicForwardProxy
 } // namespace Common

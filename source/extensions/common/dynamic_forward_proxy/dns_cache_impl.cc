@@ -92,18 +92,19 @@ absl::StatusOr<Network::DnsResolverSharedPtr> DnsCacheImpl::selectDnsResolver(
   envoy::config::core::v3::TypedExtensionConfig typed_dns_resolver_config;
   Network::DnsResolverFactory* dns_resolver_factory;
 
-  // If DnsCacheConfig doesn't have any DNS related configuration, and the
-  // default DNS resolver, i.e, the typed_dns_resolver_config in the bootstrap
-  // configuration, is not empty, then creates the default DNS resolver.
-  if (!config.has_typed_dns_resolver_config() && !config.has_dns_resolution_config() &&
-      context.api().bootstrap().has_typed_dns_resolver_config() &&
-      !(context.api().bootstrap().typed_dns_resolver_config().typed_config().type_url().empty())) {
-    typed_dns_resolver_config = context.api().bootstrap().typed_dns_resolver_config();
-    dns_resolver_factory =
-        &Network::createDnsResolverFactoryFromTypedConfig(typed_dns_resolver_config);
-  } else {
+  // If DnsCacheConfig has custom DNS settings, use them. Otherwise, create DNS resolver from
+  // the bootstrap configuration. This is consistent with what we do for CDS clusters.
+  if ((config.has_typed_dns_resolver_config() &&
+       !(config.typed_dns_resolver_config().typed_config().type_url().empty())) ||
+      config.has_dns_resolution_config() || config.use_tcp_for_dns_lookups()) {
+    // DNS cache has custom configuration, use it.
     dns_resolver_factory =
         &Network::createDnsResolverFactoryFromProto(config, typed_dns_resolver_config);
+  } else {
+    // No custom DNS configuration in cache, fall back to using the bootstrap config.
+    // This ensures that DFP gets the same DNS resolver settings as CDS clusters.
+    dns_resolver_factory = &Network::createDnsResolverFactoryFromProto(context.api().bootstrap(),
+                                                                       typed_dns_resolver_config);
   }
   return dns_resolver_factory->createDnsResolver(main_thread_dispatcher, context.api(),
                                                  typed_dns_resolver_config);
