@@ -4582,20 +4582,44 @@ TEST_P(HttpFilterTestParam, PerRouteConfigurationIntegrationTest) {
 
   prepareCheck();
 
-  // Mock client check to capture and verify the check request has proper context extensions.
-  EXPECT_CALL(*client_, check(_, _, _, _))
-      .WillOnce(Invoke([&](Filters::Common::ExtAuthz::RequestCallbacks& callbacks,
-                           const envoy::service::auth::v3::CheckRequest& check_request,
-                           Tracing::Span&, const StreamInfo::StreamInfo&) -> void {
-        // Verify that per-route context extensions were merged correctly
-        auto context_extensions = check_request.attributes().context_extensions();
+  // With per-route gRPC service configured, a per-route client is created and used.
+  // Mock raw gRPC client creation and intercept the serialized CheckRequest to verify
+  // context extensions, then respond synchronously with OK so decodeHeaders returns Continue.
+  auto mock_grpc_client_manager = std::make_unique<Grpc::MockAsyncClientManager>();
+  ON_CALL(factory_context_, clusterManager()).WillByDefault(ReturnRef(cm_));
+  ON_CALL(cm_, grpcAsyncClientManager()).WillByDefault(ReturnRef(*mock_grpc_client_manager));
+
+  auto mock_raw_grpc_client = std::make_shared<Grpc::MockAsyncClient>();
+  EXPECT_CALL(*mock_grpc_client_manager, getOrCreateRawAsyncClientWithHashKey(_, _, true))
+      .WillOnce(Return(absl::StatusOr<Grpc::RawAsyncClientSharedPtr>(mock_raw_grpc_client)));
+
+  // The default client should not be used when per-route client creation succeeds.
+  EXPECT_CALL(*client_, check(_, _, _, _)).Times(0);
+
+  EXPECT_CALL(*mock_raw_grpc_client, sendRaw(_, _, _, _, _, _))
+      .WillOnce(Invoke([](absl::string_view /*service_full_name*/,
+                          absl::string_view /*method_name*/, Buffer::InstancePtr&& request,
+                          Grpc::RawAsyncRequestCallbacks& callbacks, Tracing::Span& parent_span,
+                          const Http::AsyncClient::RequestOptions& /*options*/) -> Grpc::AsyncRequest* {
+        // Parse the serialized CheckRequest to validate context extensions were merged.
+        envoy::service::auth::v3::CheckRequest check_request;
+        std::string serialized_request;
+        serialized_request.assign(
+            static_cast<const char*>(request->linearize(request->length())), request->length());
+        EXPECT_TRUE(check_request.ParseFromString(serialized_request));
+        const auto& context_extensions = check_request.attributes().context_extensions();
         EXPECT_TRUE(context_extensions.contains("test_key"));
         EXPECT_EQ(context_extensions.at("test_key"), "test_value");
 
-        // Return OK to complete the test
-        auto response = std::make_unique<Filters::Common::ExtAuthz::Response>();
-        response->status = Filters::Common::ExtAuthz::CheckStatus::OK;
-        callbacks.onComplete(std::move(response));
+        // Synchronously return OK to allow decodeHeaders to return Continue.
+        envoy::service::auth::v3::CheckResponse check_response;
+        check_response.mutable_status()->set_code(Grpc::Status::WellKnownGrpcStatus::Ok);
+        check_response.mutable_ok_response();
+        std::string serialized_response;
+        check_response.SerializeToString(&serialized_response);
+        auto response_buffer = std::make_unique<Buffer::OwnedImpl>(serialized_response);
+        callbacks.onSuccessRaw(std::move(response_buffer), parent_span);
+        return nullptr;
       }));
 
   // This exercises the per-route configuration processing logic which includes
