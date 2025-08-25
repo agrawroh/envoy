@@ -9,6 +9,7 @@
 #include "source/common/common/scope_tracked_object_stack.h"
 #include "source/common/common/scope_tracker.h"
 #include "source/common/http/codes.h"
+#include "source/common/runtime/runtime_features.h"
 #include "source/common/http/header_map_impl.h"
 #include "source/common/http/header_utility.h"
 #include "source/common/http/utility.h"
@@ -467,10 +468,6 @@ void ActiveStreamDecoderFilter::modifyDecodingBuffer(
     std::function<void(Buffer::Instance&)> callback) {
   ASSERT(parent_.state_.latest_data_decoding_filter_ == this);
   callback(*parent_.buffered_request_data_.get());
-}
-
-void ActiveStreamDecoderFilter::setReverseConnForceLocalReply(bool value) {
-  parent_.setReverseConnForceLocalReply(value);
 }
 
 void ActiveStreamDecoderFilter::sendLocalReply(
@@ -1032,7 +1029,7 @@ void DownstreamFilterManager::sendLocalReply(
     // send local replies immediately rather than queuing them. This ensures proper handling of the
     // reversed connection flow and prevents potential issues with connection state and filter chain
     // processing.
-    if (!reverse_conn_force_local_reply_ &&
+    if (!Runtime::runtimeFeatureEnabled("envoy.reloadable_features.reverse_conn_force_local_reply") &&
         (state_.filter_call_state_ & FilterCallState::IsDecodingMask)) {
       prepareLocalReplyViaFilterChain(is_grpc_request, code, body, modify_headers, is_head_request,
                                       grpc_status, details);
