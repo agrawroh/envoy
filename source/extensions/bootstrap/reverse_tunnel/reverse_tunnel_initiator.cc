@@ -1556,9 +1556,10 @@ ReverseTunnelInitiatorExtension::ReverseTunnelInitiatorExtension(
     Server::Configuration::ServerFactoryContext& context,
     const envoy::extensions::bootstrap::reverse_tunnel::downstream_socket_interface::v3::
         DownstreamReverseConnectionSocketInterface& config)
-    : context_(context), config_(config) {
+    : context_(context), config_(config), 
+      stat_prefix_(config.stat_prefix().empty() ? "reverse_connections" : config.stat_prefix()) {
   ENVOY_LOG(debug, "Created ReverseTunnelInitiatorExtension - TLS slot will be created in "
-                   "onWorkerThreadInitialized");
+                   "onWorkerThreadInitialized with stat_prefix: {}", stat_prefix_);
 }
 
 void ReverseTunnelInitiatorExtension::updateConnectionStats(const std::string& host_address,
@@ -1571,7 +1572,7 @@ void ReverseTunnelInitiatorExtension::updateConnectionStats(const std::string& h
   // Create/update host connection stat with state suffix
   if (!host_address.empty() && !state_suffix.empty()) {
     std::string host_stat_name =
-        fmt::format("reverse_connections.host.{}.{}", host_address, state_suffix);
+        fmt::format("{}.host.{}.{}", stat_prefix_, host_address, state_suffix);
     Stats::StatNameManagedStorage host_stat_name_storage(host_stat_name, stats_store.symbolTable());
     auto& host_gauge = stats_store.gaugeFromStatName(host_stat_name_storage.statName(),
                                                      Stats::Gauge::ImportMode::Accumulate);
@@ -1589,7 +1590,7 @@ void ReverseTunnelInitiatorExtension::updateConnectionStats(const std::string& h
   // Create/update cluster connection stat with state suffix.
   if (!cluster_id.empty() && !state_suffix.empty()) {
     std::string cluster_stat_name =
-        fmt::format("reverse_connections.cluster.{}.{}", cluster_id, state_suffix);
+        fmt::format("{}.cluster.{}.{}", stat_prefix_, cluster_id, state_suffix);
     Stats::StatNameManagedStorage cluster_stat_name_storage(cluster_stat_name,
                                                             stats_store.symbolTable());
     auto& cluster_gauge = stats_store.gaugeFromStatName(cluster_stat_name_storage.statName(),
@@ -1628,8 +1629,8 @@ void ReverseTunnelInitiatorExtension::updatePerWorkerConnectionStats(
 
   // Create/update per-worker host connection stat.
   if (!host_address.empty() && !state_suffix.empty()) {
-    std::string worker_host_stat_name = fmt::format("reverse_connections.{}.host.{}.{}",
-                                                    dispatcher_name, host_address, state_suffix);
+    std::string worker_host_stat_name = fmt::format("{}.{}.host.{}.{}",
+                                                    stat_prefix_, dispatcher_name, host_address, state_suffix);
     Stats::StatNameManagedStorage worker_host_stat_name_storage(worker_host_stat_name,
                                                                 stats_store.symbolTable());
     auto& worker_host_gauge = stats_store.gaugeFromStatName(
@@ -1647,8 +1648,8 @@ void ReverseTunnelInitiatorExtension::updatePerWorkerConnectionStats(
 
   // Create/update per-worker cluster connection stat.
   if (!cluster_id.empty() && !state_suffix.empty()) {
-    std::string worker_cluster_stat_name = fmt::format("reverse_connections.{}.cluster.{}.{}",
-                                                       dispatcher_name, cluster_id, state_suffix);
+    std::string worker_cluster_stat_name = fmt::format("{}.{}.cluster.{}.{}",
+                                                       stat_prefix_, dispatcher_name, cluster_id, state_suffix);
     Stats::StatNameManagedStorage worker_cluster_stat_name_storage(worker_cluster_stat_name,
                                                                    stats_store.symbolTable());
     auto& worker_cluster_gauge = stats_store.gaugeFromStatName(
@@ -1671,16 +1672,16 @@ ReverseTunnelInitiatorExtension::getCrossWorkerStatMap() {
   auto& stats_store = context_.scope();
 
   // Iterate through all gauges and filter for cross-worker stats only.
-  // Cross-worker stats have the pattern "reverse_connections.host.<host_address>.<state_suffix>" or
-  // "reverse_connections.cluster.<cluster_id>.<state_suffix>" (no dispatcher name in the middle).
+  // Cross-worker stats have the pattern "<stat_prefix>.host.<host_address>.<state_suffix>" or
+  // "<stat_prefix>.cluster.<cluster_id>.<state_suffix>" (no dispatcher name in the middle).
   Stats::IterateFn<Stats::Gauge> gauge_callback =
-      [&stats_map](const Stats::RefcountPtr<Stats::Gauge>& gauge) -> bool {
+      [&stats_map, this](const Stats::RefcountPtr<Stats::Gauge>& gauge) -> bool {
     const std::string& gauge_name = gauge->name();
     ENVOY_LOG(trace, "ReverseTunnelInitiatorExtension: gauge_name: {} gauge_value: {}", gauge_name,
               gauge->value());
-    if (gauge_name.find("reverse_connections.") != std::string::npos &&
-        (gauge_name.find("reverse_connections.host.") != std::string::npos ||
-         gauge_name.find("reverse_connections.cluster.") != std::string::npos) &&
+    if (gauge_name.find(stat_prefix_ + ".") != std::string::npos &&
+        (gauge_name.find(stat_prefix_ + ".host.") != std::string::npos ||
+         gauge_name.find(stat_prefix_ + ".cluster.") != std::string::npos) &&
         gauge->used()) {
       stats_map[gauge_name] = gauge->value();
     }
@@ -1709,27 +1710,28 @@ ReverseTunnelInitiatorExtension::getConnectionStatsSync(
   std::vector<std::string> accepted_connections;
 
   // Process the stats to extract connection information
-  // For initiator, stats format is: reverse_connections.host.<host>.<state_suffix> or
-  // reverse_connections.cluster.<cluster>.<state_suffix> We only want hosts/clusters with
+  // For initiator, stats format is: <stat_prefix>.host.<host>.<state_suffix> or
+  // <stat_prefix>.cluster.<cluster>.<state_suffix> We only want hosts/clusters with
   // "connected" state
   for (const auto& [stat_name, count] : connection_stats) {
     if (count > 0) {
       // Parse stat name to extract host/cluster information with state suffix.
-      if (stat_name.find("reverse_connections.host.") != std::string::npos &&
+      std::string host_pattern = stat_prefix_ + ".host.";
+      std::string cluster_pattern = stat_prefix_ + ".cluster.";
+      
+      if (stat_name.find(host_pattern) != std::string::npos &&
           stat_name.find(".connected") != std::string::npos) {
-        // Find the position after "reverse_connections.host." and before ".connected".
-        size_t start_pos =
-            stat_name.find("reverse_connections.host.") + strlen("reverse_connections.host.");
+        // Find the position after "<stat_prefix>.host." and before ".connected".
+        size_t start_pos = stat_name.find(host_pattern) + host_pattern.length();
         size_t end_pos = stat_name.find(".connected");
         if (start_pos != std::string::npos && end_pos != std::string::npos && end_pos > start_pos) {
           std::string host_address = stat_name.substr(start_pos, end_pos - start_pos);
           connected_hosts.push_back(host_address);
         }
-      } else if (stat_name.find("reverse_connections.cluster.") != std::string::npos &&
+      } else if (stat_name.find(cluster_pattern) != std::string::npos &&
                  stat_name.find(".connected") != std::string::npos) {
-        // Find the position after "reverse_connections.cluster." and before ".connected".
-        size_t start_pos =
-            stat_name.find("reverse_connections.cluster.") + strlen("reverse_connections.cluster.");
+        // Find the position after "<stat_prefix>.cluster." and before ".connected".
+        size_t start_pos = stat_name.find(cluster_pattern) + cluster_pattern.length();
         size_t end_pos = stat_name.find(".connected");
         if (start_pos != std::string::npos && end_pos != std::string::npos && end_pos > start_pos) {
           std::string cluster_id = stat_name.substr(start_pos, end_pos - start_pos);
@@ -1762,11 +1764,11 @@ absl::flat_hash_map<std::string, uint64_t> ReverseTunnelInitiatorExtension::getP
 
   // Iterate through all gauges and filter for the current dispatcher.
   Stats::IterateFn<Stats::Gauge> gauge_callback =
-      [&stats_map, &dispatcher_name](const Stats::RefcountPtr<Stats::Gauge>& gauge) -> bool {
+      [&stats_map, &dispatcher_name, this](const Stats::RefcountPtr<Stats::Gauge>& gauge) -> bool {
     const std::string& gauge_name = gauge->name();
     ENVOY_LOG(trace, "ReverseTunnelInitiatorExtension: gauge_name: {} gauge_value: {}", gauge_name,
               gauge->value());
-    if (gauge_name.find("reverse_connections.") != std::string::npos &&
+    if (gauge_name.find(stat_prefix_ + ".") != std::string::npos &&
         gauge_name.find(dispatcher_name + ".") != std::string::npos &&
         (gauge_name.find(".host.") != std::string::npos ||
          gauge_name.find(".cluster.") != std::string::npos) &&

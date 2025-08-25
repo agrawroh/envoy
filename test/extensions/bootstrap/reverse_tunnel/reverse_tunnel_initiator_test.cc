@@ -1374,6 +1374,39 @@ TEST_F(ReverseConnectionIOHandleTest, EmptySrcNodeIdNoStatsUpdate) {
   EXPECT_EQ(stat_map.size(), 0); // No stats should be created
 }
 
+// Test that custom stat prefix is used in stats.
+TEST_F(ReverseConnectionIOHandleTest, CustomStatPrefix) {
+  // Set up thread local slot first so stats can be properly tracked.
+  setupThreadLocalSlot();
+
+  // Create config with custom stat prefix.
+  ReverseConnectionSocketConfig custom_prefix_config;
+  custom_prefix_config.src_cluster_id = "test-cluster";
+  custom_prefix_config.src_node_id = "test-node";
+  custom_prefix_config.remote_clusters.push_back(RemoteClusterConnectionConfig("remote-cluster", 2));
+
+  // Create a new extension with custom stat prefix.
+  envoy::extensions::bootstrap::reverse_tunnel::downstream_socket_interface::v3::
+      DownstreamReverseConnectionSocketInterface custom_config;
+  custom_config.set_stat_prefix("custom_stats");
+
+  auto custom_extension = std::make_unique<ReverseTunnelInitiatorExtension>(context_, custom_config);
+  custom_extension->setTestOnlyTLSRegistry(std::move(tls_slot_));
+
+  // Create IO handle with custom extension.
+  auto custom_io_handle = std::make_unique<ReverseConnectionIOHandle>(
+      8, // dummy fd
+      custom_prefix_config, cluster_manager_, custom_extension.get(), *stats_scope_);
+
+  // Update connection stats to trigger stat creation.
+  custom_io_handle->updateConnectionStats("test-node", "test-cluster", "connecting", true);
+
+  // Verify that the custom stat prefix is used.
+  auto stat_map = custom_extension->getCrossWorkerStatMap();
+  std::string expected_stat_name = "test_scope.custom_stats.host.test-node.connecting";
+  EXPECT_EQ(stat_map[expected_stat_name], 1);
+}
+
 // Test that rev_conn_retry_timer_ gets created and enabled upon calling initializeFileEvent.
 TEST_F(ReverseConnectionIOHandleTest, RetryTimerEnabled) {
   // Set up thread local slot first so stats can be properly tracked.
