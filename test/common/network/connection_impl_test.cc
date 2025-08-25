@@ -362,23 +362,6 @@ TEST_P(ConnectionImplTest, GetCongestionWindow) {
   disconnect(true);
 }
 
-TEST_P(ConnectionImplTest, TestMoveSocket) {
-  setUpBasicConnection();
-  connect();
-
-  EXPECT_CALL(client_callbacks_, onEvent(ConnectionEvent::LocalClose));
-  // Mark the client connection's socket as reused.
-  client_connection_->setSocketReused(true);
-  // Call moveSocket and verify the behavior.
-  auto moved_socket = client_connection_->moveSocket();
-  EXPECT_NE(moved_socket, nullptr);                                  // Ensure the socket is moved.
-  EXPECT_EQ(client_connection_->state(), Connection::State::Closed); // Connection should be closed.
-
-  // Mark the socket dead to raise a close() event on the server connection.
-  moved_socket->close();
-  disconnect(true /* wait_for_remote_close */, true /* client_socket_closed */);
-}
-
 TEST_P(ConnectionImplTest, CloseDuringConnectCallback) {
   setUpBasicConnection();
 
