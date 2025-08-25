@@ -376,13 +376,13 @@ bool GrpcReverseTunnelService::registerTunnelConnection(
 
     auto* socket_manager = local_registry->socketManager();
 
-    // Create a connection socket from the TCP connection
-    // This is a simplified approach - in full implementation we'd need proper socket management
-    Network::ConnectionSocketPtr socket = connection->moveSocket();
+    // Get the socket from the connection without moving it
+    // Since we're not duplicating sockets, we use the existing socket
+    const Network::ConnectionSocketPtr& socket = connection->getSocket();
 
     // Register the connection with the socket manager
     socket_manager->addConnectionSocket(initiator.node_id(), initiator.cluster_id(),
-                                        std::move(socket), ping_interval,
+                                        socket, ping_interval,
                                         false // not rebalanced
     );
 

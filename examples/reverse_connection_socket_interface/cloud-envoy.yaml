@@ -94,9 +94,10 @@ layered_runtime:
   - name: layer
     static_layer:
       re2.max_program_size.error_level: 1000
+      envoy.reloadable_features.reverse_conn_force_local_reply: true
 # Enable reverse connection bootstrap extension
 bootstrap_extensions:
-- name: envoy.bootstrap.reverse_connection.upstream_reverse_connection_socket_interface
+- name: envoy.bootstrap.reverse_tunnel.upstream_socket_interface
   typed_config:
-    "@type": type.googleapis.com/envoy.extensions.bootstrap.reverse_connection_socket_interface.v3.UpstreamReverseConnectionSocketInterface
+    "@type": type.googleapis.com/envoy.extensions.bootstrap.reverse_tunnel.upstream_socket_interface.v3.UpstreamReverseConnectionSocketInterface
     stat_prefix: "upstream_reverse_connection"
