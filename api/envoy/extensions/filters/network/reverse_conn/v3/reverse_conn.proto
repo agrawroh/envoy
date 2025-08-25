@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.network.reverse_conn.v3;
+
+import "udpa/annotations/status.proto";
+import "udpa/annotations/versioning.proto";
+
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/reverse_conn/v3;reverse_connv3";
+
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc_title: Reverse Connection Network Filter]
+// Reverse Connection Network Filter :ref:`configuration overview
+// <config_network_filters_reverse_conn>`.
+// [#extension: envoy.filters.network.reverse_conn]
+
+// Configuration for the reverse connection network filter.
+message ReverseConn {
+  // This filter has no configuration options currently.
+  // All behavior is hardcoded to handle reverse connection requests.
+} 

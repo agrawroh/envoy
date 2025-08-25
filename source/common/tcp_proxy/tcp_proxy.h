@@ -548,8 +548,8 @@ public:
     }
     void addDownstreamWatermarkCallbacks(Http::DownstreamWatermarkCallbacks&) override {}
     void removeDownstreamWatermarkCallbacks(Http::DownstreamWatermarkCallbacks&) override {}
-    void setDecoderBufferLimit(uint32_t) override {}
-    uint32_t decoderBufferLimit() override { return 0; }
+    void setDecoderBufferLimit(uint64_t) override {}
+    uint64_t decoderBufferLimit() override { return 0; }
     bool recreateStream(const Http::ResponseHeaderMap*) override { return false; }
     void addUpstreamSocketOptions(const Network::Socket::OptionsSharedPtr&) override {}
     Network::Socket::OptionsSharedPtr getUpstreamSocketOptions() const override { return nullptr; }
@@ -582,6 +582,7 @@ public:
       os << spaces << "TcpProxy " << this << DUMP_MEMBER(streamId()) << "\n";
       DUMP_DETAILS(parent_->getStreamInfo().upstreamInfo());
     }
+
     Filter* parent_{};
     Http::RequestTrailerMapPtr request_trailer_map_;
     std::shared_ptr<Http::NullRouteImpl> route_;

@@ -136,6 +136,12 @@ FALSE_RUNTIME_GUARD(envoy_reloadable_features_use_canonical_suffix_for_quic_brok
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_use_canonical_suffix_for_srtt);
 // TODO(fredyw): Remove after done with debugging.
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_log_ip_families_on_network_error);
+// TODO(abeyad): Flip to true after prod testing. Simple filtering applies to link-local addresses
+// only.
+FALSE_RUNTIME_GUARD(envoy_reloadable_features_mobile_ipv6_probe_simple_filtering);
+// TODO(abeyad): Flip to true after prod testing. Advanced filtering applies to all IP reserved
+// range addresses.
+FALSE_RUNTIME_GUARD(envoy_reloadable_features_mobile_ipv6_probe_advanced_filtering);
 // TODO(botengyao): flip to true after canarying the feature internally without problems.
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_connection_close_through_filter_manager);
 // TODO(adisuissa): flip to true after all xDS types use the new subscription
@@ -161,6 +167,8 @@ FALSE_RUNTIME_GUARD(envoy_reloadable_features_getaddrinfo_no_ai_flags);
 // take over the split ones, and will be used as a base for the
 // implementation of on-demand DNS.
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_enable_new_dns_implementation);
+// Force a local reply from upstream envoy for reverse connections.
+FALSE_RUNTIME_GUARD(envoy_reloadable_features_reverse_conn_force_local_reply);
 
 // Block of non-boolean flags. Use of int flags is deprecated. Do not add more.
 ABSL_FLAG(uint64_t, re2_max_program_size_error_level, 100, ""); // NOLINT
