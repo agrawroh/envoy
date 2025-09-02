@@ -206,6 +206,7 @@ extensions/upstreams/tcp @ggreenway @mattklein123
 # user space socket pair, event, connection and listener
 /*/extensions/io_socket/user_space @kyessenov @lambdai
 /*/extensions/bootstrap/internal_listener @kyessenov @adisuissa
+/*/extensions/bootstrap/reverse_tunnel/ @agrawroh @basundhara-c @botengyao @yanavlasov
 # Default UUID4 request ID extension
 /*/extensions/request_id/uuid @mattklein123 @botengyao
 # HTTP header formatters
@@ -428,3 +429,4 @@ extensions/upstreams/tcp @ggreenway @mattklein123
 /contrib/qat/ @giantcroc @soulxu
 /contrib/generic_proxy/ @wbpcode @UNOWNED
 /contrib/tap_sinks/ @coolg92003 @yiyibaoguo
+/contrib/reverse_connection/ @arun-vasudev @basundhara-c @agrawoh
