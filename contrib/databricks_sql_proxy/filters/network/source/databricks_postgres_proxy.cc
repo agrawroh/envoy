@@ -143,7 +143,11 @@ bool PostgresProxy::processClientFirstMessage(Buffer::Instance& data) {
     uint32_t process_id = cancellation_id >> 32;
     uint32_t secret_key = cancellation_id & 0x00000000FFFFFFFF;
 
-    setDynamicMetadataNumber(CommonConstants::CANCELLATION_ID_KEY, cancellation_id);
+    // Need to convert the uint64_t to string to store in dynamic metadata so that we don't lose
+    // precision because the number_value in ProtobufWkt::Value only supports double (precision
+    // upto 2^53).
+    std::string cancellation_id_str = std::to_string(cancellation_id);
+    setDynamicMetadataString(CommonConstants::CANCELLATION_ID_KEY, cancellation_id_str);
     setDynamicMetadataNumber(CommonConstants::CANCELLATION_PROCESS_ID_KEY, process_id);
     setDynamicMetadataNumber(CommonConstants::CANCELLATION_SECRET_KEY_KEY, secret_key);
     setDynamicMetadataNumber(CommonConstants::FIRST_CLIENT_MESSAGE_TYPE,
@@ -379,17 +383,6 @@ void PostgresProxy::sendPostgresStartupMessageToUpstream() {
  * For postgres, this is where we expect to receive the SSL response from the upstream.
  */
 Network::FilterStatus PostgresProxy::handleUpstreamData(Buffer::Instance& data, bool end_stream) {
-  // If upstream is ending and we have not processed the backend key data message nor processed the
-  // cancellation message we should flush all buffered data to downstream by calling
-  // Network::FilterStatus::Continue.
-  if (end_stream && upstream_handshake_state_ < UpstreamHandshakeState::ProcessedBackendKeyData) {
-    ENVOY_CONN_LOG(info,
-                   "databricks_sql_proxy: Upstream is closing TCP connection end_stream: {}. Flush "
-                   "all buffered data to downstream. data.length: {}",
-                   read_callbacks_->connection(), end_stream, data.length());
-    return Network::FilterStatus::Continue;
-  }
-
   if (upstream_handshake_state_ == UpstreamHandshakeState::Init) {
     std::string error_msg =
         "Received data from upstream before sending SSL request. This is a protocol violation.";
@@ -456,15 +449,18 @@ Network::FilterStatus PostgresProxy::handleUpstreamData(Buffer::Instance& data, 
 
     write_callbacks_->injectWriteDataToFilterChain(data_to_forward_, end_stream);
 
-    // If we processed backend key data message and need to store the cancellation key, store it.
-    if (config_->protoConfig().postgres_config().store_cancellation_key() &&
-        upstream_handshake_state_ == UpstreamHandshakeState::ProcessedBackendKeyData) {
-      ENVOY_CONN_LOG(debug, "databricks_sql_proxy: Storing cancellation key in sidecar.",
-                     read_callbacks_->connection());
-      parent_.storeMetadataInSidecar();
+    if (upstream_handshake_state_ == UpstreamHandshakeState::ProcessedBackendKeyData) {
+      // If we processed backend key data message and need to store the cancellation key, store it.
+      if (config_->protoConfig().postgres_config().store_cancellation_key()) {
+        ENVOY_CONN_LOG(debug, "databricks_sql_proxy: Storing cancellation key in sidecar.",
+                       read_callbacks_->connection());
+        parent_.storeMetadataInSidecar();
+      }
+      // Only increment successful login stats if we have processed backend key data message.
+      // When we see backend key data, it means that the authentication is successful.
+      // We will switch to forward mode.
+      config_->stats().successful_login_.inc();
     }
-
-    config_->stats().successful_login_.inc();
   }
 
   return Network::FilterStatus::Continue;
@@ -504,7 +500,7 @@ Network::FilterStatus PostgresProxy::handleUpstreamSslResponse(Buffer::Instance&
                    read_callbacks_->connection());
 
     if (read_callbacks_->startUpstreamSecureTransport()) {
-      ENVOY_CONN_LOG(info, "databricks_sql_proxy: Upstream connection is now secure.",
+      ENVOY_CONN_LOG(debug, "databricks_sql_proxy: Upstream connection is now secure.",
                      read_callbacks_->connection());
 
       sendPostgresStartupMessageToUpstream();
@@ -647,7 +643,11 @@ void PostgresProxy::processBackendKeyDataMessage(Buffer::Instance& data) {
   // key, or forward the original backend key data message.
   if (config_->protoConfig().postgres_config().randomize_cancellation_key()) {
     uint64_t cancellation_id = Envoy::Random::RandomUtility::random();
-    setDynamicMetadataNumber(CommonConstants::CANCELLATION_ID_KEY, cancellation_id);
+    // Need to convert the uint64_t to string to store in dynamic metadata so that we don't lose
+    // precision because the number_value in ProtobufWkt::Value only supports double (precision
+    // upto 2^53).
+    std::string cancellation_id_str = std::to_string(cancellation_id);
+    setDynamicMetadataString(CommonConstants::CANCELLATION_ID_KEY, cancellation_id_str);
 
     Buffer::OwnedImpl new_backend_key_data;
     new_backend_key_data.writeByte(PostgresConstants::BACKEND_KEY_DATA_MESSAGE_TYPE);

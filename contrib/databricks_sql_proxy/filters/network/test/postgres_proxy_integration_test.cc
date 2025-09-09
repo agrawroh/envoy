@@ -44,22 +44,28 @@ namespace {
 class DatabricksSqlProxyPostgresIntegrationTest : public Grpc::EnvoyGrpcClientIntegrationParamTest,
                                                   public BaseIntegrationTest {
 public:
-  DatabricksSqlProxyPostgresIntegrationTest(bool enable_upstream_tls = true)
-      : BaseIntegrationTest(GetParam(), postgresConfig(enable_upstream_tls)) {}
+  DatabricksSqlProxyPostgresIntegrationTest(bool enable_upstream_tls = true,
+                                            bool enable_proxy_protocol = false)
+      : BaseIntegrationTest(GetParam(), postgresConfig(enable_upstream_tls, enable_proxy_protocol)),
+        enable_upstream_tls_{enable_upstream_tls}, enable_proxy_protocol_{enable_proxy_protocol} {}
 
-  std::string postgresConfig(bool enable_upstream_tls) {
+  bool enable_upstream_tls_{};
+  bool enable_proxy_protocol_{};
+
+  std::string postgresConfig(bool enable_upstream_tls, bool enable_proxy_protocol) {
     return fmt::format(
         fmt::runtime(TestEnvironment::readFileToStringForTest(
             TestEnvironment::runfilesPath("contrib/databricks_sql_proxy/filters/network/test/"
                                           "postgres_integration_test_config.yaml"))),
-        Platform::null_device_path,                          // admin access log path
-        Network::Test::getLoopbackAddressString(GetParam()), // admin endpoint address
-        Network::Test::getLoopbackAddressString(GetParam()), // upstream cluster address
-        enable_upstream_tls ? upstream_tls_config : "",      // upstream tls config
-        "{}",                                                // http2_protocol_options
-        Network::Test::getLoopbackAddressString(GetParam()), // ext_authz-service address
-        Network::Test::getAnyAddressString(GetParam()),      // listener address
-        enable_upstream_tls ? "true" : "false"               // enable_upstream_tls
+        Platform::null_device_path,                          // Arg 1: admin access log path
+        Network::Test::getLoopbackAddressString(GetParam()), // Arg 2: admin endpoint address
+        Network::Test::getLoopbackAddressString(GetParam()), // Arg 3: upstream cluster address
+        enable_upstream_tls ? upstream_tls_config : "",      // Arg 4: upstream tls config
+        "{}",                                                // Arg 5: http2_protocol_options
+        Network::Test::getLoopbackAddressString(GetParam()), // Arg 6: ext_authz-service address
+        Network::Test::getAnyAddressString(GetParam()),      // Arg 7: listener address
+        enable_proxy_protocol ? proxy_protocol_config : "",  // Arg 8: proxy protocol config
+        enable_upstream_tls ? "true" : "false"               // Arg 9: enable_upstream_tls
     );
   }
 
@@ -70,6 +76,16 @@ public:
         cleartext_socket_config:
         tls_socket_config:
           common_tls_context: 
+)EOF";
+
+  static constexpr absl::string_view proxy_protocol_config = R"EOF(
+      - name: envoy.listener.proxy_protocol
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.listener.proxy_protocol.v3.ProxyProtocol
+          rules:
+          - tlv_type: 2
+            on_tlv_present:
+              key: PP2TypeAuthority
 )EOF";
 
   static constexpr absl::string_view accesslog_config =
@@ -91,7 +107,8 @@ public:
       "DOWNSTREAM_WIRE_BYTES_SENT=%DOWNSTREAM_WIRE_BYTES_SENT% "
       "DOWNSTREAM_WIRE_BYTES_RECEIVED=%DOWNSTREAM_WIRE_BYTES_RECEIVED% "
       "UPSTREAM_WIRE_BYTES_SENT=%UPSTREAM_WIRE_BYTES_SENT% "
-      "UPSTREAM_WIRE_BYTES_RECEIVED=%UPSTREAM_WIRE_BYTES_RECEIVED%";
+      "UPSTREAM_WIRE_BYTES_RECEIVED=%UPSTREAM_WIRE_BYTES_RECEIVED% "
+      "real_ip=%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT% ";
 
   void initialize() override {
     // By default, the integration test will create 1 fake upstream - fake_upstreams_[0].
@@ -256,7 +273,6 @@ public:
   }
 
   void runEndToEndTest(
-      bool enable_upstream_tls,
       DatabricksSqlProxyProto::DestinationClusterSource destination_cluster_source,
       envoy::extensions::filters::network::databricks_sql_proxy::v3::PostgresRoutingConfig
           postgres_config,
@@ -277,7 +293,6 @@ public:
 // Then the client sends the next message to the filter and verifies that the upstream received the
 // message.
 void DatabricksSqlProxyPostgresIntegrationTest::runEndToEndTest(
-    bool enable_upstream_tls,
     DatabricksSqlProxyProto::DestinationClusterSource destination_cluster_source,
     envoy::extensions::filters::network::databricks_sql_proxy::v3::PostgresRoutingConfig
         postgres_config,
@@ -310,6 +325,31 @@ void DatabricksSqlProxyPostgresIntegrationTest::runEndToEndTest(
   initialize();
 
   IntegrationTcpClientPtr client = makeTcpConnection(lookupPort("listener_0"));
+
+  if (enable_proxy_protocol_) {
+    // Write proxy protocol Tlv to the connection.
+    // The TLV PP2_TYPE_AUTHORITY is picked randomly.
+    // Please refer to the proxy protocol spec for more details.
+    // https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
+    constexpr uint8_t buffer[] = {
+        0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a, // signature
+        0x21, 0x11,             // version, command, address, proto
+        0x00, 0x1a,             // address length
+        0x01, 0x02, 0x03, 0x04, // source addr 1.2.3.4
+        0x00, 0x01, 0x01, 0x02, // dest addr 0.1.1.2
+        0x03, 0x05,             // source port 773
+        0x00, 0x02,             // dest port 2
+        0x00, 0x00, 0x01, 0xff, // type (1 byte) = 0 (custom/unknown), length-hi (1 byte), length-lo
+                                // (1 byte), value = 255
+        0x02,                   // type (1 byte) - (0x02 = PP2_TYPE_AUTHORITY)
+        0x00, 0x07,             // , length-hi (1 byte), length-lo (1 byte),
+        0x66, 0x6f, 0x6f, 0x2e, 0x63, 0x6f, 0x6d}; // value = "foo.com"
+
+    Buffer::OwnedImpl buf(buffer, sizeof(buffer));
+    ASSERT_TRUE(client->connected());
+    ASSERT_TRUE(client->write(buf.toString()));
+  }
+
   Buffer::OwnedImpl postgres_startup_message = createPostgresStartupMessage();
   std::string ssl_support_response(1, PostgresConstants::POSTGRES_SUPPORT_SSL);
 
@@ -324,6 +364,17 @@ void DatabricksSqlProxyPostgresIntegrationTest::runEndToEndTest(
                                                           fake_ext_authz_upstream_connection));
     ASSERT_TRUE(
         fake_ext_authz_upstream_connection->waitForNewStream(*dispatcher_, ext_authz_request));
+
+    envoy::service::auth::v3::CheckRequest request;
+    ASSERT_TRUE(ext_authz_request->waitForGrpcMessage(*dispatcher_, request));
+
+    if (enable_proxy_protocol_) {
+      // Check that we have the original source address from proxy protocol in the request.
+      ASSERT(request.attributes().source().address().socket_address().address() == "1.2.3.4");
+    } else {
+      ASSERT(request.attributes().destination().address().socket_address().address() ==
+             Network::Test::getLoopbackAddressString(GetParam()));
+    }
 
     // Create ext_authz response
     envoy::service::auth::v3::CheckResponse check_response;
@@ -351,7 +402,7 @@ void DatabricksSqlProxyPostgresIntegrationTest::runEndToEndTest(
   // is a bug with the code.
   timeSystem().advanceTimeWaitImpl(std::chrono::milliseconds(2000));
 
-  if (enable_upstream_tls) {
+  if (enable_upstream_tls_) {
     // Wait for SSL request to be sent to the upstream.
     ASSERT_TRUE(fake_postgres_upstream_connection->waitForData(8, &postgres_upstream_received));
     ASSERT_EQ(PostgresConstants::POSTGRES_SSL_REQUEST_MESSAGE, postgres_upstream_received);
@@ -395,22 +446,23 @@ void DatabricksSqlProxyPostgresIntegrationTest::runEndToEndTest(
   fake_postgres_upstream_connection->clearData();
 
   const std::string_view ip = "1.2.3.4";
-  Buffer::OwnedImpl upstream_data;
-  // If we need to read upstream_ip parameter status message then inject it.
-  if (postgres_config.read_parameter_status_upstream_ip()) {
-    size_t parameter_status_message_len =
-        sizeof(uint32_t) + CommonConstants::PARAMETER_STATUS_UPSTREAM_IP_KEY.size() +
-        1 /* null-terminator */ + ip.size() + 1 /* null-terminator */;
-    Buffer::OwnedImpl parameter_status_message;
-    parameter_status_message.writeByte(PostgresConstants::PARAMETER_STATUS_MESSAGE_TYPE);
-    parameter_status_message.writeBEInt<int32_t>(parameter_status_message_len);
-    parameter_status_message.add(CommonConstants::PARAMETER_STATUS_UPSTREAM_IP_KEY);
-    parameter_status_message.writeByte(0); // null-terminator
-    parameter_status_message.add(ip);
-    parameter_status_message.writeByte(0); // null-terminator
+  size_t parameter_status_message_len =
+      sizeof(uint32_t) + CommonConstants::PARAMETER_STATUS_UPSTREAM_IP_KEY.size() +
+      1 /* null-terminator */ + ip.size() + 1 /* null-terminator */;
+  Buffer::OwnedImpl parameter_status_message;
+  parameter_status_message.writeByte(PostgresConstants::PARAMETER_STATUS_MESSAGE_TYPE);
+  parameter_status_message.writeBEInt<int32_t>(parameter_status_message_len);
+  parameter_status_message.add(CommonConstants::PARAMETER_STATUS_UPSTREAM_IP_KEY);
+  parameter_status_message.writeByte(0); // null-terminator
+  parameter_status_message.add(ip);
+  parameter_status_message.writeByte(0); // null-terminator
 
-    upstream_data.add(parameter_status_message);
-  }
+  // Send one parameter status message separately.
+  ASSERT_TRUE(fake_postgres_upstream_connection->write(parameter_status_message.toString()));
+
+  Buffer::OwnedImpl upstream_data;
+  // Add it to the combined data.
+  upstream_data.add(parameter_status_message);
   // Upstream always sends the backend key data message.
   Buffer::OwnedImpl backend_key_data_message;
   backend_key_data_message.writeByte(PostgresConstants::BACKEND_KEY_DATA_MESSAGE_TYPE);
@@ -516,7 +568,7 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, EndToEndTLSSidecarService) {
   postgres_config.set_store_cancellation_key(true);
   postgres_config.set_randomize_cancellation_key(true);
   runEndToEndTest(
-      true, DatabricksSqlProxyProto::SIDECAR_SERVICE, postgres_config,
+      DatabricksSqlProxyProto::SIDECAR_SERVICE, postgres_config,
       fmt::format("Protocol={} "
                   "handshake_state={} "
                   "upstream_handshake_state={} "
@@ -524,13 +576,14 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, EndToEndTLSSidecarService) {
                   "database=testdb "
                   "upstream_ip=1.2.3.4 "
                   "cancellation_secret_key=9876 "
-                  "termination_detail=- "
+                  "termination_detail=downstream_closed_tcp_conn "
                   "response_code_details=- "
                   "response_flags=- "
-                  "DOWNSTREAM_WIRE_BYTES_SENT=39 "
+                  "DOWNSTREAM_WIRE_BYTES_SENT=64 "
                   "DOWNSTREAM_WIRE_BYTES_RECEIVED=59 "
                   "UPSTREAM_WIRE_BYTES_SENT=59 "
-                  "UPSTREAM_WIRE_BYTES_RECEIVED=39"
+                  "UPSTREAM_WIRE_BYTES_RECEIVED=64 "
+                  "real_ip=127.0.0.1 "
                   "\r?.*",
                   DatabricksSqlProxyProto::Protocol_Name(DatabricksSqlProxyProto::POSTGRES),
                   static_cast<int>(HandshakeState::UpstreamConnected),
@@ -542,7 +595,7 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, EndToEndTLSSni) {
       postgres_config;
   postgres_config.set_send_parameter_status_upstream_ip(true);
   runEndToEndTest(
-      true, DatabricksSqlProxyProto::SNI, postgres_config,
+      DatabricksSqlProxyProto::SNI, postgres_config,
       fmt::format("Protocol={} "
                   "handshake_state={} "
                   "upstream_handshake_state={} "
@@ -551,13 +604,14 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, EndToEndTLSSni) {
                   "upstream_ip={} " // Because read_parameter_status_upstream_ip is not set, we are
                                     // reading the upstream ip from the connection itself.
                   "cancellation_secret_key=9876 "
-                  "termination_detail=- "
+                  "termination_detail=downstream_closed_tcp_conn "
                   "response_code_details=- "
                   "response_flags=- "
-                  "DOWNSTREAM_WIRE_BYTES_SENT=14 "
+                  "DOWNSTREAM_WIRE_BYTES_SENT=64 "
                   "DOWNSTREAM_WIRE_BYTES_RECEIVED=59 "
                   "UPSTREAM_WIRE_BYTES_SENT=59 "
-                  "UPSTREAM_WIRE_BYTES_RECEIVED=14"
+                  "UPSTREAM_WIRE_BYTES_RECEIVED=64 "
+                  "real_ip=127.0.0.1 "
                   "\r?.*",
                   DatabricksSqlProxyProto::Protocol_Name(DatabricksSqlProxyProto::POSTGRES),
                   static_cast<int>(HandshakeState::UpstreamConnected),
@@ -639,7 +693,8 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, HandshakeTimeout) {
                   "DOWNSTREAM_WIRE_BYTES_SENT=0 "
                   "DOWNSTREAM_WIRE_BYTES_RECEIVED=0 "
                   "UPSTREAM_WIRE_BYTES_SENT=0 "
-                  "UPSTREAM_WIRE_BYTES_RECEIVED=0"
+                  "UPSTREAM_WIRE_BYTES_RECEIVED=0 "
+                  "real_ip=127.0.0.1 "
                   "\r?.*",
                   DatabricksSqlProxyProto::Protocol_Name(DatabricksSqlProxyProto::POSTGRES),
                   static_cast<int>(HandshakeState::Init),
@@ -691,8 +746,9 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, ExtAuthzTimeout) {
   timeSystem().advanceTimeWaitImpl(std::chrono::milliseconds(2000));
 
   EXPECT_EQ(1, test_server_->counter("databricks_sql_proxy.postgres_stats.errors")->value());
-  EXPECT_EQ(1,
-            test_server_->counter("databricks_sql_proxy.postgres_stats.ext_authz_failed")->value());
+  EXPECT_EQ(
+      1, test_server_->counter("databricks_sql_proxy.postgres_stats.ext_authz_failed_system_error")
+             ->value());
 
   client->close(Network::ConnectionCloseType::NoFlush);
 
@@ -711,7 +767,8 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, ExtAuthzTimeout) {
                   "DOWNSTREAM_WIRE_BYTES_SENT=0 "
                   "DOWNSTREAM_WIRE_BYTES_RECEIVED=0 "
                   "UPSTREAM_WIRE_BYTES_SENT=0 "
-                  "UPSTREAM_WIRE_BYTES_RECEIVED=0"
+                  "UPSTREAM_WIRE_BYTES_RECEIVED=0 "
+                  "real_ip=127.0.0.1 "
                   "\r?.*",
                   DatabricksSqlProxyProto::Protocol_Name(DatabricksSqlProxyProto::POSTGRES),
                   static_cast<int>(HandshakeState::ExtAuthzResponseCompleted),
@@ -776,7 +833,8 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, ExtAuthzReturnNotExistCluster)
                   "DOWNSTREAM_WIRE_BYTES_SENT=0 "
                   "DOWNSTREAM_WIRE_BYTES_RECEIVED=0 "
                   "UPSTREAM_WIRE_BYTES_SENT=0 "
-                  "UPSTREAM_WIRE_BYTES_RECEIVED=0"
+                  "UPSTREAM_WIRE_BYTES_RECEIVED=0 "
+                  "real_ip=127.0.0.1 "
                   "\r?.*",
                   DatabricksSqlProxyProto::Protocol_Name(DatabricksSqlProxyProto::POSTGRES),
                   static_cast<int>(HandshakeState::CreatingUpstreamConnection),
@@ -895,13 +953,14 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, CancellationRequest) {
                                                "database=- "
                                                "upstream_ip=- "
                                                "cancellation_secret_key=9876 "
-                                               "termination_detail=- "
+                                               "termination_detail=downstream_closed_tcp_conn "
                                                "response_code_details=- "
                                                "response_flags=- "
                                                "DOWNSTREAM_WIRE_BYTES_SENT=0 "
                                                "DOWNSTREAM_WIRE_BYTES_RECEIVED=16 "
                                                "UPSTREAM_WIRE_BYTES_SENT=16 "
-                                               "UPSTREAM_WIRE_BYTES_RECEIVED=0"
+                                               "UPSTREAM_WIRE_BYTES_RECEIVED=0 "
+                                               "real_ip=127.0.0.1 "
                                                "\r?.*",
                                                DatabricksSqlProxyProto::Protocol_Name(
                                                    DatabricksSqlProxyProto::POSTGRES),
@@ -1024,13 +1083,15 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, UpstreamDisconnectBeforePgAuth
   fake_postgres_upstream_connection->clearData();
 
   // Upstream is closing the connection before the handshake is complete.
-  ASSERT_TRUE(fake_postgres_upstream_connection->write("", true /*end_stream*/));
+  ASSERT_TRUE(fake_postgres_upstream_connection->write("last message", true));
 
   if (fake_ext_authz_upstream_connection != nullptr) {
     ASSERT_TRUE(fake_ext_authz_upstream_connection->close());
     ASSERT_TRUE(fake_ext_authz_upstream_connection->waitForDisconnect());
   }
 
+  // Client should have received the last message.
+  client->waitForData("last message", true);
   // Client should be in half close state because upstream send end_stream
   client->waitForHalfClose();
 
@@ -1055,10 +1116,161 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, UpstreamDisconnectBeforePgAuth
                                                "termination_detail=- "
                                                "response_code_details=- "
                                                "response_flags=- "
+                                               "DOWNSTREAM_WIRE_BYTES_SENT=13 "
+                                               "DOWNSTREAM_WIRE_BYTES_RECEIVED=59 "
+                                               "UPSTREAM_WIRE_BYTES_SENT=59 "
+                                               "UPSTREAM_WIRE_BYTES_RECEIVED=13 "
+                                               "real_ip=127.0.0.1 "
+                                               "\r?.*",
+                                               DatabricksSqlProxyProto::Protocol_Name(
+                                                   DatabricksSqlProxyProto::POSTGRES),
+                                               static_cast<int>(HandshakeState::Init),
+                                               static_cast<int>(UpstreamHandshakeState::Init)));
+}
+
+// Test that if the downstream disconnects by sending FIN (end_stream = true) before the filter
+// finishes processing backend key data message, the disconnect is propagated to the upstream. The
+// upstream should be in a half-closed state.
+TEST_P(DatabricksSqlProxyPostgresIntegrationTest, DownstreamDisconnectBeforePgAuthComplete) {
+  std::string access_log_path = TestEnvironment::temporaryPath(
+      fmt::format("access_log{}{}.txt", version_ == Network::Address::IpVersion::v4 ? "v4" : "v6",
+                  TestUtility::uniqueFilename()));
+
+  envoy::extensions::filters::network::databricks_sql_proxy::v3::PostgresRoutingConfig
+      postgres_config;
+  postgres_config.set_read_parameter_status_upstream_ip(true);
+  postgres_config.set_store_cancellation_key(true);
+  postgres_config.set_randomize_cancellation_key(true);
+
+  config_helper_.addConfigModifier([&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
+    setupAccesslog(access_log_path, bootstrap);
+
+    auto* listener = bootstrap.mutable_static_resources()->mutable_listeners(0);
+    auto* filter_chain = listener->mutable_filter_chains(0);
+    auto* databricks_sql_proxy_config_blob =
+        filter_chain->mutable_filters(0)->mutable_typed_config();
+    ASSERT_TRUE(databricks_sql_proxy_config_blob->Is<DatabricksSqlProxyProto>());
+    auto databricks_sql_proxy_config =
+        MessageUtil::anyConvert<DatabricksSqlProxyProto>(*databricks_sql_proxy_config_blob);
+
+    // Set filter handshake timeout to 1 second.
+    databricks_sql_proxy_config.mutable_handshake_timeout()->set_seconds(1);
+
+    databricks_sql_proxy_config.mutable_postgres_config()->CopyFrom(postgres_config);
+
+    databricks_sql_proxy_config_blob->PackFrom(databricks_sql_proxy_config);
+  });
+
+  // Enable half close on the fake upstream connection to test that the connection
+  enableHalfClose(true);
+
+  initialize();
+
+  IntegrationTcpClientPtr client = makeTcpConnection(lookupPort("listener_0"));
+  Buffer::OwnedImpl postgres_startup_message = createPostgresStartupMessage();
+  std::string ssl_support_response(1, PostgresConstants::POSTGRES_SUPPORT_SSL);
+
+  startPostgresConnectionAndSendStartupMessage(client);
+
+  FakeHttpConnectionPtr fake_ext_authz_upstream_connection = nullptr;
+  FakeStreamPtr ext_authz_request = nullptr;
+
+  // Wait for ext_authz call to be made.
+  ASSERT_TRUE(
+      fake_upstreams_[1]->waitForHttpConnection(*dispatcher_, fake_ext_authz_upstream_connection));
+  ASSERT_TRUE(
+      fake_ext_authz_upstream_connection->waitForNewStream(*dispatcher_, ext_authz_request));
+
+  // Create ext_authz response
+  envoy::service::auth::v3::CheckResponse check_response;
+  check_response.mutable_status()->set_code(Grpc::Status::WellKnownGrpcStatus::Ok);
+  std::string expected_target_cluster{"brickstore.database.databricks.com"};
+  ProtobufWkt::Struct dynamic_metadata;
+  ProtobufWkt::Value target_cluster_value;
+  target_cluster_value.set_string_value(expected_target_cluster);
+  (*check_response.mutable_dynamic_metadata()
+        ->mutable_fields())[CommonConstants::TARGET_CLUSTER_KEY] = target_cluster_value;
+
+  // Send ext_authz response.
+  ext_authz_request->startGrpcStream();
+  ext_authz_request->sendGrpcMessage(check_response);
+  ext_authz_request->finishGrpcStream(Grpc::Status::Ok);
+
+  // Wait for postgres upstream connection to be established.
+  FakeRawConnectionPtr fake_postgres_upstream_connection;
+  std::string postgres_upstream_received;
+  ASSERT_TRUE(fake_upstreams_[0]->waitForRawConnection(fake_postgres_upstream_connection));
+
+  // Move the time to test that the connection will not be closed because of timeout.
+  // We set the timeout to be 1 second. So moving by 2 seconds should trigger the timeout if there
+  // is a bug with the code.
+  timeSystem().advanceTimeWaitImpl(std::chrono::milliseconds(2000));
+
+  // Wait for SSL request to be sent to the upstream.
+  ASSERT_TRUE(fake_postgres_upstream_connection->waitForData(8, &postgres_upstream_received));
+  ASSERT_EQ(PostgresConstants::POSTGRES_SSL_REQUEST_MESSAGE, postgres_upstream_received);
+  // Now that wait for data succeeded, we can clear the buffered data that fake upstream received.
+  fake_postgres_upstream_connection->clearData();
+
+  // Reply that upstream support SSL.
+  ASSERT_TRUE(fake_postgres_upstream_connection->write(ssl_support_response));
+  // Wait for the upstream reply to flush from the current transport socket by
+  // confirming that envoy received the reply before switching the fake upstream transport socket
+  // to TLS.
+  config_factory_.recv_sync_.WaitForNotification();
+
+  enableTLSOnFakeUpstream(fake_postgres_upstream_connection);
+
+  // Now we can signal the envoy to proceed with the TLS handshake.
+  // This will forward the reply the upstream support SSL to the postgres filter.
+  // After which the filter will switch the upstream to TLS and send the TLS handshake message to
+  // the upstream.
+  config_factory_.proceed_sync_.Notify();
+
+  // Upstream connection waits for postgres startup message from the filter.
+  ASSERT_TRUE(fake_postgres_upstream_connection->waitForData(postgres_startup_message.length(),
+                                                             &postgres_upstream_received));
+  ASSERT_EQ(postgres_startup_message.toString(), postgres_upstream_received);
+  fake_postgres_upstream_connection->clearData();
+
+  // Client send the next message with end_stream set to true.
+  // This will trigger the filter to close downstream connection.
+  std::string next_message("next message");
+  ASSERT_TRUE(client->write(next_message, true /* end_stream */));
+  // Upstream should receive the next message
+  ASSERT_TRUE(fake_postgres_upstream_connection->waitForData(next_message.size(),
+                                                             &postgres_upstream_received));
+  ASSERT_EQ(next_message, postgres_upstream_received);
+  // Connection should be in half-closed state because the client sent end_stream.
+  ASSERT_TRUE(fake_postgres_upstream_connection->waitForHalfClose());
+  fake_postgres_upstream_connection->clearData();
+
+  client->close();
+
+  ASSERT_TRUE(fake_postgres_upstream_connection->close());
+
+  // Verify the stat is incremented.
+  EXPECT_EQ(
+      0,
+      test_server_->gauge("databricks_sql_proxy.postgres_stats.buffered_first_message")->value());
+  EXPECT_EQ(0,
+            test_server_->counter("databricks_sql_proxy.postgres_stats.successful_login")->value());
+
+  verifyAccessLog(access_log_path, fmt::format("Protocol={} "
+                                               "handshake_state=4 "
+                                               "upstream_handshake_state=2 "
+                                               "user=testuser "
+                                               "database=testdb "
+                                               "upstream_ip=- "
+                                               "cancellation_secret_key=- "
+                                               "termination_detail=downstream_closed_tcp_conn "
+                                               "response_code_details=- "
+                                               "response_flags=- "
                                                "DOWNSTREAM_WIRE_BYTES_SENT=1 "
                                                "DOWNSTREAM_WIRE_BYTES_RECEIVED=59 "
                                                "UPSTREAM_WIRE_BYTES_SENT=59 "
-                                               "UPSTREAM_WIRE_BYTES_RECEIVED=1"
+                                               "UPSTREAM_WIRE_BYTES_RECEIVED=1 "
+                                               "real_ip=127.0.0.1 "
                                                "\r?.*",
                                                DatabricksSqlProxyProto::Protocol_Name(
                                                    DatabricksSqlProxyProto::POSTGRES),
@@ -1093,7 +1305,7 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTestNoUpstreamSSL, EndToEndNoUpstrea
   envoy::extensions::filters::network::databricks_sql_proxy::v3::PostgresRoutingConfig
       postgres_config;
   runEndToEndTest(
-      false, DatabricksSqlProxyProto::SIDECAR_SERVICE, postgres_config,
+      DatabricksSqlProxyProto::SIDECAR_SERVICE, postgres_config,
       fmt::format("Protocol={} "
                   "handshake_state={} "
                   "upstream_handshake_state={} "
@@ -1101,13 +1313,55 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTestNoUpstreamSSL, EndToEndNoUpstrea
                   "database=testdb "
                   "upstream_ip={} "
                   "cancellation_secret_key=9876 "
-                  "termination_detail=- "
+                  "termination_detail=downstream_closed_tcp_conn "
                   "response_code_details=- "
                   "response_flags=- "
-                  "DOWNSTREAM_WIRE_BYTES_SENT=13 "
+                  "DOWNSTREAM_WIRE_BYTES_SENT=63 "
                   "DOWNSTREAM_WIRE_BYTES_RECEIVED=51 "
                   "UPSTREAM_WIRE_BYTES_SENT=51 "
-                  "UPSTREAM_WIRE_BYTES_RECEIVED=13"
+                  "UPSTREAM_WIRE_BYTES_RECEIVED=63 "
+                  "real_ip=127.0.0.1 "
+                  "\r?.*",
+                  DatabricksSqlProxyProto::Protocol_Name(DatabricksSqlProxyProto::POSTGRES),
+                  static_cast<int>(HandshakeState::UpstreamConnected),
+                  static_cast<int>(UpstreamHandshakeState::ProcessedBackendKeyData),
+                  Network::Test::getLoopbackAddressString(version_)));
+}
+
+class DatabricksSqlProxyPostgresIntegrationTestProxyProtocol
+    : public DatabricksSqlProxyPostgresIntegrationTest {
+public:
+  DatabricksSqlProxyPostgresIntegrationTestProxyProtocol()
+      : DatabricksSqlProxyPostgresIntegrationTest(true, true) {}
+};
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, DatabricksSqlProxyPostgresIntegrationTestProxyProtocol,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         Grpc::EnvoyGrpcClientIntegrationParamTest::protocolTestParamsToString);
+
+// Test that we can get real ip address from the proxy protocol header.
+// The test sends proxy protocol v2 header before sending postgres ssl request.
+// Then we verify that the real ip address is set in the access log.
+TEST_P(DatabricksSqlProxyPostgresIntegrationTestProxyProtocol, EndToEndWithProxyProtocol) {
+  envoy::extensions::filters::network::databricks_sql_proxy::v3::PostgresRoutingConfig
+      postgres_config;
+  runEndToEndTest(
+      DatabricksSqlProxyProto::SIDECAR_SERVICE, postgres_config,
+      fmt::format("Protocol={} "
+                  "handshake_state={} "
+                  "upstream_handshake_state={} "
+                  "user=testuser "
+                  "database=testdb "
+                  "upstream_ip={} "
+                  "cancellation_secret_key=9876 "
+                  "termination_detail=downstream_closed_tcp_conn "
+                  "response_code_details=- "
+                  "response_flags=- "
+                  "DOWNSTREAM_WIRE_BYTES_SENT=64 "
+                  "DOWNSTREAM_WIRE_BYTES_RECEIVED=59 "
+                  "UPSTREAM_WIRE_BYTES_SENT=59 "
+                  "UPSTREAM_WIRE_BYTES_RECEIVED=64 "
+                  "real_ip=1.2.3.4 "
                   "\r?.*",
                   DatabricksSqlProxyProto::Protocol_Name(DatabricksSqlProxyProto::POSTGRES),
                   static_cast<int>(HandshakeState::UpstreamConnected),

@@ -253,7 +253,9 @@ MySQLPacketUtils::extractConnectionAttributes(Buffer::Instance& data, size_t& of
   // Ease debugging by logging the data at the connection attributes position
   if (ENVOY_LOG_CHECK_LEVEL(debug) && offset < data.length()) {
     std::stringstream hex_dump;
-    for (size_t i = offset; i < std::min(offset + 16, data.length()); i++) {
+    const size_t end =
+        std::min(static_cast<size_t>(offset + 16), static_cast<size_t>(data.length()));
+    for (size_t i = offset; i < end; i++) {
       hex_dump << std::hex << std::setw(2) << std::setfill('0')
                << static_cast<int>(data.peekBEInt<uint8_t>(i)) << " ";
     }

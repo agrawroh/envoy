@@ -37,14 +37,14 @@ message PostgresRoutingConfig {
   // Store cancellation key from Postgres BackendKeyData message in the sidecar.
   bool store_cancellation_key = 3;
 
-  // Should the filter randomize and replace the cancellation key (PID and secret) with 
+  // Should the filter randomize and replace the cancellation key (PID and secret) with
   // 64-bit integer in the Postgres BackendKeyData message.
   bool randomize_cancellation_key = 4;
 }
 
 // [#protodoc-title: Databricks SQL Proxy Filter]
 // A filter that proxies Postgres or MySQL traffic to Databricks SQL.
-// [#next-free-field: 10]
+// [#next-free-field: 12]
 message DatabricksSqlProxy {
   enum Protocol {
     UNDEFINED_PROTOCOL = 0;
@@ -106,4 +106,25 @@ message DatabricksSqlProxy {
   // already be present with the keys in the incoming request. Type of the metadata should be ``envoy.hashable_string``
   // or otherwise it would not get extracted and propagated.
   repeated string filter_state_propagation_keys_to_ext_authz = 10;
+
+  // It is defined as a grace period after connection close processing has been locally initiated
+  // during which Envoy will wait for the peer to close (i.e., a TCP FIN/RST is received by Envoy
+  // from the downstream connection) prior to Envoy closing the socket associated with that
+  // connection.
+  // NOTE: This timeout is enforced even when the socket associated with the downstream connection
+  // is pending a flush of the write buffer. However, any progress made writing data to the socket
+  // will restart the timer associated with this timeout. This means that the total grace period for
+  // a socket in this state will be
+  // <total_time_waiting_for_write_buffer_flushes>+<delayed_close_timeout>.
+  //
+  // Delaying Envoy's connection close and giving the peer the opportunity to initiate the close
+  // sequence mitigates a race condition that exists when downstream clients do not drain/process
+  // data in a connection's receive buffer after a remote close has been detected via a socket
+  // write(). This race leads to such clients failing to process the response code sent by Envoy,
+  // which could result in erroneous downstream processing.
+  //
+  // If the timeout triggers, Envoy will close the connection's socket.
+  //
+  // The default timeout is 1000 ms if this option is not specified.
+  google.protobuf.Duration delayed_close_timeout = 11;
 }

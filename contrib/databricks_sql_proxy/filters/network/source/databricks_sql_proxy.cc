@@ -7,6 +7,7 @@
 #include "envoy/network/connection.h"
 
 #include "source/common/network/upstream_server_name.h"
+#include "source/common/protobuf/utility.h"
 #include "source/common/tcp_proxy/tcp_proxy.h"
 #include "source/extensions/filters/network/well_known_names.h"
 
@@ -34,6 +35,9 @@ Config::Config(const DatabricksSqlProxyProto& proto_config,
       destination_cluster_source_(proto_config.destination_cluster_source()),
       include_peer_certificate_(proto_config.include_peer_certificate()),
       enable_upstream_tls_(proto_config.enable_upstream_tls().value()),
+      handshake_timeout_ms_(PROTOBUF_GET_MS_OR_DEFAULT(proto_config, handshake_timeout, 15000)),
+      delayed_close_timeout_ms_(
+          PROTOBUF_GET_MS_OR_DEFAULT(proto_config, delayed_close_timeout, 1000)),
       filter_state_propagation_keys_to_ext_authz_(
           {proto_config.filter_state_propagation_keys_to_ext_authz().begin(),
            proto_config.filter_state_propagation_keys_to_ext_authz().end()}) {
@@ -42,15 +46,6 @@ Config::Config(const DatabricksSqlProxyProto& proto_config,
                        DatabricksSqlProxy::MYSQL &&
       !proto_config.has_mysql_config()) {
     throw EnvoyException("MySQL routing config required when protocol is MYSQL");
-  }
-
-  if (proto_config.has_handshake_timeout()) {
-    const uint64_t timeout = DurationUtil::durationToMilliseconds(proto_config.handshake_timeout());
-    if (timeout > 0) {
-      handshake_timeout_ms_ = std::chrono::milliseconds(timeout);
-    }
-  } else {
-    handshake_timeout_ms_ = std::chrono::seconds(15);
   }
 }
 
@@ -78,12 +73,14 @@ void Filter::initializeReadFilterCallbacks(Network::ReadFilterCallbacks& callbac
       NetworkFilterNames::get().DatabricksSqlProxy, metadata);
 
   read_callbacks_->connection().addConnectionCallbacks(*this);
+  read_callbacks_->connection().setDelayedCloseTimeout(config_->delayedCloseTimeoutMs());
 
   sql_proxy_->initializeReadFilterCallbacks(callbacks);
 }
 
 void Filter::initializeWriteFilterCallbacks(Network::WriteFilterCallbacks& callbacks) {
   write_callbacks_ = &callbacks;
+  write_callbacks_->connection().setDelayedCloseTimeout(config_->delayedCloseTimeoutMs());
   sql_proxy_->initializeWriteFilterCallbacks(callbacks);
 }
 
@@ -117,6 +114,24 @@ Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
   ENVOY_CONN_LOG(
       debug, "databricks_sql_proxy: onData received {} handshake_state_: {} end_stream: {}",
       read_callbacks_->connection(), data.length(), static_cast<int>(handshake_state_), end_stream);
+  if (end_stream) {
+    ENVOY_CONN_LOG(debug,
+                   "databricks_sql_proxy: Downstream is closing TCP connection end_stream: {}.",
+                   read_callbacks_->connection(), end_stream);
+
+    // If we have any data in the buffer, delay the close after the data is flushed to give peer
+    // opportunity to read it. If there is no data, we can close immediately.
+    Network::ConnectionCloseType closeType = data.length() > 0
+                                                 ? Network::ConnectionCloseType::FlushWriteAndDelay
+                                                 : Network::ConnectionCloseType::FlushWrite;
+
+    // Flush all buffered data to upstream, including end_stream.
+    read_callbacks_->injectReadDataToFilterChain(data, end_stream);
+
+    closeConnection("downstream_closed_tcp_conn", StreamInfo::CoreResponseFlag::LastFlag,
+                    closeType);
+    return Network::FilterStatus::Continue;
+  }
 
   if (sql_proxy_->isOnDataForwardingMode()) {
     ENVOY_CONN_LOG(trace, "databricks_sql_proxy: onData: Forwarding mode",
@@ -365,7 +380,13 @@ void Filter::onComplete(Filters::Common::ExtAuthz::ResponsePtr&& response) {
       closeConnection("Ext Authz failed",
                       StreamInfo::CoreResponseFlag::UnauthorizedExternalService);
       config_->stats().errors_.inc();
-      config_->stats().ext_authz_failed_.inc();
+      if (response->status == Filters::Common::ExtAuthz::CheckStatus::Error ||
+          reason_phrase == CommonConstants::REASON_CODE_PRIVATE_LINK_NOT_SUPPORTED ||
+          reason_phrase == CommonConstants::REASON_CODE_UNSUPPORTED_DESTINATION_TYPE) {
+        config_->stats().ext_authz_failed_system_error_.inc();
+      } else {
+        config_->stats().ext_authz_failed_.inc();
+      }
     }
     break;
   }
@@ -397,7 +418,7 @@ void Filter::onEvent(Network::ConnectionEvent event) {
 }
 
 void Filter::setUpstreamSni(std::string& sni) {
-  ENVOY_CONN_LOG(info, "databricks_sql_proxy: SNI {}", read_callbacks_->connection(), sni);
+  ENVOY_CONN_LOG(debug, "databricks_sql_proxy: SNI {}", read_callbacks_->connection(), sni);
 
   // Override upstream SNI with downstream SNI to keep the original target hostname.
   read_callbacks_->connection().streamInfo().filterState()->setData(
@@ -457,14 +478,16 @@ void Filter::pollForUpstreamConnected() {
                      static_cast<int>(handshake_state_)));
 
   // If read is enabled, it means that TcpProxy established the upstream connection.
-  if (read_callbacks_->connection().state() == Network::Connection::State::Open && read_callbacks_->connection().readEnabled()) {
+  if (read_callbacks_->connection().state() == Network::Connection::State::Open &&
+      read_callbacks_->connection().readEnabled()) {
     // Disable the timer task since we do not need it anymore.
     upstream_connect_check_timer_->disableTimer();
     sql_proxy_->onUpstreamConnected();
     // Set the handshake state to UpstreamConnected and call onUpstreamConnected on the sql_proxy.
     setHandshakeState(HandshakeState::UpstreamConnected);
   } else {
-    if (read_callbacks_->connection().state() == Network::Connection::State::Open && shouldPollForUpstreamConnected()) {
+    if (read_callbacks_->connection().state() == Network::Connection::State::Open &&
+        shouldPollForUpstreamConnected()) {
       // Enable timer to try again.
       upstream_connect_check_timer_->enableTimer(std::chrono::milliseconds(1));
     } else {
@@ -477,6 +500,24 @@ void Filter::pollForUpstreamConnected() {
 Network::FilterStatus Filter::onWrite(Buffer::Instance& data, bool end_stream) {
   ENVOY_CONN_LOG(debug, "databricks_sql_proxy: onWrite data.length={}",
                  read_callbacks_->connection(), data.length());
+  if (end_stream) {
+    ENVOY_CONN_LOG(debug,
+                   "databricks_sql_proxy: Upstream is closing TCP connection end_stream: {}. Flush "
+                   "all buffered data to downstream. data.length: {}",
+                   read_callbacks_->connection(), end_stream, data.length());
+
+    // If we have any data in the buffer, delay the close after the data is flushed to give peer
+    // opportunity to read it. If there is no data, we can close immediately.
+    Network::ConnectionCloseType closeType = data.length() > 0
+                                                 ? Network::ConnectionCloseType::FlushWriteAndDelay
+                                                 : Network::ConnectionCloseType::FlushWrite;
+
+    // Flush all buffered data to downstream, including end_stream.
+    write_callbacks_->injectWriteDataToFilterChain(data, end_stream);
+
+    write_callbacks_->connection().close(closeType, "Upstream is closing connection");
+    return Network::FilterStatus::Continue;
+  }
 
   if (sql_proxy_->isOnWriteForwardingMode()) {
     ENVOY_CONN_LOG(trace, "databricks_sql_proxy: onWrite: Forwarding mode",
@@ -533,14 +574,14 @@ Network::FilterStatus Filter::onWrite(Buffer::Instance& data, bool end_stream) {
 }
 
 void Filter::closeConnection(const std::string& connection_termination_details,
-                             StreamInfo::CoreResponseFlag response_flag) {
+                             StreamInfo::CoreResponseFlag response_flag,
+                             Network::ConnectionCloseType type) {
   read_callbacks_->connection().streamInfo().setConnectionTerminationDetails(
       connection_termination_details);
   if (response_flag != StreamInfo::CoreResponseFlag::LastFlag) {
     read_callbacks_->connection().streamInfo().setResponseFlag(response_flag);
   }
-  read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush,
-                                      connection_termination_details);
+  read_callbacks_->connection().close(type, connection_termination_details);
 }
 
 /**
