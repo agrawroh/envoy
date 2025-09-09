@@ -49,6 +49,7 @@ envoy_cc_library(
         ":listeners_handler_lib",
         ":logs_handler_lib",
         ":profiling_handler_lib",
+        ":reverse_tunnels_handler_lib",
         ":runtime_handler_lib",
         ":server_cmd_handler_lib",
         ":server_info_handler_lib",
@@ -243,6 +244,52 @@ envoy_cc_library(
         "//source/common/http:codes_lib",
         "//source/common/http:header_map_lib",
         "@envoy_api//envoy/admin/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_library(
+    name = "reverse_tunnels_params_lib",
+    srcs = ["reverse_tunnels_params.cc"],
+    hdrs = ["reverse_tunnels_params.h"],
+    deps = [
+        "//envoy/buffer:buffer_interface",
+        "//envoy/http:codes_interface",
+        "//source/common/common:utility_lib",
+        "//source/common/http:utility_lib",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/types:optional",
+        "@com_googlesource_code_re2//:re2",
+    ],
+)
+
+envoy_cc_library(
+    name = "reverse_tunnels_handler_lib",
+    srcs = ["reverse_tunnels_handler.cc"],
+    hdrs = ["reverse_tunnels_handler.h"],
+    deps = [
+        ":handler_ctx_lib",
+        ":reverse_tunnels_params_lib",
+        ":utils_lib",
+        "//envoy/buffer:buffer_interface",
+        "//envoy/http:codes_interface",
+        "//envoy/http:header_map_interface",
+        "//envoy/network:socket_interface",
+        "//envoy/server:admin_interface",
+        "//envoy/server:instance_interface",
+        "//source/common/buffer:buffer_lib",
+        "//source/common/common:logger_lib",
+        "//source/common/common:macros",
+        "//source/common/http:codes_lib",
+        "//source/common/http:header_map_lib",
+        "//source/common/http:utility_lib",
+        "//source/extensions/bootstrap/reverse_tunnel/upstream_socket_interface:reverse_tunnel_acceptor_lib",
+        "//source/extensions/bootstrap/reverse_tunnel/upstream_socket_interface:upstream_socket_manager_lib",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:optional",
     ],
 )
 

@@ -781,4 +781,84 @@ TEST_P(StatsMatcherIntegrationTest, DEPRECATED_FEATURE_TEST(IncludeExact)) {
   EXPECT_EQ(response_->body(), "listener_manager.listener_create_success: 1\n");
 }
 
+// Test reverse tunnels admin endpoint.
+TEST_P(IntegrationAdminTest, ReverseTunnelsEndpoint) {
+  initialize();
+
+  // Test basic JSON response.
+  BufferingStreamDecoderPtr response = IntegrationUtil::makeSingleRequest(
+      lookupPort("admin"), "GET", "/reverse_tunnels", "", downstreamProtocol(), version_);
+  EXPECT_TRUE(response->complete());
+  EXPECT_THAT(response->headers(), Http::HttpStatusIs("200"));
+  EXPECT_THAT(contentType(response), HasSubstr("application/json"));
+
+  // Should contain expected JSON structure.
+  EXPECT_THAT(response->body(), HasSubstr("\"timestamp\""));
+  EXPECT_THAT(response->body(), HasSubstr("\"summary\""));
+  EXPECT_THAT(response->body(), HasSubstr("\"total_connections\":0"));
+  EXPECT_THAT(response->body(), HasSubstr("\"aggregations\""));
+}
+
+// Test reverse tunnels admin endpoint with text format.
+TEST_P(IntegrationAdminTest, ReverseTunnelsTextFormat) {
+  initialize();
+
+  BufferingStreamDecoderPtr response =
+      IntegrationUtil::makeSingleRequest(lookupPort("admin"), "GET", "/reverse_tunnels?format=text",
+                                         "", downstreamProtocol(), version_);
+  EXPECT_TRUE(response->complete());
+  EXPECT_THAT(response->headers(), Http::HttpStatusIs("200"));
+  EXPECT_THAT(contentType(response), HasSubstr("text/plain"));
+
+  // Should contain expected text structure.
+  EXPECT_THAT(response->body(), HasSubstr("Reverse Tunnel Connections"));
+  EXPECT_THAT(response->body(), HasSubstr("Summary:"));
+  EXPECT_THAT(response->body(), HasSubstr("Total Connections: 0"));
+}
+
+// Test reverse tunnels admin endpoint with Prometheus format.
+TEST_P(IntegrationAdminTest, ReverseTunnelsPrometheusFormat) {
+  initialize();
+
+  BufferingStreamDecoderPtr response = IntegrationUtil::makeSingleRequest(
+      lookupPort("admin"), "GET", "/reverse_tunnels?format=prometheus", "", downstreamProtocol(),
+      version_);
+  EXPECT_TRUE(response->complete());
+  EXPECT_THAT(response->headers(), Http::HttpStatusIs("200"));
+  EXPECT_THAT(contentType(response), HasSubstr("text/plain"));
+
+  // Should contain Prometheus metrics.
+  EXPECT_THAT(response->body(), HasSubstr("# HELP envoy_reverse_tunnels_total"));
+  EXPECT_THAT(response->body(), HasSubstr("# TYPE envoy_reverse_tunnels_total gauge"));
+  EXPECT_THAT(response->body(), HasSubstr("envoy_reverse_tunnels_total 0"));
+}
+
+// Test reverse tunnels admin endpoint with invalid format.
+TEST_P(IntegrationAdminTest, ReverseTunnelsInvalidFormat) {
+  initialize();
+
+  BufferingStreamDecoderPtr response = IntegrationUtil::makeSingleRequest(
+      lookupPort("admin"), "GET", "/reverse_tunnels?format=invalid", "", downstreamProtocol(),
+      version_);
+  EXPECT_TRUE(response->complete());
+  EXPECT_THAT(response->headers(), Http::HttpStatusIs("400"));
+  EXPECT_THAT(response->body(), HasSubstr("Invalid format parameter"));
+}
+
+// Test reverse tunnels admin endpoint with filtering parameters.
+TEST_P(IntegrationAdminTest, ReverseTunnelsWithFilters) {
+  initialize();
+
+  BufferingStreamDecoderPtr response = IntegrationUtil::makeSingleRequest(
+      lookupPort("admin"), "GET",
+      "/reverse_tunnels?node_id=test&healthy_only=true&aggregate_only=true", "",
+      downstreamProtocol(), version_);
+  EXPECT_TRUE(response->complete());
+  EXPECT_THAT(response->headers(), Http::HttpStatusIs("200"));
+  EXPECT_THAT(contentType(response), HasSubstr("application/json"));
+
+  // Should not contain connections array in aggregate mode.
+  EXPECT_THAT(response->body(), Not(HasSubstr("\"connections\":")));
+}
+
 } // namespace Envoy

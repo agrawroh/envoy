@@ -44,6 +44,7 @@
 #include "source/server/admin/listeners_handler.h"
 #include "source/server/admin/logs_handler.h"
 #include "source/server/admin/profiling_handler.h"
+#include "source/server/admin/reverse_tunnels_handler.h"
 #include "source/server/admin/runtime_handler.h"
 #include "source/server/admin/server_cmd_handler.h"
 #include "source/server/admin/server_info_handler.h"
@@ -475,6 +476,7 @@ private:
   Server::LogsHandler logs_handler_;
   Server::ProfilingHandler profiling_handler_;
   Server::TcmallocProfilingHandler tcmalloc_profiling_handler_;
+  Server::ReverseTunnelsHandler reverse_tunnels_handler_;
   Server::RuntimeHandler runtime_handler_;
   Server::ListenersHandler listeners_handler_;
   Server::ServerCmdHandler server_cmd_handler_;

@@ -66,6 +66,18 @@ void UpstreamSocketManager::addConnectionSocket(const std::string& node_id,
   ENVOY_LOG(debug, "reverse_tunnel: mapping fd {} to node: {}", fd, node_id);
   fd_to_node_map_[fd] = node_id;
 
+  // Initialize connection metadata.
+  ConnectionMetadata metadata;
+  metadata.established_time = std::chrono::system_clock::now();
+  metadata.last_activity = metadata.established_time;
+  metadata.ping_interval = std::chrono::duration_cast<std::chrono::milliseconds>(ping_interval);
+  fd_to_metadata_map_[fd] = metadata;
+
+  ENVOY_LOG(
+      debug, "UpstreamSocketManager: initialized metadata for fd {} at {}", fd,
+      std::chrono::duration_cast<std::chrono::seconds>(metadata.established_time.time_since_epoch())
+          .count());
+
   // Update stats registry
   if (auto extension = getUpstreamExtension()) {
     extension->updateConnectionStats(node_id, cluster_id, true /* increment */);
@@ -195,6 +207,9 @@ void UpstreamSocketManager::markSocketDead(const int fd) {
                                ? node_to_cluster_map_[node_id]
                                : "";
   fd_to_node_map_.erase(fd); // Now it's safe to erase since node_id is a copy
+
+  // Clean up connection metadata.
+  fd_to_metadata_map_.erase(fd);
 
   // Check if this is a used connection by looking for node_id in accepted_reverse_connections_
   auto& sockets = accepted_reverse_connections_[node_id];
@@ -335,6 +350,34 @@ void UpstreamSocketManager::onPingResponse(Network::IoHandle& io_handle) {
     markSocketDead(fd);
     return;
   }
+
+  // Update connection metadata for successful ping response.
+  auto now = std::chrono::system_clock::now();
+  if (auto metadata_it = fd_to_metadata_map_.find(fd); metadata_it != fd_to_metadata_map_.end()) {
+    auto& metadata = metadata_it->second;
+    metadata.last_ping_received = now;
+    metadata.last_activity = now;
+    metadata.total_pings_received++;
+    metadata.consecutive_ping_failures = 0; // Reset failure count on successful ping.
+
+    // Calculate average ping latency if we have sent time.
+    if (metadata.last_ping_sent != std::chrono::system_clock::time_point{}) {
+      auto latency =
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - metadata.last_ping_sent);
+      // Simple moving average with weight factor.
+      if (metadata.average_ping_latency.count() == 0) {
+        metadata.average_ping_latency = latency;
+      } else {
+        // Weighted average: 80% old, 20% new.
+        metadata.average_ping_latency = std::chrono::milliseconds(
+            (metadata.average_ping_latency.count() * 4 + latency.count()) / 5);
+      }
+    }
+
+    ENVOY_LOG(trace, "UpstreamSocketManager: FD: {}: updated ping metadata, latency={}ms", fd,
+              metadata.average_ping_latency.count());
+  }
+
   ENVOY_LOG(trace, "UpstreamSocketManager: FD: {}: received ping response", fd);
   fd_to_timer_map_[fd]->disableTimer();
 }
@@ -353,6 +396,14 @@ void UpstreamSocketManager::pingConnections(const std::string& node_id) {
     auto ping_response_timeout = ping_interval_ / 2;
     fd_to_timer_map_[fd]->enableTimer(ping_response_timeout);
 
+    // Update ping metadata before sending.
+    auto now = std::chrono::system_clock::now();
+    if (auto metadata_it = fd_to_metadata_map_.find(fd); metadata_it != fd_to_metadata_map_.end()) {
+      auto& metadata = metadata_it->second;
+      metadata.last_ping_sent = now;
+      metadata.total_pings_sent++;
+    }
+
     // Use a flag to signal whether the socket needs to be marked dead. If the socket is marked dead
     // in markSocketDead(), it is erased from the list, and the iterator becomes invalid. We need to
     // break out of the loop to avoid a use after free error.
@@ -368,6 +419,13 @@ void UpstreamSocketManager::pingConnections(const std::string& node_id) {
         if (result.err_->getErrorCode() != Api::IoError::IoErrorCode::Again) {
           ENVOY_LOG(error, "UpstreamSocketManager: node:{} FD:{}: failed to send ping", node_id,
                     fd);
+
+          // Update ping failure metadata.
+          if (auto metadata_it = fd_to_metadata_map_.find(fd);
+              metadata_it != fd_to_metadata_map_.end()) {
+            metadata_it->second.consecutive_ping_failures++;
+          }
+
           markSocketDead(fd);
           socket_dead = true;
           break;
@@ -431,6 +489,98 @@ UpstreamSocketManager::~UpstreamSocketManager() {
     ping_timer_->disableTimer();
     ping_timer_.reset();
   }
+}
+
+std::vector<UpstreamSocketManager::ConnectionSnapshot>
+UpstreamSocketManager::getConnectionSnapshots() const {
+  std::vector<ConnectionSnapshot> snapshots;
+
+  // Iterate through all accepted connections.
+  for (const auto& [node_id, sockets] : accepted_reverse_connections_) {
+    std::string cluster_id;
+    if (auto cluster_it = node_to_cluster_map_.find(node_id);
+        cluster_it != node_to_cluster_map_.end()) {
+      cluster_id = cluster_it->second;
+    }
+
+    // Process each socket for this node.
+    for (const auto& socket : sockets) {
+      if (!socket || !socket->ioHandle().isOpen()) {
+        continue;
+      }
+
+      ConnectionSnapshot snapshot;
+      snapshot.node_id = node_id;
+      snapshot.cluster_id = cluster_id;
+      // Note: tenant_id is not stored in socket manager, would need to be tracked separately.
+      snapshot.tenant_id = "";
+      snapshot.remote_address = socket->connectionInfoProvider().remoteAddress()->asString();
+      snapshot.local_address = socket->connectionInfoProvider().localAddress()->asString();
+      snapshot.fd = socket->ioHandle().fdDoNotUse();
+
+      // Get connection metadata if available.
+      if (auto metadata_it = fd_to_metadata_map_.find(snapshot.fd);
+          metadata_it != fd_to_metadata_map_.end()) {
+        const auto& metadata = metadata_it->second;
+        snapshot.established_time = metadata.established_time;
+        snapshot.last_activity = metadata.last_activity;
+        snapshot.last_ping_sent = metadata.last_ping_sent;
+        snapshot.last_ping_received = metadata.last_ping_received;
+        snapshot.bytes_sent = metadata.bytes_sent;
+        snapshot.bytes_received = metadata.bytes_received;
+        snapshot.consecutive_ping_failures = metadata.consecutive_ping_failures;
+        snapshot.total_pings_sent = metadata.total_pings_sent;
+        snapshot.total_pings_received = metadata.total_pings_received;
+        snapshot.ping_interval = metadata.ping_interval;
+        snapshot.average_ping_latency = metadata.average_ping_latency;
+
+        // Connection is healthy if consecutive ping failures are low.
+        snapshot.is_healthy = metadata.consecutive_ping_failures < 3;
+      } else {
+        // Fallback if metadata not available.
+        auto now = std::chrono::system_clock::now();
+        snapshot.established_time = now;
+        snapshot.last_activity = now;
+        snapshot.is_healthy = true;
+      }
+
+      snapshots.push_back(snapshot);
+    }
+  }
+
+  ENVOY_LOG(debug, "UpstreamSocketManager: collected {} connection snapshots", snapshots.size());
+  return snapshots;
+}
+
+absl::flat_hash_map<std::string, uint64_t> UpstreamSocketManager::getLocalStats() const {
+  absl::flat_hash_map<std::string, uint64_t> stats;
+
+  // Count connections per node.
+  for (const auto& [node_id, sockets] : accepted_reverse_connections_) {
+    stats[fmt::format("node.{}.connections", node_id)] = sockets.size();
+  }
+
+  // Count connections per cluster.
+  absl::flat_hash_map<std::string, uint64_t> cluster_counts;
+  for (const auto& [node_id, cluster_id] : node_to_cluster_map_) {
+    if (auto node_it = accepted_reverse_connections_.find(node_id);
+        node_it != accepted_reverse_connections_.end()) {
+      cluster_counts[cluster_id] += node_it->second.size();
+    }
+  }
+
+  for (const auto& [cluster_id, count] : cluster_counts) {
+    stats[fmt::format("cluster.{}.connections", cluster_id)] = count;
+  }
+
+  // Total connections.
+  uint64_t total = 0;
+  for (const auto& [node_id, sockets] : accepted_reverse_connections_) {
+    total += sockets.size();
+  }
+  stats["total_connections"] = total;
+
+  return stats;
 }
 
 } // namespace ReverseConnection

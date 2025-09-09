@@ -286,3 +286,20 @@ envoy_cc_test(
         "//test/mocks:common_lib",
     ],
 )
+
+envoy_cc_test(
+    name = "reverse_tunnels_handler_test",
+    srcs = envoy_select_admin_functionality(["reverse_tunnels_handler_test.cc"]),
+    rbe_pool = "6gig",
+    deps = [
+        ":admin_instance_lib",
+        "//source/server/admin:reverse_tunnels_handler_lib",
+        "//test/mocks/event:event_mocks",
+        "//test/mocks/network:network_mocks",
+        "//test/mocks/server:admin_stream_mocks",
+        "//test/mocks/server:server_mocks",
+        "//test/mocks/stats:stats_mocks",
+        "//test/mocks/thread_local:thread_local_mocks",
+        "//test/test_common:utility_lib",
+    ],
+)

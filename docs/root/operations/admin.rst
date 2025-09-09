@@ -306,6 +306,162 @@ modify different aspects of the server:
   Dump the */listeners* output in a JSON-serialized proto. See the
   :ref:`definition <envoy_v3_api_msg_admin.v3.Listeners>` for more information.
 
+.. _operations_admin_interface_reverse_tunnels:
+
+.. http:get:: /reverse_tunnels
+
+  Display information about active reverse tunnel connections. This endpoint provides visibility
+  into reverse tunnel connections established from downstream nodes to the current Envoy instance.
+  The information includes connection status, health metrics, and detailed metadata for monitoring
+  and debugging reverse tunnel connectivity.
+
+  Basic connection information
+    - Node ID, cluster ID, and tenant ID for each connection
+    - Remote and local addresses
+    - Connection establishment time and last activity
+    - Health status based on ping response patterns
+    - Worker thread assignment
+
+  Connection health status
+    A connection is considered healthy if it's actively responding to ping messages.
+    Connections become unhealthy if they fail to respond to consecutive ping attempts.
+
+    Health indicators:
+    - ``healthy``: Connection is responding to pings normally
+    - ``unhealthy``: Connection has failed multiple consecutive ping attempts
+
+  Connection statistics (when ``include_metadata=true``)
+    - Ping interval and average latency
+    - Total pings sent and received
+    - Consecutive ping failures count
+    - Bytes sent and received (when available)
+
+.. http:get:: /reverse_tunnels?format=json
+
+  Output reverse tunnels information as JSON. Default format.
+
+  .. code-block:: json
+
+    {
+      "timestamp": "2024-01-15T10:30:00Z",
+      "summary": {
+        "total_connections": 150,
+        "healthy_connections": 145,
+        "unhealthy_connections": 5,
+        "unique_nodes": 50,
+        "unique_clusters": 3,
+        "unique_tenants": 10
+      },
+      "aggregations": {
+        "by_node": {
+          "node-001": 3,
+          "node-002": 2
+        },
+        "by_cluster": {
+          "cluster-west": 75,
+          "cluster-east": 75
+        }
+      },
+      "connections": [
+        {
+          "node_id": "node-001",
+          "cluster_id": "cluster-west",
+          "remote_address": "10.0.1.5:45678",
+          "local_address": "10.0.0.1:8080",
+          "established_time": "2024-01-15T09:00:00Z",
+          "is_healthy": true,
+          "worker_thread": "worker_0"
+        }
+      ]
+    }
+
+.. http:get:: /reverse_tunnels?format=text
+
+  Output reverse tunnels information in human-readable text format.
+
+  .. code-block:: none
+
+    Reverse Tunnel Connections
+    ==========================
+    Generated: 2024-01-15T10:30:00Z
+
+    Summary:
+      Total Connections: 150
+      Healthy: 145
+      Unhealthy: 5
+      Unique Nodes: 50
+      Unique Clusters: 3
+
+    Connection Details:
+    NodeID     | ClusterID    | Remote -> Local              | Health  | Worker
+    -----------|--------------|------------------------------|---------|--------
+    node-001   | cluster-west | 10.0.1.5:45678 -> 10.0.0.1  | HEALTHY | worker_0
+
+.. http:get:: /reverse_tunnels?format=prometheus
+
+  Output reverse tunnels information in Prometheus metrics format.
+
+  .. code-block:: none
+
+    # HELP envoy_reverse_tunnels_total Total number of reverse tunnel connections
+    # TYPE envoy_reverse_tunnels_total gauge
+    envoy_reverse_tunnels_total 150
+
+    # HELP envoy_reverse_tunnels_healthy Number of healthy reverse tunnel connections
+    # TYPE envoy_reverse_tunnels_healthy gauge
+    envoy_reverse_tunnels_healthy 145
+
+    # HELP envoy_reverse_tunnels_by_cluster Reverse tunnel connections by cluster
+    # TYPE envoy_reverse_tunnels_by_cluster gauge
+    envoy_reverse_tunnels_by_cluster{cluster="cluster-west"} 75
+    envoy_reverse_tunnels_by_cluster{cluster="cluster-east"} 75
+
+.. http:get:: /reverse_tunnels?node_id=node-001
+
+  Filter connections by specific node ID. Shows only connections from the specified node.
+
+.. http:get:: /reverse_tunnels?cluster_id=cluster-west
+
+  Filter connections by specific cluster ID. Shows only connections from nodes in the specified cluster.
+
+.. http:get:: /reverse_tunnels?health=healthy
+
+  Filter connections by health status. Valid values: ``all``, ``healthy``, ``unhealthy``.
+
+.. http:get:: /reverse_tunnels?filter=regex
+
+  Filter connections using regular expressions. The regex is applied to node ID, cluster ID,
+  and tenant ID fields. Uses Google RE2 regex syntax. Compatible with other filters.
+
+  Example: ``/reverse_tunnels?filter=prod`` will return all connections containing "prod"
+  in any of the identifier fields.
+
+.. http:get:: /reverse_tunnels?since=2024-01-15T10:00:00Z
+
+  Filter connections established since the specified timestamp. Uses ISO8601 format.
+  Can be combined with ``until`` parameter for time range filtering.
+
+.. http:get:: /reverse_tunnels?aggregate_only=true
+
+  Return only summary statistics without individual connection details. Useful for
+  monitoring dashboards that need aggregate metrics.
+
+.. http:get:: /reverse_tunnels?include_metadata=true
+
+  Include detailed connection metadata such as ping statistics, latency measurements,
+  and failure counts. Increases response size but provides comprehensive debugging information.
+
+.. http:get:: /reverse_tunnels?sort_by=last_activity&desc=true
+
+  Sort connections by specified field in descending order. Available sort fields:
+  ``node_id``, ``cluster_id``, ``established_time``, ``last_activity``,
+  ``ping_latency``, ``failures``.
+
+.. http:get:: /reverse_tunnels?limit=100&offset=50
+
+  Pagination support for large result sets. ``limit`` specifies maximum connections to return,
+  ``offset`` skips the first N connections. Useful for processing large connection counts.
+
 .. _operations_admin_interface_logging:
 
 .. http:post:: /logging

@@ -16,6 +16,12 @@
 #include "source/common/common/random_generator.h"
 
 namespace Envoy {
+
+// Forward declaration for friend class.
+namespace Server {
+class ReverseTunnelsHandler;
+} // namespace Server
+
 namespace Extensions {
 namespace Bootstrap {
 namespace ReverseConnection {
@@ -30,6 +36,8 @@ class UpstreamSocketManager : public ThreadLocal::ThreadLocalObject,
                               public Logger::Loggable<Logger::Id::filter> {
   // Friend class for testing
   friend class TestUpstreamSocketManager;
+  // Friend class for admin interface
+  friend class Server::ReverseTunnelsHandler;
 
 public:
   UpstreamSocketManager(Event::Dispatcher& dispatcher,
@@ -104,6 +112,42 @@ public:
    */
   std::string getNodeID(const std::string& key);
 
+  /**
+   * Connection snapshot structure for admin interface.
+   */
+  struct ConnectionSnapshot {
+    std::string node_id;
+    std::string cluster_id;
+    std::string tenant_id;
+    std::string remote_address;
+    std::string local_address;
+    int fd;
+    bool is_healthy;
+    std::chrono::system_clock::time_point established_time;
+    std::chrono::system_clock::time_point last_activity;
+    std::chrono::system_clock::time_point last_ping_sent;
+    std::chrono::system_clock::time_point last_ping_received;
+    uint64_t bytes_sent{0};
+    uint64_t bytes_received{0};
+    uint32_t consecutive_ping_failures{0};
+    uint64_t total_pings_sent{0};
+    uint64_t total_pings_received{0};
+    std::chrono::milliseconds ping_interval{0};
+    std::chrono::milliseconds average_ping_latency{0};
+  };
+
+  /**
+   * Get snapshot of all connections on this thread for admin interface.
+   * @return vector of connection snapshots.
+   */
+  std::vector<ConnectionSnapshot> getConnectionSnapshots() const;
+
+  /**
+   * Get aggregated stats for this thread.
+   * @return map of stat name to value.
+   */
+  absl::flat_hash_map<std::string, uint64_t> getLocalStats() const;
+
 private:
   // Thread local dispatcher instance.
   Event::Dispatcher& dispatcher_;
@@ -125,6 +169,24 @@ private:
   // File events and timers for ping functionality.
   absl::flat_hash_map<int, Event::FileEventPtr> fd_to_event_map_;
   absl::flat_hash_map<int, Event::TimerPtr> fd_to_timer_map_;
+
+  // Connection metadata tracking.
+  struct ConnectionMetadata {
+    std::chrono::system_clock::time_point established_time;
+    std::chrono::system_clock::time_point last_activity;
+    std::chrono::system_clock::time_point last_ping_sent;
+    std::chrono::system_clock::time_point last_ping_received;
+    uint64_t bytes_sent{0};
+    uint64_t bytes_received{0};
+    uint32_t consecutive_ping_failures{0};
+    uint64_t total_pings_sent{0};
+    uint64_t total_pings_received{0};
+    std::chrono::milliseconds ping_interval{0};
+    std::chrono::milliseconds average_ping_latency{0};
+  };
+
+  // Map from file descriptor to connection metadata.
+  absl::flat_hash_map<int, ConnectionMetadata> fd_to_metadata_map_;
 
   Event::TimerPtr ping_timer_;
   std::chrono::seconds ping_interval_{0};
