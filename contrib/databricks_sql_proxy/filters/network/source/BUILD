@@ -37,6 +37,7 @@ envoy_cc_library(
         "//envoy/stats:stats_macros",
         "//source/common/buffer:buffer_lib",
         "//source/common/common:random_generator_lib",
+        "//source/common/protobuf:utility_lib",
         "//source/common/router:string_accessor_lib",
         "//source/common/tcp_proxy",
         "//source/extensions/filters/common/ext_authz:ext_authz_grpc_lib",

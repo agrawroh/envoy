@@ -38,6 +38,7 @@ namespace DatabricksSqlProxy {
   COUNTER(downstream_not_support_ssl)                                                              \
   COUNTER(downstream_no_sni)                                                                       \
   COUNTER(ext_authz_failed)                                                                        \
+  COUNTER(ext_authz_failed_system_error)                                                           \
   COUNTER(handshake_timeout)                                                                       \
   COUNTER(malformed_packet)                                                                        \
   COUNTER(invalid_capability_flags)                                                                \
@@ -79,6 +80,7 @@ public:
   bool includePeerCertificate() { return include_peer_certificate_; }
   bool enableUpstreamTls() { return enable_upstream_tls_; }
   std::chrono::milliseconds handshakeTimeoutMs() { return handshake_timeout_ms_; }
+  std::chrono::milliseconds delayedCloseTimeoutMs() { return delayed_close_timeout_ms_; }
 
   // Get full proto config
   const envoy::extensions::filters::network::databricks_sql_proxy::v3::DatabricksSqlProxy&
@@ -102,6 +104,7 @@ private:
   const bool include_peer_certificate_;
   const bool enable_upstream_tls_;
   std::chrono::milliseconds handshake_timeout_ms_;
+  std::chrono::milliseconds delayed_close_timeout_ms_;
   std::vector<std::string> filter_state_propagation_keys_to_ext_authz_;
 };
 
@@ -249,7 +252,8 @@ public:
   void pollForUpstreamConnected();
   void closeConnection(
       const std::string& connection_termination_details,
-      StreamInfo::CoreResponseFlag response_flag = StreamInfo::CoreResponseFlag::LastFlag);
+      StreamInfo::CoreResponseFlag response_flag = StreamInfo::CoreResponseFlag::LastFlag,
+      Network::ConnectionCloseType type = Network::ConnectionCloseType::NoFlush);
   void storeMetadataInSidecar();
 
   enum class HandshakeState {

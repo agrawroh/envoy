@@ -65,6 +65,7 @@ envoy_cc_test(
         "//contrib/databricks_sql_proxy/filters/network/source:config",
         "//source/common/tcp_proxy",
         "//source/extensions/access_loggers/file:config",
+        "//source/extensions/filters/listener/proxy_protocol:config",
         "//source/extensions/filters/network/tcp_proxy:config",
         "//source/extensions/transport_sockets/raw_buffer:config",
         "//source/extensions/transport_sockets/starttls:config",

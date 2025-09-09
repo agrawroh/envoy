@@ -101,7 +101,8 @@ public:
   }
 
   void runExtAuthzFailureTest(Filters::Common::ExtAuthz::CheckStatus ext_auth_response,
-                              const std::string& expected_response_code_details);
+                              const std::string& expected_response_code_details,
+                              bool expected_system_error, absl::string_view reason_phrase);
 
   const std::string stat_prefix_{"test."};
   const std::string sni_{"brickstore.database.databricks.com"};
@@ -248,6 +249,10 @@ TEST_F(PostgresProxyTest, FullEndToEndWithSidecarService) {
   parameter_status_message.add(ip);
   parameter_status_message.writeByte(0); // null-terminator
 
+  // Send the parameter status message to the filter.
+  EXPECT_EQ(Envoy::Network::FilterStatus::Continue,
+            filter_->onWrite(parameter_status_message, false /*end_stream*/));
+
   const int32_t process_id = 1111;
   const int32_t secret_key = 9876;
   Buffer::OwnedImpl backend_key_data_message;
@@ -298,6 +303,9 @@ TEST_F(PostgresProxyTest, FullEndToEndWithSidecarService) {
   // For the test, we don't care about the data.
   EXPECT_EQ(Envoy::Network::FilterStatus::Continue,
             filter_->onWrite(ssl_response, false /*end_stream*/));
+
+  EXPECT_EQ(0, config_->stats().errors_.value());
+  EXPECT_EQ(1, config_->stats().successful_login_.value());
 }
 
 // Test that when destination_cluster_source is set to SNI, the SNI is used as the upstream cluster
@@ -351,6 +359,8 @@ TEST_F(PostgresProxyTest, SniAsDestinationClusterSource) {
   // Should not have any active ext_authz call.
   EXPECT_EQ(0, config->stats().active_ext_authz_call_.value());
   EXPECT_EQ(0, config->stats().errors_.value());
+  // We have not finished authentication yet. successful_login should be 0.
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
 }
 
 // Test that if there is not enough data to process the first start-up message,
@@ -395,6 +405,7 @@ TEST_F(PostgresProxyTest, NotEnoughData) {
 
   // Code should proceed to a point where we call ext_authz.
   EXPECT_EQ(1, config_->stats().active_ext_authz_call_.value());
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
   // onData should drain the buffer because the message is processed.
   EXPECT_EQ(0, postgres_startup_message.length());
 }
@@ -414,6 +425,7 @@ TEST_F(PostgresProxyTest, ShorterThanExpectedMessage) {
 
   EXPECT_EQ(1UL, config_->stats().invalid_message_length_.value());
   EXPECT_EQ(1UL, config_->stats().errors_.value());
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
 }
 
 // Test that if the start-up message length is larger than expected, the connection should be
@@ -430,6 +442,7 @@ TEST_F(PostgresProxyTest, LargerThanExpectedMessage) {
 
   EXPECT_EQ(1UL, config_->stats().invalid_message_length_.value());
   EXPECT_EQ(1UL, config_->stats().errors_.value());
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
 }
 
 // Test that if the protocol version is incorrect, the connection should be closed.
@@ -458,6 +471,7 @@ TEST_F(PostgresProxyTest, IncorrectProtocolVersion) {
 
   EXPECT_EQ(1UL, config_->stats().invalid_protocol_version_.value());
   EXPECT_EQ(1UL, config_->stats().errors_.value());
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
 }
 
 // Test that if the upstream return some data before the postgres SSL request is sent, the
@@ -509,6 +523,7 @@ TEST_F(PostgresProxyTest, HandleUpstreamDataInitState) {
   EXPECT_EQ(Envoy::Network::FilterStatus::StopIteration, filter_->onWrite(upstream_message, false));
   EXPECT_EQ(1, config_->stats().protocol_violation_.value());
   EXPECT_EQ(2, config_->stats().errors_.value());
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
 }
 
 // Test multiple scenarios that the upstream can return invalid data.
@@ -586,11 +601,13 @@ TEST_F(PostgresProxyTest, HandleUpstreamDataSentSslRequestUpstreamState) {
             "Failed to start secure transport with upstream.");
   EXPECT_EQ(1UL, config_->stats().failed_upstream_ssl_handshake_.value());
   EXPECT_EQ(3UL, config_->stats().errors_.value());
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
 }
 
 void PostgresProxyTest::runExtAuthzFailureTest(
     Filters::Common::ExtAuthz::CheckStatus ext_auth_response,
-    const std::string& expected_response_code_details) {
+    const std::string& expected_response_code_details, bool expected_system_error = false,
+    const absl::string_view reason_phrase = "ip address is not allowed") {
   // ==== Test setup: ====
   // Set the filter to the correct state before calling ext_authz Check.
   Buffer::OwnedImpl postgres_startup_message = createPostgresStartupMessage();
@@ -599,7 +616,7 @@ void PostgresProxyTest::runExtAuthzFailureTest(
             filter_->onData(postgres_startup_message, false));
 
   EXPECT_CALL(write_callbacks_, injectWriteDataToFilterChain(_, _))
-      .WillOnce(Invoke([](Buffer::Instance& data, bool /* end_stream */) {
+      .WillOnce(Invoke([reason_phrase](Buffer::Instance& data, bool /* end_stream */) {
         // Do some basic check on the error response. Not checking the full content.
         // First byte is 'E' identifies the error message.
         EXPECT_EQ('E', data.peekBEInt<uint8_t>());
@@ -607,7 +624,7 @@ void PostgresProxyTest::runExtAuthzFailureTest(
         // message.
         EXPECT_EQ('S', data.peekBEInt<uint8_t>(5));
         EXPECT_THAT(data.toString(), HasSubstr("External authorization failed"));
-        EXPECT_THAT(data.toString(), HasSubstr("ip address is not allowed"));
+        EXPECT_THAT(data.toString(), HasSubstr(reason_phrase));
         return Api::IoCallUint64Result{1, Api::IoErrorPtr(nullptr, [](Api::IoError*) {})};
       }));
 
@@ -615,7 +632,7 @@ void PostgresProxyTest::runExtAuthzFailureTest(
   response.status = ext_auth_response;
   ProtobufWkt::Struct dynamic_metadata;
   (*dynamic_metadata.mutable_fields())[CommonConstants::REASON_PHRASE_KEY].set_string_value(
-      "ip address is not allowed");
+      reason_phrase);
   response.dynamic_metadata = dynamic_metadata;
 
   // Ext Authz server response with failure.
@@ -629,18 +646,39 @@ void PostgresProxyTest::runExtAuthzFailureTest(
   EXPECT_TRUE(read_callbacks_.connection_.stream_info_.hasResponseFlag(
       StreamInfo::CoreResponseFlag::UnauthorizedExternalService));
 
-  EXPECT_EQ(1, config_->stats().ext_authz_failed_.value());
+  if (expected_system_error) {
+    EXPECT_EQ(1, config_->stats().ext_authz_failed_system_error_.value());
+  } else {
+    EXPECT_EQ(1, config_->stats().ext_authz_failed_.value());
+  }
   EXPECT_EQ(1, config_->stats().errors_.value());
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
+}
+
+TEST_F(PostgresProxyTest, ExtAuthzPrivateLinkNotSupported) {
+  runExtAuthzFailureTest(Filters::Common::ExtAuthz::CheckStatus::Denied,
+                         Filters::Common::ExtAuthz::ResponseCodeDetails::get().AuthzDenied,
+                         /*expected_system_error=*/true,
+                         CommonConstants::REASON_CODE_PRIVATE_LINK_NOT_SUPPORTED);
+}
+
+TEST_F(PostgresProxyTest, ExtAuthzUnsupportedDestinationType) {
+  runExtAuthzFailureTest(Filters::Common::ExtAuthz::CheckStatus::Denied,
+                         Filters::Common::ExtAuthz::ResponseCodeDetails::get().AuthzDenied,
+                         /*expected_system_error=*/true,
+                         CommonConstants::REASON_CODE_UNSUPPORTED_DESTINATION_TYPE);
 }
 
 TEST_F(PostgresProxyTest, ExtAuthzError) {
   runExtAuthzFailureTest(Filters::Common::ExtAuthz::CheckStatus::Error,
-                         Filters::Common::ExtAuthz::ResponseCodeDetails::get().AuthzError);
+                         Filters::Common::ExtAuthz::ResponseCodeDetails::get().AuthzError,
+                         /*expected_system_error=*/true);
 }
 
 TEST_F(PostgresProxyTest, ExtAuthzDenied) {
   runExtAuthzFailureTest(Filters::Common::ExtAuthz::CheckStatus::Denied,
-                         Filters::Common::ExtAuthz::ResponseCodeDetails::get().AuthzDenied);
+                         Filters::Common::ExtAuthz::ResponseCodeDetails::get().AuthzDenied,
+                         /*expected_system_error=*/false);
 }
 
 // Test that if the downstream connection does not have ssl, we error out.
@@ -670,6 +708,7 @@ TEST_F(PostgresProxyTest, DownstreamNotSsl) {
 
   EXPECT_EQ(1, config_->stats().downstream_not_support_ssl_.value());
   EXPECT_EQ(1, config_->stats().errors_.value());
+  EXPECT_EQ(0, config_->stats().successful_login_.value());
 }
 
 // Test that if the downstream connection does not have SNI, we error out.
@@ -790,6 +829,7 @@ TEST_F(PostgresProxyTest, OutputConnectionStringToDynamicMetadata) {
   read_callbacks_.connection_.stream_info_.metadata_.clear_filter_metadata();
   data.drain(8);
 }
+
 } // namespace DatabricksSqlProxy
 } // namespace NetworkFilters
 } // namespace Extensions

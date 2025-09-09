@@ -3,9 +3,11 @@ admin:
   - name: envoy.access_loggers.file
     typed_config:
       "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+      # Arg 1: admin access log path
       path: "{}"
   address:
     socket_address:
+      # Arg 2: admin endpoint address
       address: "{}"
       port_value: 0
 static_resources:
@@ -19,9 +21,11 @@ static_resources:
         - endpoint:
             address:
               socket_address:
+                # Arg 3: upstream cluster address
                 address: "{}"
                 port_value: 0
     # Transport socket configuration for the upstream cluster
+    # Arg 4: upstream tls config
     {}
   - name: ext_authz-service
     connect_timeout: 2s
@@ -30,6 +34,7 @@ static_resources:
       envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
         "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
         explicit_http_config:
+          # Arg 5: http2_protocol_options
           http2_protocol_options: {}
     load_assignment:
       cluster_name: ext_authz-service
@@ -38,15 +43,19 @@ static_resources:
         - endpoint:
             address:
               socket_address:
+                # Arg 6: ext_authz_service address
                 address: "{}"
                 port_value: 0
   listeners:
     name: listener_0
     address:
       socket_address:
+        # Arg 7: listener address
         address: "{}"
         port_value: 0
     listener_filters:
+      # Arg 8: Proxy protocol configuration if needed
+      {}
       - name: "envoy.filters.listener.databricks_sql_inspector"
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.filters.listener.databricks_sql_inspector.v3.DatabricksSqlInspector
@@ -59,6 +68,7 @@ static_resources:
           "@type": type.googleapis.com/envoy.extensions.filters.network.databricks_sql_proxy.v3.DatabricksSqlProxy
           stat_prefix: postgres_stats
           protocol: POSTGRES
+          # Arg 9: enable_upstream_tls
           enable_upstream_tls: {}
           destination_cluster_source: SIDECAR_SERVICE
           ext_authz_service:

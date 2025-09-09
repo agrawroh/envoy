@@ -43,6 +43,14 @@ public:
   // Databricks SQL Inspector Filter Name
   static inline constexpr absl::string_view DATABRICKS_SQL_INSPECTOR_FILTER_NAMESPACE{
       "envoy.filters.listener.databricks_sql_proxy"};
+
+  // See
+  // universe/pop-proxy/src/main/scala/com/databricks/backend/pop-proxy/utils/RoutingReasons.scala
+  // for reason codes
+  static inline constexpr absl::string_view REASON_CODE_PRIVATE_LINK_NOT_SUPPORTED{
+      "private-link-not-supported"};
+  static inline constexpr absl::string_view REASON_CODE_UNSUPPORTED_DESTINATION_TYPE{
+      "unsupported-destination-type"};
 };
 
 } // namespace Helper

@@ -77,8 +77,8 @@ TEST(DatabricksSqlFilterConfigFactoryTest, BadConfigSidecarServiceNoGrpcService)
   TestUtility::loadFromYaml(yaml, proto_config);
 
   Network::FilterFactoryCb cb;
-  EXPECT_THROW({ factory.createFilterFactoryFromProto(proto_config, context).value(); },
-               EnvoyException);
+  EXPECT_THROW(
+      { factory.createFilterFactoryFromProto(proto_config, context).value(); }, EnvoyException);
 }
 
 } // namespace
