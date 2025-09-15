@@ -66,38 +66,6 @@ TEST_F(UpstreamReverseConnectionIOHandleTest, ShutdownIgnoredWhenOwned) {
   EXPECT_EQ(result.errno_, 0);
 }
 
-class UpstreamReverseConnectionIOHandleTest : public testing::Test {
-protected:
-  void SetUp() override {
-    auto socket = std::make_unique<NiceMock<Network::MockConnectionSocket>>();
-
-    auto mock_io_handle = std::make_unique<NiceMock<Network::MockIoHandle>>();
-    EXPECT_CALL(*mock_io_handle, fdDoNotUse()).WillRepeatedly(Return(123));
-    EXPECT_CALL(*socket, ioHandle()).WillRepeatedly(ReturnRef(*mock_io_handle));
-
-    socket->io_handle_ = std::move(mock_io_handle);
-
-    handle_ =
-        std::make_unique<UpstreamReverseConnectionIOHandle>(std::move(socket), "test-cluster");
-  }
-
-  std::unique_ptr<UpstreamReverseConnectionIOHandle> handle_;
-};
-
-TEST_F(UpstreamReverseConnectionIOHandleTest, ConnectReturnsSuccess) {
-  auto address = Network::Utility::parseInternetAddressNoThrow("127.0.0.1", 8080);
-
-  auto result = handle_->connect(address);
-
-  EXPECT_EQ(result.return_value_, 0);
-  EXPECT_EQ(result.errno_, 0);
-}
-
-TEST_F(UpstreamReverseConnectionIOHandleTest, GetSocketReturnsValidReference) {
-  const auto& socket = handle_->getSocket();
-  EXPECT_NE(&socket, nullptr);
-}
-
 } // namespace ReverseConnection
 } // namespace Bootstrap
 } // namespace Extensions

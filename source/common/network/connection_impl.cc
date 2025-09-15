@@ -127,19 +127,8 @@ ConnectionImpl::ConnectionImpl(Event::Dispatcher& dispatcher, ConnectionSocketPt
 }
 
 ConnectionImpl::~ConnectionImpl() {
-  ENVOY_CONN_LOG(debug,
-                 "ConnectionImpl destructor ENTRY - this={}, socket_={}, socket_isOpen={}, "
-                 "delayed_close_timer_={}, reuse_socket_={}, connection_id={}, fd={}",
-                 *this, static_cast<void*>(this), socket_ ? "not_null" : "null",
-                 socket_ ? socket_->isOpen() : false, delayed_close_timer_ ? "not_null" : "null",
-                 static_cast<bool>(reuse_socket_), id(),
-                 socket_ ? socket_->ioHandle().fdDoNotUse() : -1);
-
-  if (reuse_socket_) {
-    ENVOY_CONN_LOG(trace, "ConnectionImpl destructor called, reuse_socket_=true, skipping close",
-                   *this);
-    return;
-  }
+  ASSERT(!socket_->isOpen() && delayed_close_timer_ == nullptr,
+         "ConnectionImpl destroyed with open socket and/or active timer");
 
   // In general we assume that owning code has called close() previously to the destructor being
   // run. This generally must be done so that callbacks run in the correct context (vs. deferred
@@ -172,8 +161,8 @@ void ConnectionImpl::close(ConnectionCloseType type) {
       socket_ ? socket_->ioHandle().fdDoNotUse() : -1, socket_ ? socket_->isOpen() : false);
 
   if (!socket_->isOpen()) {
-    ENVOY_CONN_LOG_EVENT(debug, "connection_closing",
-                         "Not closing conn, socket object is null or socket is not open", *this);
+    ENVOY_CONN_LOG_EVENT(debug, "connection_closing", "Not closing conn, socket is not open",
+                         *this);
     return;
   }
 
@@ -338,6 +327,7 @@ void ConnectionImpl::closeSocket(ConnectionEvent close_type) {
                  socket_ ? "not_null" : "null", socket_ ? socket_->isOpen() : false);
 
   if (!socket_->isOpen()) {
+    ENVOY_CONN_LOG(trace, "closeSocket: socket is not open, returning", *this);
     return;
   }
 
@@ -989,8 +979,6 @@ bool ConnectionImpl::setSocketOption(Network::SocketOptionName name, absl::Span<
   Api::SysCallIntResult result =
       SocketOptionImpl::setSocketOption(*socket_, name, value.data(), value.size());
   if (result.return_value_ != 0) {
-    ENVOY_LOG(warn, "Setting option on socket failed, errno: {}, message: {}", result.errno_,
-              errorDetails(result.errno_));
     return false;
   }
 

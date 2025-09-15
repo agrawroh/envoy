@@ -63,8 +63,6 @@ public:
   bool initializeReadFilters() override;
 
   const ConnectionSocketPtr& getSocket() const override { return socket_; }
-  void setSocketReused(bool value) override { reuse_socket_ = value; }
-  bool isSocketReused() override { return reuse_socket_; }
 
   // Network::Connection
   void addBytesSentCallback(BytesSentCb cb) override;

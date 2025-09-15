@@ -1211,14 +1211,11 @@ TEST_F(MultiConnectionBaseImplTest, SetSocketOptionFailedTest) {
   EXPECT_FALSE(impl_->setSocketOption(sockopt_name, sockopt_val));
 }
 
-TEST_F(MultiConnectionBaseImplTest, SetSocketReused) {
+TEST_F(MultiConnectionBaseImplTest, GetSocketPanics) {
   setupMultiConnectionImpl(2);
-  impl_->setSocketReused(true);
-}
 
-TEST_F(MultiConnectionBaseImplTest, isSocketReused) {
-  setupMultiConnectionImpl(2);
-  EXPECT_EQ(impl_->isSocketReused(), false);
+  // getSocket() should panic as it's not implemented for MultiConnectionBaseImpl.
+  EXPECT_DEATH(impl_->getSocket(), "not implemented");
 }
 
 } // namespace Network

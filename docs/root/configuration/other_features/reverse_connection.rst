@@ -1,58 +1,39 @@
 .. _config_reverse_connection:
 
 Reverse Connection
-------------------
+==================
 
-Envoy supports reverse connections that enable re-using existing connectionns to access services behind a private network from behind a public network. This feature is designed to solve the challenge of accessing downstream services in private networks from applications behind a firewall or NAT.
+Envoy supports reverse connections that enable establishing persistent connections from downstream Envoy instances
+to upstream Envoy instances without requiring the upstream to be directly reachable from the downstream.
+This feature is particularly useful in scenarios where downstream instances are behind NATs, firewalls,
+or in private networks, and need to initiate connections to upstream instances in public networks or cloud environments.
 
-Background
-----------
+Reverse connections work by having the downstream Envoy initiate TCP connections to upstream Envoy instances
+and keep them alive for reuse. These connections are established using a handshake protocol and can be
+used for forwarding traffic from services behind upstream Envoy to downstream services behind the downstream Envoy.
 
-The following is an environment where reverse connections are used:
+.. _config_reverse_connection_bootstrap:
 
-* There are services behind downstream Envoy instances in a private network.
-* There are services behind upstream Envoy instances in a public network. These services cannot access the services behind the downstream Envoy instances using forward connections but need to send requests to them using reverse connections.
-* Downstream envoys initiate HTTPS connections to upstream envoy instances, following which upstream envoy caches the connection socket -> these are "reverse connections".
-* When a request for a downstream service is received, the upstream Envoy picks an available "reverse connection" or cached connection socket for the downstream cluster and uses it to send the request.
+Bootstrap Configuration
+-----------------------
 
-.. image:: /_static/reverse_connection_concept.png
-   :alt: Reverse Connection Architecture
-   :align: center
+To enable reverse connections, two bootstrap extensions need to be configured:
 
-Reverse Connection Workflow
----------------------------
+1. **Downstream Reverse Connection Socket Interface**: Configures the downstream Envoy to initiate
+   reverse connections to upstream instances.
 
-The following sequence diagram illustrates the workflow for establishing and managing reverse connections:
+2. **Upstream Reverse Connection Socket Interface**: Configures the upstream Envoy to accept
+   and manage reverse connections from downstream instances.
 
-.. image:: /_static/reverse_connection_workflow.png
-   :alt: Reverse Connection Workflow
-   :align: center
+.. _config_reverse_connection_downstream:
 
-**Workflow Steps:**
+Downstream Configuration
+~~~~~~~~~~~~~~~~~~~~~~~~
 
-1. **Create Reverse Connection Listener**: On downstream envoy, reverse connections are initiated by the addition of a reverse connection listener via a LDS update. This makes it easy to pass metadata identifying source Envoy and the remote clusters and reverse tunnel count to each cluster. The upstream clusters are dynamically configurable via CDS.
-2. **Initiate Reverse Connections**: The listener calls the reverse connection workflow and initiates raw TCP connections to upstream clusters. This triggers the reverse connection handshake where downstream Envoy should passes metadata identifying itself (node ID, cluster ID) in the reverse connection request. Upstream Envoy will use this to index and store sockets for each downstream node ID by node ID.
-3. **Map Connections**: Upstream Envoy accepts the reverse connection handshake and stores the TCP socket mapped to the downstream node ID.
-4. **Keepalive**: Reverse connections are long lived connections between downstream and upstream Envoy. Once established, there is a keepalive mechanism to detect connection closure.
-6. **Request Routing**: When upstream envoy receives a request that needs to be sent to a downstream service, specific headers indicate which downstream node the request needs to be sent to. Upstream envoy picks a cached socket for the downstream node and sends the request over it.
-7. **Connection Closure and Re-initiation**: If a cached reverse connection socket closes on either downstream or upstream envoy, envoy detects it and downstream envoy re-initiates the reverse connection.
-
-Configuration
--------------
-
-Reverse connections require different configurations on downstream (on-prem) and upstream (cloud) Envoy instances. The following sections describe the required components for each side.
-
-Configuration Required on Downstream (On-Prem Envoy)
--------------------------------------------------------
-
-The downstream Envoy instance initiates reverse connections to upstream clusters. A complete example configuration can be found :repo:`here <configs/reverse_connection/onprem-envoy.yaml>`.
-
-**Downstream Socket Interface**
-
-The downstream socket interface is a bootstrap extension that instantiates necessary components for reverse connection initiation on downstream envoy.
+The downstream reverse connection socket interface is configured in the bootstrap as follows:
 
 .. validated-code-block:: yaml
-  :type-name: envoy.extensions.bootstrap.reverse_tunnel.downstream_socket_interface.v3.DownstreamReverseConnectionSocketInterface
+  :type-name: envoy.config.bootstrap.v3.Bootstrap
 
   bootstrap_extensions:
   - name: envoy.bootstrap.reverse_tunnel.downstream_socket_interface
@@ -60,94 +41,15 @@ The downstream socket interface is a bootstrap extension that instantiates neces
       "@type": type.googleapis.com/envoy.extensions.bootstrap.reverse_tunnel.downstream_socket_interface.v3.DownstreamReverseConnectionSocketInterface
       stat_prefix: "downstream_reverse_connection"
 
-**Reverse Connection Listener**
+.. _config_reverse_connection_upstream:
 
-Reverse Connections are initiated by the addition of a listener on downstream envoy. The reverse connection listener uses a special address format to encode reverse connection metadata, indicating the local identifiers, and the upstream cluster to which reverse connections need to be initiated, and how many need to be initiated. The local identifiers are crucial as upstream envoy uses them to index and store sockets for each downstream node ID by node ID.
+Upstream Configuration
+~~~~~~~~~~~~~~~~~~~~~~
 
-.. validated-code-block:: yaml
-  :type-name: envoy.config.listener.v3.Listener
-
-  - name: reverse_conn_listener
-    listener_filters_timeout: 0s
-    listener_filters:
-    - name: envoy.filters.listener.reverse_connection
-      typed_config:
-        "@type": type.googleapis.com/envoy.extensions.filters.listener.reverse_connection.v3.ReverseConnection
-        ping_wait_timeout: 10
-    address:
-      socket_address:
-        address: "rc://node-id:cluster-id:tenant-id@remote-cluster:connection-count"
-        port_value: 0
-        resolver_name: "envoy.resolvers.reverse_connection"
-
-The address format `rc://` encodes:
-- `node-id`: Source node identifier
-- `cluster-id`: Source cluster identifier  
-- `tenant-id`: Source tenant identifier
-- `remote-cluster`: Target upstream cluster name
-- `connection-count`: Number of reverse connections to establish
-
-**Reverse Connection Handshake**
-
-The addition of the reverse connection listener triggers a handshake process between downstream and upstream Envoy instances. The downstream Envoy initiates TCP connections to each host of the upstream cluster, and writes the handshake request on it over HTTP/1.1 POST.
-
-The handshake request contains a protobuf message with node identification metadata:
+The upstream reverse connection socket interface is configured in the bootstrap as follows:
 
 .. validated-code-block:: yaml
-  :type-name: envoy.extensions.bootstrap.reverse_connection_handshake.v3.ReverseConnHandshakeArg
-
-  POST /reverse_connections/request HTTP/1.1
-  Host: {upstream_host}
-  Accept: */*
-  Content-length: {protobuf_size}
-
-  {protobuf_body}
-
-The protobuf message contains:
-- `tenant_uuid`: Source tenant identifier
-- `cluster_uuid`: Source cluster identifier  
-- `node_uuid`: Source node identifier
-
-Upstream Envoy validates whether the request contains the node identifier, and then sends an HTTP response indicating where the reverse connection is accepted or rejected.
-
-.. validated-code-block:: yaml
-  :type-name: envoy.extensions.bootstrap.reverse_connection_handshake.v3.ReverseConnHandshakeRet
-
-  HTTP/1.1 200 OK
-  Content-Type: application/octet-stream
-  Content-Length: {protobuf_size}
-  Connection: close
-
-  {protobuf_body}
-
-The response protobuf contains:
-- `status`: ACCEPTED or REJECTED
-- `status_message`: Optional error message if rejected
-
-**Reverse Connection Listener Filter**
-
-The reverse connection listener filter on downstream envoy owns the socket after the handshake is complete and before data is received on it. It is responsible for replying to TCP keepalives on the socket, and mark the socket dead if replies are not received within a timeout.
-
-.. validated-code-block:: yaml
-  :type-name: envoy.extensions.filters.listener.reverse_connection.v3.ReverseConnection
-
-  listener_filters:
-  - name: envoy.filters.listener.reverse_connection
-    typed_config:
-      "@type": type.googleapis.com/envoy.extensions.filters.listener.reverse_connection.v3.ReverseConnection
-      ping_wait_timeout: 10
-
-Configuration Required on Upstream (Cloud Envoy)
------------------------------------------------
-
-The upstream Envoy instance instantiates components that accept and manage reverse connections from downstream instances. A complete example configuration can be found :repo:`here <configs/reverse_connection/cloud-envoy.yaml>`.
-
-**Upstream Socket Interface**
-
-The upstream socket interface is configured via bootstrap extensions and enables the Envoy instance to accept and manage reverse connections from downstream instances.
-
-.. validated-code-block:: yaml
-  :type-name: envoy.extensions.bootstrap.reverse_tunnel.upstream_socket_interface.v3.UpstreamReverseConnectionSocketInterface
+  :type-name: envoy.config.bootstrap.v3.Bootstrap
 
   bootstrap_extensions:
   - name: envoy.bootstrap.reverse_tunnel.upstream_socket_interface
@@ -155,54 +57,277 @@ The upstream socket interface is configured via bootstrap extensions and enables
       "@type": type.googleapis.com/envoy.extensions.bootstrap.reverse_tunnel.upstream_socket_interface.v3.UpstreamReverseConnectionSocketInterface
       stat_prefix: "upstream_reverse_connection"
 
-**Reverse Connection HTTP Filter**
+.. _config_reverse_connection_listener:
 
-The reverse connection HTTP filter on upstream envoy is responsible for accepting reverse connection handshake from downstream envoy and passing the socket to the upstream socket inteface.
-It also exposes the reverse connection API endpoint exposing details like the list of connected clusters via reverse connections.
+Listener Configuration
+----------------------
 
-.. validated-code-block:: yaml
-  :type-name: envoy.extensions.filters.http.reverse_conn.v3.ReverseConn
-
-  - name: envoy.filters.http.reverse_conn
-    typed_config:
-      "@type": type.googleapis.com/envoy.extensions.filters.http.reverse_conn.v3.ReverseConn
-      ping_interval: 2
-
-**Reverse Connection Cluster**
-
-On upstream envoy, any downstream node that needs to be reached via reverse connection needs to be added as a REVERSE_CONNECTION cluster. Requests to such a node need to be made with:
-- Special headers set as indicated in the REVERSE_CONNECTION cluster configuration. By default, the headers are:
-  - x-remote-node-id: Downstream node ID
-  - x-dst-cluster-uuid: Downstream cluster ID
-- Host Header set to the downstream node/cluster ID
-- SNI set to the downstream node ID
-
-The REVERSE_CONNECTION cluster checks for the uuid in the above sequence, and if found, interfaces with the upstream socket interface and ensures that a cached socket is used to service the request.
+Reverse connections are initiated through special reverse connection listeners that use the following
+reverse connection address format:
 
 .. validated-code-block:: yaml
-  :type-name: envoy.extensions.clusters.reverse_connection.v3.RevConClusterConfig
+  :type-name: envoy.config.listener.v3.Listener
 
-  - name: reverse_connection_cluster
-    connect_timeout: 200s
-    lb_policy: CLUSTER_PROVIDED
-    cluster_type:
-      name: envoy.clusters.reverse_connection
+  name: reverse_connection_listener
+  address:
+    socket_address:
+      address: "rc://downstream-node-id:downstream-cluster-id:downstream-tenant-id@upstream-cluster:connection-count"
+      port_value: 0
+  filter_chains:
+  - filters:
+    - name: envoy.filters.network.tcp_proxy
       typed_config:
-        "@type": type.googleapis.com/envoy.extensions.clusters.reverse_connection.v3.RevConClusterConfig
-        http_header_names:
-          - x-remote-node-id      # Downstream node ID
-          - x-dst-cluster-uuid   # Downstream cluster ID
+        "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+        stat_prefix: tcp
+        cluster: upstream-cluster
 
-**Runtime Configuration**
+The reverse connection address format ``rc://src_node:src_cluster:src_tenant@target_cluster:count``
+encodes the following information:
 
-Enable the following reverse connection on upstream envoy to ensure that it sends a response immediately to the reverse connection handshake request.
+* ``src_node``: Unique identifier for the downstream node
+* ``src_cluster``: Cluster name of the downstream Envoy
+* ``src_tenant``: Tenant identifier for multi-tenant deployments
+* ``target_cluster``: Name of the upstream cluster to connect to
+* ``count``: Number of reverse connections to establish to upstream-cluster
 
-.. code-block:: yaml
+The upstream-cluster can be dynamically configurable via CDS. The listener calls the reverse connection
+workflow and initiates raw TCP connections to upstream clusters, thereby This triggering the reverse
+connection handshake.
 
-  layered_runtime:
-    layers:
-    - name: layer
-      static_layer:
-        envoy.reloadable_features.reverse_conn_force_local_reply: true
+.. _config_reverse_connection_handshake:
 
+Handshake Protocol
+------------------
 
+Reverse connections use a handshake protocol to establish authenticated connections between
+downstream and upstream Envoy instances. The handshake has the following steps:
+
+1. **Connection Initiation**: Downstream Envoy initiates TCP connections to each host of the upstream cluster,
+and writes the handshake request on it over a HTTP/1.1 POST call.
+2. **Identity Exchange**: The downstream Envoy's reverse connection handshake contains identity information (node ID, cluster ID, tenant ID).
+3. **Authentication**: Optional authentication and authorization checks are performed by the upstream Envoy on receiving the handshake request.
+4. **Connection Establishment**: Post a successful handshake, the upstream Envoy stores the TCP socket mapped to the downstream node ID.
+
+.. _config_reverse_connection_stats:
+
+Statistics
+----------
+
+The reverse connection extensions emit the following statistics:
+
+**Downstream Extension:**
+
+The downstream reverse connection extension emits both host-level and cluster-level statistics for connection states. The stat names follow the pattern:
+
+- Host-level: ``<stat_prefix>.host.<host_address>.<state>``
+- Cluster-level: ``<stat_prefix>.cluster.<cluster_id>.<state>``
+
+Where ``<state>`` can be one of:
+
+.. csv-table::
+   :header: State, Type, Description
+   :widths: 1, 1, 2
+
+   connecting, Gauge, Number of connections currently being established
+   connected, Gauge, Number of successfully established connections
+   failed, Gauge, Number of failed connection attempts
+   recovered, Gauge, Number of connections that recovered from failure
+   backoff, Gauge, Number of hosts currently in backoff state
+   cannot_connect, Gauge, Number of connection attempts that could not be initiated
+   unknown, Gauge, Number of connections in unknown state (fallback)
+
+For example, with ``stat_prefix: "downstream_rc"``:
+- ``downstream_rc.host.192.168.1.1.connecting`` - connections being established to host 192.168.1.1
+- ``downstream_rc.cluster.upstream-cluster.connected`` - established connections to upstream-cluster
+
+**Upstream Extension:**
+
+The upstream reverse connection extension emits node-level and cluster-level statistics for accepted connections. The stat names follow the pattern:
+
+- Node-level: ``reverse_connections.nodes.<node_id>``
+- Cluster-level: ``reverse_connections.clusters.<cluster_id>``
+
+.. csv-table::
+   :header: Name, Type, Description
+   :widths: 1, 1, 2
+
+   reverse_connections.nodes.<node_id>, Gauge, Number of active connections from downstream node
+   reverse_connections.clusters.<cluster_id>, Gauge, Number of active connections from downstream cluster
+
+For example:
+- ``reverse_connections.nodes.node-1`` - active connections from downstream node "node-1"
+- ``reverse_connections.clusters.downstream-cluster`` - active connections from downstream cluster "downstream-cluster"
+
+.. _config_reverse_connection_security:
+
+Security Considerations
+-----------------------
+
+Reverse connections should be used with appropriate security measures:
+
+* **Authentication**: Implement proper authentication mechanisms for handshake validation
+* **Authorization**: Validate that downstream nodes are authorized to connect to upstream clusters
+* **TLS**: Use TLS transport sockets for encrypted communication
+* **Network Policies**: Restrict network access to only allow expected downstream-to-upstream communication
+* **Monitoring**: Monitor connection statistics and handshake failures for security anomalies
+
+.. _config_reverse_connection_examples:
+
+Examples
+--------
+
+.. _config_reverse_connection_simple:
+
+Simple Reverse Connection
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A basic configuration example for using the downstream and upstream reverse connection socket interfaces
+are shown below.
+
+**Downstream Configuration:**
+
+.. validated-code-block:: yaml
+  :type-name: envoy.config.bootstrap.v3.Bootstrap
+
+  bootstrap_extensions:
+  - name: envoy.bootstrap.reverse_tunnel.downstream_socket_interface
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.bootstrap.reverse_tunnel.downstream_socket_interface.v3.DownstreamReverseConnectionSocketInterface
+      stat_prefix: "downstream_rc"
+
+  static_resources:
+    listeners:
+    - name: reverse_listener
+      address:
+        socket_address:
+          address: "rc://node-1:downstream-cluster:tenant-a@upstream-cluster:3"
+          port_value: 0
+      filter_chains:
+      - filters:
+        - name: envoy.filters.network.tcp_proxy
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+            stat_prefix: tcp
+            cluster: upstream-cluster
+
+    clusters:
+    - name: upstream-cluster
+      type: LOGICAL_DNS
+      dns_lookup_family: V4_ONLY
+      load_assignment:
+        cluster_name: upstream-cluster
+        endpoints:
+        - lb_endpoints:
+          - endpoint:
+              address:
+                socket_address:
+                  address: "upstream.example.com"
+                  port_value: 8080
+
+**Upstream Configuration:**
+
+.. validated-code-block:: yaml
+  :type-name: envoy.config.bootstrap.v3.Bootstrap
+
+  bootstrap_extensions:
+  - name: envoy.bootstrap.reverse_tunnel.upstream_socket_interface
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.bootstrap.reverse_tunnel.upstream_socket_interface.v3.UpstreamReverseConnectionSocketInterface
+      stat_prefix: "upstream_rc"
+
+  static_resources:
+    listeners:
+    - name: upstream_listener
+      address:
+        socket_address:
+          address: "0.0.0.0"
+          port_value: 8080
+      filter_chains:
+      - filters:
+        - name: envoy.filters.network.tcp_proxy
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+            stat_prefix: tcp
+            cluster: backend
+
+    clusters:
+    - name: backend
+      type: LOGICAL_DNS
+      dns_lookup_family: V4_ONLY
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+        - lb_endpoints:
+          - endpoint:
+              address:
+                socket_address:
+                  address: "backend.example.com"
+                  port_value: 9000
+
+.. _config_reverse_connection_multi_cluster:
+
+Multiple Clusters
+~~~~~~~~~~~~~~~~~
+
+Configure reverse connections to multiple upstream clusters:
+
+.. validated-code-block:: yaml
+  :type-name: envoy.config.listener.v3.Listener
+
+  name: multi_cluster_listener
+  address:
+    socket_address:
+      address: "rc://node-1:downstream-cluster:tenant-a@cluster-a:2"
+      port_value: 0
+  additional_addresses:
+  - address:
+      socket_address:
+        address: "rc://node-1:downstream-cluster:tenant-a@cluster-b:3"
+        port_value: 0
+  filter_chains:
+  - filters:
+    - name: envoy.filters.network.tcp_proxy
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+        stat_prefix: tcp
+        cluster: dynamic_cluster
+
+This configuration establishes:
+* 2 connections to ``cluster-a``
+* 3 connections to ``cluster-b``
+
+.. _config_reverse_connection_tls:
+
+TLS-Enabled Reverse Connections
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Add TLS encryption to reverse connections:
+
+.. validated-code-block:: yaml
+  :type-name: envoy.config.listener.v3.Listener
+
+  name: tls_reverse_listener
+  address:
+    socket_address:
+      address: "rc://node-1:downstream-cluster:tenant-a@upstream-cluster:2"
+      port_value: 0
+  filter_chains:
+  - transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+        common_tls_context:
+          tls_certificates:
+          - certificate_chain:
+              filename: "/etc/ssl/certs/downstream.crt"
+            private_key:
+              filename: "/etc/ssl/private/downstream.key"
+          validation_context:
+            trusted_ca:
+              filename: "/etc/ssl/certs/ca.crt"
+    filters:
+    - name: envoy.filters.network.tcp_proxy
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+        stat_prefix: tcp
+        cluster: upstream-cluster
