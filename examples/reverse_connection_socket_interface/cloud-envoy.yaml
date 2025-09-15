@@ -12,30 +12,13 @@ static_resources:
           port_value: 9000
       filter_chains:
         - filters:
-            - name: envoy.http_connection_manager
+            - name: envoy.filters.network.reverse_tunnel
               typed_config:
-                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
-                stat_prefix: rev_conn_api
-                # Any dummy route config works
-                route_config:
-                  virtual_hosts:
-                  - name: rev_conn_api_route
-                    domains:
-                      - "*"
-                    routes:
-                      - match:
-                          prefix: '/on_prem_service'
-                        route:
-                          cluster: reverse_connection_cluster
-                http_filters:
-                  # Filter that services reverse conn APIs
-                  - name: envoy.filters.http.reverse_conn
-                    typed_config:
-                      "@type": type.googleapis.com/envoy.extensions.filters.http.reverse_conn.v3.ReverseConn
-                      ping_interval: 2
-                  - name: envoy.filters.http.router
-                    typed_config:
-                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                "@type": type.googleapis.com/envoy.extensions.filters.network.reverse_tunnel.v3.ReverseTunnel
+                ping_interval: 2s
+                auto_close_connections: false
+                request_path: "/reverse_connections/request"
+                request_method: "POST"
 
     # Listener that will route the downstream request to the reverse connection cluster
     - name: egress_listener
