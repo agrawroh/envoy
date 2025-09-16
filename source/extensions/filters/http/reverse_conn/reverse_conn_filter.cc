@@ -138,7 +138,6 @@ Http::FilterDataStatus ReverseConnFilter::acceptReverseConnection() {
   ENVOY_STREAM_LOG(info, "DEBUG: About to save connection with node_uuid='{}' cluster_uuid='{}'",
                    *decoder_callbacks_, node_uuid, cluster_uuid);
   saveDownstreamConnection(*connection, node_uuid, cluster_uuid);
-  connection->setSocketReused(true);
 
   // Reset file events on the connection socket
   if (connection->getSocket()) {
