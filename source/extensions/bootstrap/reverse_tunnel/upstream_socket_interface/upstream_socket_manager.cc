@@ -83,7 +83,7 @@ void UpstreamSocketManager::addConnectionSocket(const std::string& node_id,
       },
       Event::FileTriggerType::Edge, Event::FileReadyType::Read);
 
-  fd_to_timer_map_[fd] = dispatcher_.createTimer([this, fd]() { markSocketDead(fd); });
+  fd_to_timer_map_[fd] = dispatcher_.createTimer([this, fd]() { onPingTimeout(fd); });
 
   // Initiate ping keepalives on the socket.
   tryEnablePingTimer(std::chrono::seconds(ping_interval.count()));
@@ -332,11 +332,14 @@ void UpstreamSocketManager::onPingResponse(Network::IoHandle& io_handle) {
   if (!::Envoy::Extensions::Bootstrap::ReverseConnection::ReverseConnectionUtility::isPingMessage(
           buffer.toString())) {
     ENVOY_LOG(debug, "UpstreamSocketManager: FD: {}: response is not RPING", fd);
-    markSocketDead(fd);
+    // Treat as a miss; do not immediately kill unless threshold crossed.
+    onPingTimeout(fd);
     return;
   }
   ENVOY_LOG(trace, "UpstreamSocketManager: FD: {}: received ping response", fd);
   fd_to_timer_map_[fd]->disableTimer();
+  // Reset miss counter on success.
+  fd_to_miss_count_.erase(fd);
 }
 
 void UpstreamSocketManager::pingConnections(const std::string& node_id) {
@@ -397,6 +400,19 @@ void UpstreamSocketManager::pingConnections() {
     pingConnections(itr.first);
   }
   ping_timer_->enableTimer(ping_interval_);
+}
+
+void UpstreamSocketManager::onPingTimeout(const int fd) {
+  ENVOY_LOG(debug, "UpstreamSocketManager: ping timeout (or invalid ping) for fd {}", fd);
+  // Increment miss count and evaluate threshold.
+  const uint32_t misses = ++fd_to_miss_count_[fd];
+  ENVOY_LOG(trace, "UpstreamSocketManager: fd {} miss count {}", fd, misses);
+  if (misses >= miss_threshold_) {
+    ENVOY_LOG(debug, "UpstreamSocketManager: fd {} exceeded miss threshold {} — marking dead", fd,
+              miss_threshold_);
+    fd_to_miss_count_.erase(fd);
+    markSocketDead(fd);
+  }
 }
 
 UpstreamSocketManager::~UpstreamSocketManager() {

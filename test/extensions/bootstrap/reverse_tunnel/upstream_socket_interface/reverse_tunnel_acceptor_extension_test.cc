@@ -1,10 +1,12 @@
 #include "envoy/extensions/bootstrap/reverse_tunnel/upstream_socket_interface/v3/upstream_reverse_connection_socket_interface.pb.h"
 
+#include "source/common/network/utility.h"
 #include "source/extensions/bootstrap/reverse_tunnel/upstream_socket_interface/reverse_tunnel_acceptor.h"
 #include "source/extensions/bootstrap/reverse_tunnel/upstream_socket_interface/reverse_tunnel_acceptor_extension.h"
 #include "source/extensions/bootstrap/reverse_tunnel/upstream_socket_interface/upstream_socket_manager.h"
 
 #include "test/mocks/event/mocks.h"
+#include "test/mocks/network/mocks.h"
 #include "test/mocks/server/factory_context.h"
 #include "test/mocks/stats/mocks.h"
 #include "test/mocks/thread_local/mocks.h"
@@ -326,6 +328,64 @@ TEST_F(ReverseTunnelAcceptorExtensionTest, CreateEmptyConfigProto) {
       dynamic_cast<envoy::extensions::bootstrap::reverse_tunnel::upstream_socket_interface::v3::
                        UpstreamReverseConnectionSocketInterface*>(proto.get());
   EXPECT_NE(typed_proto, nullptr);
+}
+
+TEST_F(ReverseTunnelAcceptorExtensionTest, MissThresholdOneMarksDeadOnFirstInvalidPing) {
+  // Recreate extension_ with threshold = 1.
+  envoy::extensions::bootstrap::reverse_tunnel::upstream_socket_interface::v3::
+      UpstreamReverseConnectionSocketInterface cfg;
+  cfg.set_stat_prefix("test_prefix");
+  cfg.mutable_ping_failure_threshold()->set_value(1);
+  extension_.reset(new ReverseTunnelAcceptorExtension(*socket_interface_, context_, cfg));
+
+  // Provide dispatcher to thread local and set expectations for timers/file events.
+  thread_local_.setDispatcher(&dispatcher_);
+  EXPECT_CALL(dispatcher_, createTimer_(_))
+      .WillRepeatedly(testing::ReturnNew<NiceMock<Event::MockTimer>>());
+  EXPECT_CALL(dispatcher_, createFileEvent_(_, _, _, _))
+      .WillRepeatedly(testing::ReturnNew<NiceMock<Event::MockFileEvent>>());
+
+  // Use helper to install TLS registry for the (recreated) extension_.
+  setupThreadLocalSlot();
+
+  // Get the registry and socket manager back through the API and apply threshold.
+  auto* registry = extension_->getLocalRegistry();
+  ASSERT_NE(registry, nullptr);
+  auto* socket_manager = registry->socketManager();
+  ASSERT_NE(socket_manager, nullptr);
+  socket_manager->setMissThreshold(extension_->pingFailureThreshold());
+
+  // Create a mock socket with FD and addresses.
+  auto socket = std::make_unique<NiceMock<Network::MockConnectionSocket>>();
+  auto io_handle = std::make_unique<NiceMock<Network::MockIoHandle>>();
+  EXPECT_CALL(*io_handle, fdDoNotUse()).WillRepeatedly(testing::Return(123));
+  EXPECT_CALL(*socket, ioHandle()).WillRepeatedly(testing::ReturnRef(*io_handle));
+  socket->io_handle_ = std::move(io_handle);
+
+  auto local_address = Network::Utility::parseInternetAddressNoThrow("127.0.0.1", 10000);
+  auto remote_address = Network::Utility::parseInternetAddressNoThrow("127.0.0.1", 10001);
+  socket->connection_info_provider_->setLocalAddress(local_address);
+  socket->connection_info_provider_->setRemoteAddress(remote_address);
+
+  const std::string node_id = "n1";
+  const std::string cluster_id = "c1";
+  socket_manager->addConnectionSocket(node_id, cluster_id, std::move(socket),
+                                      std::chrono::seconds(30), false);
+
+  // Simulate an invalid ping response (not RPING). With threshold=1, one miss should kill it.
+  NiceMock<Network::MockIoHandle> mock_read_handle;
+  EXPECT_CALL(mock_read_handle, fdDoNotUse()).WillRepeatedly(testing::Return(123));
+  EXPECT_CALL(mock_read_handle, read(testing::_, testing::_))
+      .WillOnce(testing::Invoke([](Buffer::Instance& buffer, absl::optional<uint64_t>) {
+        buffer.add("XXXXX"); // 5 bytes, not RPING
+        return Api::IoCallUint64Result{5, Api::IoError::none()};
+      }));
+
+  socket_manager->onPingResponse(mock_read_handle);
+
+  // With threshold=1, the socket should be marked dead immediately.
+  auto retrieved = socket_manager->getConnectionSocket(node_id);
+  EXPECT_EQ(retrieved, nullptr);
 }
 
 TEST_F(ReverseTunnelAcceptorExtensionTest, FactoryName) {

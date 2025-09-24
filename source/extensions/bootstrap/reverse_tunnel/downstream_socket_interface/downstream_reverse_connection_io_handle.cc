@@ -1,6 +1,7 @@
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/downstream_reverse_connection_io_handle.h"
 
 #include "source/common/common/logger.h"
+#include "source/extensions/bootstrap/reverse_tunnel/common/reverse_connection_utility.h"
 #include "source/extensions/bootstrap/reverse_tunnel/downstream_socket_interface/reverse_connection_io_handle.h"
 
 namespace Envoy {
@@ -26,6 +27,60 @@ DownstreamReverseConnectionIOHandle::~DownstreamReverseConnectionIOHandle() {
       debug,
       "DownstreamReverseConnectionIOHandle: destroying handle for FD: {} with connection key: {}",
       fd_, connection_key_);
+}
+
+Api::IoCallUint64Result
+DownstreamReverseConnectionIOHandle::read(Buffer::Instance& buffer,
+                                          absl::optional<uint64_t> max_length) {
+  // Perform the actual read first.
+  Api::IoCallUint64Result result = IoSocketHandleImpl::read(buffer, max_length);
+
+  // If ping echoing is still active, inspect incoming data for RPING and echo back.
+  if (ping_echo_active_ && result.err_ == nullptr && result.return_value_ > 0) {
+    const uint64_t expected =
+        ::Envoy::Extensions::Bootstrap::ReverseConnection::ReverseConnectionUtility::PING_MESSAGE
+            .size();
+
+    // Copy out up to expected bytes to check for RPING without destroying app payload semantics.
+    const uint64_t len = std::min<uint64_t>(buffer.length(), expected);
+    std::string peek;
+    peek.resize(static_cast<size_t>(len));
+    buffer.copyOut(0, len, peek.data());
+
+    // If we have at least expected bytes, check direct match.
+    if (len == expected &&
+        ::Envoy::Extensions::Bootstrap::ReverseConnection::ReverseConnectionUtility::isPingMessage(
+            peek)) {
+      buffer.drain(expected);
+      auto echo_rc = ::Envoy::Extensions::Bootstrap::ReverseConnection::ReverseConnectionUtility::
+          sendPingResponse(*this);
+      if (!echo_rc.ok()) {
+        ENVOY_LOG(trace, "DownstreamReverseConnectionIOHandle: failed to send RPING echo on FD: {}",
+                  fd_);
+      } else {
+        ENVOY_LOG(trace, "DownstreamReverseConnectionIOHandle: echoed RPING on FD: {}", fd_);
+      }
+      // If buffer now only contained RPING, suppress delivery to upper layers.
+      if (buffer.length() == 0) {
+        return Api::IoCallUint64Result{0, Api::IoError::none()};
+      }
+      // There is remaining data beyond RPING; continue returning remaining data this call.
+      // Report number of bytes excluding the drained ping.
+      const uint64_t adjusted =
+          (result.return_value_ >= expected) ? (result.return_value_ - expected) : 0;
+      return Api::IoCallUint64Result{adjusted, Api::IoError::none()};
+    }
+
+    // If fewer than expected bytes, we cannot conclusively detect ping yet; wait for more bytes.
+    if (len < expected) {
+      // Do nothing; a subsequent read will deliver more bytes.
+    } else {
+      // We had expected bytes but not RPING; disable echo permanently.
+      ping_echo_active_ = false;
+    }
+  }
+
+  return result;
 }
 
 // DownstreamReverseConnectionIOHandle close() implementation.
