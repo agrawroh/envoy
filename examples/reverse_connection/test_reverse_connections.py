@@ -35,9 +35,9 @@ CONFIG = {
         os.path.join(os.path.dirname(os.path.abspath(__file__)), 'docker-compose.yaml'),
     'on_prem_config_file':
         os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), 'on-prem-envoy-custom-resolver.yaml'),
+            os.path.dirname(os.path.abspath(__file__)), 'initiator-envoy.yaml'),
     'cloud_config_file':
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cloud-envoy.yaml'),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'responder-envoy.yaml'),
 
     # Ports
     'cloud_admin_port':
@@ -164,12 +164,12 @@ class ReverseConnectionTester:
                 f"{on_prem_config}:/etc/on-prem-envoy.yaml"
             ]
 
-            # Copy cloud-envoy.yaml to temp directory and update the path
+            # Copy responder-envoy.yaml to temp directory and update the path
             import shutil
-            temp_cloud_config = os.path.join(self.temp_dir, "cloud-envoy.yaml")
+            temp_cloud_config = os.path.join(self.temp_dir, "responder-envoy.yaml")
             shutil.copy(CONFIG['cloud_config_file'], temp_cloud_config)
             compose_config['services']['cloud-envoy']['volumes'] = [
-                f"{temp_cloud_config}:/etc/cloud-envoy.yaml"
+                f"{temp_cloud_config}:/etc/responder-envoy.yaml"
             ]
 
             # Copy Dockerfile.xds to temp directory
