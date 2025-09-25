@@ -34,23 +34,26 @@ DownstreamReverseConnectionIOHandle::read(Buffer::Instance& buffer,
                                           absl::optional<uint64_t> max_length) {
   // Perform the actual read first.
   Api::IoCallUint64Result result = IoSocketHandleImpl::read(buffer, max_length);
+  ENVOY_LOG(trace, "DownstreamReverseConnectionIOHandle: read result: {}", result.return_value_);
+  ENVOY_LOG(trace, "DownstreamReverseConnectionIOHandle: read data {}", buffer.toString());
 
-  // If ping echoing is still active, inspect incoming data for RPING and echo back.
+  // If RPING keepalives are still active, check whether the incoming data is a RPING message.
   if (ping_echo_active_ && result.err_ == nullptr && result.return_value_ > 0) {
     const uint64_t expected =
         ::Envoy::Extensions::Bootstrap::ReverseConnection::ReverseConnectionUtility::PING_MESSAGE
             .size();
 
-    // Copy out up to expected bytes to check for RPING without destroying app payload semantics.
+    // Copy out up to expected bytes to check for RPING.
     const uint64_t len = std::min<uint64_t>(buffer.length(), expected);
     std::string peek;
     peek.resize(static_cast<size_t>(len));
     buffer.copyOut(0, len, peek.data());
 
-    // If we have at least expected bytes, check direct match.
+    // Check if we have a complete RPING message.
     if (len == expected &&
         ::Envoy::Extensions::Bootstrap::ReverseConnection::ReverseConnectionUtility::isPingMessage(
             peek)) {
+      // Found complete RPING - echo it back and drain from buffer.
       buffer.drain(expected);
       auto echo_rc = ::Envoy::Extensions::Bootstrap::ReverseConnection::ReverseConnectionUtility::
           sendPingResponse(*this);
@@ -60,24 +63,44 @@ DownstreamReverseConnectionIOHandle::read(Buffer::Instance& buffer,
       } else {
         ENVOY_LOG(trace, "DownstreamReverseConnectionIOHandle: echoed RPING on FD: {}", fd_);
       }
-      // If buffer now only contained RPING, suppress delivery to upper layers.
+
+      // If buffer only contained RPING, return showing we processed it.
       if (buffer.length() == 0) {
-        return Api::IoCallUint64Result{0, Api::IoError::none()};
+        return Api::IoCallUint64Result{expected, Api::IoError::none()};
       }
-      // There is remaining data beyond RPING; continue returning remaining data this call.
-      // Report number of bytes excluding the drained ping.
+
+      // Mixed RPING + application data: disable echo and return remaining data.
+      ENVOY_LOG(debug,
+                "DownstreamReverseConnectionIOHandle: received application data after RPING, "
+                "disabling RPING echo for FD: {}",
+                fd_);
+      ping_echo_active_ = false;
+      // The adjusted return value is the number of bytes excluding the drained RPING. It should be
+      // transparent to upper layers that the RPING was processed.
       const uint64_t adjusted =
           (result.return_value_ >= expected) ? (result.return_value_ - expected) : 0;
       return Api::IoCallUint64Result{adjusted, Api::IoError::none()};
     }
 
-    // If fewer than expected bytes, we cannot conclusively detect ping yet; wait for more bytes.
+    // Check if partial data could be start of RPING (only if we have less than expected bytes).
     if (len < expected) {
-      // Do nothing; a subsequent read will deliver more bytes.
-    } else {
-      // We had expected bytes but not RPING; disable echo permanently.
-      ping_echo_active_ = false;
+      const std::string rping_prefix =
+          std::string(ReverseConnectionUtility::PING_MESSAGE.substr(0, len));
+      if (peek == rping_prefix) {
+        ENVOY_LOG(trace,
+                  "DownstreamReverseConnectionIOHandle: partial RPING received ({} bytes), waiting "
+                  "for more",
+                  len);
+        return result; // Wait for more data.
+      }
     }
+
+    // Not RPING (either complete non-RPING data or partial non-RPING data) - disable echo.
+    ENVOY_LOG(debug,
+              "DownstreamReverseConnectionIOHandle: received application data ({} bytes), "
+              "permanently disabling RPING echo for FD: {}",
+              len, fd_);
+    ping_echo_active_ = false;
   }
 
   return result;

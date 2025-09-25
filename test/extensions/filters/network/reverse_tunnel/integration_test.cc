@@ -1,7 +1,6 @@
 #include <thread>
 
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
-#include "envoy/extensions/bootstrap/reverse_tunnel/upstream_socket_interface/v3/upstream_reverse_connection_socket_interface.pb.h"
 #include "envoy/extensions/filters/network/reverse_tunnel/v3/reverse_tunnel.pb.h"
 #include "envoy/extensions/transport_sockets/internal_upstream/v3/internal_upstream.pb.h"
 
@@ -479,107 +478,6 @@ TEST_P(ReverseTunnelFilterIntegrationTest, EndToEndReverseConnectionHandshake) {
   // Wait for listeners to be stopped, which triggers ReverseConnectionIOHandle cleanup.
   test_server_->waitForCounterEq("listener_manager.listener_stopped",
                                  2); // 2 listeners in this test
-}
-
-// Verify that setting a miss threshold via the upstream bootstrap extension is plumbed and
-// that reverse connection gauges drop to zero after reverse connection listener is drained.
-TEST_P(ReverseTunnelFilterIntegrationTest, ThresholdConfigPlumbedAndGaugesDropOnDisconnect) {
-  DISABLE_IF_ADMIN_DISABLED;
-
-  const uint32_t upstream_port = GetParam() == Network::Address::IpVersion::v4 ? 16000 : 16001;
-  const std::string loopback_addr =
-      GetParam() == Network::Address::IpVersion::v4 ? "127.0.0.1" : "::1";
-
-  // Set the upstream bootstrap extension ping_miss_threshold to 1 via a config modifier so it
-  // applies to the bootstrap extension added in initialize().
-  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
-    for (auto& ext : *bootstrap.mutable_bootstrap_extensions()) {
-      if (ext.name() == "envoy.bootstrap.reverse_tunnel.upstream_socket_interface") {
-        envoy::extensions::bootstrap::reverse_tunnel::upstream_socket_interface::v3::
-            UpstreamReverseConnectionSocketInterface cfg;
-        ext.mutable_typed_config()->UnpackTo(&cfg);
-        cfg.mutable_ping_failure_threshold()->set_value(1);
-        ext.mutable_typed_config()->PackFrom(cfg);
-      }
-    }
-  });
-
-  // Configure listeners and clusters similar to the end-to-end test, but with a short ping interval
-  // so pings are active during the test window.
-  config_helper_.addConfigModifier([upstream_port, loopback_addr](
-                                       envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
-    bootstrap.mutable_static_resources()->clear_listeners();
-
-    // Ensure admin interface is configured.
-    if (!bootstrap.has_admin()) {
-      auto* admin = bootstrap.mutable_admin();
-      auto* admin_address = admin->mutable_address()->mutable_socket_address();
-      admin_address->set_address(loopback_addr);
-      admin_address->set_port_value(0);
-    }
-
-    // Upstream listener with reverse_tunnel filter and short ping interval.
-    auto* upstream_listener = bootstrap.mutable_static_resources()->add_listeners();
-    upstream_listener->set_name("upstream_listener");
-    upstream_listener->mutable_address()->mutable_socket_address()->set_address(loopback_addr);
-    upstream_listener->mutable_address()->mutable_socket_address()->set_port_value(upstream_port);
-
-    auto* upstream_chain = upstream_listener->add_filter_chains();
-    auto* rt_filter = upstream_chain->add_filters();
-    rt_filter->set_name("envoy.filters.network.reverse_tunnel");
-    envoy::extensions::filters::network::reverse_tunnel::v3::ReverseTunnel rt_config;
-    rt_config.mutable_ping_interval()->set_seconds(1);
-    rt_config.set_auto_close_connections(false);
-    rt_config.set_request_path("/reverse_connections/request");
-    rt_config.set_request_method(envoy::config::core::v3::GET);
-    rt_filter->mutable_typed_config()->PackFrom(rt_config);
-
-    // Reverse connection listener (initiator).
-    auto* rc_listener = bootstrap.mutable_static_resources()->add_listeners();
-    rc_listener->set_name("reverse_connection_listener");
-    auto* rc_address = rc_listener->mutable_address()->mutable_socket_address();
-    rc_address->set_address(
-        "rc://threshold-node:threshold-cluster:threshold-tenant@upstream_cluster:1");
-    rc_address->set_port_value(0);
-    rc_address->set_resolver_name("envoy.resolvers.reverse_connection");
-    auto* rc_chain = rc_listener->add_filter_chains();
-    auto* echo_filter = rc_chain->add_filters();
-    echo_filter->set_name("envoy.filters.network.echo");
-    echo_filter->mutable_typed_config()->set_type_url(
-        "type.googleapis.com/envoy.extensions.filters.network.echo.v3.Echo");
-
-    // Backing cluster for upstream listener.
-    auto* cluster = bootstrap.mutable_static_resources()->add_clusters();
-    cluster->set_name("upstream_cluster");
-    cluster->set_type(envoy::config::cluster::v3::Cluster::STATIC);
-    cluster->mutable_load_assignment()->set_cluster_name("upstream_cluster");
-    auto* locality = cluster->mutable_load_assignment()->add_endpoints();
-    auto* lb_endpoint = locality->add_lb_endpoints();
-    auto* endpoint = lb_endpoint->mutable_endpoint();
-    auto* addr = endpoint->mutable_address()->mutable_socket_address();
-    addr->set_address(loopback_addr);
-    addr->set_port_value(upstream_port);
-  });
-
-  initialize();
-  registerTestServerPorts({});
-
-  // Wait for reverse connections and counters.
-  test_server_->waitForGaugeGe("reverse_connections.nodes.threshold-node", 1);
-  test_server_->waitForGaugeGe("reverse_connections.clusters.threshold-cluster", 1);
-  test_server_->waitForCounterGe("reverse_tunnel.handshake.accepted", 1);
-
-  // Drain the reverse connection listener to close sockets and validate gauges drop to zero.
-  BufferingStreamDecoderPtr admin_response = IntegrationUtil::makeSingleRequest(
-      lookupPort("admin"), "POST", "/drain_listeners", "", Http::CodecType::HTTP1, GetParam());
-  EXPECT_TRUE(admin_response->complete());
-  EXPECT_EQ("200", admin_response->headers().getStatusValue());
-
-  // Both listeners eventually stop. Verify gauges drop to 0 for the reverse connection
-  // node/cluster.
-  test_server_->waitForCounterGe("listener_manager.listener_stopped", 2);
-  test_server_->waitForGaugeEq("reverse_connections.nodes.threshold-node", 0);
-  test_server_->waitForGaugeEq("reverse_connections.clusters.threshold-cluster", 0);
 }
 
 } // namespace

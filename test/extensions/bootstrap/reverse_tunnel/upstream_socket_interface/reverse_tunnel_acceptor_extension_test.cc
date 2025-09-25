@@ -10,6 +10,7 @@
 #include "test/mocks/server/factory_context.h"
 #include "test/mocks/stats/mocks.h"
 #include "test/mocks/thread_local/mocks.h"
+#include "test/test_common/logging.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -75,6 +76,9 @@ protected:
 
   NiceMock<Event::MockDispatcher> another_dispatcher_{"worker_1"};
   std::shared_ptr<UpstreamSocketThreadLocal> another_thread_local_registry_;
+
+  // Set log level to debug for this test class.
+  LogLevelSetter log_level_setter_ = LogLevelSetter(spdlog::level::debug);
 };
 
 TEST_F(ReverseTunnelAcceptorExtensionTest, InitializeWithDefaultStatPrefix) {
@@ -386,6 +390,44 @@ TEST_F(ReverseTunnelAcceptorExtensionTest, MissThresholdOneMarksDeadOnFirstInval
   // With threshold=1, the socket should be marked dead immediately.
   auto retrieved = socket_manager->getConnectionSocket(node_id);
   EXPECT_EQ(retrieved, nullptr);
+}
+
+TEST_F(ReverseTunnelAcceptorExtensionTest, PingFailureThresholdConfiguration) {
+  // Test default threshold value
+  EXPECT_EQ(extension_->pingFailureThreshold(), 3); // Default threshold should be 3.
+
+  // Create extension with custom threshold = 5
+  envoy::extensions::bootstrap::reverse_tunnel::upstream_socket_interface::v3::
+      UpstreamReverseConnectionSocketInterface custom_config;
+  custom_config.set_stat_prefix("test_custom");
+  custom_config.mutable_ping_failure_threshold()->set_value(5);
+
+  auto custom_extension =
+      std::make_unique<ReverseTunnelAcceptorExtension>(*socket_interface_, context_, custom_config);
+
+  EXPECT_EQ(custom_extension->pingFailureThreshold(), 5);
+
+  // Test threshold = 1 (minimum value)
+  envoy::extensions::bootstrap::reverse_tunnel::upstream_socket_interface::v3::
+      UpstreamReverseConnectionSocketInterface min_config;
+  min_config.set_stat_prefix("test_min");
+  min_config.mutable_ping_failure_threshold()->set_value(1);
+
+  auto min_extension =
+      std::make_unique<ReverseTunnelAcceptorExtension>(*socket_interface_, context_, min_config);
+
+  EXPECT_EQ(min_extension->pingFailureThreshold(), 1);
+
+  // Test very high threshold
+  envoy::extensions::bootstrap::reverse_tunnel::upstream_socket_interface::v3::
+      UpstreamReverseConnectionSocketInterface max_config;
+  max_config.set_stat_prefix("test_max");
+  max_config.mutable_ping_failure_threshold()->set_value(100);
+
+  auto max_extension =
+      std::make_unique<ReverseTunnelAcceptorExtension>(*socket_interface_, context_, max_config);
+
+  EXPECT_EQ(max_extension->pingFailureThreshold(), 100);
 }
 
 TEST_F(ReverseTunnelAcceptorExtensionTest, FactoryName) {
