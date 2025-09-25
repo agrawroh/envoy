@@ -10,11 +10,11 @@ services:
     networks:
       - envoy-network
 
-  on-prem-envoy:
+  downstream-envoy:
     image: debug/envoy:latest
     volumes:
-      - ./initiator-envoy.yaml:/etc/on-prem-envoy.yaml
-    command: envoy -c /etc/on-prem-envoy.yaml --concurrency 1 -l trace --drain-time-s 3
+      - ./initiator-envoy.yaml:/etc/downstream-envoy.yaml
+    command: envoy -c /etc/downstream-envoy.yaml --concurrency 1 -l trace --drain-time-s 3
     ports:
       # Admin interface
       - "8888:8888"
@@ -28,18 +28,18 @@ services:
       - envoy-network
     depends_on:
       - xds-server
-      - on-prem-service
+      - downstream-service
 
-  on-prem-service:
+  downstream-service:
     image: nginxdemos/hello:plain-text
     networks:
       - envoy-network
 
-  cloud-envoy:
+  upstream-envoy:
     image: debug/envoy:latest
     volumes:
-      - ./responder-envoy.yaml:/etc/responder-envoy.yaml
-    command: envoy -c /etc/responder-envoy.yaml --concurrency 1 -l trace --drain-time-s 3
+      - ./responder-envoy.yaml:/etc/upstream-envoy.yaml
+    command: envoy -c /etc/upstream-envoy.yaml --concurrency 1 -l trace --drain-time-s 3
     ports:
       # Admin interface
       - "8889:8888"

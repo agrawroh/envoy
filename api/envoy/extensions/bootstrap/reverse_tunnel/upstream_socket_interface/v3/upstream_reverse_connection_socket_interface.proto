@@ -3,8 +3,9 @@ syntax = "proto3";
 package envoy.extensions.bootstrap.reverse_tunnel.upstream_socket_interface.v3;
 
 import "google/protobuf/wrappers.proto";
-import "validate/validate.proto";
+
 import "udpa/annotations/status.proto";
+import "validate/validate.proto";
 
 option java_package = "io.envoyproxy.envoy.extensions.bootstrap.reverse_tunnel.upstream_socket_interface.v3";
 option java_outer_classname = "UpstreamReverseConnectionSocketInterfaceProto";
@@ -22,5 +23,5 @@ message UpstreamReverseConnectionSocketInterface {
 
   // Number of consecutive ping failures before an idle reverse connection socket is marked dead.
   // Defaults to 3 if unset. Must be at least 1.
-  google.protobuf.UInt32Value ping_failure_threshold = 2 [(validate.rules).uint32 = { gte: 1 }];
+  google.protobuf.UInt32Value ping_failure_threshold = 2 [(validate.rules).uint32 = {gte: 1}];
 }
