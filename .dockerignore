@@ -1,10 +1,12 @@
 /*
 !/VERSION.txt
 !/build_envoy
+!/build_envoy_debug
 !/ci
 !/distribution/docker
 !/configs/google-vrp
 !/configs/*yaml
+!/linux/amd64/build_envoy_debug
 !/linux/amd64/release.tar.zst
 !/linux/amd64/schema_validator_tool
 !/linux/amd64/router_check_tool

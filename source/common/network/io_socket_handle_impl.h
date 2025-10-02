@@ -75,7 +75,12 @@ public:
   void activateFileEvents(uint32_t events) override;
   void enableFileEvents(uint32_t events) override;
 
-  void resetFileEvents() override { file_event_.reset(); }
+  void resetFileEvents() override {
+    ENVOY_LOG_MISC(debug, "IoSocketHandleImpl::resetFileEvents() called for fd={}, file_event_={}",
+                   fd_, file_event_ ? "not_null" : "null");
+    file_event_.reset();
+    ENVOY_LOG_MISC(debug, "IoSocketHandleImpl::resetFileEvents() completed for fd={}", fd_);
+  }
 
   Api::SysCallIntResult shutdown(int how) override;
 

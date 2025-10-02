@@ -87,10 +87,11 @@ ConnectionImpl::ConnectionImpl(Event::Dispatcher& dispatcher, ConnectionSocketPt
       write_buffer_above_high_watermark_(false), detect_early_close_(true),
       enable_half_close_(false), read_end_stream_raised_(false), read_end_stream_(false),
       write_end_stream_(false), current_write_end_stream_(false), dispatch_buffered_data_(false),
-      transport_wants_read_(false),
+      transport_wants_read_(false), reuse_socket_(false),
       enable_close_through_filter_manager_(Runtime::runtimeFeatureEnabled(
           "envoy.reloadable_features.connection_close_through_filter_manager")) {
 
+  ENVOY_CONN_LOG(debug, "ConnectionImpl constructor called", *this);
   if (!socket_->isOpen()) {
     IS_ENVOY_BUG("Client socket failure");
     return;
@@ -103,9 +104,15 @@ ConnectionImpl::ConnectionImpl(Event::Dispatcher& dispatcher, ConnectionSocketPt
 
   // We never ask for both early close and read at the same time. If we are reading, we want to
   // consume all available data.
+  ENVOY_CONN_LOG(
+      debug, "Initializing file event with callback that captures this={}, connection_id={}, fd={}",
+      *this, static_cast<void*>(this), id(), socket_->ioHandle().fdDoNotUse());
+
   socket_->ioHandle().initializeFileEvent(
       dispatcher_,
       [this](uint32_t events) {
+        ENVOY_CONN_LOG(debug, "File event callback ENTRY - this={}, connection_id={}, events={}",
+                       *this, static_cast<void*>(this), id(), events);
         onFileEvent(events);
         return absl::OkStatus();
       },
@@ -147,6 +154,12 @@ void ConnectionImpl::removeReadFilter(ReadFilterSharedPtr filter) {
 bool ConnectionImpl::initializeReadFilters() { return filter_manager_.initializeReadFilters(); }
 
 void ConnectionImpl::close(ConnectionCloseType type) {
+  ENVOY_CONN_LOG(
+      debug,
+      "ConnectionImpl::close() ENTRY - this={}, type={}, connection_id={}, fd={}, socket_isOpen={}",
+      *this, static_cast<void*>(this), static_cast<int>(type), id(),
+      socket_ ? socket_->ioHandle().fdDoNotUse() : -1, socket_ ? socket_->isOpen() : false);
+
   if (!socket_->isOpen()) {
     ENVOY_CONN_LOG_EVENT(debug, "connection_closing", "Not closing conn, socket is not open",
                          *this);
@@ -190,7 +203,12 @@ void ConnectionImpl::closeInternal(ConnectionCloseType type) {
     if (data_to_write > 0 && type != ConnectionCloseType::Abort) {
       // We aren't going to wait to flush, but try to write as much as we can if there is pending
       // data.
-      transport_socket_->doWrite(*write_buffer_, true);
+      if (reuse_socket_) {
+        // Don't close connection socket in case of reversed connection.
+        transport_socket_->doWrite(*write_buffer_, false);
+      } else {
+        transport_socket_->doWrite(*write_buffer_, true);
+      }
     }
 
     if (type != ConnectionCloseType::FlushWriteAndDelay || !delayed_close_timeout_set) {
@@ -288,10 +306,12 @@ void ConnectionImpl::setDetectedCloseType(DetectedCloseType close_type) {
 }
 
 void ConnectionImpl::closeThroughFilterManager(ConnectionCloseAction close_action) {
+  ENVOY_LOG_MISC(debug, "ConnectionImpl: closeThroughFilterManager() called.");
   if (!socket_->isOpen()) {
+    ENVOY_LOG_MISC(debug, "socket is not open");
     return;
   }
-
+  ENVOY_LOG_MISC(debug, "socket is open");
   if (!enable_close_through_filter_manager_) {
     ENVOY_CONN_LOG(trace, "connection is closing not through the filter manager", *this);
     closeConnection(close_action);
@@ -303,6 +323,9 @@ void ConnectionImpl::closeThroughFilterManager(ConnectionCloseAction close_actio
 }
 
 void ConnectionImpl::closeSocket(ConnectionEvent close_type) {
+  ENVOY_CONN_LOG(trace, "closeSocket called, socket_={}, socket_isOpen={}", *this,
+                 socket_ ? "not_null" : "null", socket_ ? socket_->isOpen() : false);
+
   if (!socket_->isOpen()) {
     ENVOY_CONN_LOG(trace, "closeSocket: socket is not open, returning", *this);
     return;
@@ -315,7 +338,12 @@ void ConnectionImpl::closeSocket(ConnectionEvent close_type) {
   }
 
   ENVOY_CONN_LOG(debug, "closing socket: {}", *this, static_cast<uint32_t>(close_type));
-  transport_socket_->closeSocket(close_type);
+
+  // Don't close the socket transport if this is a reused connection
+  if (!reuse_socket_) {
+    ENVOY_CONN_LOG(debug, "closing socket transport_socket_", *this);
+    transport_socket_->closeSocket(close_type);
+  }
 
   // Drain input and output buffers.
   updateReadBufferStats(0, 0);
@@ -424,7 +452,8 @@ void ConnectionImpl::onRead(uint64_t read_buffer_size) {
     }
     read_end_stream_raised_ = true;
   }
-
+  ENVOY_CONN_LOG(debug, "calling filter_manager_.onRead() - connection_id={}, fd={}", *this, id(),
+                 socket_->ioHandle().fdDoNotUse());
   filter_manager_.onRead();
 }
 
@@ -655,7 +684,7 @@ void ConnectionImpl::setFailureReason(absl::string_view failure_reason) {
 
 void ConnectionImpl::onFileEvent(uint32_t events) {
   ScopeTrackerScopeState scope(this, this->dispatcher_);
-  ENVOY_CONN_LOG(trace, "socket event: {}", *this, events);
+  ENVOY_CONN_LOG(debug, "onFileEvent() ENTRY", *this);
 
   if (immediate_error_event_ == ConnectionEvent::LocalClose ||
       immediate_error_event_ == ConnectionEvent::RemoteClose) {
@@ -694,12 +723,27 @@ void ConnectionImpl::onFileEvent(uint32_t events) {
 
   // It's possible for a write event callback to close the socket (which will cause fd_ to be -1).
   // In this case ignore read event processing.
+  ENVOY_CONN_LOG(debug, "onFileEvent() read check - socket_isOpen={}, readEvent={}, fd={}", *this,
+                 socket_ ? socket_->isOpen() : false,
+                 (events & Event::FileReadyType::Read) ? "true" : "false",
+                 socket_ ? socket_->ioHandle().fdDoNotUse() : -1);
+
   if (socket_->isOpen() && (events & Event::FileReadyType::Read)) {
+    ENVOY_CONN_LOG(debug, "onFileEvent() calling onReadReady() - connection_id={}, fd={}", *this,
+                   id(), socket_->ioHandle().fdDoNotUse());
     onReadReady();
+  } else {
+    ENVOY_CONN_LOG(debug,
+                   "onFileEvent() NOT calling onReadReady() - socket_={}, isOpen={}, readEvent={}",
+                   *this, socket_ ? "not_null" : "null", socket_ ? socket_->isOpen() : false,
+                   (events & Event::FileReadyType::Read) ? "true" : "false");
   }
 }
 
 void ConnectionImpl::onReadReady() {
+  ENVOY_CONN_LOG(debug, "onReadReady() ENTRY - socket_={}, state={}, id={}", *this,
+                 socket_ ? "not_null" : "null", static_cast<int>(state()), id());
+
   ENVOY_CONN_LOG(trace, "read ready. dispatch_buffered_data={}", *this,
                  static_cast<int>(dispatch_buffered_data_));
   const bool latched_dispatch_buffered_data = dispatch_buffered_data_;
@@ -728,7 +772,9 @@ void ConnectionImpl::onReadReady() {
     }
     return;
   }
-
+  ENVOY_CONN_LOG(debug,
+                 "onReadReady() calling transport_socket_->doRead() - connection_id={}, fd={}",
+                 *this, id(), socket_->ioHandle().fdDoNotUse());
   // Clear transport_wants_read_ just before the call to doRead. This is the only way to ensure that
   // the transport socket read resumption happens as requested; onReadReady() returns early without
   // reading from the transport if the read buffer is above high watermark at the start of the
@@ -737,7 +783,9 @@ void ConnectionImpl::onReadReady() {
   IoResult result = transport_socket_->doRead(*read_buffer_);
   uint64_t new_buffer_size = read_buffer_->length();
   updateReadBufferStats(result.bytes_processed_, new_buffer_size);
-
+  ENVOY_CONN_LOG(debug,
+                 "onReadReady() transport_socket_->doRead() returned - connection_id={}, fd={}",
+                 *this, id(), socket_->ioHandle().fdDoNotUse());
   // The socket is closed immediately when receiving RST.
   if (result.err_code_.has_value() &&
       result.err_code_ == Api::IoError::IoErrorCode::ConnectionReset) {
@@ -764,6 +812,8 @@ void ConnectionImpl::onReadReady() {
   }
 
   read_end_stream_ |= result.end_stream_read_;
+  ENVOY_CONN_LOG(debug, "calling onRead() - connection_id={}, fd={}", *this, id(),
+                 socket_->ioHandle().fdDoNotUse());
   if (result.bytes_processed_ != 0 || result.end_stream_read_ ||
       (latched_dispatch_buffered_data && read_buffer_->length() > 0)) {
     // Skip onRead if no bytes were processed unless we explicitly want to force onRead for
@@ -771,7 +821,8 @@ void ConnectionImpl::onReadReady() {
     // more data.
     onRead(new_buffer_size);
   }
-
+  ENVOY_CONN_LOG(debug, "onRead() returned - connection_id={}, fd={}", *this, id(),
+                 socket_->ioHandle().fdDoNotUse());
   // The read callback may have already closed the connection.
   if (result.action_ == PostIoAction::Close || bothSidesHalfClosed()) {
     ENVOY_CONN_LOG(debug, "remote close", *this);

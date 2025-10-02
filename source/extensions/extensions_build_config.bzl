@@ -27,6 +27,7 @@ EXTENSIONS = {
     "envoy.clusters.strict_dns":                        "//source/extensions/clusters/strict_dns:strict_dns_cluster_lib",
     "envoy.clusters.original_dst":                      "//source/extensions/clusters/original_dst:original_dst_cluster_lib",
     "envoy.clusters.logical_dns":                       "//source/extensions/clusters/logical_dns:logical_dns_cluster_lib",
+    "envoy.clusters.reverse_connection":                "//source/extensions/clusters/reverse_connection:reverse_connection_lib",
 
     #
     # Compression
@@ -212,6 +213,7 @@ EXTENSIONS = {
     #       configured on the listener. Do not remove it in that case or configs will fail to load.
     "envoy.filters.listener.proxy_protocol":            "//source/extensions/filters/listener/proxy_protocol:config",
     "envoy.filters.listener.tls_inspector":             "//source/extensions/filters/listener/tls_inspector:config",
+    "envoy.filters.listener.reverse_connection":        "//source/extensions/filters/listener/reverse_connection:config_factory_lib",
 
     #
     # Network filters

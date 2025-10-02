@@ -93,7 +93,7 @@ public:
   absl::optional<UnixDomainSocketPeerCredentials> unixSocketPeerCredentials() const override;
   Ssl::ConnectionInfoConstSharedPtr ssl() const override {
     // SSL info may be overwritten by a filter in the provider.
-    return socket_->connectionInfoProvider().sslConnection();
+    return (socket_ != nullptr) ? socket_->connectionInfoProvider().sslConnection() : nullptr;
   }
   State state() const override;
   bool connecting() const override {
@@ -174,6 +174,10 @@ protected:
   // socket. If the read count is greater than one, or equal to one when the buffer is not overrun,
   // then the filter chain has called readDisable, and does not want additional data.
   bool filterChainWantsData();
+
+  // Cleans up the connection resources without closing the socket.
+  // Used when transferring socket ownership for reverse connections.
+  // void cleanUpConnectionImpl();
 
   // Network::ConnectionImplBase
   void closeConnectionImmediately() final;
@@ -263,6 +267,11 @@ private:
   // read_disable_count_ == 0 to ensure that read resumption happens when remaining bytes are held
   // in transport socket internal buffers.
   bool transport_wants_read_ : 1;
+
+  // Used on the responder envoy to mark an active connection accepted by a listener which will
+  // be used as a reverse connection. The socket for such a connection is closed upon draining
+  // of the owning listener.
+  bool reuse_socket_ : 1;
   bool enable_close_through_filter_manager_ : 1;
 };
 
@@ -304,9 +313,13 @@ public:
                        Network::TransportSocketPtr&& transport_socket,
                        const Network::ConnectionSocket::OptionsSharedPtr& options,
                        const Network::TransportSocketOptionsConstSharedPtr& transport_options);
+  // Method to create client connection from downstream connection
+  ClientConnectionImpl(Event::Dispatcher& dispatcher,
+                       Network::TransportSocketPtr&& transport_socket,
+                       Network::ConnectionSocketPtr&& downstream_socket);
 
   // Network::ClientConnection
-  void connect() override;
+  virtual void connect() override;
 
 private:
   void onConnected() override;

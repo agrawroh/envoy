@@ -589,6 +589,7 @@ public:
       os << spaces << "TcpProxy " << this << DUMP_MEMBER(streamId()) << "\n";
       DUMP_DETAILS(parent_->getStreamInfo().upstreamInfo());
     }
+
     Filter* parent_{};
     Http::RequestTrailerMapPtr request_trailer_map_;
     std::shared_ptr<Http::NullRouteImpl> route_;

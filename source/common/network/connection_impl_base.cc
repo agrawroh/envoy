@@ -63,6 +63,7 @@ void ConnectionImplBase::raiseConnectionEvent(ConnectionEvent event) {
     }
 
     if (callback != nullptr) {
+      ENVOY_LOG_MISC(debug, "ConnectionImplBase: calling onEvent()");
       callback->onEvent(event);
     }
   }

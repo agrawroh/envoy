@@ -209,14 +209,18 @@ protected:
     dispatcher_->run(Event::Dispatcher::RunType::Block);
   }
 
-  void disconnect(bool wait_for_remote_close) {
+  void disconnect(bool wait_for_remote_close, bool client_socket_closed = false) {
     if (client_write_buffer_) {
       EXPECT_CALL(*client_write_buffer_, drain(_))
           .Times(AnyNumber())
           .WillRepeatedly(
               Invoke([&](uint64_t size) -> void { client_write_buffer_->baseDrain(size); }));
     }
-    EXPECT_CALL(client_callbacks_, onEvent(ConnectionEvent::LocalClose));
+    // client_socket_closed is set when the client socket has been moved,
+    // and the LocalClose won't be raised.
+    if (!client_socket_closed) {
+      EXPECT_CALL(client_callbacks_, onEvent(ConnectionEvent::LocalClose));
+    }
     client_connection_->close(ConnectionCloseType::NoFlush);
     if (wait_for_remote_close) {
       EXPECT_CALL(server_callbacks_, onEvent(ConnectionEvent::RemoteClose))
