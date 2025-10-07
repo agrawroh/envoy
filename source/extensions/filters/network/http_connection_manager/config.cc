@@ -738,6 +738,56 @@ HttpConnectionManagerConfig::HttpConnectionManagerConfig(
       helper.processFilters(config.http_filters(), "http", "http", filter_factories_),
       creation_status);
 
+  // Parse named HTTP filter chains if configured.
+  for (const auto& filter_chain : config.http_filter_chains()) {
+    if (filter_chain.name().empty()) {
+      creation_status = absl::InvalidArgumentError("HTTP filter chain name cannot be empty.");
+      return;
+    }
+    if (named_filter_chain_factories_.contains(filter_chain.name())) {
+      creation_status = absl::InvalidArgumentError(
+          fmt::format("Duplicate HTTP filter chain name: '{}'", filter_chain.name()));
+      return;
+    }
+    FilterFactoriesList chain_factories;
+    SET_AND_RETURN_IF_NOT_OK(
+        helper.processFilters(filter_chain.http_filters(), "http", "http", chain_factories),
+        creation_status);
+    named_filter_chain_factories_[filter_chain.name()] = std::move(chain_factories);
+  }
+
+  // Create matcher tree if http_filter_chain_matcher is configured.
+  if (config.has_http_filter_chain_matcher()) {
+    if (config.http_filter_chains().empty()) {
+      creation_status = absl::InvalidArgumentError(
+          "http_filter_chain_matcher is configured but no http_filter_chains are defined.");
+      return;
+    }
+
+    // Create validation visitor.
+    Http::FilterChainMatcher::HttpFilterChainMatchTreeValidationVisitor validation_visitor;
+
+    // Create matcher factory.
+    Matcher::MatchTreeFactory<Http::FilterChainMatcher::HttpFilterChainMatchingData,
+                              Http::FilterChainMatcher::HttpFilterChainActionFactoryContext>
+        matcher_factory(context_.serverFactoryContext(), context_.serverFactoryContext(),
+                        validation_visitor);
+
+    // Create matcher tree factory callback.
+    auto factory_cb = matcher_factory.create(config.http_filter_chain_matcher());
+
+    // Check for validation errors.
+    if (!validation_visitor.errors().empty()) {
+      creation_status =
+          absl::InvalidArgumentError(fmt::format("HTTP filter chain matcher validation error: {}",
+                                                 validation_visitor.errors()[0].message()));
+      return;
+    }
+
+    // Instantiate the matcher tree.
+    filter_chain_matcher_ = factory_cb();
+  }
+
   for (const auto& upgrade_config : config.upgrade_configs()) {
     const std::string& name = upgrade_config.upgrade_type();
     const bool enabled = upgrade_config.has_enabled() ? upgrade_config.enabled().value() : true;
@@ -805,6 +855,50 @@ Http::ServerConnectionPtr HttpConnectionManagerConfig::createCodec(
         maxRequestHeadersCount(), headersWithUnderscoresAction(), overload_manager);
   }
   PANIC_DUE_TO_CORRUPT_ENUM;
+}
+
+const HttpConnectionManagerConfig::FilterFactoriesList*
+HttpConnectionManagerConfig::selectFilterChain(const Http::RequestHeaderMap& headers,
+                                               StreamInfo::StreamInfo& stream_info) const {
+  // If no matcher is configured, use the default filter chain.
+  if (!filter_chain_matcher_) {
+    return nullptr;
+  }
+
+  // Create matching data for the matcher.
+  Http::FilterChainMatcher::HttpFilterChainMatchingData matching_data(headers, stream_info);
+
+  // Evaluate the matcher.
+  auto match_result = Matcher::evaluateMatch<Http::FilterChainMatcher::HttpFilterChainMatchingData>(
+      *filter_chain_matcher_, matching_data);
+
+  // If no match, use the default filter chain.
+  if (!match_result.isMatch()) {
+    return nullptr;
+  }
+
+  // Get the action from the match result.
+  const auto& action = match_result.action();
+  if (!action) {
+    return nullptr;
+  }
+
+  // Cast to HttpFilterChainAction to get the filter chain name.
+  const auto* filter_chain_action =
+      dynamic_cast<const Http::FilterChainMatcher::HttpFilterChainAction*>(action.get());
+  if (!filter_chain_action) {
+    return nullptr;
+  }
+
+  // Look up the named filter chain.
+  auto it = named_filter_chain_factories_.find(std::string(filter_chain_action->name()));
+  if (it == named_filter_chain_factories_.end()) {
+    ENVOY_LOG(warn, "Matched filter chain name '{}' not found, using default",
+              filter_chain_action->name());
+    return nullptr;
+  }
+
+  return &it->second;
 }
 
 bool HttpConnectionManagerConfig::createFilterChain(Http::FilterChainManager& manager,

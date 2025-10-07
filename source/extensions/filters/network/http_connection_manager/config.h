@@ -28,11 +28,14 @@
 #include "source/common/http/date_provider_impl.h"
 #include "source/common/http/dependency_manager.h"
 #include "source/common/http/filter_chain_helper.h"
+#include "source/common/http/filter_chain_matcher/action.h"
+#include "source/common/http/filter_chain_matcher/matching_data.h"
 #include "source/common/http/http1/codec_stats.h"
 #include "source/common/http/http2/codec_stats.h"
 #include "source/common/http/http3/codec_stats.h"
 #include "source/common/json/json_loader.h"
 #include "source/common/local_reply/local_reply.h"
+#include "source/common/matcher/matcher.h"
 #include "source/common/network/cidr_range.h"
 #include "source/common/tracing/http_tracer_impl.h"
 #include "source/extensions/filters/network/common/factory_base.h"
@@ -150,6 +153,16 @@ public:
                                 const Http::FilterChainFactory::UpgradeMap* per_route_upgrade_map,
                                 Http::FilterChainManager& manager,
                                 const Http::FilterChainOptions& options) const override;
+
+  /**
+   * Select the appropriate filter chain based on request attributes.
+   * @param headers The request headers.
+   * @param stream_info The stream info.
+   * @return A pointer to the filter factories list to use, or nullptr if the default should be
+   * used.
+   */
+  const FilterFactoriesList* selectFilterChain(const Http::RequestHeaderMap& headers,
+                                               StreamInfo::StreamInfo& stream_info) const;
 
   // Http::ConnectionManagerConfig
   const Http::RequestIDExtensionSharedPtr& requestIDExtension() override {
@@ -294,6 +307,9 @@ private:
   Http::RequestIDExtensionSharedPtr request_id_extension_;
   Server::Configuration::FactoryContext& context_;
   FilterFactoriesList filter_factories_;
+  std::map<std::string, FilterFactoriesList> named_filter_chain_factories_;
+  Matcher::MatchTreeSharedPtr<Http::FilterChainMatcher::HttpFilterChainMatchingData>
+      filter_chain_matcher_;
   std::map<std::string, FilterConfig> upgrade_filter_factories_;
   AccessLog::InstanceSharedPtrVector access_logs_;
   bool flush_access_log_on_new_request_;

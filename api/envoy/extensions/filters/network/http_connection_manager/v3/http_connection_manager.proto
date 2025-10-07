@@ -12,9 +12,12 @@ import "envoy/config/core/v3/substitution_format_string.proto";
 import "envoy/config/route/v3/route.proto";
 import "envoy/config/route/v3/scoped_route.proto";
 import "envoy/config/trace/v3/http_tracer.proto";
+import "envoy/extensions/filters/network/http_connection_manager/v3/http_filter_chain_matcher.proto";
 import "envoy/type/http/v3/path_transformation.proto";
 import "envoy/type/tracing/v3/custom_tag.proto";
 import "envoy/type/v3/percent.proto";
+
+import "xds/type/matcher/v3/matcher.proto";
 
 import "google/protobuf/any.proto";
 import "google/protobuf/duration.proto";
@@ -37,7 +40,7 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 // HTTP connection manager :ref:`configuration overview <config_http_conn_man>`.
 // [#extension: envoy.filters.network.http_connection_manager]
 
-// [#next-free-field: 60]
+// [#next-free-field: 62]
 message HttpConnectionManager {
   option (udpa.annotations.versioning).previous_message_type =
       "envoy.config.filter.network.http_connection_manager.v2.HttpConnectionManager";
@@ -433,7 +436,104 @@ message HttpConnectionManager {
   // A list of individual HTTP filters that make up the filter chain for
   // requests made to the connection manager. :ref:`Order matters <arch_overview_http_filters_ordering>`
   // as the filters are processed sequentially as request events happen.
+  //
+  // .. note::
+  //
+  //   If :ref:`http_filter_chain_matcher
+  //   <envoy_v3_api_field_extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.http_filter_chain_matcher>`
+  //   is configured, this field is used as the default filter chain when no matcher matches.
+  //   If the matcher is not configured, this field specifies the only filter chain.
   repeated HttpFilter http_filters = 5;
+
+  // Optional list of named HTTP filter chains.
+  //
+  // These filter chains can be selected dynamically per-request using
+  // :ref:`http_filter_chain_matcher
+  // <envoy_v3_api_field_extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.http_filter_chain_matcher>`.
+  //
+  // Each filter chain must have a unique name. Filter chain names are referenced
+  // by the matcher's action to select which chain to use for a given request.
+  //
+  // Example configuration:
+  //
+  // .. code-block:: yaml
+  //
+  //   http_filter_chains:
+  //   - name: "api-chain"
+  //     http_filters:
+  //     - name: envoy.filters.http.rbac
+  //       typed_config: {...}
+  //     - name: envoy.filters.http.router
+  //       typed_config: {...}
+  //   - name: "storage-chain"
+  //     http_filters:
+  //     - name: envoy.filters.http.dynamic_forward_proxy
+  //       typed_config: {...}
+  //     - name: envoy.filters.http.router
+  //       typed_config: {...}
+  repeated HttpFilterChain http_filter_chains = 60;
+
+  // Optional matcher to select an HTTP filter chain based on request attributes.
+  //
+  // If configured, the matcher evaluates request attributes (such as headers, path, method,
+  // metadata, or filter state) to select a named filter chain from
+  // :ref:`http_filter_chains
+  // <envoy_v3_api_field_extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.http_filter_chains>`.
+  //
+  // If the matcher does not produce a match or if the matcher is not configured,
+  // the filter chain specified in
+  // :ref:`http_filters
+  // <envoy_v3_api_field_extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.http_filters>`
+  // is used as the default.
+  //
+  // The matcher action must be :ref:`HttpFilterChainAction
+  // <envoy_v3_api_msg_extensions.filters.network.http_connection_manager.v3.HttpFilterChainAction>`.
+  //
+  // Available inputs for matching include:
+  //
+  // * :ref:`HttpRequestHeaderMatchInput
+  //   <envoy_v3_api_msg_extensions.filters.network.http_connection_manager.v3.HttpRequestHeaderMatchInput>` -
+  //   Match on request headers
+  // * :ref:`HttpRequestMethodMatchInput
+  //   <envoy_v3_api_msg_extensions.filters.network.http_connection_manager.v3.HttpRequestMethodMatchInput>` -
+  //   Match on HTTP method
+  // * :ref:`HttpRequestPathMatchInput
+  //   <envoy_v3_api_msg_extensions.filters.network.http_connection_manager.v3.HttpRequestPathMatchInput>` -
+  //   Match on request path
+  // * :ref:`HttpRequestMetadataMatchInput
+  //   <envoy_v3_api_msg_extensions.filters.network.http_connection_manager.v3.HttpRequestMetadataMatchInput>` -
+  //   Match on dynamic or route metadata
+  // * :ref:`HttpRequestFilterStateMatchInput
+  //   <envoy_v3_api_msg_extensions.filters.network.http_connection_manager.v3.HttpRequestFilterStateMatchInput>` -
+  //   Match on filter state
+  //
+  // .. note::
+  //
+  //   All inputs refer to downstream request attributes. For example, ``HttpRequestHeaderMatchInput``
+  //   matches on headers from the downstream client, not headers sent to the upstream.
+  //
+  // Example configuration:
+  //
+  // .. code-block:: yaml
+  //
+  //   http_filter_chain_matcher:
+  //     matcher_list:
+  //       matchers:
+  //       - predicate:
+  //           single_predicate:
+  //             input:
+  //               name: request-path
+  //               typed_config:
+  //                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpRequestPathMatchInput
+  //             value_match:
+  //               prefix: "/api/"
+  //         on_match:
+  //           action:
+  //             name: http-filter-chain
+  //             typed_config:
+  //               "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpFilterChainAction
+  //               name: "api-chain"
+  xds.type.matcher.v3.Matcher http_filter_chain_matcher = 61;
 
   // Whether the connection manager manipulates the :ref:`config_http_conn_man_headers_user-agent`
   // and :ref:`config_http_conn_man_headers_downstream-service-cluster` headers. See the linked
@@ -1208,6 +1308,15 @@ message ScopedRds {
   // xdstp:// resource locator for scoped RDS collection.
   // [#not-implemented-hide:]
   string srds_resources_locator = 2;
+}
+
+// [#next-free-field: 3]
+message HttpFilterChain {
+  // The name of the filter chain. Must be unique within the HTTP connection manager configuration.
+  string name = 1 [(validate.rules).string = {min_len: 1}];
+
+  // The list of HTTP filters that make up this filter chain.
+  repeated HttpFilter http_filters = 2 [(validate.rules).repeated = {min_items: 1}];
 }
 
 // [#next-free-field: 8]

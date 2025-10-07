@@ -1,0 +1,132 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.network.http_connection_manager.v3;
+
+import "envoy/type/metadata/v3/metadata.proto";
+
+import "google/protobuf/wrappers.proto";
+
+import "envoy/annotations/deprecation.proto";
+import "udpa/annotations/status.proto";
+import "udpa/annotations/versioning.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.network.http_connection_manager.v3";
+option java_outer_classname = "HttpFilterChainMatcherProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3;http_connection_managerv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: HTTP filter chain matcher]
+
+// Specifies the segment of the matcher tree that describes the select HTTP filter chain based
+// on the request attributes.
+//
+// The action for the matcher is :ref:`HttpFilterChainAction
+// <envoy_v3_api_msg_extensions.filters.network.http_connection_manager.v3.HttpFilterChainAction>`.
+//
+// The inputs are:
+// * :ref:`HttpRequestHeaderMatchInput <envoy_v3_api_msg_extensions.filters.network.http_connection_manager.v3.HttpRequestHeaderMatchInput>`
+// * :ref:`HttpRequestMethodMatchInput <envoy_v3_api_msg_extensions.filters.network.http_connection_manager.v3.HttpRequestMethodMatchInput>`
+// * :ref:`HttpRequestPathMatchInput <envoy_v3_api_msg_extensions.filters.network.http_connection_manager.v3.HttpRequestPathMatchInput>`
+// * :ref:`HttpRequestMetadataMatchInput <envoy_v3_api_msg_extensions.filters.network.http_connection_manager.v3.HttpRequestMetadataMatchInput>`
+// * :ref:`HttpRequestFilterStateMatchInput <envoy_v3_api_msg_extensions.filters.network.http_connection_manager.v3.HttpRequestFilterStateMatchInput>`
+
+// [#next-free-field: 2]
+message HttpFilterChainAction {
+  // The name of the HTTP filter chain to use, as specified in the
+  // :ref:`http_filter_chains <envoy_v3_api_field_extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.http_filter_chains>`
+  // field.
+  string name = 1 [(validate.rules).string = {min_len: 1}];
+}
+
+// [#next-free-field: 2]
+message HttpRequestHeaderMatchInput {
+  // The request header name to match on.
+  //
+  // .. note::
+  //
+  //   This refers to the downstream request header, not the upstream request header.
+  string header_name = 1 [(validate.rules).string = {min_len: 1}];
+}
+
+// [#next-free-field: 1]
+message HttpRequestMethodMatchInput {
+  // Matches the HTTP request method (e.g., GET, POST, PUT).
+  //
+  // .. note::
+  //
+  //   This refers to the downstream request method.
+}
+
+// [#next-free-field: 1]
+message HttpRequestPathMatchInput {
+  // Matches the HTTP request path (the :path pseudo-header for HTTP/2 and HTTP/3).
+  //
+  // .. note::
+  //
+  //   This refers to the downstream request path.
+}
+
+// [#next-free-field: 3]
+message HttpRequestMetadataMatchInput {
+  // Metadata kind.
+  enum Kind {
+    // Dynamic metadata.
+    DYNAMIC = 0;
+    // Route metadata.
+    ROUTE = 1;
+  }
+
+  // The kind of metadata to match on.
+  Kind kind = 1 [(validate.rules).enum = {defined_only: true}];
+
+  // The metadata namespace and key path.
+  //
+  // For dynamic metadata, this specifies the filter name and key path within the metadata.
+  // For example, if the filter is ``envoy.filters.http.rbac`` and the key is ``shadow_effective_policy_id``,
+  // the metadata path would be ``envoy.filters.http.rbac`` as the filter name and
+  // ``shadow_effective_policy_id`` as the key path.
+  //
+  // For route metadata, this specifies the metadata namespace and key path.
+  //
+  // The metadata value is converted to a string for matching:
+  // * string values are used as-is
+  // * numeric values are converted to strings
+  // * boolean values are converted to "true" or "false"
+  // * null values are converted to "null"
+  // * struct and list values are not supported and will result in no match
+  //
+  // Example configuration to match on dynamic metadata:
+  //
+  // .. code-block:: yaml
+  //
+  //   kind: DYNAMIC
+  //   metadata_key:
+  //     key: envoy.filters.http.rbac
+  //     path:
+  //     - key: shadow_effective_policy_id
+  //
+  // Example configuration to match on route metadata:
+  //
+  // .. code-block:: yaml
+  //
+  //   kind: ROUTE
+  //   metadata_key:
+  //     key: custom.metadata
+  //     path:
+  //     - key: endpoint_type
+  envoy.type.metadata.v3.MetadataKey metadata_key = 2 [(validate.rules).message = {required: true}];
+}
+
+// [#next-free-field: 2]
+message HttpRequestFilterStateMatchInput {
+  // The filter state key to match on.
+  //
+  // The filter state value is converted to a string for matching.
+  //
+  // .. note::
+  //
+  //   This refers to the downstream request filter state.
+  string key = 1 [(validate.rules).string = {min_len: 1}];
+}

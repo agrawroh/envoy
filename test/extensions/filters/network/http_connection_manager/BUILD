@@ -95,3 +95,13 @@ envoy_extension_cc_test(
         "@envoy_api//envoy/extensions/filters/common/dependency/v3:pkg_cc_proto",
     ],
 )
+
+envoy_extension_cc_test(
+    name = "filter_chain_matcher_integration_test",
+    srcs = ["filter_chain_matcher_integration_test.cc"],
+    extension_names = ["envoy.filters.network.http_connection_manager"],
+    deps = [
+        "//test/test_common:utility_lib",
+        "@envoy_api//envoy/extensions/filters/network/http_connection_manager/v3:pkg_cc_proto",
+    ],
+)
