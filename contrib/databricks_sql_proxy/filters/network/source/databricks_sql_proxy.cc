@@ -65,9 +65,9 @@ void Filter::initializeReadFilterCallbacks(Network::ReadFilterCallbacks& callbac
 
   setHandshakeState(HandshakeState::Init);
 
-  ProtobufWkt::Value protocol_val;
+  Protobuf::Value protocol_val;
   protocol_val.set_string_value(DatabricksSqlProxyProto::Protocol_Name(config_->protocol()));
-  ProtobufWkt::Struct metadata;
+  Protobuf::Struct metadata;
   (*metadata.mutable_fields())[CommonConstants::PROTOCOL_KEY] = protocol_val;
   read_callbacks_->connection().streamInfo().setDynamicMetadata(
       NetworkFilterNames::get().DatabricksSqlProxy, metadata);
@@ -212,7 +212,7 @@ void Filter::callExternalAuthorizationService() {
       Protobuf::Map<std::string, std::string>()); // destination_labels
 
   sidecar_operation_ = SidecarOperation::CheckAuthorization;
-  ProtobufWkt::Struct metadata;
+  Protobuf::Struct metadata;
   (*metadata.mutable_fields())[CommonConstants::OPERATION_KEY].set_number_value(
       enumToInt(sidecar_operation_));
   read_callbacks_->connection().streamInfo().setDynamicMetadata(
@@ -243,7 +243,7 @@ void Filter::callExternalAuthorizationService() {
             .filterState()
             ->getDataReadOnly<Filters::Common::SetFilterState::HashableStringObject>(key);
     if (data != nullptr) {
-      ProtobufWkt::Value value;
+      Protobuf::Value value;
       value.set_string_value(data->asString());
       (*check_request_.mutable_attributes()
             ->mutable_metadata_context()
@@ -277,7 +277,7 @@ void Filter::storeMetadataInSidecar() {
       Protobuf::Map<std::string, std::string>()); // destination_labels
 
   sidecar_operation_ = SidecarOperation::StoreMetadata;
-  ProtobufWkt::Struct metadata;
+  Protobuf::Struct metadata;
   (*metadata.mutable_fields())[CommonConstants::OPERATION_KEY].set_number_value(
       enumToInt(sidecar_operation_));
   read_callbacks_->connection().streamInfo().setDynamicMetadata(
@@ -315,7 +315,7 @@ void Filter::onComplete(Filters::Common::ExtAuthz::ResponsePtr&& response) {
 
     // Add duration of call to dynamic metadata if applicable
     if (start_time_.has_value()) {
-      ProtobufWkt::Value ext_authz_duration_value;
+      Protobuf::Value ext_authz_duration_value;
       auto duration = read_callbacks_->connection().dispatcher().timeSource().monotonicTime() -
                       start_time_.value();
       ext_authz_duration_value.set_number_value(
@@ -591,9 +591,9 @@ void Filter::setHandshakeState(HandshakeState state) {
   handshake_state_ = state;
 
   // Set dynamic metadata to keep track of the handshake state for access log debugging.
-  ProtobufWkt::Value handshake_state_val;
+  Protobuf::Value handshake_state_val;
   handshake_state_val.set_number_value(static_cast<int>(state));
-  ProtobufWkt::Struct metadata;
+  Protobuf::Struct metadata;
   (*metadata.mutable_fields())[CommonConstants::HANDSHAKE_STATE_KEY] = handshake_state_val;
   read_callbacks_->connection().streamInfo().setDynamicMetadata(
       NetworkFilterNames::get().DatabricksSqlProxy, metadata);

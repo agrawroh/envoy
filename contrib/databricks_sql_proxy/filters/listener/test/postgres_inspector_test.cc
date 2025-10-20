@@ -29,7 +29,7 @@ namespace DatabricksSqlInspector {
 namespace {
 
 MATCHER_P(MapEq, rhs, "") {
-  const ProtobufWkt::Struct& obj = arg;
+  const Protobuf::Struct& obj = arg;
   EXPECT_TRUE(!rhs.empty());
   for (auto const& entry : rhs) {
     EXPECT_EQ(obj.fields().at(entry.first).string_value(), entry.second);
@@ -59,7 +59,7 @@ public:
     EXPECT_CALL(callbacks_, socket()).WillRepeatedly(ReturnRef(socket_));
     EXPECT_CALL(socket_, ioHandle()).WillRepeatedly(ReturnRef(io_handle_));
     ON_CALL(callbacks_, setDynamicMetadata(_, _))
-        .WillByDefault(Invoke([this](const std::string& name, const ProtobufWkt::Struct& obj) {
+        .WillByDefault(Invoke([this](const std::string& name, const Protobuf::Struct& obj) {
           (*metadata_.mutable_filter_metadata())[name].MergeFrom(obj);
         }));
   }

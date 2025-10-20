@@ -373,7 +373,7 @@ bool MySQLProxy::parseHandshakeResponse(Buffer::Instance& data) {
     const auto& existing_metadata = stream_info.dynamicMetadata().filter_metadata();
 
     // Create a new metadata struct
-    ProtobufWkt::Struct metadata;
+    Protobuf::Struct metadata;
 
     // Copy existing metadata if it exists
     auto it = existing_metadata.find(NetworkFilterNames::get().DatabricksSqlProxy);
@@ -382,7 +382,7 @@ bool MySQLProxy::parseHandshakeResponse(Buffer::Instance& data) {
     }
 
     // Get or create connection_string_options
-    ProtobufWkt::Struct connection_string_options;
+    Protobuf::Struct connection_string_options;
     if (metadata.fields().contains(CommonConstants::CONNECTION_STRING_OPTIONS_KEY)) {
       connection_string_options =
           metadata.fields().at(CommonConstants::CONNECTION_STRING_OPTIONS_KEY).struct_value();
@@ -411,7 +411,7 @@ bool MySQLProxy::parseHandshakeResponse(Buffer::Instance& data) {
     const auto& existing_metadata = stream_info.dynamicMetadata().filter_metadata();
 
     // Create a new metadata struct
-    ProtobufWkt::Struct metadata;
+    Protobuf::Struct metadata;
 
     // Copy existing metadata if it exists
     auto it = existing_metadata.find(NetworkFilterNames::get().DatabricksSqlProxy);
@@ -420,11 +420,11 @@ bool MySQLProxy::parseHandshakeResponse(Buffer::Instance& data) {
     }
 
     // Create a ListValue to hold the attributes
-    ProtobufWkt::ListValue attributes_list;
+    Protobuf::ListValue attributes_list;
 
     for (const auto& attr : connection_attributes) {
       // For each attribute, create a Struct with "key" and "value" fields
-      ProtobufWkt::Struct attr_struct;
+      Protobuf::Struct attr_struct;
       (*attr_struct.mutable_fields())["key"].set_string_value(attr.key);
       (*attr_struct.mutable_fields())["value"].set_string_value(attr.value);
 
@@ -767,11 +767,11 @@ void MySQLProxy::setConnectionMetadata(const std::string& username, const std::s
       debug, "mysql_proxy: setting connection metadata username: {}, workspace: {}, hostname: {}",
       read_callbacks_->connection(), username, workspace_id, hostname);
 
-  ProtobufWkt::Struct connection_string_options;
+  Protobuf::Struct connection_string_options;
   (*connection_string_options.mutable_fields())[CommonConstants::USERNAME_KEY].set_string_value(
       username);
 
-  ProtobufWkt::Struct metadata;
+  Protobuf::Struct metadata;
   (*metadata.mutable_fields())[CommonConstants::CONNECTION_STRING_OPTIONS_KEY]
       .mutable_struct_value()
       ->MergeFrom(connection_string_options);
@@ -840,7 +840,7 @@ void MySQLProxy::closeWithError(const std::string& message,
 void MySQLProxy::setUpstreamHandshakeState(UpstreamHandshakeState state) {
   upstream_handshake_state_ = state;
 
-  ProtobufWkt::Struct metadata;
+  Protobuf::Struct metadata;
   (*metadata.mutable_fields())[CommonConstants::UPSTREAM_HANDSHAKE_STATE_KEY].set_number_value(
       static_cast<int>(state));
   (*metadata.mutable_fields())[CommonConstants::CLIENT_CAPABILITIES_KEY].set_number_value(

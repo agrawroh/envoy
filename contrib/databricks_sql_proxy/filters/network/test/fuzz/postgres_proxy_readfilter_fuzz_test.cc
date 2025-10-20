@@ -33,7 +33,7 @@ makeAuthzResponse(Filters::Common::ExtAuthz::CheckStatus status) {
   response->status = status;
 
   std::string expected_target_cluster{"non_existent_cluster"};
-  ProtobufWkt::Value target_cluster_value;
+  Protobuf::Value target_cluster_value;
   target_cluster_value.set_string_value(expected_target_cluster);
   (*response->dynamic_metadata.mutable_fields())[CommonConstants::TARGET_CLUSTER_KEY] =
       target_cluster_value;
