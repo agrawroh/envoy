@@ -98,8 +98,8 @@ DEFINE_PROTO_FUZZER(const envoy::extensions::filters::network::test::fuzz::
 
   Filters::Common::ExtAuthz::Response ext_authz_response{};
   ext_authz_response.status = Filters::Common::ExtAuthz::CheckStatus::OK;
-  ProtobufWkt::Struct dynamic_metadata;
-  ProtobufWkt::Value target_cluster_value;
+  Protobuf::Struct dynamic_metadata;
+  Protobuf::Value target_cluster_value;
   target_cluster_value.set_string_value("some_target_cluster");
   (*ext_authz_response.dynamic_metadata.mutable_fields())[CommonConstants::TARGET_CLUSTER_KEY] =
       target_cluster_value;

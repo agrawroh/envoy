@@ -380,8 +380,8 @@ void DatabricksSqlProxyPostgresIntegrationTest::runEndToEndTest(
     envoy::service::auth::v3::CheckResponse check_response;
     check_response.mutable_status()->set_code(Grpc::Status::WellKnownGrpcStatus::Ok);
     std::string expected_target_cluster{"brickstore.database.databricks.com"};
-    ProtobufWkt::Struct dynamic_metadata;
-    ProtobufWkt::Value target_cluster_value;
+    Protobuf::Struct dynamic_metadata;
+    Protobuf::Value target_cluster_value;
     target_cluster_value.set_string_value(expected_target_cluster);
     (*check_response.mutable_dynamic_metadata()
           ->mutable_fields())[CommonConstants::TARGET_CLUSTER_KEY] = target_cluster_value;
@@ -804,8 +804,8 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, ExtAuthzReturnNotExistCluster)
   envoy::service::auth::v3::CheckResponse check_response;
   check_response.mutable_status()->set_code(Grpc::Status::WellKnownGrpcStatus::Ok);
   std::string expected_target_cluster{"non_existent_cluster"};
-  ProtobufWkt::Struct dynamic_metadata;
-  ProtobufWkt::Value target_cluster_value;
+  Protobuf::Struct dynamic_metadata;
+  Protobuf::Value target_cluster_value;
   target_cluster_value.set_string_value(expected_target_cluster);
   (*check_response.mutable_dynamic_metadata()
         ->mutable_fields())[CommonConstants::TARGET_CLUSTER_KEY] = target_cluster_value;
@@ -899,20 +899,20 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, CancellationRequest) {
   envoy::service::auth::v3::CheckResponse check_response;
   check_response.mutable_status()->set_code(Grpc::Status::WellKnownGrpcStatus::Ok);
   std::string expected_target_cluster{"brickstore.database.databricks.com"};
-  ProtobufWkt::Struct dynamic_metadata;
-  ProtobufWkt::Value target_cluster_value;
+  Protobuf::Struct dynamic_metadata;
+  Protobuf::Value target_cluster_value;
   target_cluster_value.set_string_value(expected_target_cluster);
   (*check_response.mutable_dynamic_metadata()
         ->mutable_fields())[CommonConstants::TARGET_CLUSTER_KEY] = target_cluster_value;
-  ProtobufWkt::Value upstream_ip;
+  Protobuf::Value upstream_ip;
   upstream_ip.set_string_value("10-20-30-40.hadron-compute.pod.cluster.local");
   (*check_response.mutable_dynamic_metadata()
         ->mutable_fields())[CommonConstants::OVERRIDE_UPSTREAM_SNI_KEY] = upstream_ip;
-  ProtobufWkt::Value cancellation_process_id;
+  Protobuf::Value cancellation_process_id;
   cancellation_process_id.set_number_value(process_id);
   (*check_response.mutable_dynamic_metadata()
         ->mutable_fields())[CommonConstants::CANCELLATION_PROCESS_ID_KEY] = cancellation_process_id;
-  ProtobufWkt::Value cancellation_secret_key;
+  Protobuf::Value cancellation_secret_key;
   cancellation_secret_key.set_number_value(secret_key);
   (*check_response.mutable_dynamic_metadata()
         ->mutable_fields())[CommonConstants::CANCELLATION_SECRET_KEY_KEY] = cancellation_secret_key;
@@ -1025,8 +1025,8 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, UpstreamDisconnectBeforePgAuth
   envoy::service::auth::v3::CheckResponse check_response;
   check_response.mutable_status()->set_code(Grpc::Status::WellKnownGrpcStatus::Ok);
   std::string expected_target_cluster{"brickstore.database.databricks.com"};
-  ProtobufWkt::Struct dynamic_metadata;
-  ProtobufWkt::Value target_cluster_value;
+  Protobuf::Struct dynamic_metadata;
+  Protobuf::Value target_cluster_value;
   target_cluster_value.set_string_value(expected_target_cluster);
   (*check_response.mutable_dynamic_metadata()
         ->mutable_fields())[CommonConstants::TARGET_CLUSTER_KEY] = target_cluster_value;
@@ -1185,8 +1185,8 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, DownstreamDisconnectBeforePgAu
   envoy::service::auth::v3::CheckResponse check_response;
   check_response.mutable_status()->set_code(Grpc::Status::WellKnownGrpcStatus::Ok);
   std::string expected_target_cluster{"brickstore.database.databricks.com"};
-  ProtobufWkt::Struct dynamic_metadata;
-  ProtobufWkt::Value target_cluster_value;
+  Protobuf::Struct dynamic_metadata;
+  Protobuf::Value target_cluster_value;
   target_cluster_value.set_string_value(expected_target_cluster);
   (*check_response.mutable_dynamic_metadata()
         ->mutable_fields())[CommonConstants::TARGET_CLUSTER_KEY] = target_cluster_value;

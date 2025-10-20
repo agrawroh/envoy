@@ -53,8 +53,8 @@ Network::FilterStatus Filter::onAccept(Network::ListenerFilterCallbacks& cb) {
   ENVOY_LOG(trace, "databricks_sql_inspector: onAccept");
 
   std::string metadata_key = Filter::name();
-  ProtobufWkt::Struct metadata((*cb.dynamicMetadata().mutable_filter_metadata())[metadata_key]);
-  ProtobufWkt::Value protocol_val;
+  Protobuf::Struct metadata((*cb.dynamicMetadata().mutable_filter_metadata())[metadata_key]);
+  Protobuf::Value protocol_val;
   protocol_val.set_string_value(envoy::extensions::filters::listener::databricks_sql_inspector::v3::
                                     DatabricksSqlInspector::Protocol_Name(config_->protocol()));
   (*metadata.mutable_fields())[CommonConstants::PROTOCOL_KEY] = protocol_val;
@@ -82,8 +82,8 @@ Network::FilterStatus Filter::onData(Network::ListenerFilterBuffer& buffer) {
 void Filter::setErrorMsgInDynamicMetadata(Network::ListenerFilterCallbacks& cb,
                                           const std::string& error_msg) {
   std::string metadata_key = Filter::name();
-  ProtobufWkt::Struct metadata((*cb.dynamicMetadata().mutable_filter_metadata())[metadata_key]);
-  ProtobufWkt::Value error_msg_val;
+  Protobuf::Struct metadata((*cb.dynamicMetadata().mutable_filter_metadata())[metadata_key]);
+  Protobuf::Value error_msg_val;
   error_msg_val.set_string_value(error_msg);
   (*metadata.mutable_fields())[CommonConstants::ERROR_MESSAGE_KEY] = error_msg_val;
   cb.setDynamicMetadata(metadata_key, metadata);

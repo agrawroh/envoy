@@ -309,7 +309,7 @@ void MySQLInspector::setShortHandshakeData(const Buffer::Instance& data, uint32_
         Envoy::Base64::encode(reinterpret_cast<const char*>(binary_data.data()), binary_data.size(),
                               /*add_padding=*/true);
 
-    ProtobufWkt::Struct metadata;
+    Protobuf::Struct metadata;
     (*metadata.mutable_fields())[CommonConstants::SHORT_HANDSHAKE_KEY].set_string_value(
         base64_data);
 

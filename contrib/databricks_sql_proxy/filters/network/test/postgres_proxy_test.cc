@@ -80,7 +80,7 @@ public:
       }
     }));
     ON_CALL(read_callbacks_.connection_.stream_info_, setDynamicMetadata(_, _))
-        .WillByDefault(Invoke([this](const std::string& name, const ProtobufWkt::Struct& obj) {
+        .WillByDefault(Invoke([this](const std::string& name, const Protobuf::Struct& obj) {
           (*read_callbacks_.connection_.stream_info_.metadata_.mutable_filter_metadata())[name]
               .MergeFrom(obj);
         }));
@@ -158,8 +158,8 @@ TEST_F(PostgresProxyTest, FullEndToEndWithSidecarService) {
   std::string expected_target_cluster{"some_target_cluster"};
   Filters::Common::ExtAuthz::Response response{};
   response.status = Filters::Common::ExtAuthz::CheckStatus::OK;
-  ProtobufWkt::Struct dynamic_metadata;
-  ProtobufWkt::Value target_cluster_value;
+  Protobuf::Struct dynamic_metadata;
+  Protobuf::Value target_cluster_value;
   target_cluster_value.set_string_value(expected_target_cluster);
   (*response.dynamic_metadata.mutable_fields())[CommonConstants::TARGET_CLUSTER_KEY] =
       target_cluster_value;
@@ -279,7 +279,7 @@ TEST_F(PostgresProxyTest, FullEndToEndWithSidecarService) {
                            const envoy::service::auth::v3::CheckRequest& request,
                            Tracing::Span& /*parent_span*/,
                            const StreamInfo::StreamInfo& /*stream_info*/) {
-        ProtobufWkt::Struct dynamic_metadata =
+        Protobuf::Struct dynamic_metadata =
             request.attributes().metadata_context().filter_metadata().at(
                 NetworkFilterNames::get().DatabricksSqlProxy);
         EXPECT_EQ(dynamic_metadata.fields()
@@ -542,8 +542,8 @@ TEST_F(PostgresProxyTest, HandleUpstreamDataSentSslRequestUpstreamState) {
   std::string expected_target_cluster{"some_target_cluster"};
   Filters::Common::ExtAuthz::Response response{};
   response.status = Filters::Common::ExtAuthz::CheckStatus::OK;
-  ProtobufWkt::Struct dynamic_metadata;
-  ProtobufWkt::Value target_cluster_value;
+  Protobuf::Struct dynamic_metadata;
+  Protobuf::Value target_cluster_value;
   target_cluster_value.set_string_value(expected_target_cluster);
   (*response.dynamic_metadata.mutable_fields())[CommonConstants::TARGET_CLUSTER_KEY] =
       target_cluster_value;
@@ -630,7 +630,7 @@ void PostgresProxyTest::runExtAuthzFailureTest(
 
   Filters::Common::ExtAuthz::Response response{};
   response.status = ext_auth_response;
-  ProtobufWkt::Struct dynamic_metadata;
+  Protobuf::Struct dynamic_metadata;
   (*dynamic_metadata.mutable_fields())[CommonConstants::REASON_PHRASE_KEY].set_string_value(
       reason_phrase);
   response.dynamic_metadata = dynamic_metadata;
@@ -754,7 +754,7 @@ TEST_F(PostgresProxyTest, OutputConnectionStringToDynamicMetadata) {
   auto& filter_meta =
       read_callbacks_.connection().streamInfo().dynamicMetadata().mutable_filter_metadata()->at(
           NetworkFilterNames::get().DatabricksSqlProxy);
-  Protobuf::Map<std::string, ProtobufWkt::Value> fields = filter_meta.fields();
+  Protobuf::Map<std::string, Protobuf::Value> fields = filter_meta.fields();
   // Should contain any connection_string_options
   EXPECT_FALSE(fields.contains("connection_string_options"));
 

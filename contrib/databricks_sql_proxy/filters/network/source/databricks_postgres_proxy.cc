@@ -144,7 +144,7 @@ bool PostgresProxy::processClientFirstMessage(Buffer::Instance& data) {
     uint32_t secret_key = cancellation_id & 0x00000000FFFFFFFF;
 
     // Need to convert the uint64_t to string to store in dynamic metadata so that we don't lose
-    // precision because the number_value in ProtobufWkt::Value only supports double (precision
+    // precision because the number_value in Protobuf::Value only supports double (precision
     // upto 2^53).
     std::string cancellation_id_str = std::to_string(cancellation_id);
     setDynamicMetadataString(CommonConstants::CANCELLATION_ID_KEY, cancellation_id_str);
@@ -249,7 +249,7 @@ void PostgresProxy::outputConnectionStringToDynamicMetadata(Buffer::Instance& da
     const Extensions::Common::SQLUtils::SQLUtils::DecoderAttributes attributes_ =
         absl::StrSplit(message, absl::ByChar('\0'));
     // Read connection string and copy them to Struct.
-    ProtobufWkt::Struct connection_string_options;
+    Protobuf::Struct connection_string_options;
     for (const auto& [key, value] : attributes_) {
       ENVOY_CONN_LOG(debug, "Connection String: Key: {}, Value: {}", read_callbacks_->connection(),
                      key, value);
@@ -258,7 +258,7 @@ void PostgresProxy::outputConnectionStringToDynamicMetadata(Buffer::Instance& da
     // Create another struct to wrap the connection_string_options to make sure that
     // there is no collision with other fields under the same namespace
     // (NetworkFilterNames::get().DatabricksSqlProxy)
-    ProtobufWkt::Struct metadata;
+    Protobuf::Struct metadata;
     (*metadata.mutable_fields())[CommonConstants::CONNECTION_STRING_OPTIONS_KEY]
         .mutable_struct_value()
         ->CopyFrom(connection_string_options);
@@ -644,7 +644,7 @@ void PostgresProxy::processBackendKeyDataMessage(Buffer::Instance& data) {
   if (config_->protoConfig().postgres_config().randomize_cancellation_key()) {
     uint64_t cancellation_id = Envoy::Random::RandomUtility::random();
     // Need to convert the uint64_t to string to store in dynamic metadata so that we don't lose
-    // precision because the number_value in ProtobufWkt::Value only supports double (precision
+    // precision because the number_value in Protobuf::Value only supports double (precision
     // upto 2^53).
     std::string cancellation_id_str = std::to_string(cancellation_id);
     setDynamicMetadataString(CommonConstants::CANCELLATION_ID_KEY, cancellation_id_str);
@@ -672,16 +672,16 @@ void PostgresProxy::processBackendKeyDataMessage(Buffer::Instance& data) {
 }
 
 void PostgresProxy::setDynamicMetadataNumber(const absl::string_view key, const int64_t value) {
-  ProtobufWkt::Struct metadata;
+  Protobuf::Struct metadata;
   (*metadata.mutable_fields())[key].set_number_value(value);
   read_callbacks_->connection().streamInfo().setDynamicMetadata(
       NetworkFilterNames::get().DatabricksSqlProxy, metadata);
 }
 
 void PostgresProxy::setDynamicMetadataString(const absl::string_view key, std::string& value) {
-  ProtobufWkt::Value proto_value;
+  Protobuf::Value proto_value;
   proto_value.set_string_value(value);
-  ProtobufWkt::Struct metadata;
+  Protobuf::Struct metadata;
   (*metadata.mutable_fields())[key] = proto_value;
   read_callbacks_->connection().streamInfo().setDynamicMetadata(
       NetworkFilterNames::get().DatabricksSqlProxy, metadata);
