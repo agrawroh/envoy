@@ -2,33 +2,16 @@ date: Pending
 
 behavior_changes:
 # *Changes that are expected to cause an incompatibility if applicable; deployment changes are likely required*
-- area: dynamic modules
-  change: |
-    The dynamic module ABI has been updated to support streaming body manipulation. This change also
-    fixed potential incorrect behavior when access or modify the request or response body. See
-    https://github.com/envoyproxy/envoy/issues/40918 for more details.
 
 minor_behavior_changes:
 # *Changes that may cause incompatibilities for some users, but should not for most*
 
 bug_fixes:
 # *Changes expected to improve the state of the world and are unlikely to have negative effects*
-- area: bootstrap
-  change: |
-    Fixed an issue where the custom
-    :ref:`header_prefix <envoy_v3_api_field_config.bootstrap.v3.Bootstrap.header_prefix>`
-    will result in crash at startup.
 
 removed_config_or_runtime:
 # *Normally occurs at the end of the* :ref:`deprecation period <deprecated>`
 
 new_features:
-- area: overload management
-  change: |
-    The fixed heap resource monitor can now calculate memory pressure as currently allocated memory divided by maximum heap size,
-    giving more accurate and lower memory pressure values.
-    This can avoid unnecessary load shedding or overload actions.
-    To enable, set ``envoy.reloadable_features.fixed_heap_use_allocated`` to true.
-    The default algorithm (heap_size - pageheap_unmapped - pageheap_free) does not discount for free memory in TCMalloc caches.
 
 deprecated:
