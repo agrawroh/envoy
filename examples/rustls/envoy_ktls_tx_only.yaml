@@ -1,0 +1,91 @@
+# Envoy configuration with kTLS TX-only mode for troubleshooting
+# This enables kTLS for encryption (TX) only, keeping decryption (RX) in userspace.
+
+static_resources:
+  listeners:
+  - name: listener_0
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 10000
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          codec_type: AUTO
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: backend
+              domains: ["*"]
+              routes:
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: secure_backend
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      
+      transport_socket:
+        name: envoy.transport_sockets.rustls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.rustls.v3.RustlsDownstreamTlsContext
+          common_tls_context:
+            tls_certificate:
+              certificate_chain:
+                filename: examples/rustls/certs/server-cert.pem
+              private_key:
+                filename: examples/rustls/certs/server-key.pem
+            alpn_protocols:
+            - h2
+            - http/1.1
+          # Enable kTLS for downstream (server) side with full TX+RX.
+          enable_ktls: true
+
+  clusters:
+  - name: secure_backend
+    connect_timeout: 5s
+    type: STRICT_DNS
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: secure_backend
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 8443
+    
+    transport_socket:
+      name: envoy.transport_sockets.rustls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.rustls.v3.RustlsUpstreamTlsContext
+        common_tls_context:
+          validation_context:
+            trusted_ca:
+              filename: examples/rustls/certs/ca-cert.pem
+            verify_subject_alt_name:
+            - localhost
+          
+          alpn_protocols:
+          - h2
+          - http/1.1
+        
+        sni: localhost
+        
+        # Enable kTLS for upstream (client) side but TX ONLY.
+        # This tests whether the EIO error is specific to RX kTLS.
+        enable_ktls: true
+        ktls_tx_only: true
+
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+
