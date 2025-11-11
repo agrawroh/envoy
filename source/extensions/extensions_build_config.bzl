@@ -599,6 +599,11 @@ EXTENSIONS = {
 
     # Dynamic mocules
     "envoy.filters.http.dynamic_modules":                      "//source/extensions/filters/http/dynamic_modules:factory_registration",
+
+    #
+    # Transport sockets - rustls
+    #
+    "envoy.transport_sockets.rustls":                          "//source/extensions/transport_sockets/rustls:config",
 }
 
 # These can be changed to ["//visibility:public"], for  downstream builds which
