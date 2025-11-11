@@ -1,0 +1,574 @@
+#![allow(non_camel_case_types)]
+
+use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
+use std::io::{Read, Write};
+use std::os::unix::io::{RawFd, FromRawFd};
+use std::sync::Arc;
+
+mod ktls;
+mod key_extraction;
+
+use ktls::{enable_ktls_rx, enable_ktls_tx};
+use key_extraction::{extract_client_keys, extract_server_keys};
+
+// Opaque handle types for C FFI.
+#[repr(C)]
+pub struct rustls_connection_handle {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct rustls_config_handle {
+    _private: [u8; 0],
+}
+
+// Result codes for C FFI.
+pub const RUSTLS_OK: i32 = 0;
+pub const RUSTLS_ERR_INVALID_PARAM: i32 = -1;
+pub const RUSTLS_ERR_IO: i32 = -2;
+pub const RUSTLS_ERR_HANDSHAKE: i32 = -3;
+pub const RUSTLS_ERR_CERTIFICATE: i32 = -4;
+pub const RUSTLS_ERR_KTLS_NOT_SUPPORTED: i32 = -5;
+
+// Internal connection state.
+enum Connection {
+    Client(Box<ClientConnection>),
+    Server(Box<ServerConnection>),
+    KtlsEnabled, // Connection consumed for kTLS offload.
+}
+
+struct RustlsConnection {
+    connection: Connection,
+    fd: RawFd,
+    ktls_tx_enabled: bool,
+    ktls_rx_enabled: bool,
+}
+
+struct RustlsConfig {
+    client_config: Option<Arc<ClientConfig>>,
+    server_config: Option<Arc<ServerConfig>>,
+}
+
+/// Creates a new client TLS configuration.
+///
+/// # Safety
+/// cert_pem and key_pem must be valid null-terminated C strings if provided.
+#[no_mangle]
+pub unsafe extern "C" fn rustls_client_config_new(
+    cert_pem: *const libc::c_char,
+    cert_len: usize,
+    key_pem: *const libc::c_char,
+    key_len: usize,
+    ca_pem: *const libc::c_char,
+    ca_len: usize,
+    alpn_protocols: *const *const libc::c_char,
+    alpn_count: usize,
+) -> *mut rustls_config_handle {
+    let root_store = if !ca_pem.is_null() && ca_len > 0 {
+        let ca_bytes = std::slice::from_raw_parts(ca_pem as *const u8, ca_len);
+        let mut root_store = rustls::RootCertStore::empty();
+        
+        // rustls_pemfile::certs returns an iterator, not a Result.
+        for cert_result in rustls_pemfile::certs(&mut &ca_bytes[..]) {
+            if let Ok(cert) = cert_result {
+                let _ = root_store.add(cert);
+            }
+        }
+        root_store
+    } else {
+        // Use webpki-roots for default CA certificates.
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        root_store
+    };
+
+    let config_builder = ClientConfig::builder()
+        .with_root_certificates(root_store);
+
+    let config = if !cert_pem.is_null() && !key_pem.is_null() {
+        let cert_bytes = std::slice::from_raw_parts(cert_pem as *const u8, cert_len);
+        let key_bytes = std::slice::from_raw_parts(key_pem as *const u8, key_len);
+        
+        // rustls_pemfile::certs returns an iterator, not a Result.
+        let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_bytes[..])
+            .filter_map(|c| c.ok())
+            .collect();
+
+        let key = match rustls_pemfile::private_key(&mut &key_bytes[..]) {
+            Ok(Some(key)) => key,
+            _ => return std::ptr::null_mut(),
+        };
+
+        match config_builder.with_client_auth_cert(certs, key) {
+            Ok(cfg) => cfg,
+            Err(_) => return std::ptr::null_mut(),
+        }
+    } else {
+        config_builder.with_no_client_auth()
+    };
+
+    // Add ALPN protocols if provided.
+    let mut config = config;
+    if !alpn_protocols.is_null() && alpn_count > 0 {
+        let protocols: Vec<Vec<u8>> = (0..alpn_count)
+            .map(|i| {
+                let proto_ptr = *alpn_protocols.add(i);
+                let proto_cstr = std::ffi::CStr::from_ptr(proto_ptr);
+                proto_cstr.to_bytes().to_vec()
+            })
+            .collect();
+        config.alpn_protocols = protocols;
+    }
+
+    let rustls_config = Box::new(RustlsConfig {
+        client_config: Some(Arc::new(config)),
+        server_config: None,
+    });
+
+    Box::into_raw(rustls_config) as *mut rustls_config_handle
+}
+
+/// Creates a new server TLS configuration.
+///
+/// # Safety
+/// cert_pem and key_pem must be valid null-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn rustls_server_config_new(
+    cert_pem: *const libc::c_char,
+    cert_len: usize,
+    key_pem: *const libc::c_char,
+    key_len: usize,
+    alpn_protocols: *const *const libc::c_char,
+    alpn_count: usize,
+) -> *mut rustls_config_handle {
+    let cert_bytes = std::slice::from_raw_parts(cert_pem as *const u8, cert_len);
+    let key_bytes = std::slice::from_raw_parts(key_pem as *const u8, key_len);
+
+    // rustls_pemfile::certs returns an iterator, not a Result.
+    let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_bytes[..])
+        .filter_map(|c| c.ok())
+        .collect();
+
+    let key = match rustls_pemfile::private_key(&mut &key_bytes[..]) {
+        Ok(Some(key)) => key,
+        _ => return std::ptr::null_mut(),
+    };
+
+    let mut config = match ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+    {
+        Ok(cfg) => cfg,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    // Add ALPN protocols if provided.
+    if !alpn_protocols.is_null() && alpn_count > 0 {
+        let protocols: Vec<Vec<u8>> = (0..alpn_count)
+            .map(|i| {
+                let proto_ptr = *alpn_protocols.add(i);
+                let proto_cstr = std::ffi::CStr::from_ptr(proto_ptr);
+                proto_cstr.to_bytes().to_vec()
+            })
+            .collect();
+        config.alpn_protocols = protocols;
+    }
+
+    let rustls_config = Box::new(RustlsConfig {
+        client_config: None,
+        server_config: Some(Arc::new(config)),
+    });
+
+    Box::into_raw(rustls_config) as *mut rustls_config_handle
+}
+
+/// Frees a rustls configuration.
+///
+/// # Safety
+/// config must be a valid pointer previously returned from rustls_client_config_new or rustls_server_config_new.
+#[no_mangle]
+pub unsafe extern "C" fn rustls_config_free(config: *mut rustls_config_handle) {
+    if !config.is_null() {
+        let _ = Box::from_raw(config as *mut RustlsConfig);
+    }
+}
+
+/// Creates a new client TLS connection.
+///
+/// # Safety
+/// config must be a valid pointer, server_name must be a valid null-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn rustls_client_connection_new(
+    config: *const rustls_config_handle,
+    fd: RawFd,
+    server_name: *const libc::c_char,
+) -> *mut rustls_connection_handle {
+    if config.is_null() || server_name.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let rustls_config = &*(config as *const RustlsConfig);
+    let client_config = match &rustls_config.client_config {
+        Some(cfg) => cfg.clone(),
+        None => return std::ptr::null_mut(),
+    };
+
+    let server_name_str = match std::ffi::CStr::from_ptr(server_name).to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let server_name = match rustls::pki_types::ServerName::try_from(server_name_str) {
+        Ok(name) => name.to_owned(),
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let connection = match ClientConnection::new(client_config, server_name) {
+        Ok(conn) => Connection::Client(Box::new(conn)),
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let rustls_conn = Box::new(RustlsConnection {
+        connection,
+        fd,
+        ktls_tx_enabled: false,
+        ktls_rx_enabled: false,
+    });
+
+    Box::into_raw(rustls_conn) as *mut rustls_connection_handle
+}
+
+/// Creates a new server TLS connection.
+///
+/// # Safety
+/// config must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn rustls_server_connection_new(
+    config: *const rustls_config_handle,
+    fd: RawFd,
+) -> *mut rustls_connection_handle {
+    if config.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let rustls_config = &*(config as *const RustlsConfig);
+    let server_config = match &rustls_config.server_config {
+        Some(cfg) => cfg.clone(),
+        None => return std::ptr::null_mut(),
+    };
+
+    let connection = match ServerConnection::new(server_config) {
+        Ok(conn) => Connection::Server(Box::new(conn)),
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let rustls_conn = Box::new(RustlsConnection {
+        connection,
+        fd,
+        ktls_tx_enabled: false,
+        ktls_rx_enabled: false,
+    });
+
+    Box::into_raw(rustls_conn) as *mut rustls_connection_handle
+}
+
+/// Frees a rustls connection.
+///
+/// # Safety
+/// conn must be a valid pointer previously returned from rustls_client_connection_new or rustls_server_connection_new.
+#[no_mangle]
+pub unsafe extern "C" fn rustls_connection_free(conn: *mut rustls_connection_handle) {
+    if !conn.is_null() {
+        let _ = Box::from_raw(conn as *mut RustlsConnection);
+    }
+}
+
+/// Enables kernel TLS (kTLS) offload for transmission.
+///
+/// This must be called after the TLS handshake is complete.
+///
+/// # Safety
+/// conn must be a valid pointer and handshake must be complete.
+#[no_mangle]
+pub unsafe extern "C" fn rustls_enable_ktls_tx(conn: *mut rustls_connection_handle) -> i32 {
+    if conn.is_null() {
+        return RUSTLS_ERR_INVALID_PARAM;
+    }
+
+    let rustls_conn = &mut *(conn as *mut RustlsConnection);
+    
+    // Check if already using kTLS.
+    if matches!(rustls_conn.connection, Connection::KtlsEnabled) {
+        return RUSTLS_ERR_KTLS_NOT_SUPPORTED;
+    }
+    
+    // Extract session keys by consuming the connection.
+    let connection = std::mem::replace(&mut rustls_conn.connection, Connection::KtlsEnabled);
+    let keys = match connection {
+        Connection::Client(client_conn) => extract_client_keys(*client_conn),
+        Connection::Server(server_conn) => extract_server_keys(*server_conn),
+        Connection::KtlsEnabled => unreachable!(),
+    };
+
+    match keys {
+        Some(session_keys) => {
+            if enable_ktls_tx(rustls_conn.fd, &session_keys) {
+                rustls_conn.ktls_tx_enabled = true;
+                RUSTLS_OK
+            } else {
+                // Restore connection on failure (though it's consumed, can't really restore).
+                log::error!("Failed to enable kTLS TX - connection state lost");
+                RUSTLS_ERR_KTLS_NOT_SUPPORTED
+            }
+        }
+        None => {
+            log::warn!("Failed to extract session keys for kTLS TX");
+            // Restore connection marker on failure.
+            RUSTLS_ERR_KTLS_NOT_SUPPORTED
+        }
+    }
+}
+
+/// Enables kernel TLS (kTLS) offload for reception.
+///
+/// This must be called after the TLS handshake is complete.
+///
+/// # Safety
+/// conn must be a valid pointer and handshake must be complete.
+#[no_mangle]
+pub unsafe extern "C" fn rustls_enable_ktls_rx(conn: *mut rustls_connection_handle) -> i32 {
+    if conn.is_null() {
+        return RUSTLS_ERR_INVALID_PARAM;
+    }
+
+    let rustls_conn = &mut *(conn as *mut RustlsConnection);
+    
+    // Check if already using kTLS.
+    if matches!(rustls_conn.connection, Connection::KtlsEnabled) {
+        return RUSTLS_ERR_KTLS_NOT_SUPPORTED;
+    }
+    
+    // Extract session keys by consuming the connection.
+    let connection = std::mem::replace(&mut rustls_conn.connection, Connection::KtlsEnabled);
+    let keys = match connection {
+        Connection::Client(client_conn) => extract_client_keys(*client_conn),
+        Connection::Server(server_conn) => extract_server_keys(*server_conn),
+        Connection::KtlsEnabled => unreachable!(),
+    };
+
+    match keys {
+        Some(session_keys) => {
+            if enable_ktls_rx(rustls_conn.fd, &session_keys) {
+                rustls_conn.ktls_rx_enabled = true;
+                RUSTLS_OK
+            } else {
+                log::error!("Failed to enable kTLS RX - connection state lost");
+                RUSTLS_ERR_KTLS_NOT_SUPPORTED
+            }
+        }
+        None => {
+            log::warn!("Failed to extract session keys for kTLS RX");
+            RUSTLS_ERR_KTLS_NOT_SUPPORTED
+        }
+    }
+}
+
+/// Performs TLS handshake I/O operations.
+///
+/// # Safety
+/// conn must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn rustls_connection_handshake(conn: *mut rustls_connection_handle) -> i32 {
+    if conn.is_null() {
+        return RUSTLS_ERR_INVALID_PARAM;
+    }
+
+    let rustls_conn = &mut *(conn as *mut RustlsConnection);
+    let fd = rustls_conn.fd;
+
+    let result = match &mut rustls_conn.connection {
+        Connection::Client(client_conn) => {
+            // Read TLS data from socket.
+            let mut tls_stream = std::os::unix::net::UnixStream::from(std::os::fd::OwnedFd::from_raw_fd(fd));
+            match client_conn.read_tls(&mut tls_stream) {
+                Ok(_) => {
+                    // Process received TLS messages.
+                    if let Err(_) = client_conn.process_new_packets() {
+                        std::mem::forget(tls_stream); // Don't close the fd.
+                        return RUSTLS_ERR_HANDSHAKE;
+                    }
+                }
+                Err(_) => {
+                    std::mem::forget(tls_stream); // Don't close the fd.
+                    return RUSTLS_ERR_IO;
+                }
+            }
+
+            // Write pending TLS data to socket.
+            match client_conn.write_tls(&mut tls_stream) {
+                Ok(_) => RUSTLS_OK,
+                Err(_) => RUSTLS_ERR_IO,
+            }
+        }
+        Connection::Server(server_conn) => {
+            // Read TLS data from socket.
+            let mut tls_stream = std::os::unix::net::UnixStream::from(std::os::fd::OwnedFd::from_raw_fd(fd));
+            match server_conn.read_tls(&mut tls_stream) {
+                Ok(_) => {
+                    // Process received TLS messages.
+                    if let Err(_) = server_conn.process_new_packets() {
+                        std::mem::forget(tls_stream); // Don't close the fd.
+                        return RUSTLS_ERR_HANDSHAKE;
+                    }
+                }
+                Err(_) => {
+                    std::mem::forget(tls_stream); // Don't close the fd.
+                    return RUSTLS_ERR_IO;
+                }
+            }
+
+            // Write pending TLS data to socket.
+            match server_conn.write_tls(&mut tls_stream) {
+                Ok(_) => RUSTLS_OK,
+                Err(_) => RUSTLS_ERR_IO,
+            }
+        }
+        Connection::KtlsEnabled => {
+            // Connection consumed for kTLS - handshake already complete.
+            RUSTLS_OK
+        }
+    };
+
+    result
+}
+
+/// Checks if TLS handshake is complete.
+///
+/// # Safety
+/// conn must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn rustls_connection_is_handshaking(
+    conn: *const rustls_connection_handle,
+) -> bool {
+    if conn.is_null() {
+        return false;
+    }
+
+    let rustls_conn = &*(conn as *const RustlsConnection);
+    
+    match &rustls_conn.connection {
+        Connection::Client(client_conn) => client_conn.is_handshaking(),
+        Connection::Server(server_conn) => server_conn.is_handshaking(),
+        Connection::KtlsEnabled => false, // kTLS enabled means handshake is complete.
+    }
+}
+
+/// Reads decrypted application data.
+///
+/// # Safety
+/// conn and buf must be valid pointers, buf must have at least len capacity.
+#[no_mangle]
+pub unsafe extern "C" fn rustls_connection_read(
+    conn: *mut rustls_connection_handle,
+    buf: *mut u8,
+    len: usize,
+) -> isize {
+    if conn.is_null() || buf.is_null() {
+        return RUSTLS_ERR_INVALID_PARAM as isize;
+    }
+
+    let rustls_conn = &mut *(conn as *mut RustlsConnection);
+    let output = std::slice::from_raw_parts_mut(buf, len);
+
+    // If kTLS RX is enabled, read directly from socket (kernel decrypts).
+    if rustls_conn.ktls_rx_enabled {
+        return libc::read(rustls_conn.fd, buf as *mut libc::c_void, len);
+    }
+
+    // Otherwise, use rustls userspace decryption.
+    let result = match &mut rustls_conn.connection {
+        Connection::Client(client_conn) => client_conn.reader().read(output),
+        Connection::Server(server_conn) => server_conn.reader().read(output),
+        Connection::KtlsEnabled => {
+            // With kTLS, read directly from socket (kernel handles decryption).
+            return RUSTLS_ERR_KTLS_NOT_SUPPORTED as isize;
+        }
+    };
+
+    match result {
+        Ok(n) => n as isize,
+        Err(_) => RUSTLS_ERR_IO as isize,
+    }
+}
+
+/// Writes application data to be encrypted and sent.
+///
+/// # Safety
+/// conn and buf must be valid pointers, buf must have at least len bytes.
+#[no_mangle]
+pub unsafe extern "C" fn rustls_connection_write(
+    conn: *mut rustls_connection_handle,
+    buf: *const u8,
+    len: usize,
+) -> isize {
+    if conn.is_null() || buf.is_null() {
+        return RUSTLS_ERR_INVALID_PARAM as isize;
+    }
+
+    let rustls_conn = &mut *(conn as *mut RustlsConnection);
+    let input = std::slice::from_raw_parts(buf, len);
+
+    // If kTLS TX is enabled, write directly to socket (kernel encrypts).
+    if rustls_conn.ktls_tx_enabled {
+        return libc::write(rustls_conn.fd, buf as *const libc::c_void, len);
+    }
+
+    // Otherwise, use rustls userspace encryption.
+    let result = match &mut rustls_conn.connection {
+        Connection::Client(client_conn) => client_conn.writer().write(input),
+        Connection::Server(server_conn) => server_conn.writer().write(input),
+        Connection::KtlsEnabled => {
+            // With kTLS, write directly to socket (kernel handles encryption).
+            return RUSTLS_ERR_KTLS_NOT_SUPPORTED as isize;
+        }
+    };
+
+    match result {
+        Ok(n) => n as isize,
+        Err(_) => RUSTLS_ERR_IO as isize,
+    }
+}
+
+/// Gets the negotiated ALPN protocol.
+///
+/// # Safety
+/// conn must be a valid pointer. Returns a pointer to internal buffer or null.
+#[no_mangle]
+pub unsafe extern "C" fn rustls_connection_get_alpn_protocol(
+    conn: *const rustls_connection_handle,
+    len: *mut usize,
+) -> *const u8 {
+    if conn.is_null() || len.is_null() {
+        return std::ptr::null();
+    }
+
+    let rustls_conn = &*(conn as *const RustlsConnection);
+    
+    let protocol = match &rustls_conn.connection {
+        Connection::Client(client_conn) => client_conn.alpn_protocol(),
+        Connection::Server(server_conn) => server_conn.alpn_protocol(),
+        Connection::KtlsEnabled => None, // ALPN already negotiated before kTLS.
+    };
+
+    match protocol {
+        Some(p) => {
+            *len = p.len();
+            p.as_ptr()
+        }
+        None => {
+            *len = 0;
+            std::ptr::null()
+        }
+    }
+}
+

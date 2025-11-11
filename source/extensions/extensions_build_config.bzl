@@ -639,6 +639,11 @@ EXTENSIONS = {
 
     # Local address selectors
     "envoy.upstream.local_address_selector.filter_state_override": "//source/extensions/local_address_selectors/filter_state_override:config",
+
+    #
+    # Transport sockets - rustls
+    #
+    "envoy.transport_sockets.rustls":                          "//source/extensions/transport_sockets/rustls:config",
 }
 
 # These can be changed to ["//visibility:public"], for  downstream builds which
