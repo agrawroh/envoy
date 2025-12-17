@@ -122,8 +122,13 @@ ListenSocketFactoryImpl::ListenSocketFactoryImpl(
   if (sockets_[0] != nullptr && local_address_->ip() && local_address_->ip()->port() == 0) {
     local_address_ = sockets_[0]->connectionInfoProvider().localAddress();
   }
-  ENVOY_LOG(debug, "Set listener {} socket factory local address to {}", listener_name,
-            local_address_->asString());
+  ENVOY_LOG(debug,
+            "Set listener {} socket factory local address to {} has_network_namespace={} "
+            "network_namespace='{}'",
+            listener_name, local_address_->asString(), local_address_->networkNamespace().has_value(),
+            local_address_->networkNamespace().has_value()
+                ? local_address_->networkNamespace().value()
+                : "");
 
   // Now create the remainder of the sockets that will be used by the rest of the workers.
   for (uint32_t i = 1; i < num_sockets; i++) {

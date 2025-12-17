@@ -87,7 +87,15 @@ void ActiveTcpListener::onAccept(Network::ConnectionSocketPtr&& socket) {
     return;
   }
 
-  onAcceptWorker(std::move(socket), config_->handOffRestoredDestinationConnections(), false);
+  const auto& netns = listen_address_->networkNamespace();
+  ENVOY_LOG(debug,
+            "ActiveTcpListener::onAccept: listen_address={} has_network_namespace={} "
+            "network_namespace='{}'",
+            listen_address_->asString(), netns.has_value(),
+            netns.has_value() ? netns.value() : "");
+
+  onAcceptWorker(std::move(socket), config_->handOffRestoredDestinationConnections(), false,
+                 netns);
 }
 
 void ActiveTcpListener::onReject(RejectCause cause) {
@@ -107,7 +115,8 @@ void ActiveTcpListener::recordConnectionsAcceptedOnSocketEvent(uint32_t connecti
 
 void ActiveTcpListener::onAcceptWorker(Network::ConnectionSocketPtr&& socket,
                                        bool hand_off_restored_destination_connections,
-                                       bool rebalanced) {
+                                       bool rebalanced,
+                                       const absl::optional<std::string>& network_namespace) {
   // Get Round Trip Time
   absl::optional<std::chrono::milliseconds> t = socket->lastRoundTripTime();
   if (t.has_value()) {
@@ -123,8 +132,8 @@ void ActiveTcpListener::onAcceptWorker(Network::ConnectionSocketPtr&& socket,
     }
   }
 
-  auto active_socket = std::make_unique<ActiveTcpSocket>(*this, std::move(socket),
-                                                         hand_off_restored_destination_connections);
+  auto active_socket = std::make_unique<ActiveTcpSocket>(
+      *this, std::move(socket), hand_off_restored_destination_connections, network_namespace);
 
   onSocketAccepted(std::move(active_socket));
 }
@@ -176,7 +185,8 @@ void ActiveTcpListener::post(Network::ConnectionSocketPtr&& socket) {
                      handoff = config_->handOffRestoredDestinationConnections()]() {
     auto balanced_handler = tcp_conn_handler.getBalancedHandlerByTag(tag, *address);
     if (balanced_handler.has_value()) {
-      balanced_handler->get().onAcceptWorker(std::move(socket_to_rebalance->socket), handoff, true);
+      balanced_handler->get().onAcceptWorker(std::move(socket_to_rebalance->socket), handoff, true,
+                                             address->networkNamespace());
       return;
     }
   });
