@@ -238,6 +238,10 @@ bug_fixes:
     Fixed a crash in the :ref:`Proto API Scrubber <config_http_filters_proto_api_scrubber>` filter when internal buffer
     conversion fails. The filter now gracefully rejects the traffic with a local reply and error detail
     ``proto_api_scrubber_FAILED_PRECONDITION`` instead of terminating the process.
+- area: json
+  change: |
+    Fixed an off-by-one write in ``JsonEscaper::escapeString()`` that could corrupt the string null terminator
+    when the input string ends with a control character.
 
 removed_config_or_runtime:
 # *Normally occurs at the end of the* :ref:`deprecation period <deprecated>`
