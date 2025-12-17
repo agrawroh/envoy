@@ -17,7 +17,18 @@ namespace NetworkFilters {
 namespace SetFilterState {
 
 Network::FilterStatus SetFilterState::onNewConnection() {
-  config_->updateFilterState({}, read_callbacks_->connection().streamInfo());
+  auto& stream_info = read_callbacks_->connection().streamInfo();
+  ENVOY_LOG(debug, "SetFilterState::onNewConnection: filterState={}",
+            static_cast<void*>(stream_info.filterState().get()));
+
+  // Debug: check if the network namespace is actually in filter state.
+  const auto* ns_obj =
+      stream_info.filterState()->getDataReadOnly<StreamInfo::FilterState::Object>(
+          "envoy.network.network_namespace");
+  ENVOY_LOG(debug, "SetFilterState::onNewConnection: envoy.network.network_namespace present={}",
+            ns_obj != nullptr);
+
+  config_->updateFilterState({}, stream_info);
   return Network::FilterStatus::Continue;
 }
 

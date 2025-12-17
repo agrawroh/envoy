@@ -32,8 +32,16 @@ ActiveTcpSocket::ActiveTcpSocket(ActiveStreamListenerBase& listener,
         std::make_unique<Network::DownstreamNetworkNamespace>(network_namespace.value()),
         StreamInfo::FilterState::StateType::ReadOnly,
         StreamInfo::FilterState::LifeSpan::Connection);
-    ENVOY_LOG(debug, "ActiveTcpSocket: set filter state '{}' with value '{}'",
-              Network::DownstreamNetworkNamespace::key(), network_namespace.value());
+    ENVOY_LOG(debug, "ActiveTcpSocket: set filter state '{}' with value '{}' on filterState={}",
+              Network::DownstreamNetworkNamespace::key(), network_namespace.value(),
+              static_cast<void*>(stream_info_->filterState().get()));
+
+    // Verify the filter state was actually set.
+    const auto* verify =
+        stream_info_->filterState()->getDataReadOnly<Network::DownstreamNetworkNamespace>(
+            Network::DownstreamNetworkNamespace::key());
+    ENVOY_LOG(debug, "ActiveTcpSocket: verification - found={} value='{}'", verify != nullptr,
+              verify != nullptr ? verify->value() : "");
   }
 }
 
