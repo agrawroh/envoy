@@ -24,4 +24,15 @@ message DownstreamReverseConnectionSocketInterface {
   // When enabled, emits hidden statistics for individual hosts and clusters.
   // Defaults to false.
   bool enable_detailed_stats = 2;
+
+  // HTTP handshake settings for data plane initiated reverse tunnels.
+  message HttpHandshakeConfig {
+    // Request path used when issuing the HTTP reverse-connection handshake. Defaults to
+    // "/reverse_connections/request".
+    string request_path = 1;
+  }
+
+  // Optional HTTP handshake configuration. When unset, the data plane uses the defaults
+  // provided by ``HttpHandshakeConfig``.
+  HttpHandshakeConfig http_handshake = 3;
 }
