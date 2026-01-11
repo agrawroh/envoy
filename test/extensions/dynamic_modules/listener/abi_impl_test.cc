@@ -8,6 +8,7 @@
 #include "source/extensions/filters/listener/dynamic_modules/filter.h"
 
 #include "test/extensions/dynamic_modules/util.h"
+#include "test/mocks/event/mocks.h"
 #include "test/mocks/network/mocks.h"
 
 namespace Envoy {
@@ -56,8 +57,9 @@ public:
     auto dynamic_module = newDynamicModule(testSharedObjectPath("listener_no_op", "c"), false);
     EXPECT_TRUE(dynamic_module.ok()) << dynamic_module.status().message();
 
-    auto filter_config_or_status = newDynamicModuleListenerFilterConfig(
-        "test_filter", "", std::move(dynamic_module.value()), *stats_.rootScope());
+    auto filter_config_or_status =
+        newDynamicModuleListenerFilterConfig("test_filter", "", std::move(dynamic_module.value()),
+                                             *stats_.rootScope(), main_thread_dispatcher_);
     EXPECT_TRUE(filter_config_or_status.ok()) << filter_config_or_status.status().message();
     filter_config_ = filter_config_or_status.value();
 
@@ -75,6 +77,7 @@ public:
   DynamicModuleListenerFilterConfigSharedPtr filter_config_;
   std::shared_ptr<DynamicModuleListenerFilter> filter_;
   NiceMock<Network::MockListenerFilterCallbacks> callbacks_;
+  NiceMock<Event::MockDispatcher> main_thread_dispatcher_;
 };
 
 // =============================================================================
@@ -1168,6 +1171,60 @@ TEST_F(DynamicModuleListenerFilterAbiCallbackTest, MaxReadBytes) {
       envoy_dynamic_module_callback_listener_filter_max_read_bytes(filterPtr());
   // The default maxReadBytes() implementation returns 0, but filters can override it.
   EXPECT_EQ(0, max_bytes);
+}
+
+// =============================================================================
+// Tests for scheduler callbacks.
+// =============================================================================
+
+TEST_F(DynamicModuleListenerFilterAbiCallbackTest, ListenerFilterSchedulerNewDelete) {
+  // Set up the dispatcher for the filter.
+  NiceMock<Event::MockDispatcher> worker_dispatcher;
+  EXPECT_CALL(callbacks_, dispatcher()).WillRepeatedly(testing::ReturnRef(worker_dispatcher));
+
+  auto* scheduler = envoy_dynamic_module_callback_listener_filter_scheduler_new(filterPtr());
+  EXPECT_NE(nullptr, scheduler);
+
+  envoy_dynamic_module_callback_listener_filter_scheduler_delete(scheduler);
+}
+
+TEST_F(DynamicModuleListenerFilterAbiCallbackTest, ListenerFilterSchedulerCommit) {
+  // Set up the dispatcher for the filter.
+  NiceMock<Event::MockDispatcher> worker_dispatcher;
+  EXPECT_CALL(callbacks_, dispatcher()).WillRepeatedly(testing::ReturnRef(worker_dispatcher));
+
+  auto* scheduler = envoy_dynamic_module_callback_listener_filter_scheduler_new(filterPtr());
+  EXPECT_NE(nullptr, scheduler);
+
+  // Expect the callback to be posted.
+  EXPECT_CALL(worker_dispatcher, post(_));
+
+  envoy_dynamic_module_callback_listener_filter_scheduler_commit(scheduler, 123);
+
+  // Clean up.
+  envoy_dynamic_module_callback_listener_filter_scheduler_delete(scheduler);
+}
+
+TEST_F(DynamicModuleListenerFilterAbiCallbackTest, ListenerFilterConfigSchedulerNewDelete) {
+  auto* scheduler = envoy_dynamic_module_callback_listener_filter_config_scheduler_new(
+      static_cast<void*>(filter_config_.get()));
+  EXPECT_NE(nullptr, scheduler);
+
+  envoy_dynamic_module_callback_listener_filter_config_scheduler_delete(scheduler);
+}
+
+TEST_F(DynamicModuleListenerFilterAbiCallbackTest, ListenerFilterConfigSchedulerCommit) {
+  auto* scheduler = envoy_dynamic_module_callback_listener_filter_config_scheduler_new(
+      static_cast<void*>(filter_config_.get()));
+  EXPECT_NE(nullptr, scheduler);
+
+  // Expect the callback to be posted.
+  EXPECT_CALL(main_thread_dispatcher_, post(_));
+
+  envoy_dynamic_module_callback_listener_filter_config_scheduler_commit(scheduler, 456);
+
+  // Clean up.
+  envoy_dynamic_module_callback_listener_filter_config_scheduler_delete(scheduler);
 }
 
 } // namespace ListenerFilters
