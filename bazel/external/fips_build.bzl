@@ -13,10 +13,12 @@ else
     export SYSROOT_FLAG=""
 fi
 export CC="$$(realpath $(CC))"
+TOOLCHAIN_DIR="$$(dirname $$(realpath $(CC)))/.."
+
 # bazel doesnt expose CXX so we have to construct it (or use foreign_cc)
 if [[ "%s" == "libc++" ]]; then
-    export CXXFLAGS="-stdlib=libc++ $${SYSROOT_FLAG}"
-    export LDFLAGS="-fuse-ld=lld -stdlib=libc++ -l:libc++.a -l:libc++abi.a -lm -pthread $${SYSROOT_FLAG}"
+    export CXXFLAGS="-stdlib=libc++ --sysroot=$${SYSROOT}"
+    export LDFLAGS="-fuse-ld=lld -stdlib=libc++ -Wl,-rpath,$${TOOLCHAIN_DIR}/lib -lc++ -lc++abi -lm -pthread --sysroot=$${SYSROOT}"
 else
     export CXXFLAGS="$${SYSROOT_FLAG}"
     export LDFLAGS="-fuse-ld=lld -lstdc++ -lm -pthread $${SYSROOT_FLAG}"
@@ -78,8 +80,9 @@ else
 fi
 # bazel doesnt expose CXX so we have to construct it (or use foreign_cc)
 if [[ "%s" == "libc++" ]]; then
-    export CXXFLAGS="-stdlib=libc++ $${SYSROOT_FLAG}"
-    export LDFLAGS="-fuse-ld=lld -stdlib=libc++ -l:libc++.a -l:libc++abi.a -lm -pthread $${SYSROOT_FLAG}"
+    export CXXFLAGS="-stdlib=libc++ --sysroot=$${SYSROOT}"
+    # Use -static to avoid runtime dependency on libc++.so.1
+    export LDFLAGS="-fuse-ld=lld -stdlib=libc++ -static -lc++ -lc++abi -lm -pthread --sysroot=$${SYSROOT}"
 else
     export CXXFLAGS="$${SYSROOT_FLAG}"
     export LDFLAGS="-fuse-ld=lld -lstdc++ -lm -pthread $${SYSROOT_FLAG}"

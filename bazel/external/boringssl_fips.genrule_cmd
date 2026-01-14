@@ -2,12 +2,8 @@
 
 set -eo pipefail
 
-# BoringSSL build as described in the Security Policy for BoringCrypto module "update stream":
-# https://boringssl.googlesource.com/boringssl/+/refs/heads/main/crypto/fipsmodule/FIPS.md#update-stream
-
 OS=$(uname)
 ARCH=$(uname -m)
-# This works only on Linux-x86_64 and Linux-aarch64.
 if [[ "$OS" != "Linux" || ("$ARCH" != "x86_64" && "$ARCH" != "aarch64") ]]; then
     echo "ERROR: BoringSSL FIPS is currently supported only on Linux-x86_64 and Linux-aarch64." >&2
     echo "  found: $OS-$ARCH" >&2
@@ -16,25 +12,69 @@ fi
 
 if [[ -z "$CRYPTO_OUT" ]]; then
     echo "ERROR: CRYPTO_OUT not set for crypto lib path." >&2
-    exit
+    exit 1
 fi
 
 if [[ -z "$SSL_OUT" ]]; then
     echo "ERROR: SSL_OUT not set for ssl lib path." >&2
-    exit
+    exit 1
 fi
+
+find_libcxx_path() {
+    # First try using CC with arch-specific paths
+    if [[ -n "$CC" ]]; then
+        local toolchain_dir
+        toolchain_dir="$(dirname "$(realpath "$CC")")/.."
+        for subdir in "lib/x86_64-unknown-linux-gnu" "lib/aarch64-unknown-linux-gnu" "lib"; do
+            if [[ -f "${toolchain_dir}/${subdir}/libc++.so.1" ]]; then
+                echo "${toolchain_dir}/${subdir}"
+                return
+            fi
+        done
+    fi
+    
+    # Fallback: search common locations
+    local search_paths=(
+        "/build/bazel_root/base/external/llvm_toolchain_llvm/lib/x86_64-unknown-linux-gnu"
+        "/build/bazel_root/base/external/llvm_toolchain/lib/x86_64-unknown-linux-gnu"
+        "/build/bazel_root/base/external/llvm_toolchain_llvm/lib"
+        "/build/bazel_root/base/external/llvm_toolchain/lib"
+    )
+    
+    # Add all /usr/lib/llvm-*/lib paths (sorted descending to prefer newer versions)
+    while IFS= read -r dir; do
+        search_paths+=("$dir")
+    done < <(ls -d /usr/lib/llvm-*/lib 2>/dev/null | sort -t'-' -k2 -V -r)
+    
+    for path in "${search_paths[@]}"; do
+        if [[ -f "${path}/libc++.so.1" ]]; then
+            echo "${path}"
+            return
+        fi
+    done
+    
+    echo ""
+}
 
 build_boringssl_fips() {
     cd "$BSSL_SRC" || exit 1
     export HOME="${BSSL_SRC}"
 
-    # The security policy recommends using the recent compiler versions:
-    # "The latest stable versions of Clang, Go, Ninja, and CMake should be used".
-    # This build makes use of the same LLVM toolchain as the rest of Envoy.
+    # Find libcxx path AFTER CC is set by the calling environment
+    LIBCXX_PATH="$(find_libcxx_path)"
+    echo "LIBCXX_PATH detected as: ${LIBCXX_PATH:-'(not found)'}"
+    
+    # Debug: show what's in the toolchain directory
+    if [[ -n "$CC" ]]; then
+        local toolchain_dir
+        toolchain_dir="$(dirname "$(realpath "$CC")")/.."
+        echo "Toolchain directory: ${toolchain_dir}"
+        echo "Contents of ${toolchain_dir}/lib:"
+        ls -la "${toolchain_dir}/lib/"*.so* 2>/dev/null | head -20 || echo "No .so files or directory doesn't exist"
+    fi
+
     printf "set(CMAKE_C_COMPILER \"${CC}\")\nset(CMAKE_CXX_COMPILER \"${CC}\")\n" > "${BSSL_SRC}/toolchain"
 
-    # Go tests use go:embed directives which fail to compile in a Bazel sandbox because Go refuses to embed symlinks.
-    # (see issue https://github.com/golang/go/issues/59924). As a workaround, replace symlinks with the file copies.
     for pem in $(ls ssl/test/runner/*.pem); do
         cp --dereference "${pem}" tmp.pem; mv tmp.pem "${pem}";
     done
@@ -42,11 +82,47 @@ build_boringssl_fips() {
         cp --dereference "${testdata}" tmp.json; mv tmp.json "${testdata}";
     done
 
-    # Build BoringSSL.
-    # Setting -fPIC only affects the compilation of the non-module code in libcrypto.a,
-    # because the FIPS module itself is already built with -fPIC.
     mkdir build
     cd build
+
+    # Copy libc++ libraries to build directory so they can be found at runtime
+    if [[ -n "$LIBCXX_PATH" ]]; then
+        echo "Copying libc++ libraries from ${LIBCXX_PATH} to build directory..."
+        for lib in libc++.so.1 libc++abi.so.1 libunwind.so.1; do
+            if [[ -f "${LIBCXX_PATH}/${lib}" ]]; then
+                cp -v "${LIBCXX_PATH}/${lib}" .
+            else
+                echo "WARNING: ${LIBCXX_PATH}/${lib} not found"
+            fi
+        done
+        # Create symlinks
+        [[ -f libc++.so.1 ]] && ln -sf libc++.so.1 libc++.so
+        [[ -f libc++abi.so.1 ]] && ln -sf libc++abi.so.1 libc++abi.so
+        [[ -f libunwind.so.1 ]] && ln -sf libunwind.so.1 libunwind.so
+        
+        echo "Libraries copied to build directory:"
+        ls -la *.so* 2>/dev/null || echo "No .so files found after copy"
+        
+        # Set LD_LIBRARY_PATH to include both the build directory and original path
+        export LD_LIBRARY_PATH="${PWD}:${LIBCXX_PATH}:${LD_LIBRARY_PATH:-}"
+        echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+    else
+        echo "WARNING: LIBCXX_PATH not found, attempting to locate libc++ manually..."
+        # Try to find it by searching
+        LIBC_SO=$(find /build -name "libc++.so.1" 2>/dev/null | head -1)
+        if [[ -n "$LIBC_SO" ]]; then
+            LIBCXX_PATH="$(dirname "$LIBC_SO")"
+            echo "Found libc++ at: ${LIBCXX_PATH}"
+            for lib in libc++.so.1 libc++abi.so.1 libunwind.so.1; do
+                [[ -f "${LIBCXX_PATH}/${lib}" ]] && cp -v "${LIBCXX_PATH}/${lib}" .
+            done
+            [[ -f libc++.so.1 ]] && ln -sf libc++.so.1 libc++.so
+            [[ -f libc++abi.so.1 ]] && ln -sf libc++abi.so.1 libc++abi.so
+            [[ -f libunwind.so.1 ]] && ln -sf libunwind.so.1 libunwind.so
+            export LD_LIBRARY_PATH="${PWD}:${LIBCXX_PATH}:${LD_LIBRARY_PATH:-}"
+        fi
+    fi
+
     cmake -GNinja \
           -DCMAKE_TOOLCHAIN_FILE="${BSSL_SRC}/toolchain" \
           -DFIPS=1 \
@@ -57,12 +133,84 @@ build_boringssl_fips() {
           -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS}" \
           -DBUILD_TESTING=off \
           ..
-    ninja -j "${NINJA_CORES:-1}"
+
+    # Build specific targets - excludes acvp_tests which we'll run manually
+    ninja -j "${NINJA_CORES:-1}" crypto ssl bssl modulewrapper
+
+    # Run ACVP tests manually with proper LD_LIBRARY_PATH
+    run_acvp_tests_manually
+}
+
+run_acvp_tests_manually() {
+    echo "=== Running ACVP tests manually with LD_LIBRARY_PATH ==="
+    
+    BUILD_DIR="${BSSL_SRC}/build"
+    cd "$BSSL_SRC" || exit 1
+    
+    # Re-detect LIBCXX_PATH if not set
+    if [[ -z "$LIBCXX_PATH" ]]; then
+        LIBCXX_PATH="$(find_libcxx_path)"
+    fi
+    
+    # Ensure LD_LIBRARY_PATH includes the build directory where we copied the libraries
+    export LD_LIBRARY_PATH="${BUILD_DIR}:${LIBCXX_PATH}:${LD_LIBRARY_PATH:-}"
+    echo "LD_LIBRARY_PATH set to: ${LD_LIBRARY_PATH}"
+    
+    # Also add rpath to the build directory for CGO
+    export CGO_LDFLAGS="${CGO_LDFLAGS} -Wl,-rpath,${BUILD_DIR}"
+    echo "CGO_LDFLAGS set to: ${CGO_LDFLAGS}"
+    
+    # Verify libraries exist in build directory
+    echo "Libraries in build directory before go build:"
+    ls -la "${BUILD_DIR}"/*.so* 2>/dev/null || echo "No .so files found"
+    
+    # Build acvptool
+    echo "Building acvptool..."
+    go build -o "${BUILD_DIR}/acvptool" \
+        boringssl.googlesource.com/boringssl.git/util/fipstools/acvp/acvptool
+    
+    # Build testmodulewrapper
+    echo "Building testmodulewrapper..."
+    go build -o "${BUILD_DIR}/testmodulewrapper" \
+        boringssl.googlesource.com/boringssl.git/util/fipstools/acvp/acvptool/testmodulewrapper
+    
+    # Show what libraries the binary needs
+    echo "Checking acvptool dependencies:"
+    ldd "${BUILD_DIR}/acvptool" || true
+    
+    # Test running acvptool with explicit LD_LIBRARY_PATH
+    echo "Testing acvptool binary with LD_LIBRARY_PATH=${BUILD_DIR}:${LIBCXX_PATH}..."
+    if ! LD_LIBRARY_PATH="${BUILD_DIR}:${LIBCXX_PATH}" "${BUILD_DIR}/acvptool" -help >/dev/null 2>&1; then
+        echo "ERROR: acvptool failed to run"
+        echo "Debug: checking if libraries exist..."
+        ls -la "${BUILD_DIR}/libc++"* 2>/dev/null || echo "No libc++ in build dir"
+        ls -la "${LIBCXX_PATH}/libc++"* 2>/dev/null || echo "No libc++ in LIBCXX_PATH"
+        exit 1
+    fi
+    echo "acvptool binary works!"
+    
+    # Run the ACVP test suite with explicit LD_LIBRARY_PATH
+    echo "Running ACVP test suite..."
+    cd "${BSSL_SRC}/util/fipstools/acvp/acvptool/test"
+    LD_LIBRARY_PATH="${BUILD_DIR}:${LIBCXX_PATH}" \
+    go run check_expected.go \
+        -tool "${BUILD_DIR}/acvptool" \
+        -module-wrappers "modulewrapper:${BUILD_DIR}/modulewrapper,testmodulewrapper:${BUILD_DIR}/testmodulewrapper" \
+        -tests tests.json
+    
+    echo "=== ACVP tests passed! ==="
 }
 
 validate_fips() {
     cd "$BSSL_SRC/build" || exit 1
-    # Verify correctness of the FIPS build.
+    
+    # Re-detect LIBCXX_PATH if not set
+    if [[ -z "$LIBCXX_PATH" ]]; then
+        LIBCXX_PATH="$(find_libcxx_path)"
+    fi
+    
+    export LD_LIBRARY_PATH="${PWD}:${LIBCXX_PATH}:${LD_LIBRARY_PATH:-}"
+    
     IS_FIPS="$(./bssl isfips)"
     if [[ "${IS_FIPS}" != "1" ]]; then
         echo "ERROR: BoringSSL tool didn't report FIPS build." >&2
@@ -70,10 +218,11 @@ validate_fips() {
         echo "  found: ${IS_FIPS}" >&2
         return 1
     fi
+    
+    echo "=== FIPS validation passed! ==="
 }
 
 output_libs() {
-    # Move compiled libraries to the expected destinations.
     mv "${BSSL_SRC}/build/libcrypto.a" "$CRYPTO_OUT"
     mv "${BSSL_SRC}/build/libssl.a" "$SSL_OUT"
 }
