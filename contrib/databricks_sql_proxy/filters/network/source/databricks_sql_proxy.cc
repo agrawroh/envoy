@@ -74,13 +74,27 @@ void Filter::initializeReadFilterCallbacks(Network::ReadFilterCallbacks& callbac
 
   read_callbacks_->connection().addConnectionCallbacks(*this);
   read_callbacks_->connection().setDelayedCloseTimeout(config_->delayedCloseTimeoutMs());
-
   sql_proxy_->initializeReadFilterCallbacks(callbacks);
 }
 
 void Filter::initializeWriteFilterCallbacks(Network::WriteFilterCallbacks& callbacks) {
   write_callbacks_ = &callbacks;
   write_callbacks_->connection().setDelayedCloseTimeout(config_->delayedCloseTimeoutMs());
+  if (config_->protocol() == DatabricksSqlProxyProto::POSTGRES) {
+    // Postgres client has a bug where it can't handle TLS packet >= 8KB
+    // https://www.postgresql.org/message-id/2039ac58-d3e0-434b-ac1a-2a987f3b4cb1%40greiz-reinsdorf.de
+    // Postgres server limit the send buffer to 8KB
+    // https://github.com/postgres/postgres/blob/master/src/backend/libpq/pqcomm.c#L119
+    // https://github.com/postgres/postgres/blob/master/src/backend/libpq/pqcomm.c#L1284
+    // So we need to limit how much TLS data chunk can be sent to downstream here as well to
+    // workaround the bug.
+    auto& conn = write_callbacks_->connection();
+    conn.setTransportSocketDataChunkSendLimit(8192);
+    ENVOY_CONN_LOG(info,
+                   "databricks_sql_proxy: write filter setTransportSocketDataChunkSendLimit to "
+                   "8192; connection type: {}",
+                   conn, typeid(conn).name());
+  }
   sql_proxy_->initializeWriteFilterCallbacks(callbacks);
 }
 
@@ -208,8 +222,9 @@ Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
 void Filter::callExternalAuthorizationService() {
   Filters::Common::ExtAuthz::CheckRequestUtils::createTcpCheck(
       read_callbacks_, check_request_, config_->includePeerCertificate(),
-      true,                                       // include_tls_session
-      Protobuf::Map<std::string, std::string>()); // destination_labels
+      true,                                      // include_tls_session
+      Protobuf::Map<std::string, std::string>(), // destination_labels
+      envoy::config::core::v3::Metadata());      // metadata_context
 
   sidecar_operation_ = SidecarOperation::CheckAuthorization;
   Protobuf::Struct metadata;
@@ -273,8 +288,9 @@ void Filter::callExternalAuthorizationService() {
 void Filter::storeMetadataInSidecar() {
   Filters::Common::ExtAuthz::CheckRequestUtils::createTcpCheck(
       read_callbacks_, check_request_, config_->includePeerCertificate(),
-      true,                                       // include_tls_session
-      Protobuf::Map<std::string, std::string>()); // destination_labels
+      true,                                      // include_tls_session
+      Protobuf::Map<std::string, std::string>(), // destination_labels
+      envoy::config::core::v3::Metadata());      // metadata_context
 
   sidecar_operation_ = SidecarOperation::StoreMetadata;
   Protobuf::Struct metadata;
@@ -520,8 +536,8 @@ Network::FilterStatus Filter::onWrite(Buffer::Instance& data, bool end_stream) {
   }
 
   if (sql_proxy_->isOnWriteForwardingMode()) {
-    ENVOY_CONN_LOG(trace, "databricks_sql_proxy: onWrite: Forwarding mode",
-                   read_callbacks_->connection());
+    ENVOY_CONN_LOG(trace, "databricks_sql_proxy: onWrite: Forwarding mode data.length={}",
+                   read_callbacks_->connection(), data.length());
     return Network::FilterStatus::Continue;
   }
 

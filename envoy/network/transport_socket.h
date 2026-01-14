@@ -208,6 +208,8 @@ public:
    */
   virtual void configureInitialCongestionWindow(uint64_t bandwidth_bits_per_sec,
                                                 std::chrono::microseconds rtt) PURE;
+
+  virtual void setTlsDataChunkSendLimit(uint64_t data_chunk_size) PURE;
 };
 
 using TransportSocketPtr = std::unique_ptr<TransportSocket>;

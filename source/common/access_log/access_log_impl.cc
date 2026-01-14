@@ -161,7 +161,7 @@ bool RuntimeFilter::evaluate(const Formatter::Context&,
   // Store the sampling decision and fraction information in dynamic metadata if configured.
   if (emit_metadata_) {
     auto& mutable_info = const_cast<StreamInfo::StreamInfo&>(stream_info);
-    ProtobufWkt::Struct sampling_metadata;
+    Protobuf::Struct sampling_metadata;
     auto* sampling_fields = sampling_metadata.mutable_fields();
 
     // Store the basic sampling decision
