@@ -29,3 +29,8 @@ test_program(name = "http_stream_callouts_test")
 test_program(name = "bootstrap_integration_test")
 
 test_program(name = "access_log_integration_test")
+
+test_program(
+    name = "ext_proc_integration_test",
+    additional_srcs = ["ext_proc.rs"],
+)

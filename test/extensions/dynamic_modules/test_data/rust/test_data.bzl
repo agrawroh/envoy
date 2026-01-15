@@ -1,10 +1,11 @@
 load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("@rules_rust//rust:defs.bzl", "rust_clippy", "rust_shared_library", "rust_test", "rustfmt_test")
 
-def test_program(name):
+def test_program(name, additional_srcs = []):
     srcs = [name + ".rs"]
     if name + "_test.rs" in native.glob(["*.rs"]):
         srcs = srcs + [name + "_test.rs"]
+    srcs = srcs + additional_srcs
 
     _name = "_" + name
     rust_shared_library(
