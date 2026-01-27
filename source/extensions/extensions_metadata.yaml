@@ -2351,6 +2351,13 @@ envoy.tls.upstream_certificate_mappers.filter_state_override:
   status: alpha
   type_urls:
   - envoy.extensions.transport_sockets.tls.cert_mappers.filter_state_override.v3.Config
+envoy.tls.certificate_selectors.sni_with_default:
+  categories:
+  - envoy.tls.certificate_selectors
+  security_posture: robust_to_untrusted_downstream
+  status: alpha
+  type_urls:
+  - envoy.extensions.transport_sockets.tls.cert_selectors.sni_with_default.v3.Config
 envoy.tls.certificate_mappers.static_name:
   categories:
   - envoy.tls.certificate_mappers

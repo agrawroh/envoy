@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package envoy.extensions.transport_sockets.tls.cert_selectors.sni_with_default.v3;
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.transport_sockets.tls.cert_selectors.sni_with_default.v3";
+option java_outer_classname = "ConfigProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/cert_selectors/sni_with_default/v3;sni_with_defaultv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: SNI with default certificate selector]
+// [#extension: envoy.tls.certificate_selectors.sni_with_default]
+
+// Selects certificates based on SNI like the default selector, but uses a configurable default
+// certificate when no SNI is provided by the client. This allows explicit control over which
+// certificate is used for clients that do not send SNI, rather than relying on the default
+// selector's behavior of doing a full scan that prefers ECDSA certificates over RSA.
+//
+// When the client provides SNI, certificate selection follows the standard rules where the exact
+// SNI match first, then wildcard match (e.g., ``*.example.com`` for ``test.example.com``), with
+// ECDSA certificates preferred for ECDSA-capable clients. If no match is found and
+// ``full_scan_certs_on_sni_mismatch`` is enabled, a full scan of all certificates is performed.
+// Otherwise, the configured default certificate is used.
+//
+// When the client does not provide SNI, this selector uses the configured default certificate
+// directly instead of performing a full scan.
+message Config {
+  oneof default_certificate_specifier {
+    option (validate.required) = true;
+
+    // The Subject Alternative Name (SAN) or Common Name (CN) of the certificate to use when no
+    // SNI is provided by the client, or when SNI does not match any certificate and full scan is
+    // disabled. This value must match the SAN or CN of one of the configured certificates. If no
+    // matching certificate is found, the first certificate in the list is used as a fallback.
+    // Wildcard patterns (e.g., ``*.example.com``) are supported.
+    string default_san = 1 [(validate.rules).string = {min_len: 1}];
+
+    // If set to ``true``, use the first certificate in the ``tls_certificates`` list as the
+    // default when no SNI is provided. This is useful when you want a simple configuration
+    // where certificate order determines the default.
+    bool use_first_certificate = 2 [(validate.rules).bool = {const: true}];
+  }
+}

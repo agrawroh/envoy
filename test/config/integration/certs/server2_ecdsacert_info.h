@@ -1,0 +1,10 @@
+#pragma once
+
+// NOLINT(namespace-envoy)
+constexpr char TEST_SERVER2_ECDSA_CERT_256_HASH[] =
+    "7b4758f967bbf6d003b1bcd238f1136d8be4edd7c2d5940fb7bf390b150b5664";
+constexpr char TEST_SERVER2_ECDSA_CERT_1_HASH[] = "f1dd4473477686061d67dddddccd262ac864db47";
+constexpr char TEST_SERVER2_ECDSA_CERT_SPKI[] = "u8K8msGrE3PZ7kDuBtFXDVMVdeywnjEFq2bDHRN1pa8=";
+constexpr char TEST_SERVER2_ECDSA_CERT_SERIAL[] = "04021467ee03b18cfa1a6c86b9fcd794175d156a";
+constexpr char TEST_SERVER2_ECDSA_CERT_NOT_BEFORE[] = "Jan 27 23:33:51 2026 GMT";
+constexpr char TEST_SERVER2_ECDSA_CERT_NOT_AFTER[] = "Jan 27 23:33:51 2028 GMT";

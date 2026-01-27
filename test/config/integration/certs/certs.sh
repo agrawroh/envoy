@@ -123,6 +123,12 @@ generate_ecdsa_key server_ecdsa_p521 secp521r1
 generate_x509_cert server_ecdsa_p521 ca
 generate_ocsp_response server_ecdsa_p521 ca
 rm -f server_ecdsa_p521cert.cfg
+# Generate ECDSA P-256 cert for the server with different SAN (lyft2.com).
+cp -f server2cert.cfg server2_ecdsacert.cfg
+generate_ecdsa_key server2_ecdsa secp256r1
+generate_x509_cert server2_ecdsa ca
+generate_info_header server2_ecdsa
+rm -f server2_ecdsacert.cfg
 # Generate cert for the client.
 generate_rsa_key client
 generate_x509_cert client ca

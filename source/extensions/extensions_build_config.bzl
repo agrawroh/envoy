@@ -637,6 +637,7 @@ EXTENSIONS = {
 
     # Certificate selectors
     "envoy.tls.certificate_selectors.on_demand_secret":                  "//source/extensions/transport_sockets/tls/cert_selectors/on_demand:config",
+    "envoy.tls.certificate_selectors.sni_with_default":                  "//source/extensions/transport_sockets/tls/cert_selectors/sni_with_default:config",
 
     # Certificate mappers
     "envoy.tls.certificate_mappers.sni":                            "//source/extensions/transport_sockets/tls/cert_mappers/sni:config",
