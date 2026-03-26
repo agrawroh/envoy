@@ -33,8 +33,9 @@ use std::ffi::c_void;
 use std::io::{self, Cursor, Read, Write};
 use std::sync::Arc;
 
-/// Buffer size for socket and kTLS kernel reads.
-const IO_BUF_SIZE: usize = 32768;
+/// Buffer size for kTLS kernel reads/writes. 64KB aligns with the maximum TLS record payload
+/// and provides optimal throughput for large transfers.
+const IO_BUF_SIZE: usize = 65536;
 /// Maximum number of write buffer slices retrieved from Envoy per write call.
 const MAX_WRITE_SLICES: usize = 16;
 
@@ -256,20 +257,12 @@ struct RustlsTransportSocket {
   ktls_tx_only: bool,
   #[cfg(target_os = "linux")]
   ktls_attempted: bool,
-  /// Set after the handshake completes when kTLS is desired. Cleared once kTLS is installed
-  /// or when the attempt is abandoned.
   #[cfg(target_os = "linux")]
   ktls_pending: bool,
-  /// Number of payload bytes remaining in the current TLS record being read from the socket.
-  /// Used to track TLS record boundaries so that kTLS RX can be installed at a clean boundary.
   #[cfg(target_os = "linux")]
   tls_record_bytes_remaining: usize,
-  /// Number of bytes of the current 5-byte TLS record header that have been accumulated in
-  /// `tls_record_header_buf`. When this reaches 5, the payload length is parsed and
-  /// `tls_record_bytes_remaining` is set accordingly.
   #[cfg(target_os = "linux")]
   tls_record_header_seen: u8,
-  /// Buffer for accumulating a partial TLS record header across socket reads.
   #[cfg(target_os = "linux")]
   tls_record_header_buf: [u8; 5],
   connected_raised: bool,
@@ -280,6 +273,10 @@ struct RustlsTransportSocket {
   io: Option<usize>,
   #[cfg(target_os = "linux")]
   ktls_fd: Option<libc::c_int>,
+  #[cfg(target_os = "linux")]
+  ktls_shutdown_sent: bool,
+  /// Guards against re-entrant write calls from flush_write_buffer.
+  in_do_write: bool,
 }
 
 impl RustlsTransportSocket {
@@ -310,6 +307,9 @@ impl RustlsTransportSocket {
       io: None,
       #[cfg(target_os = "linux")]
       ktls_fd: None,
+      #[cfg(target_os = "linux")]
+      ktls_shutdown_sent: false,
+      in_do_write: false,
     }
   }
 
@@ -353,6 +353,9 @@ impl RustlsTransportSocket {
       io: None,
       #[cfg(target_os = "linux")]
       ktls_fd: None,
+      #[cfg(target_os = "linux")]
+      ktls_shutdown_sent: false,
+      in_do_write: false,
     }
   }
 
@@ -424,16 +427,10 @@ impl RustlsTransportSocket {
         );
         return;
       }
-      // Defer actual kTLS installation to the next on_do_read call. At this point rustls may
-      // have buffered application data in `tls_read_backlog` (the client started sending data
-      // before we finished the handshake processing). We set a pending flag so that on_do_read
-      // will process all buffered data first and then install kTLS at a clean record boundary.
       self.ktls_pending = true;
     }
   }
 
-  /// Attempts to install kTLS on the current connection. Called when `ktls_pending` is set and
-  /// record tracking indicates the kernel socket is at a clean TLS record boundary.
   #[cfg(target_os = "linux")]
   fn try_install_ktls(&mut self, envoy: &mut EnvoyTransportSocketImpl) {
     let Some(io) = self.io_handle_ptr() else {
@@ -459,21 +456,52 @@ impl RustlsTransportSocket {
     io: *mut c_void,
     fd: libc::c_int,
   ) -> Result<(), String> {
-    // Flush any pending outgoing TLS data before installing kTLS.
     self.drain_tls_backlog(envoy, io)?;
     self.drain_rustls_tls(envoy, io)?;
 
-    // Install TCP_ULP and the crypto info.
+    // Final drain: ensure every byte of decrypted plaintext has been forwarded to Envoy before
+    // dropping the rustls Connection. Without this, data sitting in rustls's reader buffer would
+    // be silently lost.
+    self.drain_all_plaintext(envoy);
+
     linux_ktls::setup_ulp(fd)?;
+
+    // Extract secrets and install crypto. We take the connection AFTER ULP setup so that if
+    // install_crypto fails, we can attempt recovery.
     let conn = self
       .conn
       .take()
       .ok_or_else(|| "missing rustls connection".to_string())?;
-    linux_ktls::install_crypto(fd, conn, self.ktls_tx_only)?;
+    if let Err(e) = linux_ktls::install_crypto(fd, conn, self.ktls_tx_only) {
+      // ULP is installed but crypto failed. The socket is in a broken state and cannot be used
+      // for either kTLS or userspace TLS. Close the connection gracefully.
+      self.failure = format!("kTLS crypto install failed: {e}");
+      return Err(self.failure.clone());
+    }
+
     self.ktls_fd = Some(fd);
     self.phase = Phase::Ktls;
     self.connected_raised = true;
     Ok(())
+  }
+
+  /// Drains every byte of decrypted plaintext from the rustls reader into Envoy's read buffer.
+  /// Called as a safety net right before dropping the Connection for kTLS transition.
+  fn drain_all_plaintext(&mut self, envoy: &mut EnvoyTransportSocketImpl) {
+    let Some(conn) = self.conn.as_mut() else {
+      return;
+    };
+    let mut buf = [0u8; IO_BUF_SIZE];
+    loop {
+      match conn.reader().read(&mut buf) {
+        Ok(0) => break,
+        Ok(n) => {
+          envoy.read_buffer_add(&buf[.. n]);
+        },
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+        Err(_) => break,
+      }
+    }
   }
 
   fn drain_tls_backlog(
@@ -582,9 +610,6 @@ impl RustlsTransportSocket {
     Ok(())
   }
 
-  /// Feeds raw bytes into the rustls connection and stores any unconsumed remainder in the read
-  /// backlog. Extracted as a helper to avoid overlapping mutable borrows of `self.conn` and
-  /// `self.advance_record_tracking`.
   fn feed_raw_to_rustls(&mut self, data: &[u8]) -> Result<(usize, bool), String> {
     let conn = self
       .conn
@@ -602,10 +627,6 @@ impl RustlsTransportSocket {
     Ok((read, false))
   }
 
-  /// Advances the TLS record boundary tracker with newly read raw bytes. This state machine
-  /// parses the 5-byte TLS record headers to maintain an accurate count of where the socket
-  /// read cursor sits relative to TLS record framing. The tracker handles partial headers that
-  /// span multiple reads.
   #[cfg(target_os = "linux")]
   fn advance_record_tracking(&mut self, data: &[u8]) {
     let mut pos = 0usize;
@@ -651,16 +672,12 @@ impl RustlsTransportSocket {
       .io_handle_ptr()
       .ok_or_else(|| "no io handle".to_string())?;
 
-    // Drain any previously buffered bytes before reading from the socket.
     if !self.tls_read_backlog.is_empty() {
       let backlog = std::mem::take(&mut self.tls_read_backlog);
       let result = self.feed_raw_to_rustls(&backlog);
       return result;
     }
 
-    // When kTLS installation is pending, clamp socket reads to complete the current TLS record
-    // exactly. Once the record boundary is reached, return (0, false) to signal that the caller
-    // can proceed with kTLS installation.
     #[cfg(target_os = "linux")]
     if self.ktls_pending {
       if self.tls_record_bytes_remaining == 0 && self.tls_record_header_seen == 0 {
@@ -727,125 +744,17 @@ impl RustlsTransportSocket {
       if n == 0 {
         break;
       }
-      if !envoy.read_buffer_add(&buf[.. n]) {
-        return Err(io::Error::other("read_buffer_add rejected data"));
-      }
+      envoy.read_buffer_add(&buf[.. n]);
       total += n;
     }
     Ok(total)
   }
-}
 
-impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
-  fn on_set_callbacks(&mut self, envoy: &mut EnvoyTransportSocketImpl) {
-    self.set_io_handle(envoy.get_io_handle());
-  }
-
-  fn on_connected(&mut self, envoy: &mut EnvoyTransportSocketImpl) {
-    if let Err(e) = self.ensure_connection() {
-      self.failure = e.clone();
-      envoy_log_error!("rustls: failed to create TLS connection: {e}");
-      return;
-    }
-    if let Some(p) = envoy.get_io_handle() {
-      self.set_io_handle(Some(p));
-    }
-    if let Err(e) = self.drain_outgoing_tls(envoy) {
-      self.failure = e.clone();
-      envoy_log_error!("rustls: initial TLS write failed: {e}");
-    }
-    envoy.set_is_readable(false);
-  }
-
-  fn on_do_read(&mut self, envoy: &mut EnvoyTransportSocketImpl) -> IoResult {
-    #[cfg(target_os = "linux")]
-    if self.phase == Phase::Ktls {
-      return self.on_do_read_ktls(envoy);
-    }
-    if !self.failure.is_empty() {
-      return IoResult::close(0, false);
-    }
-    if self.conn.is_none() {
-      if let Err(e) = self.ensure_connection() {
-        self.failure = e;
-        return IoResult::close(0, false);
-      }
-    }
-    if envoy.should_drain_read_buffer() {
-      let len = envoy.read_buffer_length();
-      if len > 0 {
-        envoy.read_buffer_drain(len);
-      }
-    }
-    let mut total_plaintext = 0usize;
-    loop {
-      match self.read_tls_from_socket(envoy) {
-        Ok((0, eof)) => {
-          if eof {
-            self.maybe_raise_connected(envoy);
-            let _ = self.drain_outgoing_tls(envoy);
-            return IoResult::close(total_plaintext, true);
-          }
-          break;
-        },
-        Ok((_n, _eof)) => {},
-        Err(e) => {
-          self.failure.clone_from(&e);
-          envoy_log_error!("rustls: read_tls path failed: {e}");
-          return IoResult::close(total_plaintext, false);
-        },
-      }
-      let proc = {
-        let conn = match self.conn.as_mut() {
-          Some(c) => c,
-          None => return IoResult::close(total_plaintext, false),
-        };
-        match conn.process_new_packets() {
-          Ok(_state) => Ok(()),
-          Err(e) => Err(e.to_string()),
-        }
-      };
-      if let Err(e) = proc {
-        self.failure = e.clone();
-        envoy_log_error!("rustls: process_new_packets: {e}");
-        return IoResult::close(total_plaintext, false);
-      }
-      match self.forward_plaintext(envoy) {
-        Ok(n) => total_plaintext += n,
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
-        Err(e) => {
-          self.failure = e.to_string();
-          return IoResult::close(total_plaintext, false);
-        },
-      }
-      self.maybe_raise_connected(envoy);
-      if !self.failure.is_empty() {
-        return IoResult::close(total_plaintext, false);
-      }
-    }
-    if let Err(e) = self.drain_outgoing_tls(envoy) {
-      self.failure = e;
-      return IoResult::close(total_plaintext, false);
-    }
-    // Install kTLS when pending and record tracking confirms the kernel socket is at a clean
-    // TLS record boundary (no partial header or payload buffered).
-    #[cfg(target_os = "linux")]
-    if self.ktls_pending
-      && self.tls_read_backlog.is_empty()
-      && self.tls_record_bytes_remaining == 0
-      && self.tls_record_header_seen == 0
-    {
-      self.ktls_pending = false;
-      self.try_install_ktls(envoy);
-    }
-    IoResult::keep_open(total_plaintext, false)
-  }
-
-  fn on_do_write(&mut self, envoy: &mut EnvoyTransportSocketImpl, _end_stream: bool) -> IoResult {
-    #[cfg(target_os = "linux")]
-    if self.phase == Phase::Ktls {
-      return self.on_do_write_ktls(envoy);
-    }
+  fn on_do_write_inner(
+    &mut self,
+    envoy: &mut EnvoyTransportSocketImpl,
+    _end_stream: bool,
+  ) -> IoResult {
     if !self.failure.is_empty() {
       return IoResult::close(0, false);
     }
@@ -893,14 +802,157 @@ impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
       self.failure = e;
       return IoResult::close(0, false);
     }
-    let _ = envoy.flush_write_buffer();
     IoResult::keep_open(total_plain, false)
+  }
+}
+
+impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
+  fn on_set_callbacks(&mut self, envoy: &mut EnvoyTransportSocketImpl) {
+    self.set_io_handle(envoy.get_io_handle());
+  }
+
+  fn on_connected(&mut self, envoy: &mut EnvoyTransportSocketImpl) {
+    if let Err(e) = self.ensure_connection() {
+      self.failure = e.clone();
+      envoy_log_error!("rustls: failed to create TLS connection: {e}");
+      return;
+    }
+    if let Some(p) = envoy.get_io_handle() {
+      self.set_io_handle(Some(p));
+    }
+    if let Err(e) = self.drain_outgoing_tls(envoy) {
+      self.failure = e.clone();
+      envoy_log_error!("rustls: initial TLS write failed: {e}");
+    }
+    envoy.set_is_readable(false);
+  }
+
+  fn on_do_read(&mut self, envoy: &mut EnvoyTransportSocketImpl) -> IoResult {
+    #[cfg(target_os = "linux")]
+    if self.phase == Phase::Ktls {
+      return self.on_do_read_ktls(envoy);
+    }
+    if !self.failure.is_empty() {
+      return IoResult::close(0, false);
+    }
+    if self.conn.is_none() {
+      if let Err(e) = self.ensure_connection() {
+        self.failure = e;
+        return IoResult::close(0, false);
+      }
+    }
+    let mut total_plaintext = 0usize;
+    loop {
+      match self.read_tls_from_socket(envoy) {
+        Ok((0, eof)) => {
+          if eof {
+            self.maybe_raise_connected(envoy);
+            let _ = self.drain_outgoing_tls(envoy);
+            return IoResult::close(total_plaintext, true);
+          }
+          break;
+        },
+        Ok((_n, _eof)) => {},
+        Err(e) => {
+          self.failure.clone_from(&e);
+          envoy_log_error!("rustls: read_tls path failed: {e}");
+          return IoResult::close(total_plaintext, false);
+        },
+      }
+      let proc = {
+        let conn = match self.conn.as_mut() {
+          Some(c) => c,
+          None => return IoResult::close(total_plaintext, false),
+        };
+        match conn.process_new_packets() {
+          Ok(_state) => Ok(()),
+          Err(e) => Err(e.to_string()),
+        }
+      };
+      if let Err(e) = proc {
+        self.failure = e.clone();
+        envoy_log_error!("rustls: process_new_packets: {e}");
+        return IoResult::close(total_plaintext, false);
+      }
+      match self.forward_plaintext(envoy) {
+        Ok(n) => total_plaintext += n,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {},
+        Err(e) => {
+          self.failure = e.to_string();
+          return IoResult::close(total_plaintext, false);
+        },
+      }
+      self.maybe_raise_connected(envoy);
+      if !self.failure.is_empty() {
+        return IoResult::close(total_plaintext, false);
+      }
+      // Respect Envoy's flow-control high watermark: stop reading and schedule a future
+      // read so the filter chain can consume buffered data before we add more.
+      if total_plaintext > 0 && envoy.should_drain_read_buffer() {
+        envoy.set_is_readable(true);
+        break;
+      }
+    }
+    if let Err(e) = self.drain_outgoing_tls(envoy) {
+      self.failure = e;
+      return IoResult::close(total_plaintext, false);
+    }
+    #[cfg(target_os = "linux")]
+    if self.ktls_pending
+      && self.tls_read_backlog.is_empty()
+      && self.tls_record_bytes_remaining == 0
+      && self.tls_record_header_seen == 0
+    {
+      self.ktls_pending = false;
+      self.try_install_ktls(envoy);
+      // After kTLS installation, signal Envoy that the socket is readable. Data from the
+      // client may already be sitting in the kernel socket buffer (e.g., the POST body for
+      // an upload). Without this, Envoy may not schedule a read until the next epoll event,
+      // which could cause the HTTP codec to stall waiting for body data.
+      if self.phase == Phase::Ktls {
+        envoy.set_is_readable(true);
+        // Attempt an immediate kTLS read to forward any data that arrived during the
+        // handshake→kTLS transition. This is critical for uploads where the client starts
+        // sending body data immediately after the handshake completes.
+        let ktls_result = self.on_do_read_ktls(envoy);
+        total_plaintext += ktls_result.bytes_processed;
+        if ktls_result.action == envoy_proxy_dynamic_modules_rust_sdk::PostIoAction::Close {
+          return IoResult::close(total_plaintext, ktls_result.end_stream_read);
+        }
+        if ktls_result.end_stream_read {
+          return IoResult::keep_open(total_plaintext, true);
+        }
+      }
+    }
+    IoResult::keep_open(total_plaintext, false)
+  }
+
+  fn on_do_write(&mut self, envoy: &mut EnvoyTransportSocketImpl, end_stream: bool) -> IoResult {
+    if self.in_do_write {
+      return IoResult::keep_open(0, false);
+    }
+    self.in_do_write = true;
+    #[cfg(target_os = "linux")]
+    let result = if self.phase == Phase::Ktls {
+      self.on_do_write_ktls(envoy, end_stream)
+    } else {
+      self.on_do_write_inner(envoy, end_stream)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let result = self.on_do_write_inner(envoy, end_stream);
+    self.in_do_write = false;
+    if result.action == envoy_proxy_dynamic_modules_rust_sdk::PostIoAction::KeepOpen
+      && result.bytes_processed > 0
+    {
+      let _ = envoy.flush_write_buffer();
+    }
+    result
   }
 
   fn on_close(&mut self, _envoy: &mut EnvoyTransportSocketImpl, _event: ConnectionEvent) {
     #[cfg(target_os = "linux")]
     if let Some(fd) = self.ktls_fd.take() {
-      if self.phase == Phase::Ktls && self.failure.is_empty() {
+      if self.phase == Phase::Ktls && self.failure.is_empty() && !self.ktls_shutdown_sent {
         let _ = linux_ktls::send_close_notify(fd);
       }
     }
@@ -952,10 +1004,15 @@ impl RustlsTransportSocket {
     loop {
       let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
       if n > 0 {
-        if !envoy.read_buffer_add(&buf[.. n as usize]) {
-          return IoResult::close(total, false);
-        }
+        envoy.read_buffer_add(&buf[.. n as usize]);
         total += n as usize;
+        // Respect Envoy's flow-control high watermark: stop reading and schedule a future
+        // read so the filter chain can consume buffered data before we add more. This matches
+        // the pattern used by BoringSSL's SslSocket::doRead and RawBufferSocket::doRead.
+        if envoy.should_drain_read_buffer() {
+          envoy.set_is_readable(true);
+          return IoResult::keep_open(total, false);
+        }
         continue;
       }
       if n == 0 {
@@ -965,18 +1022,28 @@ impl RustlsTransportSocket {
       if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
         return IoResult::keep_open(total, false);
       }
+      if errno == libc::EINTR {
+        continue;
+      }
       if errno == libc::EIO {
         match linux_ktls::receive_control_message(fd, &mut buf) {
           linux_ktls::ControlResult::Continue => continue,
           linux_ktls::ControlResult::ApplicationData(len) => {
-            if len > 0 && !envoy.read_buffer_add(&buf[.. len]) {
-              return IoResult::close(total, false);
+            if len > 0 {
+              envoy.read_buffer_add(&buf[.. len]);
             }
             total += len;
+            if envoy.should_drain_read_buffer() {
+              envoy.set_is_readable(true);
+              return IoResult::keep_open(total, false);
+            }
             continue;
           },
           linux_ktls::ControlResult::CloseNotify => {
-            let _ = linux_ktls::send_close_notify(fd);
+            if !self.ktls_shutdown_sent {
+              let _ = linux_ktls::send_close_notify(fd);
+              self.ktls_shutdown_sent = true;
+            }
             return IoResult::close(total, true);
           },
           linux_ktls::ControlResult::Error(e) => {
@@ -985,12 +1052,16 @@ impl RustlsTransportSocket {
           },
         }
       }
-      self.failure = format!("kTLS read failed (errno {errno})");
+      self.failure = format!("kTLS read failed (errno {} / {})", errno, errno_name(errno));
       return IoResult::close(total, false);
     }
   }
 
-  fn on_do_write_ktls(&mut self, envoy: &mut EnvoyTransportSocketImpl) -> IoResult {
+  fn on_do_write_ktls(
+    &mut self,
+    envoy: &mut EnvoyTransportSocketImpl,
+    end_stream: bool,
+  ) -> IoResult {
     if !self.failure.is_empty() {
       return IoResult::close(0, false);
     }
@@ -1004,7 +1075,6 @@ impl RustlsTransportSocket {
     }; MAX_WRITE_SLICES];
     let n_slices = envoy.write_buffer_get_slices(&mut envoy_bufs);
 
-    // Build iovec array from envoy buffer slices for scatter-gather I/O.
     let mut iovs: [libc::iovec; MAX_WRITE_SLICES] = unsafe { std::mem::zeroed() };
     let mut iov_count = 0usize;
     let mut total_requested = 0usize;
@@ -1020,13 +1090,21 @@ impl RustlsTransportSocket {
       iov_count += 1;
     }
     if iov_count == 0 || total_requested == 0 {
-      let _ = envoy.flush_write_buffer();
+      if end_stream && !self.ktls_shutdown_sent {
+        let _ = linux_ktls::send_close_notify(fd);
+        unsafe {
+          libc::shutdown(fd, libc::SHUT_WR);
+        }
+        self.ktls_shutdown_sent = true;
+      }
       return IoResult::keep_open(0, false);
     }
 
-    // Use sendmsg to write all slices in a single syscall.
     let mut total = 0usize;
-    while total < total_requested {
+    loop {
+      if iov_count == 0 {
+        break;
+      }
       let msg = libc::msghdr {
         msg_name: std::ptr::null_mut(),
         msg_namelen: 0,
@@ -1040,7 +1118,6 @@ impl RustlsTransportSocket {
       if n > 0 {
         let sent = n as usize;
         total += sent;
-        // Advance iovec past the bytes already sent.
         let mut skip = sent;
         while iov_count > 0 && skip > 0 {
           if skip >= iovs[0].iov_len {
@@ -1062,7 +1139,10 @@ impl RustlsTransportSocket {
       if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
         break;
       }
-      self.failure = format!("kTLS write failed (errno {errno})");
+      if errno == libc::EINTR {
+        continue;
+      }
+      self.failure = format!("kTLS write failed (errno {} / {})", errno, errno_name(errno));
       if total > 0 {
         envoy.write_buffer_drain(total);
       }
@@ -1071,7 +1151,13 @@ impl RustlsTransportSocket {
     if total > 0 {
       envoy.write_buffer_drain(total);
     }
-    let _ = envoy.flush_write_buffer();
+    if end_stream && iov_count == 0 && !self.ktls_shutdown_sent {
+      let _ = linux_ktls::send_close_notify(fd);
+      unsafe {
+        libc::shutdown(fd, libc::SHUT_WR);
+      }
+      self.ktls_shutdown_sent = true;
+    }
     IoResult::keep_open(total, false)
   }
 }
@@ -1103,10 +1189,25 @@ fn ktls_cipher_supported(conn: &Connection) -> bool {
   )
 }
 
-/// Returns the native socket fd from the I/O handle via the ABI callback.
 #[cfg(target_os = "linux")]
 fn socket_fd_for_ktls(envoy: &EnvoyTransportSocketImpl, io: *mut c_void) -> Option<i32> {
   envoy.io_handle_fd(io)
+}
+
+/// Returns a human-readable name for common errno values encountered in kTLS operations.
+#[cfg(target_os = "linux")]
+fn errno_name(errno: libc::c_int) -> &'static str {
+  match errno {
+    libc::ECONNRESET => "ECONNRESET",
+    libc::ENOTCONN => "ENOTCONN",
+    libc::EPIPE => "EPIPE",
+    libc::ECONNREFUSED => "ECONNREFUSED",
+    libc::ETIMEDOUT => "ETIMEDOUT",
+    libc::ENOMEM => "ENOMEM",
+    74 => "EBADMSG",
+    90 => "EMSGSIZE",
+    _ => "unknown",
+  }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1139,14 +1240,14 @@ mod linux_ktls {
 
   const TLS_SET_RECORD_TYPE: libc::c_int = 1;
   const TLS_GET_RECORD_TYPE: libc::c_int = 2;
+  #[allow(dead_code)]
   const TLS_RX_EXPECT_NO_PAD: libc::c_int = 3;
   const TLS_CONTENT_TYPE_ALERT: u8 = 21;
   const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 22;
   const TLS_CONTENT_TYPE_APP_DATA: u8 = 23;
 
-  /// TLS alert level: warning (1) or fatal (2).
+  #[allow(dead_code)]
   const TLS_ALERT_LEVEL_FATAL: u8 = 2;
-  /// TLS alert description for close_notify.
   const TLS_ALERT_CLOSE_NOTIFY: u8 = 0;
 
   #[repr(C)]
@@ -1195,7 +1296,6 @@ mod linux_ktls {
     Ok((salt, out_iv))
   }
 
-  /// Applies the TLS crypto info for a single direction (TX or RX) via `setsockopt`.
   fn apply_direction(
     fd: libc::c_int,
     direction: libc::c_int,
@@ -1344,8 +1444,6 @@ mod linux_ktls {
     Ok(())
   }
 
-  /// Enables the TLS upper-level protocol on the socket. This must be called before installing
-  /// crypto info for TX/RX.
   pub fn setup_ulp(fd: libc::c_int) -> Result<(), String> {
     let ret = unsafe {
       libc::setsockopt(
@@ -1365,8 +1463,6 @@ mod linux_ktls {
     Ok(())
   }
 
-  /// Extracts secrets from a completed rustls `Connection` and installs them into the kernel via
-  /// `setsockopt(SOL_TLS, TLS_TX/TLS_RX, ...)`.
   pub fn install_crypto(fd: libc::c_int, conn: Connection, tx_only: bool) -> Result<(), String> {
     let version = match conn.protocol_version() {
       Some(ProtocolVersion::TLSv1_2) => TLS_1_2_VERSION,
@@ -1382,7 +1478,6 @@ mod linux_ktls {
     apply_direction(fd, TLS_TX, version, tx_seq, &tx_sec)?;
     if !tx_only {
       apply_direction(fd, TLS_RX, version, rx_seq, &rx_sec)?;
-      // TLS 1.3: hint to the kernel that records have no padding, enabling a faster decrypt path.
       if version == TLS_1_3_VERSION {
         let val: libc::c_int = 1;
         unsafe {
@@ -1396,7 +1491,6 @@ mod linux_ktls {
         }
       }
     }
-    // Disable Nagle since kTLS handles record framing.
     unsafe {
       let val: libc::c_int = 1;
       libc::setsockopt(
@@ -1411,27 +1505,18 @@ mod linux_ktls {
     Ok(())
   }
 
-  /// Result of processing a kTLS control message received via `recvmsg`.
   pub enum ControlResult {
-    /// Non-fatal control message processed; the caller should continue reading.
     Continue,
-    /// Application data was received alongside the control message.
     ApplicationData(usize),
-    /// A close_notify alert was received; the connection should be closed gracefully.
     CloseNotify,
-    /// An unrecoverable error occurred.
     Error(String),
   }
 
-  /// Aligned buffer for cmsg data. Kernel cmsg convention requires alignment to `c_long`.
   #[repr(C, align(8))]
   struct CmsgBuf {
     data: [u8; 64],
   }
 
-  /// Reads a control message from a kTLS socket using `recvmsg`. This is called when a normal
-  /// `recv` returns `EIO`, indicating that the kernel has a non-application-data record available
-  /// (e.g., a TLS 1.3 NewSessionTicket or an alert).
   pub fn receive_control_message(fd: libc::c_int, buf: &mut [u8]) -> ControlResult {
     let mut iov = libc::iovec {
       iov_base: buf.as_mut_ptr().cast(),
@@ -1451,31 +1536,41 @@ mod linux_ktls {
       if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
         return ControlResult::Continue;
       }
-      return ControlResult::Error(format!("recvmsg failed (errno {errno})"));
+      if errno == libc::EINTR {
+        return ControlResult::Continue;
+      }
+      return ControlResult::Error(format!("recvmsg failed (errno {})", errno));
     }
 
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     if cmsg.is_null() {
+      if n > 0 {
+        return ControlResult::ApplicationData(n as usize);
+      }
       return ControlResult::Continue;
     }
     let cmsg_ref = unsafe { &*cmsg };
     if cmsg_ref.cmsg_level != SOL_TLS || cmsg_ref.cmsg_type != TLS_GET_RECORD_TYPE {
+      if n > 0 {
+        return ControlResult::ApplicationData(n as usize);
+      }
       return ControlResult::Continue;
     }
     let record_type = unsafe { *libc::CMSG_DATA(cmsg) };
     match record_type {
       TLS_CONTENT_TYPE_HANDSHAKE => ControlResult::Continue,
       TLS_CONTENT_TYPE_ALERT => {
-        let n = n as usize;
-        if n >= 2 {
-          let level = buf[0];
+        let num_bytes = n as usize;
+        if num_bytes >= 2 {
           let description = buf[1];
-          if description == TLS_ALERT_CLOSE_NOTIFY || level == TLS_ALERT_LEVEL_FATAL {
+          if description == TLS_ALERT_CLOSE_NOTIFY {
             return ControlResult::CloseNotify;
           }
-        } else if n == 1 {
-          // Only the level byte was received. Per the reference implementation, assume
-          // close_notify when the full description is not available.
+          let level = buf[0];
+          if level == 2 {
+            return ControlResult::CloseNotify;
+          }
+        } else {
           return ControlResult::CloseNotify;
         }
         ControlResult::Continue
@@ -1485,7 +1580,6 @@ mod linux_ktls {
     }
   }
 
-  /// Sends a TLS close_notify alert via `sendmsg` with the `TLS_SET_RECORD_TYPE` cmsg.
   pub fn send_close_notify(fd: libc::c_int) -> Result<(), String> {
     let mut alert_data: [u8; 2] = [1, TLS_ALERT_CLOSE_NOTIFY];
 
@@ -1494,7 +1588,7 @@ mod linux_ktls {
       iov_len: alert_data.len(),
     };
 
-    let cmsg_space = unsafe { libc::CMSG_SPACE(1) } as usize;
+    let cmsg_len = unsafe { libc::CMSG_LEN(1) } as usize;
     let mut cmsg_buf = CmsgBuf { data: [0u8; 64] };
     let cmsg_ptr = cmsg_buf.data.as_mut_ptr().cast::<libc::cmsghdr>();
     unsafe {
@@ -1510,14 +1604,18 @@ mod linux_ktls {
       msg_iov: &mut iov,
       msg_iovlen: 1,
       msg_control: cmsg_buf.data.as_mut_ptr().cast(),
-      msg_controllen: cmsg_space,
+      msg_controllen: cmsg_len,
       msg_flags: 0,
     };
 
     let ret = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
     if ret < 0 {
       let errno = unsafe { *libc::__errno_location() };
-      if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::EPIPE {
+      if errno == libc::EAGAIN
+        || errno == libc::EWOULDBLOCK
+        || errno == libc::EPIPE
+        || errno == libc::EINTR
+      {
         return Ok(());
       }
       return Err(format!("sendmsg close_notify failed (errno {errno})"));
