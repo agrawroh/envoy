@@ -1291,6 +1291,7 @@ rules_rust:
   - dataplane_ext
   extensions:
   - envoy.wasm.runtime.wasmtime
+  - envoy.transport_sockets.rustls_ktls
   license: "Apache-2.0"
   license_url: "https://github.com/bazelbuild/rules_rust/blob/{version}/LICENSE.txt"
 

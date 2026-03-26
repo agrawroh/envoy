@@ -11,6 +11,7 @@ pub mod catch_unwind;
 pub mod cert_validator;
 pub mod cluster;
 pub mod dns_resolver;
+pub mod transport_socket;
 pub mod http;
 pub mod listener;
 pub mod load_balancer;
@@ -25,6 +26,7 @@ pub use catch_unwind::*;
 pub use cert_validator::*;
 pub use cluster::*;
 pub use dns_resolver::*;
+pub use transport_socket::*;
 pub use http::*;
 pub use listener::*;
 pub use load_balancer::*;
@@ -539,6 +541,7 @@ macro_rules! declare_network_filter_init_functions {
 /// - `upstream_http_tcp_bridge:` — [`NewUpstreamHttpTcpBridgeConfigFunction`] for upstream HTTP TCP
 ///   bridges
 /// - `dns_resolver:` — [`NewDnsResolverConfigFunction`] for DNS resolvers
+/// - `transport_socket:` — [`NewTransportSocketFactoryConfigFunction`] for transport sockets
 ///
 /// # Examples
 ///
@@ -603,6 +606,10 @@ macro_rules! declare_all_init_functions {
   };
   (@register dns_resolver : $fn:expr) => {
     envoy_proxy_dynamic_modules_rust_sdk::NEW_DNS_RESOLVER_CONFIG_FUNCTION
+      .get_or_init(|| $fn);
+  };
+  (@register transport_socket : $fn:expr) => {
+    envoy_proxy_dynamic_modules_rust_sdk::NEW_TRANSPORT_SOCKET_FACTORY_CONFIG_FUNCTION
       .get_or_init(|| $fn);
   };
 }
@@ -1128,6 +1135,11 @@ pub type NewDnsResolverConfigFunction = fn(
 /// Global storage for the DNS resolver config factory function.
 pub static NEW_DNS_RESOLVER_CONFIG_FUNCTION: OnceLock<NewDnsResolverConfigFunction> =
   OnceLock::new();
+
+/// Global storage for the transport socket factory configuration function.
+pub static NEW_TRANSPORT_SOCKET_FACTORY_CONFIG_FUNCTION: OnceLock<
+  NewTransportSocketFactoryConfigFunction<EnvoyTransportSocketImpl>,
+> = OnceLock::new();
 
 /// Declare the init functions for a DNS resolver dynamic module.
 ///
