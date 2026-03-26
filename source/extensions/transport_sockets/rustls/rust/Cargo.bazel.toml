@@ -1,0 +1,22 @@
+[package]
+name = "envoy-rustls-ktls"
+version = "0.1.0"
+edition = "2021"
+authors = ["Envoy Proxy Authors <envoy-dev@googlegroups.com>"]
+description = "Rustls TLS transport socket with kTLS support for Envoy"
+license = "Apache-2.0"
+
+# This manifest is consumed by crates_repository in Bazel. The SDK dependency is provided
+# as a direct Bazel target in the BUILD file, so it is omitted here to avoid path resolution
+# issues during cargo-bazel splicing. Use Cargo.toml for local cargo builds.
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+[lib]
+path = "rustls_ktls.rs"
+crate-type = ["staticlib"]

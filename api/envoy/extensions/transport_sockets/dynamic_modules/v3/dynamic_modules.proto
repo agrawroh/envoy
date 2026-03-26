@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package envoy.extensions.transport_sockets.dynamic_modules.v3;
+
+import "envoy/extensions/dynamic_modules/v3/dynamic_modules.proto";
+
+import "google/protobuf/any.proto";
+
+import "udpa/annotations/status.proto";
+
+import "validate/validate.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.transport_sockets.dynamic_modules.v3";
+option java_outer_classname = "DynamicModulesProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/dynamic_modules/v3;dynamic_modulesv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+
+// [#protodoc-title: Dynamic module transport socket]
+// [#extension: envoy.transport_sockets.dynamic_modules]
+
+// Configuration for upstream connections using a dynamic module transport socket.
+message DynamicModuleUpstreamTransportSocket {
+  // Dynamic module loading configuration.
+  envoy.extensions.dynamic_modules.v3.DynamicModuleConfig dynamic_module_config = 1
+      [(validate.rules).message = {required: true}];
+
+  // Name of the transport socket implementation within the module.
+  string socket_name = 2 [(validate.rules).string = {min_len: 1}];
+
+  // Opaque configuration consumed by the module.
+  google.protobuf.Any socket_config = 3;
+
+  // Default SNI value for TLS-oriented factories. Ignored for plaintext sockets.
+  string sni = 4;
+
+  // Application protocols advertised for ALPN when supported by the factory.
+  repeated string alpn_protocols = 5;
+
+  // When true, the transport socket factory reports that it implements a secure transport (TLS).
+  // If not specified, defaults to false.
+  bool implements_secure_transport = 6;
+}
+
+// Configuration for downstream listeners using a dynamic module transport socket.
+message DynamicModuleDownstreamTransportSocket {
+  // Dynamic module loading configuration.
+  envoy.extensions.dynamic_modules.v3.DynamicModuleConfig dynamic_module_config = 1
+      [(validate.rules).message = {required: true}];
+
+  // Name of the transport socket implementation within the module.
+  string socket_name = 2 [(validate.rules).string = {min_len: 1}];
+
+  // Opaque configuration consumed by the module.
+  google.protobuf.Any socket_config = 3;
+
+  // When true, indicates the listener expects a client certificate. This field is informational
+  // and forwarded to the module via the opaque socket_config; the module is responsible for
+  // enforcing client certificate requirements in its TLS handshake. If not specified, defaults
+  // to false.
+  bool require_client_certificate = 4;
+
+  // Application protocols advertised for ALPN when supported by the factory. These are
+  // informational and the module is responsible for configuring ALPN in its TLS implementation
+  // via the opaque socket_config.
+  repeated string alpn_protocols = 5;
+
+  // When true, the transport socket factory reports that it implements a secure transport (TLS).
+  // If not specified, defaults to false.
+  bool implements_secure_transport = 6;
+}

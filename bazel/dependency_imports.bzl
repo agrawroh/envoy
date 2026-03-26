@@ -259,3 +259,8 @@ def crates_repositories():
         # lockfile = Label("@envoy//source/extensions/dynamic_modules/sdk/rust:Cargo.Bazel.lock"),
         manifests = ["@envoy//source/extensions/dynamic_modules/sdk/rust:Cargo.toml"],
     )
+    crates_repository(
+        name = "rustls_ktls_crate_index",
+        cargo_lockfile = "@envoy//source/extensions/transport_sockets/rustls/rust:Cargo.bazel.lock",
+        manifests = ["@envoy//source/extensions/transport_sockets/rustls/rust:Cargo.bazel.toml"],
+    )
