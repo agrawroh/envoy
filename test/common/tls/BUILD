@@ -325,3 +325,42 @@ envoy_benchmark_test(
     # Uses raw POSIX syscalls, does not build on Windows.
     tags = ["skip_on_windows"],
 )
+
+envoy_cc_benchmark_binary(
+    name = "tls_transport_socket_throughput_benchmark",
+    srcs = ["tls_transport_socket_throughput_benchmark.cc"],
+    data = [
+        "//test/common/tls/test_data:certs",
+    ],
+    external_deps = ["ssl"],
+    rbe_pool = "6gig",
+    tags = ["skip_on_windows"],
+    deps = [
+        "//source/common/buffer:buffer_lib",
+        "//source/common/event:dispatcher_lib",
+        "//source/common/network:address_lib",
+        "//source/common/network:listen_socket_lib",
+        "//source/common/network:listener_lib",
+        "//source/common/network:utility_lib",
+        "//source/common/stream_info:stream_info_lib",
+        "//source/common/tls:client_ssl_socket_lib",
+        "//source/common/tls:context_config_lib",
+        "//source/common/tls:context_lib",
+        "//source/common/tls:server_context_config_lib",
+        "//source/common/tls:server_ssl_socket_lib",
+        "//test/mocks/network:network_mocks",
+        "//test/mocks/runtime:runtime_mocks",
+        "//test/mocks/server:server_factory_context_mocks",
+        "//test/test_common:environment_lib",
+        "//test/test_common:network_utility_lib",
+        "//test/test_common:simulated_time_system_lib",
+        "//test/test_common:utility_lib",
+        "@benchmark",
+    ],
+)
+
+envoy_benchmark_test(
+    name = "tls_transport_socket_throughput_benchmark_test",
+    benchmark_binary = "tls_transport_socket_throughput_benchmark",
+    tags = ["skip_on_windows"],
+)

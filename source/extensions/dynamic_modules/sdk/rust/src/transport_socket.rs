@@ -160,6 +160,21 @@ pub trait EnvoyTransportSocket {
   fn set_is_readable(&self, _readable: bool);
   /// Flushes pending write data toward the transport.
   fn flush_write_buffer(&self) -> bool;
+  /// Returns the per-connection server name (SNI) override, if one was set by Envoy (e.g., via
+  /// auto_sni or filter state). This takes precedence over any static server_name in the module
+  /// config, enabling dynamic forward proxy and similar use cases.
+  fn get_server_name_override(&self) -> Option<String>;
+  /// Reserves writable memory slices from the read buffer for zero-copy reads. The returned slices
+  /// point directly into Envoy's internal buffer, allowing `recv()` to write data without an
+  /// intermediate copy. After writing, call [`commit_read`] with the total bytes written.
+  ///
+  /// Returns the number of slices filled (up to `slices_out.len()`).
+  fn reserve_read_slices(
+    &self,
+    slices_out: &mut [abi::envoy_dynamic_module_type_envoy_buffer],
+  ) -> usize;
+  /// Commits bytes to the active read buffer reservation created by [`reserve_read_slices`].
+  fn commit_read(&self, length: usize);
 }
 
 /// Envoy transport socket handle implemented with ABI callbacks into Envoy.
@@ -314,6 +329,48 @@ impl EnvoyTransportSocket for EnvoyTransportSocketImpl {
       abi::envoy_dynamic_module_callback_transport_socket_flush_write_buffer(self.raw);
     }
     true
+  }
+
+  fn get_server_name_override(&self) -> Option<String> {
+    let mut out = abi::envoy_dynamic_module_type_envoy_buffer {
+      ptr: std::ptr::null_mut(),
+      length: 0,
+    };
+    unsafe {
+      abi::envoy_dynamic_module_callback_transport_socket_get_server_name_override(
+        self.raw, &mut out,
+      );
+    }
+    if out.ptr.is_null() || out.length == 0 {
+      None
+    } else {
+      let slice = unsafe { std::slice::from_raw_parts(out.ptr as *const u8, out.length) };
+      Some(String::from_utf8_lossy(slice).into_owned())
+    }
+  }
+
+  fn reserve_read_slices(
+    &self,
+    slices_out: &mut [abi::envoy_dynamic_module_type_envoy_buffer],
+  ) -> usize {
+    if slices_out.is_empty() {
+      return 0;
+    }
+    let mut count = slices_out.len();
+    unsafe {
+      abi::envoy_dynamic_module_callback_transport_socket_reserve_read_slices(
+        self.raw,
+        slices_out.as_mut_ptr(),
+        &mut count,
+      );
+    }
+    count
+  }
+
+  fn commit_read(&self, length: usize) {
+    unsafe {
+      abi::envoy_dynamic_module_callback_transport_socket_commit_read(self.raw, length);
+    }
   }
 }
 

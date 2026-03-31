@@ -3271,4 +3271,33 @@ __attribute__((weak)) void envoy_dynamic_module_callback_transport_socket_flush_
                "not implemented in this context");
 }
 
+__attribute__((weak)) void
+envoy_dynamic_module_callback_transport_socket_get_server_name_override(
+    envoy_dynamic_module_type_transport_socket_envoy_ptr,
+    envoy_dynamic_module_type_envoy_buffer* out) {
+  IS_ENVOY_BUG("envoy_dynamic_module_callback_transport_socket_get_server_name_override: "
+               "not implemented in this context");
+  if (out != nullptr) {
+    out->ptr = nullptr;
+    out->length = 0;
+  }
+}
+
+__attribute__((weak)) void
+envoy_dynamic_module_callback_transport_socket_reserve_read_slices(
+    envoy_dynamic_module_type_transport_socket_envoy_ptr,
+    envoy_dynamic_module_type_envoy_buffer* /*slices*/, size_t* slices_count) {
+  IS_ENVOY_BUG("envoy_dynamic_module_callback_transport_socket_reserve_read_slices: "
+               "not implemented in this context");
+  if (slices_count != nullptr) {
+    *slices_count = 0;
+  }
+}
+
+__attribute__((weak)) void envoy_dynamic_module_callback_transport_socket_commit_read(
+    envoy_dynamic_module_type_transport_socket_envoy_ptr, size_t) {
+  IS_ENVOY_BUG("envoy_dynamic_module_callback_transport_socket_commit_read: "
+               "not implemented in this context");
+}
+
 } // extern "C"

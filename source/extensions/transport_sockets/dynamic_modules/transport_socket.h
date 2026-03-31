@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "envoy/buffer/buffer.h"
 #include "envoy/network/transport_socket.h"
 #include "envoy/upstream/host_description.h"
 
@@ -23,7 +24,8 @@ class DynamicModuleTransportSocket : public Network::TransportSocket,
                                      public Logger::Loggable<Logger::Id::dynamic_modules> {
 public:
   DynamicModuleTransportSocket(DynamicModuleTransportSocketFactoryConfigSharedPtr factory_config,
-                               bool is_upstream);
+                               bool is_upstream,
+                               Network::TransportSocketOptionsConstSharedPtr options = nullptr);
 
   ~DynamicModuleTransportSocket() override;
 
@@ -49,6 +51,15 @@ public:
   Buffer::Instance* activeReadBuffer() { return active_read_buffer_; }
   Buffer::Instance* activeWriteBuffer() { return active_write_buffer_; }
 
+  const Network::TransportSocketOptions* transportSocketOptions() const {
+    return transport_socket_options_.get();
+  }
+
+  void setActiveReadReservation(std::unique_ptr<Buffer::Reservation> reservation) {
+    active_read_reservation_ = std::move(reservation);
+  }
+  Buffer::Reservation* activeReadReservation() { return active_read_reservation_.get(); }
+
 private:
   void refreshProtocolString() const;
   void refreshFailureReasonString() const;
@@ -60,6 +71,9 @@ private:
 
   Buffer::Instance* active_read_buffer_{nullptr};
   Buffer::Instance* active_write_buffer_{nullptr};
+  std::unique_ptr<Buffer::Reservation> active_read_reservation_;
+
+  Network::TransportSocketOptionsConstSharedPtr transport_socket_options_;
 
   mutable std::string protocol_storage_;
   mutable std::string failure_reason_storage_;

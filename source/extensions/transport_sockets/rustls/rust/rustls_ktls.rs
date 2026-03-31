@@ -46,14 +46,26 @@ const MAX_WRITE_SLICES: usize = 16;
 /// JSON configuration for the rustls transport socket.
 #[derive(Debug, Deserialize)]
 struct JsonConfig {
-  /// PEM-encoded certificate chain, or path to a PEM file.
+  /// PEM-encoded certificate chain, or path to a PEM file. Required for downstream (server)
+  /// sockets. Optional for upstream (client) sockets when mTLS is needed.
+  #[serde(default)]
   cert_chain: String,
-  /// PEM-encoded private key, or path to a PEM file.
+  /// PEM-encoded private key, or path to a PEM file. Required for downstream (server) sockets.
+  /// Optional for upstream (client) sockets when mTLS is needed.
+  #[serde(default)]
   private_key: String,
-  /// PEM-encoded trusted CA certificates, or path to a PEM file. If not specified, the default
-  /// webpki root certificates are used for upstream connections.
+  /// PEM-encoded trusted CA certificates, or path to a PEM file. If not specified and
+  /// `use_system_ca` is false, the default webpki root certificates are used for upstream
+  /// connections.
   #[serde(default)]
   trusted_ca: Option<String>,
+  /// When true, loads the system CA certificate bundle for upstream certificate verification.
+  /// Looks in standard paths: `/etc/ssl/certs/ca-certificates.crt` (Debian/Ubuntu),
+  /// `/etc/pki/tls/certs/ca-bundle.crt` (RHEL/CentOS), `/etc/ssl/ca-bundle.pem` (SUSE),
+  /// and `/etc/ssl/cert.pem` (Alpine). If both `trusted_ca` and `use_system_ca` are set, both
+  /// are loaded into the trust store. If not specified, defaults to false.
+  #[serde(default)]
+  use_system_ca: bool,
   /// ALPN protocols to advertise during the TLS handshake.
   #[serde(default)]
   alpn_protocols: Option<Vec<String>>,
@@ -119,6 +131,30 @@ fn alpn_from_config(cfg: &JsonConfig) -> Vec<Vec<u8>> {
     .unwrap_or_default()
 }
 
+/// Standard paths for the system CA certificate bundle on major Linux distributions.
+const SYSTEM_CA_PATHS: &[&str] = &[
+  "/etc/ssl/certs/ca-certificates.crt", // Debian, Ubuntu, Arch
+  "/etc/pki/tls/certs/ca-bundle.crt",   // RHEL, CentOS, Fedora
+  "/etc/ssl/ca-bundle.pem",             // SUSE, openSUSE
+  "/etc/ssl/cert.pem",                  // Alpine, FreeBSD
+];
+
+fn load_system_ca_roots(roots: &mut RootCertStore) -> Result<(), String> {
+  for path in SYSTEM_CA_PATHS {
+    let p = std::path::Path::new(path);
+    if p.is_file() {
+      let pem = std::fs::read(p).map_err(|e| format!("read {path}: {e}"))?;
+      add_trusted_roots_from_pem(&pem, roots)?;
+      return Ok(());
+    }
+  }
+  Err(
+    "no system CA bundle found; checked: /etc/ssl/certs/ca-certificates.crt, \
+     /etc/pki/tls/certs/ca-bundle.crt, /etc/ssl/ca-bundle.pem, /etc/ssl/cert.pem"
+      .to_string(),
+  )
+}
+
 // -------------------------------------------------------------------------------------------------
 // Factory configuration.
 // -------------------------------------------------------------------------------------------------
@@ -166,6 +202,9 @@ impl RustlsFactoryConfig {
         let pem = load_pem_bytes(ca)?;
         add_trusted_roots_from_pem(&pem, &mut root_store)?;
       }
+    }
+    if cfg.use_system_ca {
+      load_system_ca_roots(&mut root_store)?;
     }
     if root_store.is_empty() {
       root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -216,7 +255,7 @@ impl RustlsFactoryConfig {
 impl TransportSocketFactoryConfig<EnvoyTransportSocketImpl> for RustlsFactoryConfig {
   fn new_transport_socket(
     &self,
-    _envoy: &mut EnvoyTransportSocketImpl,
+    envoy: &mut EnvoyTransportSocketImpl,
   ) -> Box<dyn TransportSocket<EnvoyTransportSocketImpl>> {
     match &self.endpoint {
       EndpointKind::Downstream(cfg) => Box::new(RustlsTransportSocket::new_server(
@@ -224,12 +263,27 @@ impl TransportSocketFactoryConfig<EnvoyTransportSocketImpl> for RustlsFactoryCon
         self.want_ktls,
         self.ktls_tx_only,
       )),
-      EndpointKind::Upstream { cfg, server_name } => Box::new(RustlsTransportSocket::new_client(
-        cfg.clone(),
-        server_name.clone(),
-        self.want_ktls,
-        self.ktls_tx_only,
-      )),
+      EndpointKind::Upstream { cfg, server_name } => {
+        let effective_sni = match envoy.get_server_name_override() {
+          Some(ref s) => match ServerName::try_from(s.clone()) {
+            Ok(sni) => sni,
+            Err(_) => {
+              envoy_log_error!(
+                "rustls: ignoring invalid server name override '{}', using static config.",
+                s
+              );
+              server_name.clone()
+            },
+          },
+          None => server_name.clone(),
+        };
+        Box::new(RustlsTransportSocket::new_client(
+          cfg.clone(),
+          effective_sni,
+          self.want_ktls,
+          self.ktls_tx_only,
+        ))
+      },
     }
   }
 }
@@ -999,61 +1053,111 @@ impl RustlsTransportSocket {
         fd
       },
     };
-    let mut buf = [0u8; IO_BUF_SIZE];
+
+    // Zero-copy read: reserve writable slices from Envoy's read buffer ONCE, then fill them
+    // with recv() calls. This matches BoringSSL's pattern: one reserveForRead(), N reads into
+    // the slices, one commit(). Eliminates the intermediate stack-buffer memcpy that was the
+    // primary throughput bottleneck.
+    const MAX_READ_SLICES: usize = 8;
     let mut total = 0usize;
-    loop {
-      let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
-      if n > 0 {
-        envoy.read_buffer_add(&buf[.. n as usize]);
-        total += n as usize;
-        // Respect Envoy's flow-control high watermark: stop reading and schedule a future
-        // read so the filter chain can consume buffered data before we add more. This matches
-        // the pattern used by BoringSSL's SslSocket::doRead and RawBufferSocket::doRead.
-        if envoy.should_drain_read_buffer() {
-          envoy.set_is_readable(true);
-          return IoResult::keep_open(total, false);
+    let mut keep_reading = true;
+    let mut end_stream = false;
+
+    while keep_reading {
+      let mut slices = [abi::envoy_dynamic_module_type_envoy_buffer {
+        ptr: std::ptr::null_mut(),
+        length: 0,
+      }; MAX_READ_SLICES];
+      let n_slices = envoy.reserve_read_slices(&mut slices);
+      if n_slices == 0 {
+        break;
+      }
+
+      let mut batch_bytes = 0usize;
+      for i in 0 .. n_slices {
+        if slices[i].ptr.is_null() || slices[i].length == 0 {
+          continue;
         }
-        continue;
-      }
-      if n == 0 {
-        return IoResult::close(total, true);
-      }
-      let errno = unsafe { *libc::__errno_location() };
-      if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
-        return IoResult::keep_open(total, false);
-      }
-      if errno == libc::EINTR {
-        continue;
-      }
-      if errno == libc::EIO {
-        match linux_ktls::receive_control_message(fd, &mut buf) {
-          linux_ktls::ControlResult::Continue => continue,
-          linux_ktls::ControlResult::ApplicationData(len) => {
-            if len > 0 {
-              envoy.read_buffer_add(&buf[.. len]);
-            }
-            total += len;
-            if envoy.should_drain_read_buffer() {
-              envoy.set_is_readable(true);
-              return IoResult::keep_open(total, false);
-            }
-            continue;
-          },
-          linux_ktls::ControlResult::CloseNotify => {
-            if !self.ktls_shutdown_sent {
-              let _ = linux_ktls::send_close_notify(fd);
-              self.ktls_shutdown_sent = true;
-            }
-            return IoResult::close(total, true);
-          },
-          linux_ktls::ControlResult::Error(e) => {
-            self.failure = format!("kTLS control message error: {e}");
-            return IoResult::close(total, false);
-          },
+        let slice_cap = slices[i].length;
+        let n = unsafe {
+          libc::recv(
+            fd,
+            slices[i].ptr as *mut libc::c_void,
+            slice_cap,
+            libc::MSG_DONTWAIT,
+          )
+        };
+        if n > 0 {
+          let received = n as usize;
+          batch_bytes += received;
+          if received < slice_cap {
+            break; // Partial fill — no more data pending; break to commit this batch.
+          }
+          continue;
+        }
+        if n == 0 {
+          end_stream = true;
+          keep_reading = false;
+          break;
+        }
+        let errno = unsafe { *libc::__errno_location() };
+        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+          keep_reading = false;
+          break;
+        }
+        if errno == libc::EINTR {
+          continue;
+        }
+        if errno == libc::EIO {
+          // Commit whatever we have so far before handling the control message.
+          envoy.commit_read(batch_bytes);
+          total += batch_bytes;
+          batch_bytes = 0;
+          let mut ctrl_buf = [0u8; IO_BUF_SIZE];
+          match linux_ktls::receive_control_message(fd, &mut ctrl_buf) {
+            linux_ktls::ControlResult::Continue => {
+              break; // Re-enter the outer while to get a fresh reservation.
+            },
+            linux_ktls::ControlResult::ApplicationData(len) => {
+              if len > 0 {
+                envoy.read_buffer_add(&ctrl_buf[.. len]);
+              }
+              total += len;
+              break; // Re-enter the outer while for fresh reservation.
+            },
+            linux_ktls::ControlResult::CloseNotify => {
+              if !self.ktls_shutdown_sent {
+                let _ = linux_ktls::send_close_notify(fd);
+                self.ktls_shutdown_sent = true;
+              }
+              return IoResult::close(total, true);
+            },
+            linux_ktls::ControlResult::Error(e) => {
+              self.failure = format!("kTLS control message error: {e}");
+              return IoResult::close(total, false);
+            },
+          }
+        } else {
+          envoy.commit_read(batch_bytes);
+          total += batch_bytes;
+          self.failure = format!("kTLS read failed (errno {} / {})", errno, errno_name(errno));
+          return IoResult::close(total, false);
         }
       }
-      self.failure = format!("kTLS read failed (errno {} / {})", errno, errno_name(errno));
-      return IoResult::close(total, false);
+
+      envoy.commit_read(batch_bytes);
+      total += batch_bytes;
+
+      if total > 0 && envoy.should_drain_read_buffer() {
+        envoy.set_is_readable(true);
+        keep_reading = false;
+      }
+    }
+
+    if end_stream {
+      IoResult::close(total, true)
+    } else {
+      IoResult::keep_open(total, false)
     }
   }
 
@@ -1160,6 +1264,28 @@ impl RustlsTransportSocket {
     }
     IoResult::keep_open(total, false)
   }
+
+  /// Sends `count` bytes from the open file `file_fd` starting at `*offset` directly to the kTLS
+  /// socket using the `sendfile64` syscall. Updates `*offset` to reflect the new position. Returns
+  /// the number of bytes sent, or an error string.
+  ///
+  /// When kTLS TX is installed, this achieves true zero-copy: data goes from the file page cache
+  /// into the kernel TLS encryption layer (software or NIC hardware offload) without entering
+  /// userspace. This is ideal for serving static files or large cached responses.
+  ///
+  /// Returns `Err` if kTLS is not active.
+  #[cfg(target_os = "linux")]
+  pub fn ktls_sendfile(
+    &mut self,
+    file_fd: libc::c_int,
+    offset: &mut libc::off_t,
+    count: usize,
+  ) -> Result<usize, String> {
+    let fd = self
+      .ktls_fd
+      .ok_or_else(|| "sendfile requires kTLS TX to be installed".to_string())?;
+    linux_ktls::sendfile(fd, file_fd, offset, count)
+  }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1240,8 +1366,8 @@ mod linux_ktls {
 
   const TLS_SET_RECORD_TYPE: libc::c_int = 1;
   const TLS_GET_RECORD_TYPE: libc::c_int = 2;
-  #[allow(dead_code)]
   const TLS_RX_EXPECT_NO_PAD: libc::c_int = 3;
+  const TLS_TX_ZEROCOPY_RO: libc::c_int = 6;
   const TLS_CONTENT_TYPE_ALERT: u8 = 21;
   const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 22;
   const TLS_CONTENT_TYPE_APP_DATA: u8 = 23;
@@ -1464,6 +1590,20 @@ mod linux_ktls {
   }
 
   pub fn install_crypto(fd: libc::c_int, conn: Connection, tx_only: bool) -> Result<(), String> {
+    // Disable Nagle's algorithm before installing the TLS ULP. Some kernel versions apply
+    // Nagle independently before and after ULP attachment, so setting this first avoids an
+    // extra RTT of buffering on the initial kTLS writes.
+    unsafe {
+      let val: libc::c_int = 1;
+      libc::setsockopt(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_NODELAY,
+        &val as *const _ as *const libc::c_void,
+        std::mem::size_of_val(&val) as libc::socklen_t,
+      );
+    }
+
     let version = match conn.protocol_version() {
       Some(ProtocolVersion::TLSv1_2) => TLS_1_2_VERSION,
       Some(ProtocolVersion::TLSv1_3) => TLS_1_3_VERSION,
@@ -1476,6 +1616,21 @@ mod linux_ktls {
     let (tx_seq, tx_sec) = secrets.tx;
     let (rx_seq, rx_sec) = secrets.rx;
     apply_direction(fd, TLS_TX, version, tx_seq, &tx_sec)?;
+
+    // Enable zero-copy for read-only TX data when NIC hardware offload is active (kernel 6.0+).
+    // Without this flag the kernel strips MSG_SPLICE_PAGES from sendfile, forcing a software copy
+    // even when the NIC could encrypt in hardware. Non-fatal on older kernels.
+    unsafe {
+      let val: libc::c_int = 1;
+      libc::setsockopt(
+        fd,
+        SOL_TLS,
+        TLS_TX_ZEROCOPY_RO,
+        &val as *const _ as *const libc::c_void,
+        std::mem::size_of_val(&val) as libc::socklen_t,
+      );
+    }
+
     if !tx_only {
       apply_direction(fd, TLS_RX, version, rx_seq, &rx_sec)?;
       if version == TLS_1_3_VERSION {
@@ -1490,16 +1645,6 @@ mod linux_ktls {
           );
         }
       }
-    }
-    unsafe {
-      let val: libc::c_int = 1;
-      libc::setsockopt(
-        fd,
-        libc::IPPROTO_TCP,
-        libc::TCP_NODELAY,
-        &val as *const _ as *const libc::c_void,
-        std::mem::size_of_val(&val) as libc::socklen_t,
-      );
     }
     envoy_log_info!("kTLS installed (TX={}, RX={}).", true, !tx_only);
     Ok(())
@@ -1578,6 +1723,47 @@ mod linux_ktls {
       TLS_CONTENT_TYPE_APP_DATA => ControlResult::ApplicationData(n as usize),
       _ => ControlResult::Continue,
     }
+  }
+
+  /// Sends file data directly from `file_fd` to the kTLS socket `sock_fd` using the `sendfile64`
+  /// syscall. With kTLS TX, the kernel reads from the file page cache and encrypts in-kernel,
+  /// achieving true zero-copy: the CPU never touches the plaintext data. If NIC TLS offload is
+  /// active, the NIC encrypts in hardware and the CPU is not involved at all.
+  ///
+  /// Returns `Ok(bytes_sent)` on success. On `EAGAIN`/`EWOULDBLOCK`, returns `Ok(0)`.
+  pub fn sendfile(
+    sock_fd: libc::c_int,
+    file_fd: libc::c_int,
+    offset: &mut libc::off_t,
+    count: usize,
+  ) -> Result<usize, String> {
+    let mut total: usize = 0;
+    let mut remaining = count;
+    while remaining > 0 {
+      let n = unsafe { libc::sendfile64(sock_fd, file_fd, offset, remaining) };
+      if n > 0 {
+        let sent = n as usize;
+        total += sent;
+        remaining -= sent;
+        continue;
+      }
+      if n == 0 {
+        break;
+      }
+      let errno = unsafe { *libc::__errno_location() };
+      if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+        break;
+      }
+      if errno == libc::EINTR {
+        continue;
+      }
+      return Err(format!(
+        "sendfile64 failed (errno {} / {})",
+        errno,
+        super::errno_name(errno)
+      ));
+    }
+    Ok(total)
   }
 
   pub fn send_close_notify(fd: libc::c_int) -> Result<(), String> {

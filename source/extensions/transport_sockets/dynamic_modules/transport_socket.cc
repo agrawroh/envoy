@@ -17,8 +17,9 @@ toPostIoAction(const envoy_dynamic_module_type_transport_socket_post_io_action a
 } // namespace
 
 DynamicModuleTransportSocket::DynamicModuleTransportSocket(
-    DynamicModuleTransportSocketFactoryConfigSharedPtr factory_config, const bool /*is_upstream*/)
-    : factory_config_(std::move(factory_config)) {
+    DynamicModuleTransportSocketFactoryConfigSharedPtr factory_config, const bool /*is_upstream*/,
+    Network::TransportSocketOptionsConstSharedPtr options)
+    : factory_config_(std::move(factory_config)), transport_socket_options_(std::move(options)) {
   socket_module_ =
       factory_config_->on_socket_new_(factory_config_->in_module_factory_config_, thisAsEnvoyPtr());
   if (socket_module_ == nullptr) {
@@ -131,9 +132,9 @@ DynamicModuleUpstreamTransportSocketFactory::DynamicModuleUpstreamTransportSocke
       implements_secure_transport_(implements_secure_transport) {}
 
 Network::TransportSocketPtr DynamicModuleUpstreamTransportSocketFactory::createTransportSocket(
-    Network::TransportSocketOptionsConstSharedPtr /*options*/,
+    Network::TransportSocketOptionsConstSharedPtr options,
     Upstream::HostDescriptionConstSharedPtr /*host*/) const {
-  return std::make_unique<DynamicModuleTransportSocket>(factory_config_, true);
+  return std::make_unique<DynamicModuleTransportSocket>(factory_config_, true, std::move(options));
 }
 
 void DynamicModuleUpstreamTransportSocketFactory::hashKey(

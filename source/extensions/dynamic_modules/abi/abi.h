@@ -11674,6 +11674,57 @@ void envoy_dynamic_module_callback_transport_socket_set_is_readable(
 void envoy_dynamic_module_callback_transport_socket_flush_write_buffer(
     envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr);
 
+/**
+ * envoy_dynamic_module_callback_transport_socket_get_server_name_override returns the per-connection
+ * SNI override from the transport socket options (e.g., set by DFP / auto_sni). This allows dynamic
+ * module transport sockets to use the correct SNI for upstream TLS connections when the hostname is
+ * resolved at runtime.
+ *
+ * @param transport_socket_envoy_ptr is the pointer to the Envoy transport socket object.
+ * @param out is the output buffer. If a server name override is present, out->ptr and out->length
+ * are set to point at the string data owned by the transport socket options. The data is read-only
+ * and valid for the lifetime of the transport socket; the module must not modify or free it. If no
+ * override is present, out->ptr is set to nullptr and out->length to 0.
+ */
+void envoy_dynamic_module_callback_transport_socket_get_server_name_override(
+    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr,
+    envoy_dynamic_module_type_envoy_buffer* out);
+
+/**
+ * envoy_dynamic_module_callback_transport_socket_reserve_read_slices reserves writable memory
+ * from the connection read buffer for zero-copy reads. The returned slices point directly into
+ * Envoy's internal buffer memory, allowing the module to recv() or read() data straight into
+ * the buffer without an intermediate copy.
+ *
+ * After writing data into the slices, the module must call
+ * envoy_dynamic_module_callback_transport_socket_commit_read to commit the bytes.
+ *
+ * Only one reservation may be active at a time per transport socket. Calling this function again
+ * before committing discards the previous reservation.
+ *
+ * @param transport_socket_envoy_ptr is the pointer to the Envoy transport socket object.
+ * @param slices is the output array where writable slice pointers and lengths are stored. Each
+ * element's ptr is set to a mutable pointer into the read buffer, and length to the available
+ * capacity of that slice.
+ * @param slices_count on input is the maximum number of slices to fill; on output is set to the
+ * actual number of slices filled.
+ */
+void envoy_dynamic_module_callback_transport_socket_reserve_read_slices(
+    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr,
+    envoy_dynamic_module_type_envoy_buffer* slices, size_t* slices_count);
+
+/**
+ * envoy_dynamic_module_callback_transport_socket_commit_read commits bytes to the active read
+ * buffer reservation created by
+ * envoy_dynamic_module_callback_transport_socket_reserve_read_slices.
+ *
+ * @param transport_socket_envoy_ptr is the pointer to the Envoy transport socket object.
+ * @param length is the total number of bytes written across all reserved slices. The module must
+ * not commit more bytes than the total capacity returned by reserve_read_slices.
+ */
+void envoy_dynamic_module_callback_transport_socket_commit_read(
+    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr, size_t length);
+
 #ifdef __cplusplus
 }
 #endif

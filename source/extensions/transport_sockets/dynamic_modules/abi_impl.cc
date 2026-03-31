@@ -182,4 +182,59 @@ void envoy_dynamic_module_callback_transport_socket_flush_write_buffer(
   socket->transportCallbacks()->flushWriteBuffer();
 }
 
+void envoy_dynamic_module_callback_transport_socket_get_server_name_override(
+    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr,
+    envoy_dynamic_module_type_envoy_buffer* out) {
+  if (out == nullptr) {
+    return;
+  }
+  out->ptr = nullptr;
+  out->length = 0;
+  auto* socket = static_cast<DynamicModuleTransportSocket*>(transport_socket_envoy_ptr);
+  const auto* options = socket->transportSocketOptions();
+  if (options == nullptr) {
+    return;
+  }
+  const auto& sni_override = options->serverNameOverride();
+  if (sni_override.has_value() && !sni_override->empty()) {
+    out->ptr = sni_override->data();
+    out->length = sni_override->size();
+  }
+}
+
+void envoy_dynamic_module_callback_transport_socket_reserve_read_slices(
+    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr,
+    envoy_dynamic_module_type_envoy_buffer* slices, size_t* slices_count) {
+  auto* socket = static_cast<DynamicModuleTransportSocket*>(transport_socket_envoy_ptr);
+  if (slices_count == nullptr) {
+    return;
+  }
+  Envoy::Buffer::Instance* buf = socket->activeReadBuffer();
+  if (buf == nullptr || slices == nullptr) {
+    *slices_count = 0;
+    return;
+  }
+  auto reservation =
+      std::make_unique<Envoy::Buffer::Reservation>(buf->reserveForRead());
+  const size_t max_out = *slices_count;
+  const uint64_t n = std::min(static_cast<uint64_t>(max_out), reservation->numSlices());
+  for (uint64_t i = 0; i < n; ++i) {
+    slices[i].ptr = static_cast<char*>(reservation->slices()[i].mem_);
+    slices[i].length = reservation->slices()[i].len_;
+  }
+  *slices_count = static_cast<size_t>(n);
+  socket->setActiveReadReservation(std::move(reservation));
+}
+
+void envoy_dynamic_module_callback_transport_socket_commit_read(
+    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr, size_t length) {
+  auto* socket = static_cast<DynamicModuleTransportSocket*>(transport_socket_envoy_ptr);
+  auto* reservation = socket->activeReadReservation();
+  if (reservation == nullptr) {
+    return;
+  }
+  reservation->commit(static_cast<uint64_t>(length));
+  socket->setActiveReadReservation(nullptr);
+}
+
 } // extern "C"
