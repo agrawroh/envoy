@@ -21,6 +21,18 @@ startup --host_jvm_args="-DBAZEL_TRACK_SOURCE_DIRECTORIES=1"
 
 common --noenable_bzlmod
 
+# Supply chain registry proxy settings.
+# proxy.golang.org and index.crates.io are DNS-blocked; route through Databricks proxies.
+# repo_env: for repository rules (go_repository, crates_repository)
+# action_env: for build actions (boringssl_fips genrule runs `go build` internally)
+common --repo_env=GOPROXY=https://go-proxy.dev.databricks.com
+common --repo_env=GONOSUMDB=*
+common --repo_env=GONOSUMCHECK=*
+common --repo_env=CARGO_BAZEL_ISOLATED=0
+build --action_env=GOPROXY=https://go-proxy.dev.databricks.com
+build --action_env=GONOSUMDB=*
+build --action_env=GONOSUMCHECK=*
+
 fetch --color=yes
 run --color=yes
 

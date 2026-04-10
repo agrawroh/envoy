@@ -9,21 +9,33 @@ def envoy_python_dependencies():
         name = "base_pip3",
         python_interpreter_target = "@python3_12_host//:python",
         requirements_lock = "@envoy//tools/base:requirements.txt",
-        extra_pip_args = ["--require-hashes"],
+        extra_pip_args = [
+            "--require-hashes",
+            "--index-url",
+            "https://pypi-proxy.dev.databricks.com/simple",
+        ],
     )
 
     pip_parse(
         name = "dev_pip3",
         python_interpreter_target = "@python3_12_host//:python",
         requirements_lock = "@envoy//tools/dev:requirements.txt",
-        extra_pip_args = ["--require-hashes"],
+        extra_pip_args = [
+            "--require-hashes",
+            "--index-url",
+            "https://pypi-proxy.dev.databricks.com/simple",
+        ],
     )
 
     pip_parse(
         name = "fuzzing_pip3",
         python_interpreter_target = "@python3_12_host//:python",
         requirements_lock = "@rules_fuzzing//fuzzing:requirements.txt",
-        extra_pip_args = ["--require-hashes"],
+        extra_pip_args = [
+            "--require-hashes",
+            "--index-url",
+            "https://pypi-proxy.dev.databricks.com/simple",
+        ],
     )
 
     system_python(
