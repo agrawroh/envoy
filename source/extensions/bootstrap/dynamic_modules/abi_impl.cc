@@ -5,6 +5,7 @@
 #include "envoy/server/admin.h"
 
 #include "source/common/buffer/buffer_impl.h"
+#include "source/common/common/thread.h"
 #include "source/common/stats/symbol_table.h"
 #include "source/common/stats/utility.h"
 #include "source/extensions/bootstrap/dynamic_modules/extension.h"
@@ -491,7 +492,25 @@ bool envoy_dynamic_module_callback_bootstrap_extension_timer_enabled(
 
 void envoy_dynamic_module_callback_bootstrap_extension_timer_delete(
     envoy_dynamic_module_type_bootstrap_extension_timer_module_ptr timer_ptr) {
-  delete static_cast<DynamicModuleBootstrapExtensionTimer*>(timer_ptr);
+  auto* timer = static_cast<DynamicModuleBootstrapExtensionTimer*>(timer_ptr);
+  // The Envoy timer wrapped by ``timer->timer()`` deregisters from the dispatcher's timer list in
+  // its destructor, which is only safe on the dispatcher thread. When the module calls
+  // ``timer_delete`` from a background thread, post the deletion to the main thread dispatcher so
+  // that the wrapper (and the underlying timer) is destroyed on the dispatcher thread. When the
+  // caller is already on the main thread or a test thread, delete synchronously to preserve the
+  // shutdown path where the dispatcher may no longer drain posted callbacks.
+  if (Envoy::Thread::MainThread::isMainThread() || Envoy::Thread::TestThread::isTestThread()) {
+    delete timer;
+    return;
+  }
+  if (auto config_shared = timer->weakConfig().lock()) {
+    config_shared->main_thread_dispatcher_.post([timer]() { delete timer; });
+    return;
+  }
+  // The config is gone, which means the dispatcher may also be torn down. Fall back to inline
+  // deletion as a best effort; this path is reachable only when the module is calling
+  // ``timer_delete`` after the server has released the config.
+  delete timer;
 }
 
 // -------------------- File Watcher Callbacks --------------------
