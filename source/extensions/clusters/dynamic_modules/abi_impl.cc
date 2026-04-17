@@ -1078,7 +1078,7 @@ void envoy_dynamic_module_callback_cluster_lb_async_host_selection_complete(
     envoy_dynamic_module_type_cluster_lb_context_envoy_ptr context_envoy_ptr,
     envoy_dynamic_module_type_cluster_host_envoy_ptr host,
     envoy_dynamic_module_type_module_buffer details) {
-  auto* lb = getLb(lb_envoy_ptr);
+  auto* lb_raw = static_cast<DynamicModuleLoadBalancer*>(lb_envoy_ptr);
 
   // Copy the details string on the calling thread. The pointer is not valid after we return.
   std::string details_str;
@@ -1086,14 +1086,28 @@ void envoy_dynamic_module_callback_cluster_lb_async_host_selection_complete(
     details_str.assign(details.ptr, details.length);
   }
 
-  auto cancelled = lb->activeAsyncCancelled();
-  auto* dispatcher = lb->activeAsyncDispatcher();
+  // The module may invoke this callback on any thread and may race with the destruction of the
+  // load balancer (for example, after a cluster is removed mid selection). Look up the raw
+  // pointer in the process wide registry of live instances. If it no longer refers to a live
+  // load balancer, silently drop the event; otherwise snapshot the state we need before
+  // releasing the registry lock.
+  std::shared_ptr<std::atomic<bool>> cancelled;
+  Event::Dispatcher* dispatcher = nullptr;
+  DynamicModuleClusterHandleSharedPtr handle;
+  const bool found = DynamicModuleLoadBalancer::withActiveInstance(
+      lb_raw, [&](const DynamicModuleLoadBalancer& lb) {
+        cancelled = lb.activeAsyncCancelled();
+        dispatcher = lb.activeAsyncDispatcher();
+        handle = lb.handle();
+      });
+  if (!found) {
+    return;
+  }
 
   if (dispatcher != nullptr) {
-    // Post all work to the worker thread. The host lookup and context access must happen
-    // on the worker thread because the module may call this from a background thread.
-    // Keep the cluster alive via the handle's shared_ptr until the callback fires.
-    auto handle = lb->handle();
+    // Post all work to the worker thread. The host lookup and context access must happen on the
+    // worker thread because the module may call this from a background thread. The handle's
+    // shared pointer keeps the cluster alive until the posted callback runs.
     dispatcher->post([context_envoy_ptr, host, details_str = std::move(details_str),
                       cancelled = std::move(cancelled), handle = std::move(handle)]() {
       if (cancelled != nullptr && cancelled->load(std::memory_order_acquire)) {
@@ -1107,11 +1121,12 @@ void envoy_dynamic_module_callback_cluster_lb_async_host_selection_complete(
       context->onAsyncHostSelection(std::move(host_shared), std::string(details_str));
     });
   } else {
-    // No worker dispatcher. Complete inline on the calling thread.
+    // No worker dispatcher. Complete inline on the calling thread. The handle shared pointer
+    // keeps the cluster alive for the host lookup.
     auto* context = getContext(context_envoy_ptr);
     Envoy::Upstream::HostConstSharedPtr host_shared;
     if (host != nullptr) {
-      host_shared = lb->handle()->cluster()->findHost(host);
+      host_shared = handle->cluster()->findHost(host);
     }
     context->onAsyncHostSelection(std::move(host_shared), std::move(details_str));
   }

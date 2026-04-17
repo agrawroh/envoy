@@ -7,6 +7,7 @@
 #include "envoy/upstream/locality.h"
 
 #include "source/common/buffer/buffer_impl.h"
+#include "source/common/common/thread.h"
 #include "source/common/network/address_impl.h"
 #include "source/common/network/utility.h"
 #include "source/common/protobuf/protobuf.h"
@@ -157,13 +158,28 @@ DynamicModuleClusterConfig::~DynamicModuleClusterConfig() {
 DynamicModuleClusterHandle::~DynamicModuleClusterHandle() {
   std::shared_ptr<DynamicModuleCluster> cluster = std::move(cluster_);
   cluster_.reset();
-  // Release lifecycle handles eagerly while the lifecycle notifier is still valid. When the
-  // dispatcher destructor clears pending callbacks, the cluster destructor would otherwise try to
-  // unregister from already-destroyed lifecycle notifier lists.
+  if (cluster == nullptr) {
+    return;
+  }
+  Event::Dispatcher& dispatcher = cluster->dispatcher_;
+  // The lifecycle handle resets unregister the cluster from main thread owned notifiers
+  // (server lifecycle notifier, drain manager). When the handle is destroyed on a worker
+  // thread, because the last shared pointer to the handle was held by a per worker load
+  // balancer, move the full teardown onto the main dispatcher. On the main thread, release
+  // the handles synchronously so that they are deregistered before the dispatcher drops
+  // pending callbacks during server shutdown.
+  if (!Thread::MainThread::isMainThread() && !Thread::TestThread::isTestThread()) {
+    dispatcher.post([cluster = std::move(cluster)]() mutable {
+      cluster->server_initialized_handle_.reset();
+      cluster->shutdown_handle_.reset();
+      cluster->drain_handle_.reset();
+      cluster.reset();
+    });
+    return;
+  }
   cluster->server_initialized_handle_.reset();
   cluster->shutdown_handle_.reset();
   cluster->drain_handle_.reset();
-  Event::Dispatcher& dispatcher = cluster->dispatcher_;
   dispatcher.post([cluster = std::move(cluster)]() mutable { cluster.reset(); });
 }
 
@@ -590,9 +606,51 @@ void DynamicModuleCluster::HttpCalloutCallback::onFailure(const Http::AsyncClien
 // DynamicModuleLoadBalancer
 // =================================================================================================
 
+namespace {
+// Process wide registry of live DynamicModuleLoadBalancer instances. Used by the async host
+// selection completion ABI callback to look up a raw pointer supplied by the module and drop the
+// event when the pointer no longer refers to a live instance (for example, after a cluster has
+// been removed mid selection).
+absl::Mutex& activeDynamicModuleLoadBalancersMutex() {
+  static auto* m = new absl::Mutex();
+  return *m;
+}
+
+absl::flat_hash_set<const DynamicModuleLoadBalancer*>& activeDynamicModuleLoadBalancers()
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(activeDynamicModuleLoadBalancersMutex()) {
+  static auto* s = new absl::flat_hash_set<const DynamicModuleLoadBalancer*>();
+  return *s;
+}
+
+void registerActiveDynamicModuleLoadBalancer(const DynamicModuleLoadBalancer* lb) {
+  absl::MutexLock lock(&activeDynamicModuleLoadBalancersMutex());
+  activeDynamicModuleLoadBalancers().insert(lb);
+}
+
+void unregisterActiveDynamicModuleLoadBalancer(const DynamicModuleLoadBalancer* lb) {
+  absl::MutexLock lock(&activeDynamicModuleLoadBalancersMutex());
+  activeDynamicModuleLoadBalancers().erase(lb);
+}
+} // namespace
+
+bool DynamicModuleLoadBalancer::withActiveInstance(
+    const DynamicModuleLoadBalancer* lb,
+    absl::FunctionRef<void(const DynamicModuleLoadBalancer&)> f) {
+  absl::MutexLock lock(&activeDynamicModuleLoadBalancersMutex());
+  if (!activeDynamicModuleLoadBalancers().contains(lb)) {
+    return false;
+  }
+  f(*lb);
+  return true;
+}
+
 DynamicModuleLoadBalancer::DynamicModuleLoadBalancer(
     const DynamicModuleClusterHandleSharedPtr& handle, const Upstream::PrioritySet& priority_set)
     : handle_(handle), priority_set_(priority_set), in_module_lb_(nullptr) {
+  // Register in the process wide registry before invoking any module hook. The async host
+  // selection completion ABI callback consults this registry to safely check whether the raw
+  // pointer it receives from a module thread still refers to a live instance.
+  registerActiveDynamicModuleLoadBalancer(this);
   in_module_lb_ =
       handle_->cluster_->config()->on_cluster_lb_new_(handle_->cluster_->inModuleCluster(), this);
 
@@ -612,6 +670,10 @@ DynamicModuleLoadBalancer::DynamicModuleLoadBalancer(
 }
 
 DynamicModuleLoadBalancer::~DynamicModuleLoadBalancer() {
+  // Unregister from the active instances registry before tearing down the module side state. Any
+  // concurrent async host selection completion that acquires the registry lock after this point
+  // will observe the instance as gone and drop the event.
+  unregisterActiveDynamicModuleLoadBalancer(this);
   if (in_module_lb_ != nullptr && handle_->cluster_->config()->on_cluster_lb_destroy_ != nullptr) {
     handle_->cluster_->config()->on_cluster_lb_destroy_(in_module_lb_);
   }
