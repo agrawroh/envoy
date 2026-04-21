@@ -423,6 +423,17 @@ new_features:
   change: |
     Added ``envoy_dynamic_module_callback_is_validation_mode`` ABI callback that allows dynamic
     modules to check if the server is running in config validation mode.
+- area: dynamic_modules
+  change: |
+    Added ``envoy_dynamic_module_callback_http_filter_register_cluster_host_watcher`` ABI callback
+    and the corresponding ``envoy_dynamic_module_on_http_filter_cluster_host_set_change`` event hook
+    that let an HTTP filter receive a notification whenever its route's cluster gains or loses hosts.
+    The registering call also returns a snapshot of the current host counts so the caller can
+    decide whether to wait without a check-then-register race. The watcher is scoped to the
+    filter's lifetime; destruction unregisters automatically. In the Rust SDK this surface is
+    exposed as ``EnvoyHttpFilter::register_cluster_host_watcher`` and
+    ``HttpFilter::on_cluster_host_set_change``. Typical use case: scale-from-zero — pause the
+    request, signal the control plane, and resume on the first host-set update.
 - area: ratelimit
   change: |
     Added ``is_negative_hits`` boolean to the ``hits_addend``

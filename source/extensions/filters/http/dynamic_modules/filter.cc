@@ -264,6 +264,19 @@ void DynamicModuleHttpFilter::onScheduled(uint64_t event_id) {
   }
 }
 
+void DynamicModuleHttpFilter::onClusterHostSetChange(uint64_t watcher_id, size_t total_count,
+                                                     size_t healthy_count, size_t degraded_count) {
+  // The watcher holds a weak_ptr to this filter and the caller in abi_impl.cc already
+  // checks isDestroyed() before invoking us; the `in_module_filter_` guard is defensive
+  // against a small window where the filter has run onDestroy (in_module_filter_ reset)
+  // but the PrioritySet callback handle has not yet been dropped. No wire event should
+  // reach the module after its on_http_filter_destroy hook ran.
+  if (in_module_filter_) {
+    config_->on_http_filter_cluster_host_set_change_(thisAsVoidPtr(), in_module_filter_, watcher_id,
+                                                     total_count, healthy_count, degraded_count);
+  }
+}
+
 void DynamicModuleHttpFilter::continueDecoding() {
   if (decoder_callbacks_ && !in_continue_) {
     decoder_callbacks_->continueDecoding();

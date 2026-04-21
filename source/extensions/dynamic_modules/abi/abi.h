@@ -1008,6 +1008,32 @@ void envoy_dynamic_module_on_http_filter_http_callout_done(
     envoy_dynamic_module_type_envoy_buffer* body_chunks, size_t body_chunks_size);
 
 /**
+ * envoy_dynamic_module_on_http_filter_cluster_host_set_change is called on the same worker
+ * thread as the filter whenever the host set of a cluster the filter has registered for
+ * (via envoy_dynamic_module_callback_http_filter_register_cluster_host_watcher) changes.
+ *
+ * The event carries the post-change absolute host counts; the module does not need to
+ * call envoy_dynamic_module_callback_http_get_cluster_host_count to retrieve them.
+ *
+ * Modules typically use this to resume a paused request: after confirming
+ * healthy_count > 0, call envoy_dynamic_module_callback_http_filter_continue_decoding.
+ *
+ * @param filter_envoy_ptr is the pointer to the DynamicModuleHttpFilter object.
+ * @param filter_module_ptr is the pointer to the in-module HTTP filter created by
+ * envoy_dynamic_module_on_http_filter_new.
+ * @param watcher_id is the opaque handle returned from
+ * envoy_dynamic_module_callback_http_filter_register_cluster_host_watcher. Modules that
+ * register multiple watchers on the same filter disambiguate them by this id.
+ * @param total_count is the post-update total host count at the watched priority.
+ * @param healthy_count is the post-update healthy host count at the watched priority.
+ * @param degraded_count is the post-update degraded host count at the watched priority.
+ */
+void envoy_dynamic_module_on_http_filter_cluster_host_set_change(
+    envoy_dynamic_module_type_http_filter_envoy_ptr filter_envoy_ptr,
+    envoy_dynamic_module_type_http_filter_module_ptr filter_module_ptr, uint64_t watcher_id,
+    size_t total_count, size_t healthy_count, size_t degraded_count);
+
+/**
  * envoy_dynamic_module_on_http_filter_http_stream_headers is called when response headers are
  * received for a streamable HTTP callout stream.
  *
@@ -2980,6 +3006,47 @@ bool envoy_dynamic_module_callback_http_get_cluster_name(
 bool envoy_dynamic_module_callback_http_get_cluster_host_count(
     envoy_dynamic_module_type_http_filter_envoy_ptr filter_envoy_ptr, uint32_t priority,
     size_t* total_count, size_t* healthy_count, size_t* degraded_count);
+
+/**
+ * envoy_dynamic_module_callback_http_filter_register_cluster_host_watcher registers a
+ * notification callback that fires whenever the host set of the current route's cluster
+ * at the given priority changes. The module receives the updated host counts via
+ * envoy_dynamic_module_on_http_filter_cluster_host_set_change on the same worker thread
+ * the filter is running on.
+ *
+ * This API exists so a filter can pause a request (for example via StopIteration on
+ * on_request_headers) when the cluster is scaled to zero, issue an out-of-band signal
+ * to the control plane, and then resume the paused request as soon as a host appears
+ * in the cluster. Polling get_cluster_host_count would require a timer API the SDK
+ * does not expose and would burn worker-thread cycles; this watcher fires exactly
+ * once per host-set update.
+ *
+ * As a convenience, the current (pre-update) host counts are written through the
+ * optional out pointers so the caller can skip a redundant get_cluster_host_count
+ * and avoid a check-then-register race where hosts arrive between the two calls.
+ *
+ * The watcher is scoped to the filter that registered it. When the filter is
+ * destroyed (end of stream or on_filter_destroy), the watcher is automatically
+ * unregistered; no explicit unregister callback exists.
+ *
+ * @param filter_envoy_ptr is the pointer to the DynamicModuleHttpFilter object.
+ * @param priority is the host-set priority to watch (0 for the default priority).
+ * @param watcher_id_out receives the opaque watcher handle. Zero means registration
+ * failed. Non-zero handles are unique within the filter's lifetime.
+ * @param total_count_out optionally receives the current total host count; can be
+ * null.
+ * @param healthy_count_out optionally receives the current healthy host count; can
+ * be null.
+ * @param degraded_count_out optionally receives the current degraded host count; can
+ * be null.
+ * @return true if registration succeeded, false if the filter has no current route
+ * cluster, the cluster manager does not have a thread-local entry for it, or the
+ * requested priority level does not exist.
+ */
+bool envoy_dynamic_module_callback_http_filter_register_cluster_host_watcher(
+    envoy_dynamic_module_type_http_filter_envoy_ptr filter_envoy_ptr, uint32_t priority,
+    uint64_t* watcher_id_out, size_t* total_count_out, size_t* healthy_count_out,
+    size_t* degraded_count_out);
 
 /**
  * envoy_dynamic_module_callback_http_set_upstream_override_host sets the override host to be used

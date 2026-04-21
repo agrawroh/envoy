@@ -2330,6 +2330,94 @@ bool envoy_dynamic_module_callback_http_get_cluster_host_count(
   return true;
 }
 
+bool envoy_dynamic_module_callback_http_filter_register_cluster_host_watcher(
+    envoy_dynamic_module_type_http_filter_envoy_ptr filter_envoy_ptr, uint32_t priority,
+    uint64_t* watcher_id_out, size_t* total_count_out, size_t* healthy_count_out,
+    size_t* degraded_count_out) {
+  auto* filter = static_cast<DynamicModuleHttpFilter*>(filter_envoy_ptr);
+  auto* callbacks = filter->callbacks();
+  if (callbacks == nullptr) {
+    return false;
+  }
+  if (!filter->hasConfig()) {
+    return false;
+  }
+  auto cluster_info = callbacks->clusterInfo();
+  if (!cluster_info) {
+    return false;
+  }
+  auto* tl_cluster =
+      filter->getFilterConfig().cluster_manager_.getThreadLocalCluster(cluster_info->name());
+  if (tl_cluster == nullptr) {
+    return false;
+  }
+  const auto& priority_set = tl_cluster->prioritySet();
+  if (priority >= priority_set.hostSetsPerPriority().size()) {
+    return false;
+  }
+  const auto& host_set = priority_set.hostSetsPerPriority()[priority];
+  if (host_set == nullptr) {
+    return false;
+  }
+
+  // Snapshot current counts so the module can skip a redundant get_cluster_host_count and
+  // avoid a check-then-register race where hosts arrive between the two calls.
+  if (total_count_out != nullptr) {
+    *total_count_out = host_set->hosts().size();
+  }
+  if (healthy_count_out != nullptr) {
+    *healthy_count_out = host_set->healthyHosts().size();
+  }
+  if (degraded_count_out != nullptr) {
+    *degraded_count_out = host_set->degradedHosts().size();
+  }
+
+  const uint64_t watcher_id = filter->getNextClusterHostWatcherId();
+  // Capture a weak_ptr so a host-set update that fires after the filter has been destroyed
+  // but before the CallbackHandle's destructor ran is a no-op. PrioritySet's update-cb
+  // machinery fires synchronously on the worker thread that owns the TLS cluster — the
+  // same thread the filter lives on — so no cross-thread concerns apply.
+  auto filter_weak = filter->weak_from_this();
+  auto handle = priority_set.addMemberUpdateCb([filter_weak, watcher_id, priority](
+                                                    const Upstream::HostVector&,
+                                                    const Upstream::HostVector&) {
+    auto fs = filter_weak.lock();
+    if (!fs || fs->isDestroyed()) {
+      return;
+    }
+    // Re-read the host set so we surface absolute post-update counts. The added/removed
+    // vectors from MemberUpdateCb are only the delta; the module wants to react to the
+    // new total, not compute it from a delta.
+    auto* cb = fs->callbacks();
+    if (cb == nullptr) {
+      return;
+    }
+    auto info = cb->clusterInfo();
+    if (!info) {
+      return;
+    }
+    auto* tl = fs->getFilterConfig().cluster_manager_.getThreadLocalCluster(info->name());
+    if (tl == nullptr) {
+      return;
+    }
+    const auto& ps = tl->prioritySet();
+    if (priority >= ps.hostSetsPerPriority().size()) {
+      return;
+    }
+    const auto& hs = ps.hostSetsPerPriority()[priority];
+    if (hs == nullptr) {
+      return;
+    }
+    fs->onClusterHostSetChange(watcher_id, hs->hosts().size(), hs->healthyHosts().size(),
+                               hs->degradedHosts().size());
+  });
+  filter->registerClusterHostWatcher(watcher_id, std::move(handle));
+  if (watcher_id_out != nullptr) {
+    *watcher_id_out = watcher_id;
+  }
+  return true;
+}
+
 bool envoy_dynamic_module_callback_http_set_upstream_override_host(
     envoy_dynamic_module_type_http_filter_envoy_ptr filter_envoy_ptr,
     envoy_dynamic_module_type_module_buffer host, bool strict) {

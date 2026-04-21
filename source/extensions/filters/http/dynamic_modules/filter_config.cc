@@ -139,6 +139,11 @@ absl::StatusOr<DynamicModuleHttpFilterConfigSharedPtr> newDynamicModuleHttpFilte
       "envoy_dynamic_module_on_http_filter_http_callout_done");
   RETURN_IF_NOT_OK_REF(on_http_callout_done.status());
 
+  auto on_cluster_host_set_change =
+      dynamic_module->getFunctionPointer<OnHttpFilterClusterHostSetChangeType>(
+          "envoy_dynamic_module_on_http_filter_cluster_host_set_change");
+  RETURN_IF_NOT_OK_REF(on_cluster_host_set_change.status());
+
   auto on_http_stream_headers =
       dynamic_module->getFunctionPointer<OnHttpFilterHttpStreamHeadersType>(
           "envoy_dynamic_module_on_http_filter_http_stream_headers");
@@ -228,6 +233,7 @@ absl::StatusOr<DynamicModuleHttpFilterConfigSharedPtr> newDynamicModuleHttpFilte
   config->on_http_filter_stream_complete_ = on_filter_stream_complete.value();
   config->on_http_filter_destroy_ = on_filter_destroy.value();
   config->on_http_filter_http_callout_done_ = on_http_callout_done.value();
+  config->on_http_filter_cluster_host_set_change_ = on_cluster_host_set_change.value();
   config->on_http_filter_http_stream_headers_ = on_http_stream_headers.value();
   config->on_http_filter_http_stream_data_ = on_http_stream_data.value();
   config->on_http_filter_http_stream_trailers_ = on_http_stream_trailers.value();

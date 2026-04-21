@@ -332,6 +332,42 @@ private:
   absl::flat_hash_map<uint64_t, std::unique_ptr<DynamicModuleHttpFilter::HttpStreamCalloutCallback>>
       http_stream_callouts_;
 
+  // Cluster host-set watchers registered via
+  // envoy_dynamic_module_callback_http_filter_register_cluster_host_watcher. Keyed by the
+  // module-facing watcher_id. The value is the Envoy PrioritySet member-update callback handle
+  // — when a handle is destroyed, PrioritySet removes the callback synchronously, so clearing
+  // the map (which happens automatically when this filter is destroyed) unregisters every
+  // watcher. There is no explicit unregister API; scope is filter lifetime.
+  absl::flat_hash_map<uint64_t, Envoy::Common::CallbackHandlePtr> cluster_host_watchers_;
+  uint64_t next_cluster_host_watcher_id_ = 1; // 0 reserved as "invalid"
+
+public:
+  /**
+   * Allocate the next monotonic watcher id. Called by abi_impl.cc as part of
+   * envoy_dynamic_module_callback_http_filter_register_cluster_host_watcher.
+   */
+  uint64_t getNextClusterHostWatcherId() { return next_cluster_host_watcher_id_++; }
+
+  /**
+   * Store the RAII callback handle returned from PrioritySet::addMemberUpdateCb. Ownership of
+   * the handle transfers to the filter; when the filter is destroyed the callback is
+   * unregistered automatically.
+   */
+  void registerClusterHostWatcher(uint64_t watcher_id, Envoy::Common::CallbackHandlePtr handle) {
+    cluster_host_watchers_.emplace(watcher_id, std::move(handle));
+  }
+
+  /**
+   * Dispatch a host-set-change event to the in-module filter. The ABI guarantees this is
+   * called on the filter's worker thread (PrioritySet member-update callbacks fire on the
+   * thread that owns the thread-local cluster). Counts are the absolute values after the
+   * update, not the delta.
+   */
+  void onClusterHostSetChange(uint64_t watcher_id, size_t total_count, size_t healthy_count,
+                              size_t degraded_count);
+
+private:
+
   // Socket options storage for HTTP filters.
   struct StoredSocketOption {
     int64_t level;

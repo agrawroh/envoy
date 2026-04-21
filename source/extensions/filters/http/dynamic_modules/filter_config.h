@@ -36,6 +36,8 @@ using OnHttpFilterStreamCompleteType =
 using OnHttpFilterDestroyType = decltype(&envoy_dynamic_module_on_http_filter_destroy);
 using OnHttpFilterHttpCalloutDoneType =
     decltype(&envoy_dynamic_module_on_http_filter_http_callout_done);
+using OnHttpFilterClusterHostSetChangeType =
+    decltype(&envoy_dynamic_module_on_http_filter_cluster_host_set_change);
 using OnHttpFilterHttpStreamHeadersType =
     decltype(&envoy_dynamic_module_on_http_filter_http_stream_headers);
 using OnHttpFilterHttpStreamDataType =
@@ -108,6 +110,7 @@ public:
   OnHttpFilterStreamCompleteType on_http_filter_stream_complete_ = nullptr;
   OnHttpFilterDestroyType on_http_filter_destroy_ = nullptr;
   OnHttpFilterHttpCalloutDoneType on_http_filter_http_callout_done_ = nullptr;
+  OnHttpFilterClusterHostSetChangeType on_http_filter_cluster_host_set_change_ = nullptr;
   OnHttpFilterHttpStreamHeadersType on_http_filter_http_stream_headers_ = nullptr;
   OnHttpFilterHttpStreamDataType on_http_filter_http_stream_data_ = nullptr;
   OnHttpFilterHttpStreamTrailersType on_http_filter_http_stream_trailers_ = nullptr;

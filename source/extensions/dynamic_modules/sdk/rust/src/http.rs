@@ -337,6 +337,25 @@ pub trait HttpFilter<EHF: EnvoyHttpFilter> {
   ) -> abi::envoy_dynamic_module_type_on_http_filter_local_reply_status {
     abi::envoy_dynamic_module_type_on_http_filter_local_reply_status::Continue
   }
+
+  /// This is called when the host set of a cluster this filter registered for (via
+  /// [`EnvoyHttpFilter::register_cluster_host_watcher`]) changes.
+  ///
+  /// * `envoy_filter` can be used to interact with the underlying Envoy filter object.
+  /// * `watcher_id` is the opaque handle returned from `register_cluster_host_watcher`.
+  ///   Filters that register multiple watchers disambiguate events by this id.
+  /// * `counts` carries the post-update absolute host counts; modules do not need to
+  ///   call `get_cluster_host_count` to retrieve them.
+  ///
+  /// Typical usage: after confirming `counts.healthy > 0`, call an envoy_filter method
+  /// like `continue_decoding()` to resume a previously-paused request.
+  fn on_cluster_host_set_change(
+    &mut self,
+    _envoy_filter: &mut EHF,
+    _watcher_id: u64,
+    _counts: ClusterHostCount,
+  ) {
+  }
 }
 
 /// An opaque object that represents the underlying Envoy Http filter config. This has one to one
@@ -1610,6 +1629,32 @@ pub trait EnvoyHttpFilter {
   ///
   /// This is useful for implementing scale-to-zero logic or custom load balancing decisions.
   fn get_cluster_host_count(&self, priority: u32) -> Option<ClusterHostCount>;
+
+  /// Register a watcher that fires whenever the host set of the current route's cluster
+  /// at the given priority changes.
+  ///
+  /// Notifications are delivered on the filter's worker thread via
+  /// [`HttpFilter::on_cluster_host_set_change`]. The returned value is a snapshot of the
+  /// current host counts at registration time, mirroring what `get_cluster_host_count`
+  /// would return — the caller can use this to decide whether to proceed without waiting
+  /// for a callback, avoiding a check-then-register race.
+  ///
+  /// Returns `None` if registration fails because there is no current route cluster,
+  /// the cluster manager has no thread-local entry for it, or the requested priority
+  /// level does not exist.
+  ///
+  /// Returns `Some((watcher_id, counts))` on success. The watcher is automatically
+  /// unregistered when the filter is destroyed; there is no explicit unregister API.
+  /// Modules that register multiple watchers disambiguate events by `watcher_id`.
+  ///
+  /// Typical usage: pause a request with `FilterAction::Stop` in `on_request_headers`
+  /// when `counts.healthy == 0`, register a watcher, issue an out-of-band scale signal
+  /// to the control plane, and resume the request from `on_cluster_host_set_change` as
+  /// soon as `healthy_count > 0`.
+  fn register_cluster_host_watcher(
+    &mut self,
+    priority: u32,
+  ) -> Option<(u64, ClusterHostCount)>;
 
   /// Set the override host to be used by the upstream load balancer.
   ///
@@ -3515,6 +3560,38 @@ impl EnvoyHttpFilter for EnvoyHttpFilterImpl {
     }
   }
 
+  fn register_cluster_host_watcher(
+    &mut self,
+    priority: u32,
+  ) -> Option<(u64, ClusterHostCount)> {
+    let mut watcher_id: u64 = 0;
+    let mut total: usize = 0;
+    let mut healthy: usize = 0;
+    let mut degraded: usize = 0;
+    let success = unsafe {
+      abi::envoy_dynamic_module_callback_http_filter_register_cluster_host_watcher(
+        self.raw_ptr,
+        priority,
+        &mut watcher_id as *mut _,
+        &mut total as *mut _,
+        &mut healthy as *mut _,
+        &mut degraded as *mut _,
+      )
+    };
+    if success && watcher_id != 0 {
+      Some((
+        watcher_id,
+        ClusterHostCount {
+          total,
+          healthy,
+          degraded,
+        },
+      ))
+    } else {
+      None
+    }
+  }
+
   fn set_upstream_override_host(&mut self, host: &str, strict: bool) -> bool {
     unsafe {
       abi::envoy_dynamic_module_callback_http_set_upstream_override_host(
@@ -4109,6 +4186,32 @@ pub unsafe extern "C" fn envoy_dynamic_module_on_http_filter_scheduled(
   let filter = filter_ptr as *mut *mut dyn HttpFilter<EnvoyHttpFilterImpl>;
   let filter = &mut **filter;
   filter.on_scheduled(&mut EnvoyHttpFilterImpl::new(envoy_ptr), event_id);
+}
+
+/// # Safety
+///
+/// This is an FFI function called by Envoy. All pointer arguments must be valid as guaranteed
+/// by the Envoy dynamic module ABI.
+#[no_mangle]
+pub unsafe extern "C" fn envoy_dynamic_module_on_http_filter_cluster_host_set_change(
+  envoy_ptr: abi::envoy_dynamic_module_type_http_filter_envoy_ptr,
+  filter_ptr: abi::envoy_dynamic_module_type_http_filter_module_ptr,
+  watcher_id: u64,
+  total_count: usize,
+  healthy_count: usize,
+  degraded_count: usize,
+) {
+  let filter = filter_ptr as *mut *mut dyn HttpFilter<EnvoyHttpFilterImpl>;
+  let filter = &mut **filter;
+  filter.on_cluster_host_set_change(
+    &mut EnvoyHttpFilterImpl::new(envoy_ptr),
+    watcher_id,
+    ClusterHostCount {
+      total: total_count,
+      healthy: healthy_count,
+      degraded: degraded_count,
+    },
+  );
 }
 
 /// # Safety
