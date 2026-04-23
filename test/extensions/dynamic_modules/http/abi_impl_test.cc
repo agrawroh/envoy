@@ -2984,17 +2984,151 @@ TEST_F(DynamicModuleHttpFilterTest, SetBufferLimitNoCallbacks) {
   envoy_dynamic_module_callback_http_set_buffer_limit(filter_no_callbacks.get(), 2048);
 }
 
-TEST_F(DynamicModuleHttpFilterTest, WatermarkCallbacksAutoRegisteredAndCleanedUp) {
-  // Create a new filter with callbacks.
-  auto filter = std::make_unique<DynamicModuleHttpFilter>(nullptr, symbol_table_, 3);
+// Fixture for lifecycle tests that exercise the ordering of
+// setDecoderFilterCallbacks() relative to initializeInModuleFilter(). SetUp()
+// only prepares the filter config; the test body constructs and sequences the
+// filter itself so each test can pick the ordering under test.
+class DynamicModuleHttpFilterLifecycleTest : public testing::Test {
+public:
+  void SetUp() override {
+    auto dynamic_module = newDynamicModule(testSharedObjectPath("no_op", "c"), false);
+    ASSERT_TRUE(dynamic_module.ok()) << dynamic_module.status().message();
+    auto filter_config_or_status = newDynamicModuleHttpFilterConfig(
+        "test_filter", "", DefaultMetricsNamespace, false, std::move(dynamic_module.value()),
+        *stats_scope_, context_);
+    ASSERT_TRUE(filter_config_or_status.ok()) << filter_config_or_status.status().message();
+    filter_config_ = filter_config_or_status.value();
+  }
 
-  // Watermark callbacks should be automatically registered when decoder callbacks are set.
+  Stats::SymbolTableImpl symbol_table_;
+  Stats::IsolatedStoreImpl stats_store_;
+  Stats::ScopeSharedPtr stats_scope_{stats_store_.createScope("")};
+  NiceMock<Server::Configuration::MockServerFactoryContext> context_;
+  DynamicModuleHttpFilterConfigSharedPtr filter_config_;
+};
+
+// Watermark callbacks must be registered only after the in-module filter has
+// been constructed. The production factory orders addStreamFilter() — which
+// synchronously drives setDecoderFilterCallbacks() — before
+// initializeInModuleFilter(). Registering watermarks inline from
+// setDecoderFilterCallbacks() used to crash when Envoy's FilterManager
+// synchronously replayed a pending onAboveWriteBufferHighWatermark() into a
+// filter whose in_module_filter_ was still null (see envoyproxy/envoy#43660
+// for the factory reorder that created the race). This test pins the fix:
+// registration is deferred until initializeInModuleFilter() runs.
+TEST_F(DynamicModuleHttpFilterLifecycleTest, WatermarkRegistersAtInitAndCleanedUpAtDestroy) {
+  auto filter = std::make_shared<DynamicModuleHttpFilter>(filter_config_, symbol_table_, 0);
+
+  NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks;
+  NiceMock<Http::MockStreamEncoderFilterCallbacks> encoder_callbacks;
+
+  // Production ordering: addStreamFilter() wires callbacks first. No watermark
+  // registration must happen yet — in_module_filter_ is still null.
+  EXPECT_CALL(decoder_callbacks, addDownstreamWatermarkCallbacks(testing::_)).Times(0);
+  filter->setDecoderFilterCallbacks(decoder_callbacks);
+  filter->setEncoderFilterCallbacks(encoder_callbacks);
+  testing::Mock::VerifyAndClearExpectations(&decoder_callbacks);
+
+  // After initializeInModuleFilter(), registration must have happened exactly
+  // once, against this filter.
+  EXPECT_CALL(decoder_callbacks, addDownstreamWatermarkCallbacks(testing::Ref(*filter)));
+  filter->initializeInModuleFilter();
+  testing::Mock::VerifyAndClearExpectations(&decoder_callbacks);
+
+  // Paired remove fires on destroy.
+  EXPECT_CALL(decoder_callbacks, removeDownstreamWatermarkCallbacks(testing::Ref(*filter)));
+  filter->onDestroy();
+}
+
+// Covers the inverted ordering used by several existing unit tests (and by
+// any caller that constructs a filter outside the production factory):
+// initializeInModuleFilter() runs before setDecoderFilterCallbacks(). The
+// two-step registration helper must still land the add — here it happens on
+// the setter side because that is the second of the two preconditions to
+// resolve.
+TEST_F(DynamicModuleHttpFilterLifecycleTest, WatermarkRegistersAtSetCallbacksWhenInitRanFirst) {
+  auto filter = std::make_shared<DynamicModuleHttpFilter>(filter_config_, symbol_table_, 0);
+
+  // Init first; decoder callbacks not yet set, so nothing to register against.
+  filter->initializeInModuleFilter();
+
   NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks;
   EXPECT_CALL(decoder_callbacks, addDownstreamWatermarkCallbacks(testing::Ref(*filter)));
   filter->setDecoderFilterCallbacks(decoder_callbacks);
+  testing::Mock::VerifyAndClearExpectations(&decoder_callbacks);
 
-  // Destroy should clean up watermark callbacks.
   EXPECT_CALL(decoder_callbacks, removeDownstreamWatermarkCallbacks(testing::Ref(*filter)));
+  filter->onDestroy();
+}
+
+// Regression test for the production crash on HTTP/2 CONNECT traffic: when
+// the stream was already above the high watermark at chain-build time,
+// Envoy's FilterManager synchronously replays onAboveWriteBufferHighWatermark()
+// from inside addDownstreamWatermarkCallbacks() (see
+// ActiveStreamDecoderFilter::addDownstreamWatermarkCallbacks in
+// source/common/http/filter_manager.cc). This test mocks the synchronous
+// replay and proves that the replay now only reaches the filter after
+// in_module_filter_ is set — the FFI wrapper never sees a null module-side
+// pointer.
+TEST_F(DynamicModuleHttpFilterLifecycleTest, WatermarkSyncReplayDoesNotFireBeforeInit) {
+  auto filter = std::make_shared<DynamicModuleHttpFilter>(filter_config_, symbol_table_, 0);
+
+  NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks;
+  NiceMock<Http::MockStreamEncoderFilterCallbacks> encoder_callbacks;
+
+  // Phase 1 — factory wires callbacks first. No registration must happen
+  // here: a registration in this window would drag the synchronous replay
+  // down with it (via the Invoke action configured below) while
+  // in_module_filter_ is still null, and the ASSERT in
+  // onAboveWriteBufferHighWatermark would abort the test. The Times(0)
+  // expectation also hard-pins the invariant so a regression that re-adds
+  // eager registration in setDecoderFilterCallbacks() is caught even before
+  // the replay hits the assert.
+  EXPECT_CALL(decoder_callbacks, addDownstreamWatermarkCallbacks(testing::_)).Times(0);
+  filter->setDecoderFilterCallbacks(decoder_callbacks);
+  filter->setEncoderFilterCallbacks(encoder_callbacks);
+  testing::Mock::VerifyAndClearExpectations(&decoder_callbacks);
+
+  // Phase 2 — configure the mock to synchronously replay
+  // onAboveWriteBufferHighWatermark() on registration, mirroring Envoy's
+  // real behavior when high_watermark_count_ > 0 (see the replay loop in
+  // ActiveStreamDecoderFilter::addDownstreamWatermarkCallbacks in
+  // source/common/http/filter_manager.cc). initializeInModuleFilter() sets
+  // in_module_filter_ first, then calls
+  // maybeRegisterDownstreamWatermarkCallbacks(), which triggers the
+  // Invoke-driven replay. The ASSERT in onAboveWriteBufferHighWatermark
+  // (filter.cc) proves that in_module_filter_ is non-null at the instant
+  // the replay fires; reaching the next line without an abort is the
+  // regression gate.
+  EXPECT_CALL(decoder_callbacks, addDownstreamWatermarkCallbacks(testing::Ref(*filter)))
+      .WillOnce(testing::Invoke([](Http::DownstreamWatermarkCallbacks& cb) {
+        cb.onAboveWriteBufferHighWatermark();
+      }));
+  filter->initializeInModuleFilter();
+  testing::Mock::VerifyAndClearExpectations(&decoder_callbacks);
+
+  EXPECT_CALL(decoder_callbacks, removeDownstreamWatermarkCallbacks(testing::Ref(*filter)));
+  filter->onDestroy();
+}
+
+// onDestroy() on a filter whose decoder callbacks are set but whose
+// in_module_filter_ was never constructed must not invoke
+// removeDownstreamWatermarkCallbacks(). Envoy's
+// ActiveStreamDecoderFilter::removeDownstreamWatermarkCallbacks asserts that
+// the callback was previously added (see source/common/http/filter_manager.cc),
+// so an unconditional remove on a never-registered filter would abort debug
+// builds. This test pins the downstream_watermark_callbacks_registered_ flag
+// as the gate for the remove, not just the decoder_callbacks_ null check that
+// preceded this fix.
+TEST_F(DynamicModuleHttpFilterLifecycleTest,
+       OnDestroySkipsRemoveWhenDecoderCallbacksSetButInitNeverRan) {
+  auto filter = std::make_shared<DynamicModuleHttpFilter>(filter_config_, symbol_table_, 0);
+
+  NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks;
+  filter->setDecoderFilterCallbacks(decoder_callbacks);
+  // Intentionally skip initializeInModuleFilter(): registration must not
+  // have happened and remove must therefore not happen.
+  EXPECT_CALL(decoder_callbacks, removeDownstreamWatermarkCallbacks(testing::_)).Times(0);
   filter->onDestroy();
 }
 

@@ -42,9 +42,18 @@ public:
   FilterMetadataStatus decodeMetadata(MetadataMap&) override;
   void setDecoderFilterCallbacks(StreamDecoderFilterCallbacks& callbacks) override {
     decoder_callbacks_ = &callbacks;
-    // We always register for downstream watermark callbacks. This allows all filters
-    // including the terminal filter to receive flow control events.
-    decoder_callbacks_->addDownstreamWatermarkCallbacks(*this);
+    // We always register for downstream watermark callbacks so every filter
+    // (including terminal ones) receives flow-control events, but registration
+    // is routed through maybeRegisterDownstreamWatermarkCallbacks() instead of
+    // firing inline. Registering inline here is unsafe because
+    // addDownstreamWatermarkCallbacks() synchronously replays outstanding
+    // onAboveWriteBufferHighWatermark() events to the newly-registered
+    // callback, and the production factory orders addStreamFilter() (which
+    // drives this setter) before initializeInModuleFilter(). A replay firing
+    // before in_module_filter_ is constructed would forward a null pointer to
+    // the module's ABI wrapper; typed-language SDKs (e.g. Rust's
+    // `let filter = &**filter_ptr` in the FFI thunk) crash on the null deref.
+    maybeRegisterDownstreamWatermarkCallbacks();
   }
   void decodeComplete() override;
 
@@ -242,6 +251,19 @@ private:
    */
   void destroy();
 
+  /**
+   * Registers this filter for downstream watermark callbacks if both the
+   * decoder callbacks have been set (via setDecoderFilterCallbacks()) and the
+   * in-module filter has been constructed (via initializeInModuleFilter()),
+   * and registration has not yet been performed. Idempotent; safe to call
+   * from both of those entry points regardless of which runs first.
+   *
+   * Registering only after in_module_filter_ is non-null avoids a null-pointer
+   * forward when Envoy's FilterManager synchronously replays pending
+   * onAboveWriteBufferHighWatermark() events to the newly-registered callback.
+   */
+  void maybeRegisterDownstreamWatermarkCallbacks();
+
   // True if the filter is in the continue state. This is to avoid prohibited calls to
   // continueDecoding() or continueEncoding() multiple times.
   bool in_continue_ = false;
@@ -257,6 +279,14 @@ private:
   envoy_dynamic_module_type_http_filter_module_ptr in_module_filter_ = nullptr;
   Stats::StatNameDynamicPool stat_name_pool_;
   uint32_t worker_index_;
+  // Tracks whether addDownstreamWatermarkCallbacks() has been invoked on
+  // decoder_callbacks_. Registration is performed once the in-module filter is
+  // live and the decoder callbacks are set; see
+  // maybeRegisterDownstreamWatermarkCallbacks(). The flag also gates the
+  // paired removeDownstreamWatermarkCallbacks() in onDestroy() so the remove
+  // does not fire on a callback list the filter never joined (the underlying
+  // implementation asserts that the callback was previously added).
+  bool downstream_watermark_callbacks_registered_ = false;
 
   /**
    * This implementation of the AsyncClient::Callbacks is used to handle the response from the HTTP

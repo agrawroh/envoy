@@ -13,7 +13,28 @@ namespace HttpFilters {
 DynamicModuleHttpFilter::~DynamicModuleHttpFilter() { destroy(); }
 
 void DynamicModuleHttpFilter::initializeInModuleFilter() {
+  // Called exactly once per filter instance by the factory lambda in
+  // source/extensions/filters/http/dynamic_modules/factory.cc. A second call
+  // would overwrite in_module_filter_, silently leaking the first module-side
+  // allocation and never delivering the matching on_http_filter_destroy.
+  ASSERT(in_module_filter_ == nullptr);
   in_module_filter_ = config_->on_http_filter_new_(config_->in_module_config_, thisAsVoidPtr());
+  // Complete the watermark-callback handshake now that the in-module filter
+  // exists. This is the second half of the two-step registration started in
+  // setDecoderFilterCallbacks(); if the decoder callbacks are already set (the
+  // production factory orders addStreamFilter() before
+  // initializeInModuleFilter()), this is where the actual registration
+  // happens.
+  maybeRegisterDownstreamWatermarkCallbacks();
+}
+
+void DynamicModuleHttpFilter::maybeRegisterDownstreamWatermarkCallbacks() {
+  if (downstream_watermark_callbacks_registered_ || decoder_callbacks_ == nullptr ||
+      in_module_filter_ == nullptr) {
+    return;
+  }
+  decoder_callbacks_->addDownstreamWatermarkCallbacks(*this);
+  downstream_watermark_callbacks_registered_ = true;
 }
 
 void DynamicModuleHttpFilter::onStreamComplete() {
@@ -22,9 +43,14 @@ void DynamicModuleHttpFilter::onStreamComplete() {
 
 void DynamicModuleHttpFilter::onDestroy() {
   destroyed_ = true;
-  // Remove watermark callbacks before destroying.
-  if (decoder_callbacks_ != nullptr) {
+  // Remove watermark callbacks before destroying, matching the register we
+  // performed in maybeRegisterDownstreamWatermarkCallbacks(). Gated on the
+  // flag because Envoy's removeDownstreamWatermarkCallbacks() asserts that
+  // the callback was previously added, and on the pre-init race path the
+  // register was intentionally deferred and may never have happened.
+  if (decoder_callbacks_ != nullptr && downstream_watermark_callbacks_registered_) {
     decoder_callbacks_->removeDownstreamWatermarkCallbacks(*this);
+    downstream_watermark_callbacks_registered_ = false;
   }
   destroy();
 };
@@ -63,6 +89,11 @@ void DynamicModuleHttpFilter::destroy() {
 
   decoder_callbacks_ = nullptr;
   encoder_callbacks_ = nullptr;
+  // Clear the watermark-registered flag alongside decoder_callbacks_ so the
+  // state machine stays self-consistent if this destroy() runs without a
+  // preceding onDestroy() (e.g. ~DynamicModuleHttpFilter() from test code
+  // that drops the shared_ptr without Envoy driving the teardown).
+  downstream_watermark_callbacks_registered_ = false;
 }
 
 FilterHeadersStatus DynamicModuleHttpFilter::decodeHeaders(RequestHeaderMap&, bool end_of_stream) {
@@ -279,11 +310,19 @@ void DynamicModuleHttpFilter::continueEncoding() {
 }
 
 void DynamicModuleHttpFilter::onAboveWriteBufferHighWatermark() {
+  // Invariant: watermark callbacks are registered only after
+  // initializeInModuleFilter() has set in_module_filter_
+  // (see maybeRegisterDownstreamWatermarkCallbacks), and removed in onDestroy()
+  // before destroy() can null in_module_filter_. This ASSERT codifies the
+  // contract and makes a regression loud in debug/test builds rather than
+  // surfacing only as a null dereference inside the module's ABI wrapper.
+  ASSERT(in_module_filter_ != nullptr);
   config_->on_http_filter_downstream_above_write_buffer_high_watermark_(thisAsVoidPtr(),
                                                                         in_module_filter_);
 }
 
 void DynamicModuleHttpFilter::onBelowWriteBufferLowWatermark() {
+  ASSERT(in_module_filter_ != nullptr);
   config_->on_http_filter_downstream_below_write_buffer_low_watermark_(thisAsVoidPtr(),
                                                                        in_module_filter_);
 }
