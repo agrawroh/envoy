@@ -53,6 +53,14 @@ minor_behavior_changes:
     Changed the behavior of ``timeout: 0s`` in the HTTP ext_authz filter to mean "no timeout" (infinite)
     instead of immediate timeout. Previously, ``timeout: 0s`` would cause requests to fail immediately.
     This aligns with other Envoy timeout configurations where ``0`` means disabled or infinite.
+- area: dynamic_modules
+  change: |
+    The legacy ``declare_access_logger!(T)`` macro in the Rust SDK now emits
+    ``envoy_dynamic_module_on_program_init`` itself. Existing modules that paired it with
+    ``declare_init_functions!`` or ``declare_all_init_functions!`` will hit a link-time duplicate
+    ``envoy_dynamic_module_on_program_init`` symbol error — migrate to
+    ``declare_all_init_functions!(..., access_logger: ...)`` per the macro's docstring. Single-logger
+    modules that used ``declare_access_logger!`` alone continue to compile unchanged.
 - area: ratelimit
   change: |
     Changed the behavior of ``timeout: 0s`` in the HTTP rate limit filter to mean "no timeout" (infinite)
@@ -270,6 +278,20 @@ new_features:
   change: |
     Added custom metrics (counters, gauges, histograms) support to load balancer dynamic modules.
     Modules can now define metrics during configuration and record them during host selection.
+- area: dynamic_modules
+  change: |
+    Added ``access_logger:`` arm to the Rust SDK's ``declare_all_init_functions!`` macro. A single
+    dynamic module ``.so`` can now host multiple access loggers dispatched by ``logger_name`` via the
+    new ``NEW_ACCESS_LOGGER_CONFIG_FUNCTION`` factory. The factory returns
+    ``Option<Box<dyn AccessLoggerConfig>>`` — same shape as every other factory type (HTTP filter,
+    network filter, bootstrap, cluster, load balancer). The legacy ``declare_access_logger!(T)``
+    macro remains as a thin back-compat shim over the same factory for single-config modules, but
+    now emits ``envoy_dynamic_module_on_program_init`` itself — callers that paired it with
+    ``declare_init_functions!`` or ``declare_all_init_functions!`` should migrate to the unified
+    macro (link-time error on duplicate ``on_program_init`` symbols otherwise). The
+    ``AccessLoggerConfig`` trait's ``Sized + 'static`` bound was removed so the trait is dyn-safe;
+    the ``new`` associated function kept its ``where Self: Sized`` bound so existing impls compile
+    unchanged. No C++/Envoy ABI changes.
 - area: golang
   change: |
     Added ``DownstreamSslConnection()`` method to the Golang HTTP filter's ``StreamInfo`` interface,

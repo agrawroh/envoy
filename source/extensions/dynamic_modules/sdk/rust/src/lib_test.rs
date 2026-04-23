@@ -4675,3 +4675,270 @@ fn test_async_host_selection_with_stored_completion() {
   let completion = lb.pending_completion.take().unwrap();
   completion.async_host_selection_complete(Some(0xBEEF as *mut _), "dns_resolved");
 }
+
+// =============================================================================
+// Access logger factory dispatch
+// =============================================================================
+
+use crate::access_log::AccessLoggerConfig as _;
+
+//
+// These tests cover the OnceLock-backed factory path introduced alongside
+// `NEW_ACCESS_LOGGER_CONFIG_FUNCTION` — the same shape HTTP filter, bootstrap,
+// cluster, and LB use. The `_impl` wrapper (see
+// `access_log::envoy_dynamic_module_on_access_logger_config_new_impl`) lets
+// us exercise the FFI pointer-wrapping logic independently of the
+// `#[no_mangle]` symbol.
+
+/// Pinning the FFI type alias. A silent change in shape — e.g. adding
+/// a lifetime parameter, swapping back to `Result<_, String>` — breaks
+/// every downstream module. Keep this const so CI surfaces the break
+/// as a compile error on this line.
+#[allow(dead_code)]
+const _ASSERT_FACTORY_SIGNATURE: NewAccessLoggerConfigFunction = |_ctx, _name, _config| {
+  None::<Box<dyn access_log::AccessLoggerConfig>>
+};
+
+/// Minimal stub — the factory never calls `create_logger` in these unit
+/// tests, so the impl is trivial.
+struct StubLoggerConfig {
+  name: String,
+}
+
+impl access_log::AccessLoggerConfig for StubLoggerConfig {
+  fn new(
+    _ctx: &access_log::ConfigContext,
+    name: &str,
+    _config: &[u8],
+  ) -> Result<Self, String> {
+    Ok(Self {
+      name: name.to_string(),
+    })
+  }
+
+  fn create_logger(
+    &self,
+    _metrics: access_log::MetricsContext,
+    _logger_envoy_ptr: *mut std::ffi::c_void,
+  ) -> Box<dyn access_log::AccessLogger> {
+    // Only exercised indirectly; keep it boring.
+    struct StubLogger;
+    impl access_log::AccessLogger for StubLogger {
+      fn log(&mut self, _ctx: &access_log::LogContext) {}
+    }
+    Box::new(StubLogger)
+  }
+}
+
+/// Counter used by `TrackingLoggerConfig` to prove that dropping the
+/// config handle actually drops the underlying trait object.
+static DROPPED_CONFIGS: AtomicUsize = AtomicUsize::new(0);
+
+struct TrackingLoggerConfig;
+
+impl access_log::AccessLoggerConfig for TrackingLoggerConfig {
+  fn new(
+    _ctx: &access_log::ConfigContext,
+    _name: &str,
+    _config: &[u8],
+  ) -> Result<Self, String> {
+    Ok(Self)
+  }
+
+  fn create_logger(
+    &self,
+    _metrics: access_log::MetricsContext,
+    _logger_envoy_ptr: *mut std::ffi::c_void,
+  ) -> Box<dyn access_log::AccessLogger> {
+    struct NoopLogger;
+    impl access_log::AccessLogger for NoopLogger {
+      fn log(&mut self, _ctx: &access_log::LogContext) {}
+    }
+    Box::new(NoopLogger)
+  }
+}
+
+impl Drop for TrackingLoggerConfig {
+  fn drop(&mut self) {
+    DROPPED_CONFIGS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+  }
+}
+
+/// Verify the factory dispatches to the right config variant by `name` —
+/// the pattern we expect downstream modules to adopt when hosting more
+/// than one access logger in a single `.so`.
+#[test]
+fn test_new_access_logger_config_function_dispatches_by_name() {
+  fn factory(
+    ctx: &access_log::ConfigContext,
+    name: &str,
+    config: &[u8],
+  ) -> Option<Box<dyn access_log::AccessLoggerConfig>> {
+    match name {
+      "ok_a" | "ok_b" => StubLoggerConfig::new(ctx, name, config)
+        .ok()
+        .map(|c| Box::new(c) as Box<dyn access_log::AccessLoggerConfig>),
+      _ => None,
+    }
+  }
+
+  // Use a fresh OnceLock so this test can run alongside the other ones
+  // without coupling to `NEW_ACCESS_LOGGER_CONFIG_FUNCTION`'s global
+  // state.
+  let slot: std::sync::OnceLock<NewAccessLoggerConfigFunction> = std::sync::OnceLock::new();
+  slot.get_or_init(|| factory);
+
+  let f = slot.get().expect("factory stored");
+  let ctx = access_log::ConfigContext::new(std::ptr::null_mut());
+
+  // Happy path: both known names produce a config.
+  for known in ["ok_a", "ok_b"] {
+    let cfg = f(&ctx, known, b"").expect("known name accepted");
+    // Round-trip the Box through *mut StubLoggerConfig to read the
+    // captured name back — the factory stored the `name` arg in the
+    // stub, so the assertion proves the right variant was built.
+    let raw = Box::into_raw(cfg) as *mut StubLoggerConfig;
+    let recovered = unsafe { Box::from_raw(raw) };
+    assert_eq!(recovered.name, known);
+  }
+
+  // Rejection path: unknown name → None, which the Envoy config loader
+  // surfaces as `InvalidArgumentError`.
+  assert!(f(&ctx, "nope", b"").is_none());
+}
+
+/// The SDK's global OnceLock is writable exactly once per process — the
+/// `declare_all_init_functions!(..., access_logger: ...)` macro relies
+/// on `get_or_init`, which silently no-ops on a second registration.
+/// Pin the behaviour so a future refactor to `set`-and-panic surfaces
+/// here rather than as a mysterious startup failure.
+#[test]
+fn test_access_logger_factory_once_lock_is_idempotent_under_get_or_init() {
+  let slot: std::sync::OnceLock<NewAccessLoggerConfigFunction> = std::sync::OnceLock::new();
+
+  fn factory_a(
+    _ctx: &access_log::ConfigContext,
+    name: &str,
+    _config: &[u8],
+  ) -> Option<Box<dyn access_log::AccessLoggerConfig>> {
+    Some(Box::new(StubLoggerConfig {
+      name: format!("from_a_{name}"),
+    }))
+  }
+  fn factory_b(
+    _ctx: &access_log::ConfigContext,
+    name: &str,
+    _config: &[u8],
+  ) -> Option<Box<dyn access_log::AccessLoggerConfig>> {
+    Some(Box::new(StubLoggerConfig {
+      name: format!("from_b_{name}"),
+    }))
+  }
+
+  slot.get_or_init(|| factory_a);
+  slot.get_or_init(|| factory_b); // no-op
+
+  let f = slot.get().expect("factory stored");
+  let ctx = access_log::ConfigContext::new(std::ptr::null_mut());
+  let cfg = f(&ctx, "x", b"").expect("factory returned a config");
+  let raw = Box::into_raw(cfg) as *mut StubLoggerConfig;
+  let recovered = unsafe { Box::from_raw(raw) };
+  assert_eq!(
+    recovered.name, "from_a_x",
+    "second `get_or_init` must not replace the first factory",
+  );
+}
+
+/// Verify the `_impl` wrapper's Option → null-pointer contract. This
+/// mirrors `test_envoy_dynamic_module_on_http_filter_config_new_impl`
+/// and covers the happy/rejection paths at the FFI boundary without
+/// needing a real Envoy `config_envoy_ptr`.
+#[test]
+fn test_envoy_dynamic_module_on_access_logger_config_new_impl() {
+  fn factory_ok(
+    _ctx: &access_log::ConfigContext,
+    name: &str,
+    _config: &[u8],
+  ) -> Option<Box<dyn access_log::AccessLoggerConfig>> {
+    Some(Box::new(StubLoggerConfig {
+      name: name.to_string(),
+    }))
+  }
+  fn factory_reject(
+    _ctx: &access_log::ConfigContext,
+    _name: &str,
+    _config: &[u8],
+  ) -> Option<Box<dyn access_log::AccessLoggerConfig>> {
+    None
+  }
+
+  let ctx = access_log::ConfigContext::new(std::ptr::null_mut());
+  let envoy_ptr: *mut std::ffi::c_void = 0xDEADBEEF_usize as *mut _;
+
+  // Happy path: returns non-null `*const c_void`.
+  let ptr = access_log::envoy_dynamic_module_on_access_logger_config_new_impl(
+    &ctx,
+    "my_logger",
+    b"{}",
+    &(factory_ok as NewAccessLoggerConfigFunction),
+    envoy_ptr,
+  );
+  assert!(!ptr.is_null(), "factory returned Some; wrapper must return non-null");
+  // Drop the handle to avoid leaking — this exercises the same path
+  // `on_access_logger_config_destroy` uses in production.
+  unsafe { access_log::envoy_dynamic_module_on_access_logger_config_destroy(ptr) };
+
+  // Rejection path: returns null.
+  let null = access_log::envoy_dynamic_module_on_access_logger_config_new_impl(
+    &ctx,
+    "x",
+    b"",
+    &(factory_reject as NewAccessLoggerConfigFunction),
+    envoy_ptr,
+  );
+  assert!(null.is_null(), "factory returned None; wrapper must return null");
+}
+
+/// Verify that `on_access_logger_config_destroy` actually drops the
+/// underlying `Box<dyn AccessLoggerConfig>` — i.e. that the cascade
+/// from `Box<AccessLoggerConfigHandle>` through its `inner` field runs
+/// the user's `Drop` impl. Mirrors
+/// `test_envoy_dynamic_module_on_http_filter_config_destroy`.
+#[test]
+fn test_envoy_dynamic_module_on_access_logger_config_destroy_drops_inner() {
+  fn factory_tracking(
+    _ctx: &access_log::ConfigContext,
+    _name: &str,
+    _config: &[u8],
+  ) -> Option<Box<dyn access_log::AccessLoggerConfig>> {
+    Some(Box::new(TrackingLoggerConfig))
+  }
+
+  let ctx = access_log::ConfigContext::new(std::ptr::null_mut());
+  let envoy_ptr: *mut std::ffi::c_void = 0xDEADBEEF_usize as *mut _;
+
+  let before = DROPPED_CONFIGS.load(std::sync::atomic::Ordering::SeqCst);
+  let ptr = access_log::envoy_dynamic_module_on_access_logger_config_new_impl(
+    &ctx,
+    "tracking",
+    b"",
+    &(factory_tracking as NewAccessLoggerConfigFunction),
+    envoy_ptr,
+  );
+  assert!(!ptr.is_null());
+
+  // Pre-destroy: no drop yet.
+  assert_eq!(
+    DROPPED_CONFIGS.load(std::sync::atomic::Ordering::SeqCst),
+    before,
+    "tracking config must not drop before destroy",
+  );
+
+  // Post-destroy: the trait-object Drop ran.
+  unsafe { access_log::envoy_dynamic_module_on_access_logger_config_destroy(ptr) };
+  assert_eq!(
+    DROPPED_CONFIGS.load(std::sync::atomic::Ordering::SeqCst),
+    before + 1,
+    "destroy must cascade into Box<dyn AccessLoggerConfig>",
+  );
+}

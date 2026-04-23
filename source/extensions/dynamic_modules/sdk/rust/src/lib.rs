@@ -308,6 +308,34 @@ pub static NEW_HTTP_FILTER_PER_ROUTE_CONFIG_FUNCTION: OnceLock<
   NewHttpFilterPerRouteConfigFunction,
 > = OnceLock::new();
 
+/// The function signature for the new access logger configuration function.
+///
+/// This is called when a new access logger configuration is created
+/// and must return a `Box<dyn AccessLoggerConfig>`. Returning `None`
+/// causes the configuration to be rejected at load time — Envoy's C++
+/// loader maps the null return to an `InvalidArgumentError`.
+///
+/// Matches the shape of [`NewHttpFilterConfigFunction`]: the factory is
+/// expected to dispatch on `name` (the `logger_name` field of the
+/// access-log config block) when the module hosts multiple access
+/// loggers in a single `.so`.
+///
+/// `ctx` is `&ConfigContext` (not `&mut`) because every config-scope
+/// metric-definition method on [`access_log::ConfigContext`] takes
+/// `&self` — Envoy's metric registry handles its own locking.
+pub type NewAccessLoggerConfigFunction = fn(
+  ctx: &access_log::ConfigContext,
+  name: &str,
+  config: &[u8],
+) -> Option<Box<dyn access_log::AccessLoggerConfig>>;
+
+/// The global factory for access logger configurations. This is set via the
+/// [`declare_all_init_functions!`] macro's `access_logger:` arm, or via the
+/// legacy [`declare_access_logger!`] single-type shim, and is not intended to
+/// be set directly.
+pub static NEW_ACCESS_LOGGER_CONFIG_FUNCTION: OnceLock<NewAccessLoggerConfigFunction> =
+  OnceLock::new();
+
 // HTTP filter types are in the http module and re-exported above.
 
 pub(crate) fn str_to_module_buffer(s: &str) -> abi::envoy_dynamic_module_type_module_buffer {
@@ -465,6 +493,7 @@ macro_rules! declare_network_filter_init_functions {
 /// - `udp_listener:` — [`NewUdpListenerFilterConfigFunction`] for UDP Listener filters
 /// - `bootstrap:` — [`NewBootstrapExtensionConfigFunction`] for Bootstrap extensions
 /// - `cert_validator:` — [`NewCertValidatorConfigFunction`] for TLS certificate validators
+/// - `access_logger:` — [`NewAccessLoggerConfigFunction`] for Access Loggers
 ///
 /// # Examples
 ///
@@ -521,6 +550,10 @@ macro_rules! declare_all_init_functions {
   };
   (@register cert_validator : $fn:expr) => {
     envoy_proxy_dynamic_modules_rust_sdk::NEW_CERT_VALIDATOR_CONFIG_FUNCTION
+      .get_or_init(|| $fn);
+  };
+  (@register access_logger : $fn:expr) => {
+    envoy_proxy_dynamic_modules_rust_sdk::NEW_ACCESS_LOGGER_CONFIG_FUNCTION
       .get_or_init(|| $fn);
   };
 }

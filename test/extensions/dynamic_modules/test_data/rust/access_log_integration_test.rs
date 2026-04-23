@@ -1,13 +1,40 @@
 //! Integration test module for access logger dynamic modules.
 //!
 //! This module implements a simple access logger that records log events and flush calls.
+//! Exercises the unified `declare_all_init_functions!(..., access_logger: ...)` entry
+//! point introduced alongside `NEW_ACCESS_LOGGER_CONFIG_FUNCTION` — the same
+//! OnceLock-factory pattern HTTP / network / bootstrap / cluster / LB use.
 
 use envoy_proxy_dynamic_modules_rust_sdk::access_log::*;
 use envoy_proxy_dynamic_modules_rust_sdk::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-declare_init_functions!(init, new_nop_http_filter_config_fn);
-declare_access_logger!(TestAccessLoggerConfig);
+declare_all_init_functions!(init,
+  http: new_nop_http_filter_config_fn,
+  access_logger: new_test_access_logger_config,
+);
+
+/// Dispatch-by-name factory. Matches the `logger_name` values the C++
+/// integration test in `test/extensions/access_loggers/dynamic_modules/
+/// integration_test.cc` uses (`test_logger`). Unknown names return
+/// `None`, which Envoy's `DynamicModuleAccessLogConfig` loader surfaces
+/// as `InvalidArgumentError` at config load.
+fn new_test_access_logger_config(
+  ctx: &ConfigContext,
+  name: &str,
+  _config: &[u8],
+) -> Option<Box<dyn AccessLoggerConfig>> {
+  match name {
+    // Accepted name — pins the dispatcher to what the C++ integration
+    // test passes in `logger_name`. The config-rejection path is
+    // covered by `BadLoggerNameRejectedAtConfigLoad` (see
+    // `test/extensions/access_loggers/dynamic_modules/integration_test.cc`).
+    "test_logger" => TestAccessLoggerConfig::new(ctx, name, _config)
+      .ok()
+      .map(|c| Box::new(c) as Box<dyn AccessLoggerConfig>),
+    _ => None,
+  }
+}
 
 /// Global counter for log events.
 static LOG_COUNT: AtomicU32 = AtomicU32::new(0);
