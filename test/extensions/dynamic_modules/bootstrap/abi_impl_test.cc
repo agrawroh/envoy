@@ -1304,6 +1304,20 @@ TEST_F(BootstrapAbiImplTest, TimerFired) {
   envoy_dynamic_module_callback_bootstrap_extension_timer_delete(timer_ptr);
 }
 
+// Verifies that `bootstrap_extension_timer_delete` is a safe no-op when called off the main
+// thread. The guard short-circuits before any pointer dereference, so passing a null timer is
+// safe here.
+TEST_F(BootstrapAbiImplTest, TimerDeleteOffMainThreadFailsClosed) {
+  EXPECT_ENVOY_BUG(
+      {
+        std::thread t(
+            [] { envoy_dynamic_module_callback_bootstrap_extension_timer_delete(nullptr); });
+        t.join();
+      },
+      "envoy_dynamic_module_callback_bootstrap_extension_timer_delete must be called on the main "
+      "thread");
+}
+
 // Test that the timer callback safely handles a destroyed config via weak_ptr.
 TEST_F(BootstrapAbiImplTest, TimerFiredAfterConfigDestroyed) {
   Event::TimerCb captured_timer_cb;
