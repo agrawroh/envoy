@@ -3541,7 +3541,7 @@ TEST_F(DynamicModuleHttpFilterSchedulerTest, HttpFilterSchedulerCommitPostsToWor
   envoy_dynamic_module_callback_http_filter_scheduler_delete(scheduler);
 }
 
-// Covers the `!filter_shared` early return.
+// Verifies that `commit` is a no-op when the filter weak_ptr can no longer be locked.
 TEST_F(DynamicModuleHttpFilterSchedulerTest, HttpFilterSchedulerCommitAfterFilterDestroyedIsNoOp) {
   filter_->setDecoderFilterCallbacks(decoder_callbacks_);
 
@@ -3583,7 +3583,7 @@ TEST_F(DynamicModuleHttpFilterSchedulerTest,
   envoy_dynamic_module_callback_http_filter_scheduler_delete(scheduler);
 }
 
-// Covers the happy path for the config scheduler: `commit` posts to the main thread dispatcher.
+// Verifies that the config scheduler `commit` posts to the main thread dispatcher.
 TEST_F(DynamicModuleHttpFilterSchedulerTest, HttpFilterConfigSchedulerCommitPostsToMainDispatcher) {
   auto* scheduler = envoy_dynamic_module_callback_http_filter_config_scheduler_new(configPtr());
   ASSERT_NE(nullptr, scheduler);
@@ -3599,7 +3599,7 @@ TEST_F(DynamicModuleHttpFilterSchedulerTest, HttpFilterConfigSchedulerCommitPost
   envoy_dynamic_module_callback_http_filter_config_scheduler_delete(scheduler);
 }
 
-// Covers the `!config_shared` early return of the config scheduler.
+// Verifies that the config scheduler `commit` is a no-op after the config has been destroyed.
 TEST_F(DynamicModuleHttpFilterSchedulerTest,
        HttpFilterConfigSchedulerCommitAfterConfigDestroyedIsNoOp) {
   auto* scheduler = envoy_dynamic_module_callback_http_filter_config_scheduler_new(configPtr());
