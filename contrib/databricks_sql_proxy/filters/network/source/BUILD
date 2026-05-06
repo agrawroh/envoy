@@ -41,7 +41,6 @@ envoy_cc_library(
         "//source/common/router:string_accessor_lib",
         "//source/common/tcp_proxy",
         "//source/extensions/filters/common/ext_authz:ext_authz_grpc_lib",
-        "//source/extensions/filters/common/set_filter_state:filter_config_lib",
         "//source/extensions/filters/network:well_known_names",
         "@envoy_api//contrib/envoy/extensions/filters/network/databricks_sql_proxy/v3:pkg_cc_proto",
     ],

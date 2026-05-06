@@ -5,6 +5,7 @@
 #include <string>
 
 #include "envoy/network/connection.h"
+#include "envoy/router/string_accessor.h"
 
 #include "source/common/network/upstream_server_name.h"
 #include "source/common/protobuf/utility.h"
@@ -244,19 +245,17 @@ void Filter::callExternalAuthorizationService() {
 
   // Propagate filter state keys to ext_authz request
   for (const auto& key : config_->filterStatePropagationKeysToExtAuthz()) {
-    ENVOY_CONN_LOG(debug,
-                   "databricks_sql_proxy: callExternalAuthorizationService: "
-                   "Filter state key = {} , hasData<HashableStringObject>()? = {}",
-                   read_callbacks_->connection(), key,
-                   read_callbacks_->connection()
-                       .streamInfo()
-                       .filterState()
-                       ->hasData<Filters::Common::SetFilterState::HashableStringObject>(key));
-    const auto* data =
-        read_callbacks_->connection()
-            .streamInfo()
-            .filterState()
-            ->getDataReadOnly<Filters::Common::SetFilterState::HashableStringObject>(key);
+    ENVOY_CONN_LOG(
+        debug,
+        "databricks_sql_proxy: callExternalAuthorizationService: "
+        "Filter state key = {} , hasData<Router::StringAccessor>()? = {}",
+        read_callbacks_->connection(), key,
+        read_callbacks_->connection().streamInfo().filterState()->hasData<Router::StringAccessor>(
+            key));
+    const auto* data = read_callbacks_->connection()
+                           .streamInfo()
+                           .filterState()
+                           ->getDataReadOnly<Router::StringAccessor>(key);
     if (data != nullptr) {
       Protobuf::Value value;
       value.set_string_value(data->asString());

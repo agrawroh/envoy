@@ -13,7 +13,6 @@
 #include "source/common/common/assert.h"
 #include "source/common/common/logger.h"
 #include "source/extensions/filters/common/ext_authz/ext_authz_grpc_impl.h"
-#include "source/extensions/filters/common/set_filter_state/filter_config.h"
 
 #include "contrib/databricks_sql_proxy/filters/network/source/databricks_sql_errors.h"
 #include "contrib/envoy/extensions/filters/network/databricks_sql_proxy/v3/databricks_sql_proxy.pb.h"
