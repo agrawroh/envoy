@@ -33,6 +33,14 @@ namespace ReverseConnection {
 
 // RCConnectionWrapper Tests.
 
+std::unique_ptr<NiceMock<Network::MockClientConnection>>
+getDeletableConn(Event::Dispatcher& dispatcher) {
+  auto mock_connection = std::make_unique<NiceMock<Network::MockClientConnection>>();
+  EXPECT_CALL(*mock_connection, dispatcher()).WillRepeatedly(ReturnRef(dispatcher));
+
+  return mock_connection;
+}
+
 class RCConnectionWrapperTest : public testing::Test {
 protected:
   void SetUp() override {
@@ -53,6 +61,9 @@ protected:
   void TearDown() override {
     io_handle_.reset();
     extension_.reset();
+    while (dispatcher_.to_delete_.size()) {
+      dispatcher_.to_delete_.pop_front();
+    }
   }
 
   void setupThreadLocalSlot() {
@@ -128,7 +139,7 @@ protected:
 
   // Helper method to set up mock connection with proper socket expectations.
   std::unique_ptr<NiceMock<Network::MockClientConnection>> setupMockConnection() {
-    auto mock_connection = std::make_unique<NiceMock<Network::MockClientConnection>>();
+    auto mock_connection = getDeletableConn(dispatcher_);
 
     // Create a mock socket for the connection.
     auto mock_socket_ptr = std::make_unique<NiceMock<Network::MockConnectionSocket>>();
@@ -180,7 +191,7 @@ protected:
 // Test RCConnectionWrapper::connect() method with HTTP/1.1 handshake success
 TEST_F(RCConnectionWrapperTest, ConnectHttpHandshakeSuccess) {
   // Create a mock connection.
-  auto mock_connection = std::make_unique<NiceMock<Network::MockClientConnection>>();
+  auto mock_connection = getDeletableConn(dispatcher_);
 
   // Set up connection expectations.
   EXPECT_CALL(*mock_connection, addConnectionCallbacks(_));
@@ -218,7 +229,7 @@ TEST_F(RCConnectionWrapperTest, ConnectHttpHandshakeSuccess) {
 // Test RCConnectionWrapper::connect() method with HTTP proxy (internal address) scenario.
 TEST_F(RCConnectionWrapperTest, ConnectHttpHandshakeWithHttpProxy) {
   // Create a mock connection.
-  auto mock_connection = std::make_unique<NiceMock<Network::MockClientConnection>>();
+  auto mock_connection = getDeletableConn(dispatcher_);
 
   // Set up connection expectations.
   EXPECT_CALL(*mock_connection, addConnectionCallbacks(_));
@@ -264,7 +275,7 @@ TEST_F(RCConnectionWrapperTest, ConnectHttpHandshakeWithHttpProxy) {
 
 // Test RCConnectionWrapper::connect() honors custom request paths.
 TEST_F(RCConnectionWrapperTest, ConnectHttpHandshakeWithCustomRequestPath) {
-  auto mock_connection = std::make_unique<NiceMock<Network::MockClientConnection>>();
+  auto mock_connection = getDeletableConn(dispatcher_);
 
   EXPECT_CALL(*mock_connection, addConnectionCallbacks(_));
   EXPECT_CALL(*mock_connection, addReadFilter(_));
@@ -307,7 +318,7 @@ TEST_F(RCConnectionWrapperTest, ConnectHttpHandshakeWithCustomRequestPath) {
 
 // Test RCConnectionWrapper::connect() includes additional headers in the handshake request.
 TEST_F(RCConnectionWrapperTest, ConnectHttpHandshakeWithAdditionalHeaders) {
-  auto mock_connection = std::make_unique<NiceMock<Network::MockClientConnection>>();
+  auto mock_connection = getDeletableConn(dispatcher_);
 
   EXPECT_CALL(*mock_connection, addConnectionCallbacks(_));
   EXPECT_CALL(*mock_connection, addReadFilter(_));
@@ -358,7 +369,7 @@ TEST_F(RCConnectionWrapperTest, ConnectHttpHandshakeWithAdditionalHeaders) {
 
 // Test that additional headers with OVERWRITE_IF_EXISTS_OR_ADD replace existing headers.
 TEST_F(RCConnectionWrapperTest, ConnectHttpHandshakeAdditionalHeadersOverwrite) {
-  auto mock_connection = std::make_unique<NiceMock<Network::MockClientConnection>>();
+  auto mock_connection = getDeletableConn(dispatcher_);
 
   EXPECT_CALL(*mock_connection, addConnectionCallbacks(_));
   EXPECT_CALL(*mock_connection, addReadFilter(_));
@@ -407,7 +418,7 @@ TEST_F(RCConnectionWrapperTest, ConnectHttpHandshakeAdditionalHeadersOverwrite) 
 
 // Test ADD_IF_ABSENT: header is added when absent, skipped when present.
 TEST_F(RCConnectionWrapperTest, ConnectHttpHandshakeAdditionalHeadersAddIfAbsent) {
-  auto mock_connection = std::make_unique<NiceMock<Network::MockClientConnection>>();
+  auto mock_connection = getDeletableConn(dispatcher_);
 
   EXPECT_CALL(*mock_connection, addConnectionCallbacks(_));
   EXPECT_CALL(*mock_connection, addReadFilter(_));
@@ -464,7 +475,7 @@ TEST_F(RCConnectionWrapperTest, ConnectHttpHandshakeAdditionalHeadersAddIfAbsent
 
 // Test OVERWRITE_IF_EXISTS: overwrites existing header, does nothing for absent header.
 TEST_F(RCConnectionWrapperTest, ConnectHttpHandshakeAdditionalHeadersOverwriteIfExists) {
-  auto mock_connection = std::make_unique<NiceMock<Network::MockClientConnection>>();
+  auto mock_connection = getDeletableConn(dispatcher_);
 
   EXPECT_CALL(*mock_connection, addConnectionCallbacks(_));
   EXPECT_CALL(*mock_connection, addReadFilter(_));
@@ -523,7 +534,7 @@ TEST_F(RCConnectionWrapperTest, ConnectHttpHandshakeAdditionalHeadersOverwriteIf
 // Test RCConnectionWrapper::connect() method with connection write failure.
 TEST_F(RCConnectionWrapperTest, ConnectHttpHandshakeWriteFailure) {
   // Create a mock connection that fails to write.
-  auto mock_connection = std::make_unique<NiceMock<Network::MockClientConnection>>();
+  auto mock_connection = getDeletableConn(dispatcher_);
 
   // Set up connection expectations.
   EXPECT_CALL(*mock_connection, addConnectionCallbacks(_));
@@ -1066,7 +1077,7 @@ TEST_F(RCConnectionWrapperTest, DecodeHeadersNonOk) {
 // Test dispatchHttp1 error path by initializing codec via connect() and
 // then feeding invalid bytes to the parser.
 TEST_F(RCConnectionWrapperTest, DispatchHttp1ErrorPath) {
-  auto mock_connection = std::make_unique<NiceMock<Network::MockClientConnection>>();
+  auto mock_connection = getDeletableConn(dispatcher_);
 
   EXPECT_CALL(*mock_connection, addConnectionCallbacks(_));
   EXPECT_CALL(*mock_connection, addReadFilter(_));
@@ -1106,7 +1117,6 @@ TEST_F(RCConnectionWrapperTest, DestructorInvokesShutdown) {
 
   EXPECT_CALL(*mock_connection, removeConnectionCallbacks(_));
   EXPECT_CALL(*mock_connection, state()).WillRepeatedly(Return(Network::Connection::State::Open));
-  EXPECT_CALL(*mock_connection, close(Network::ConnectionCloseType::FlushWrite));
   EXPECT_CALL(*mock_connection, id()).WillRepeatedly(Return(777));
 
   {
@@ -1207,7 +1217,6 @@ TEST_F(RCConnectionWrapperTest, Shutdown) {
     // Set up connection expectations for open connection.
     EXPECT_CALL(*mock_connection, removeConnectionCallbacks(_));
     EXPECT_CALL(*mock_connection, state()).WillRepeatedly(Return(Network::Connection::State::Open));
-    EXPECT_CALL(*mock_connection, close(Network::ConnectionCloseType::FlushWrite));
     EXPECT_CALL(*mock_connection, id()).WillRepeatedly(Return(12345));
 
     RCConnectionWrapper wrapper(*io_handle_, std::move(mock_connection), mock_host, "test-cluster");
@@ -1267,13 +1276,12 @@ TEST_F(RCConnectionWrapperTest, Shutdown) {
   }
   // Test 5: Multiple shutdown calls (should be safe)
   {
-    auto mock_connection = std::make_unique<NiceMock<Network::MockClientConnection>>();
+    auto mock_connection = getDeletableConn(dispatcher_);
     auto mock_host = std::make_shared<NiceMock<Upstream::MockHostDescription>>();
 
     // Set up connection expectations.
     EXPECT_CALL(*mock_connection, removeConnectionCallbacks(_));
     EXPECT_CALL(*mock_connection, state()).WillRepeatedly(Return(Network::Connection::State::Open));
-    EXPECT_CALL(*mock_connection, close(Network::ConnectionCloseType::FlushWrite));
     EXPECT_CALL(*mock_connection, id()).WillRepeatedly(Return(12348));
 
     RCConnectionWrapper wrapper(*io_handle_, std::move(mock_connection), mock_host, "test-cluster");
@@ -1305,11 +1313,14 @@ protected:
         *stats_scope_); // Use the created scope
   }
 
-  void TearDown() override { io_handle_.reset(); }
+  void TearDown() override {
+    io_handle_.reset();
+    dispatcher_.clearDeferredDeleteList();
+  }
 
   // Helper to create a mock RCConnectionWrapper.
   std::unique_ptr<RCConnectionWrapper> createMockWrapper() {
-    auto mock_connection = std::make_unique<NiceMock<Network::MockClientConnection>>();
+    auto mock_connection = getDeletableConn(dispatcher_);
     auto mock_host = std::make_shared<NiceMock<Upstream::MockHostDescription>>();
     return std::make_unique<RCConnectionWrapper>(*io_handle_, std::move(mock_connection), mock_host,
                                                  "test-cluster");
@@ -1324,6 +1335,7 @@ protected:
   Stats::IsolatedStoreImpl stats_store_;
   Stats::ScopeSharedPtr stats_scope_;
   std::unique_ptr<ReverseConnectionIOHandle> io_handle_;
+  NiceMock<Event::MockDispatcher> dispatcher_{"worker_0"};
 };
 
 TEST_F(SimpleConnReadFilterTest, OnDataWithNullParent) {
@@ -1465,6 +1477,24 @@ TEST_F(RCConnectionWrapperTest, NoOpMethods) {
 
   wrapper.onMaxStreamsChanged(0);
   wrapper.onMaxStreamsChanged(100);
+}
+
+// Verify shutdown with already-null connection doesn't crash.
+TEST_F(RCConnectionWrapperTest, ShutdownIsIdempotent) {
+  auto mock_connection = getDeletableConn(dispatcher_);
+  auto mock_host = std::make_shared<NiceMock<Upstream::MockHostDescription>>();
+  EXPECT_CALL(*mock_connection, id()).WillRepeatedly(Return(999));
+  EXPECT_CALL(*mock_connection, removeConnectionCallbacks(_));
+  auto wrapper = std::make_unique<RCConnectionWrapper>(*io_handle_, std::move(mock_connection),
+                                                       mock_host, "test-cluster");
+
+  wrapper->shutdown();
+  ASSERT_EQ(wrapper->getConnection(), nullptr);
+
+  wrapper->shutdown();
+  ASSERT_EQ(wrapper->getConnection(), nullptr);
+
+  wrapper.reset();
 }
 
 } // namespace ReverseConnection
