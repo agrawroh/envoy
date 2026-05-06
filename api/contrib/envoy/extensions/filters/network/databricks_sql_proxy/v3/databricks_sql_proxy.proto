@@ -40,6 +40,11 @@ message PostgresRoutingConfig {
   // Should the filter randomize and replace the cancellation key (PID and secret) with
   // 64-bit integer in the Postgres BackendKeyData message.
   bool randomize_cancellation_key = 4;
+
+  // Inject neon_log_id into the "options" startup parameter before forwarding to upstream.
+  // The injected value is "neon_log_id:<upstream_connection_id>".
+  // Only enable when the upstream understands neon_log_id (e.g. Neon proxy).
+  bool inject_neon_log_id = 5;
 }
 
 // [#protodoc-title: Databricks SQL Proxy Filter]

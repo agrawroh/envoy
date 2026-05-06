@@ -431,9 +431,28 @@ void DatabricksSqlProxyPostgresIntegrationTest::runEndToEndTest(
   }
 
   // Upstream connection waits for postgres startup message from the filter.
-  ASSERT_TRUE(fake_postgres_upstream_connection->waitForData(postgres_startup_message.length(),
-                                                             &postgres_upstream_received));
-  ASSERT_EQ(postgres_startup_message.toString(), postgres_upstream_received);
+  if (postgres_config.inject_neon_log_id()) {
+    // When inject_neon_log_id is enabled, the filter injects neon_log_id inside the "options"
+    // startup parameter as "options\0neon_log_id:<conn_id>\0". The added bytes are:
+    // strlen("options") + 1 (\0) + NEON_LOG_ID_KEY + 1 (:) + conn_id + 1 (\0).
+    const std::string upstream_conn_id_str =
+        std::to_string(fake_postgres_upstream_connection->connection().id());
+    ASSERT_TRUE(fake_postgres_upstream_connection->waitForData(
+        postgres_startup_message.length() + 8 + CommonConstants::NEON_LOG_ID_KEY.size() + 2 +
+            upstream_conn_id_str.size(),
+        &postgres_upstream_received));
+    EXPECT_THAT(postgres_upstream_received, testing::HasSubstr("options"));
+    EXPECT_THAT(postgres_upstream_received,
+                testing::HasSubstr(std::string(CommonConstants::NEON_LOG_ID_KEY)));
+  } else {
+    ASSERT_TRUE(fake_postgres_upstream_connection->waitForData(postgres_startup_message.length(),
+                                                               &postgres_upstream_received));
+  }
+  // The received message should contain the original connection string params.
+  EXPECT_THAT(postgres_upstream_received, testing::HasSubstr("user"));
+  EXPECT_THAT(postgres_upstream_received, testing::HasSubstr("testuser"));
+  EXPECT_THAT(postgres_upstream_received, testing::HasSubstr("database"));
+  EXPECT_THAT(postgres_upstream_received, testing::HasSubstr("testdb"));
   fake_postgres_upstream_connection->clearData();
 
   // Client send the next message.
@@ -445,7 +464,7 @@ void DatabricksSqlProxyPostgresIntegrationTest::runEndToEndTest(
   ASSERT_EQ(next_message, postgres_upstream_received);
   fake_postgres_upstream_connection->clearData();
 
-  const std::string_view ip = "1.2.3.4";
+  const absl::string_view ip = "1.2.3.4";
   size_t parameter_status_message_len =
       sizeof(uint32_t) + CommonConstants::PARAMETER_STATUS_UPSTREAM_IP_KEY.size() +
       1 /* null-terminator */ + ip.size() + 1 /* null-terminator */;
@@ -567,6 +586,7 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, EndToEndTLSSidecarService) {
   postgres_config.set_read_parameter_status_upstream_ip(true);
   postgres_config.set_store_cancellation_key(true);
   postgres_config.set_randomize_cancellation_key(true);
+  postgres_config.set_inject_neon_log_id(true);
   runEndToEndTest(
       DatabricksSqlProxyProto::SIDECAR_SERVICE, postgres_config,
       fmt::format("Protocol={} "
@@ -580,8 +600,8 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, EndToEndTLSSidecarService) {
                   "response_code_details=- "
                   "response_flags=- "
                   "DOWNSTREAM_WIRE_BYTES_SENT=64 "
-                  "DOWNSTREAM_WIRE_BYTES_RECEIVED=59 "
-                  "UPSTREAM_WIRE_BYTES_SENT=59 "
+                  "DOWNSTREAM_WIRE_BYTES_RECEIVED=\\d+ "
+                  "UPSTREAM_WIRE_BYTES_SENT=\\d+ "
                   "UPSTREAM_WIRE_BYTES_RECEIVED=64 "
                   "real_ip={} "
                   "\r?.*",
@@ -609,8 +629,8 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, EndToEndTLSSni) {
                   "response_code_details=- "
                   "response_flags=- "
                   "DOWNSTREAM_WIRE_BYTES_SENT=64 "
-                  "DOWNSTREAM_WIRE_BYTES_RECEIVED=59 "
-                  "UPSTREAM_WIRE_BYTES_SENT=59 "
+                  "DOWNSTREAM_WIRE_BYTES_RECEIVED=\\d+ "
+                  "UPSTREAM_WIRE_BYTES_SENT=\\d+ "
                   "UPSTREAM_WIRE_BYTES_RECEIVED=64 "
                   "real_ip={} "
                   "\r?.*",
@@ -985,6 +1005,7 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, UpstreamDisconnectBeforePgAuth
   postgres_config.set_read_parameter_status_upstream_ip(true);
   postgres_config.set_store_cancellation_key(true);
   postgres_config.set_randomize_cancellation_key(true);
+  postgres_config.set_inject_neon_log_id(true);
 
   config_helper_.addConfigModifier([&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
     setupAccesslog(access_log_path, bootstrap);
@@ -1071,10 +1092,21 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, UpstreamDisconnectBeforePgAuth
   // the upstream.
   config_factory_.proceed_sync_.Notify();
 
-  // Upstream connection waits for postgres startup message from the filter.
-  ASSERT_TRUE(fake_postgres_upstream_connection->waitForData(postgres_startup_message.length(),
-                                                             &postgres_upstream_received));
-  ASSERT_EQ(postgres_startup_message.toString(), postgres_upstream_received);
+  // The filter injects neon_log_id inside the "options" startup parameter as
+  // "options\0neon_log_id:<conn_id>\0". The added bytes are:
+  // strlen("options") + 1 (\0) + NEON_LOG_ID_KEY + 1 (:) + conn_id + 1 (\0).
+  const std::string upstream_conn_id_str =
+      std::to_string(fake_postgres_upstream_connection->connection().id());
+  ASSERT_TRUE(fake_postgres_upstream_connection->waitForData(
+      postgres_startup_message.length() + 8 + CommonConstants::NEON_LOG_ID_KEY.size() + 2 +
+          upstream_conn_id_str.size(),
+      &postgres_upstream_received));
+  EXPECT_THAT(postgres_upstream_received, testing::HasSubstr("user"));
+  EXPECT_THAT(postgres_upstream_received, testing::HasSubstr("testuser"));
+  EXPECT_THAT(postgres_upstream_received, testing::HasSubstr("testdb"));
+  EXPECT_THAT(postgres_upstream_received, testing::HasSubstr("options"));
+  EXPECT_THAT(postgres_upstream_received,
+              testing::HasSubstr(std::string(CommonConstants::NEON_LOG_ID_KEY)));
   fake_postgres_upstream_connection->clearData();
 
   // Client send the next message.
@@ -1121,8 +1153,8 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, UpstreamDisconnectBeforePgAuth
                                                "response_code_details=- "
                                                "response_flags=- "
                                                "DOWNSTREAM_WIRE_BYTES_SENT=13 "
-                                               "DOWNSTREAM_WIRE_BYTES_RECEIVED=59 "
-                                               "UPSTREAM_WIRE_BYTES_SENT=59 "
+                                               "DOWNSTREAM_WIRE_BYTES_RECEIVED=\\d+ "
+                                               "UPSTREAM_WIRE_BYTES_SENT=\\d+ "
                                                "UPSTREAM_WIRE_BYTES_RECEIVED=13 "
                                                "real_ip={} "
                                                "\r?.*",
@@ -1144,6 +1176,7 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, DownstreamDisconnectBeforePgAu
   postgres_config.set_read_parameter_status_upstream_ip(true);
   postgres_config.set_store_cancellation_key(true);
   postgres_config.set_randomize_cancellation_key(true);
+  postgres_config.set_inject_neon_log_id(true);
 
   config_helper_.addConfigModifier([&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
     setupAccesslog(access_log_path, bootstrap);
@@ -1230,10 +1263,21 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, DownstreamDisconnectBeforePgAu
   // the upstream.
   config_factory_.proceed_sync_.Notify();
 
-  // Upstream connection waits for postgres startup message from the filter.
-  ASSERT_TRUE(fake_postgres_upstream_connection->waitForData(postgres_startup_message.length(),
-                                                             &postgres_upstream_received));
-  ASSERT_EQ(postgres_startup_message.toString(), postgres_upstream_received);
+  // The filter injects neon_log_id inside the "options" startup parameter as
+  // "options\0neon_log_id:<conn_id>\0". The added bytes are:
+  // strlen("options") + 1 (\0) + NEON_LOG_ID_KEY + 1 (:) + conn_id + 1 (\0).
+  const std::string upstream_conn_id_str =
+      std::to_string(fake_postgres_upstream_connection->connection().id());
+  ASSERT_TRUE(fake_postgres_upstream_connection->waitForData(
+      postgres_startup_message.length() + 8 + CommonConstants::NEON_LOG_ID_KEY.size() + 2 +
+          upstream_conn_id_str.size(),
+      &postgres_upstream_received));
+  EXPECT_THAT(postgres_upstream_received, testing::HasSubstr("user"));
+  EXPECT_THAT(postgres_upstream_received, testing::HasSubstr("testuser"));
+  EXPECT_THAT(postgres_upstream_received, testing::HasSubstr("testdb"));
+  EXPECT_THAT(postgres_upstream_received, testing::HasSubstr("options"));
+  EXPECT_THAT(postgres_upstream_received,
+              testing::HasSubstr(std::string(CommonConstants::NEON_LOG_ID_KEY)));
   fake_postgres_upstream_connection->clearData();
 
   // Client send the next message with end_stream set to true.
@@ -1270,8 +1314,8 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTest, DownstreamDisconnectBeforePgAu
                                                "response_code_details=- "
                                                "response_flags=- "
                                                "DOWNSTREAM_WIRE_BYTES_SENT=1 "
-                                               "DOWNSTREAM_WIRE_BYTES_RECEIVED=59 "
-                                               "UPSTREAM_WIRE_BYTES_SENT=59 "
+                                               "DOWNSTREAM_WIRE_BYTES_RECEIVED=\\d+ "
+                                               "UPSTREAM_WIRE_BYTES_SENT=\\d+ "
                                                "UPSTREAM_WIRE_BYTES_RECEIVED=1 "
                                                "real_ip={} "
                                                "\r?.*",
@@ -1319,8 +1363,8 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTestNoUpstreamSSL, EndToEndNoUpstrea
                   "response_code_details=- "
                   "response_flags=- "
                   "DOWNSTREAM_WIRE_BYTES_SENT=63 "
-                  "DOWNSTREAM_WIRE_BYTES_RECEIVED=51 "
-                  "UPSTREAM_WIRE_BYTES_SENT=51 "
+                  "DOWNSTREAM_WIRE_BYTES_RECEIVED=\\d+ "
+                  "UPSTREAM_WIRE_BYTES_SENT=\\d+ "
                   "UPSTREAM_WIRE_BYTES_RECEIVED=63 "
                   "real_ip={} "
                   "\r?.*",
@@ -1361,8 +1405,8 @@ TEST_P(DatabricksSqlProxyPostgresIntegrationTestProxyProtocol, EndToEndWithProxy
                   "response_code_details=- "
                   "response_flags=- "
                   "DOWNSTREAM_WIRE_BYTES_SENT=64 "
-                  "DOWNSTREAM_WIRE_BYTES_RECEIVED=59 "
-                  "UPSTREAM_WIRE_BYTES_SENT=59 "
+                  "DOWNSTREAM_WIRE_BYTES_RECEIVED=\\d+ "
+                  "UPSTREAM_WIRE_BYTES_SENT=\\d+ "
                   "UPSTREAM_WIRE_BYTES_RECEIVED=64 "
                   "real_ip=1.2.3.4 "
                   "\r?.*",

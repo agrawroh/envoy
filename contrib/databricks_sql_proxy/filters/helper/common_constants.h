@@ -37,6 +37,7 @@ public:
   static inline constexpr absl::string_view DATABASE_KEY{"database"};
   static inline constexpr absl::string_view ADDITIONAL_CONNECTION_ATTRS_KEY{
       "additional_connection_attributes"};
+  static inline constexpr absl::string_view NEON_LOG_ID_KEY{"neon_log_id"};
   static inline constexpr absl::string_view DYNAMIC_FORWARD_PROXY_KEY{"DYNAMIC_FORWARD_PROXY"};
   static inline constexpr absl::string_view REASON_PHRASE_KEY{"reason_phrase"};
 

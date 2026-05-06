@@ -77,6 +77,8 @@ private:
   void sendPostgresCancelRequestToUpstream();
   void sendPostgresSslRequestToUpstream();
   void sendPostgresStartupMessageToUpstream();
+  void injectNeonLogIdIntoStartupPacket();
+  void stripNeonLogIdFromStartupPacket();
   Network::FilterStatus handleUpstreamSslResponse(Buffer::Instance& data);
   bool findAndProcessUpstreamIpParameterStatus(Buffer::Instance& data, uint32_t message_len);
   void processBackendKeyDataMessage(Buffer::Instance& data);

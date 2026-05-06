@@ -4,8 +4,13 @@
 #include <cstdint>
 
 #include "source/common/common/random_generator.h"
+#include "source/common/protobuf/protobuf.h"
 #include "source/extensions/filters/network/well_known_names.h"
 
+#include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
+#include "absl/strings/str_split.h"
 #include "contrib/common/sqlutils/source/sqlutils.h"
 #include "contrib/databricks_sql_proxy/filters/helper/common_constants.h"
 #include "contrib/databricks_sql_proxy/filters/helper/postgres_constants.h"
@@ -255,6 +260,7 @@ void PostgresProxy::outputConnectionStringToDynamicMetadata(Buffer::Instance& da
                      key, value);
       (*connection_string_options.mutable_fields())[key].set_string_value(value);
     }
+
     // Create another struct to wrap the connection_string_options to make sure that
     // there is no collision with other fields under the same namespace
     // (NetworkFilterNames::get().DatabricksSqlProxy)
@@ -307,7 +313,7 @@ void PostgresProxy::onUpstreamConnected() {
 }
 
 void PostgresProxy::sendPostgresCancelRequestToUpstream() {
-  ::google::protobuf::Map<std::string, ::google::protobuf::Value>* dynamic_metadata =
+  Protobuf::Map<std::string, Protobuf::Value>* dynamic_metadata =
       read_callbacks_->connection()
           .streamInfo()
           .dynamicMetadata()
@@ -366,6 +372,8 @@ void PostgresProxy::sendPostgresStartupMessageToUpstream() {
   ENVOY_CONN_LOG(debug, "databricks_sql_proxy: Sending startup packet to upstream",
                  read_callbacks_->connection());
 
+  injectNeonLogIdIntoStartupPacket();
+
   // Remmeber the length of temp_startup_packet_. injectReadDataToFilterChain() will drain the
   // buffer.
   uint64_t len = temp_startup_packet_.length();
@@ -374,6 +382,201 @@ void PostgresProxy::sendPostgresStartupMessageToUpstream() {
   config_->stats().buffered_first_message_.adjust(0, len);
 
   setUpstreamHandshakeState(UpstreamHandshakeState::SentStartupMessage);
+}
+
+void PostgresProxy::injectNeonLogIdIntoStartupPacket() {
+  const bool should_inject = config_->protoConfig().postgres_config().inject_neon_log_id();
+
+  if (!should_inject) {
+    // When injection is disabled, strip any existing neon_log_id from the options
+    // so upstream PostgreSQL does not receive it. Parse the packet only if it's
+    // large enough to contain an "options" key.
+    stripNeonLogIdFromStartupPacket();
+    return;
+  }
+
+  auto maybe_conn_id =
+      read_callbacks_->connection().streamInfo().upstreamInfo()->upstreamConnectionId();
+  if (!maybe_conn_id.has_value()) {
+    ENVOY_CONN_LOG(debug,
+                   "databricks_sql_proxy: upstream connection ID unavailable, "
+                   "skipping neon_log_id injection",
+                   read_callbacks_->connection());
+    return;
+  }
+
+  const std::string conn_id_str = std::to_string(maybe_conn_id.value());
+  const std::string neon_option = std::string(CommonConstants::NEON_LOG_ID_KEY) + ":" + conn_id_str;
+
+  // Read the original packet: [4 bytes length][4 bytes proto][key\0val\0...key\0val\0\0]
+  const uint64_t original_len = temp_startup_packet_.length();
+  const uint32_t original_proto = temp_startup_packet_.peekBEInt<uint32_t>(sizeof(int32_t));
+
+  // 1. Drain the header (length + proto) and read the body into a string for manipulation.
+  temp_startup_packet_.drain(PostgresConstants::MIN_STARTUP_MESSAGE_LENGTH);
+  const uint64_t remaining = temp_startup_packet_.length();
+  std::string body_str;
+  if (remaining > 0) {
+    body_str =
+        std::string(static_cast<char*>(temp_startup_packet_.linearize(remaining)), remaining);
+    temp_startup_packet_.drain(remaining);
+    // Strip the final \0 terminator — we will re-add it after modification.
+    if (!body_str.empty() && body_str.back() == '\0') {
+      body_str.pop_back();
+    }
+  }
+
+  // 2. The upstream expects neon_log_id inside the "options" startup parameter, e.g.
+  //    "options\0neon_log_id:<value>\0". Parse the null-separated key\0value\0 pairs
+  //    to find the "options" key and append to its value, or create it if absent.
+  static constexpr absl::string_view kOptionsKey = "options";
+  bool options_found = false;
+
+  size_t i = 0;
+  while (i < body_str.size()) {
+    size_t key_end = body_str.find('\0', i);
+    if (key_end == std::string::npos || key_end == i) {
+      break; // empty key or malformed
+    }
+    absl::string_view key(&body_str[i], key_end - i);
+
+    size_t val_start = key_end + 1;
+    size_t val_end = body_str.find('\0', val_start);
+    if (val_end == std::string::npos) {
+      break; // malformed — no value terminator
+    }
+
+    if (key == kOptionsKey) {
+      // Append " neon_log_id:<value>" to the existing options value.
+      std::string separator = (val_end > val_start) ? " " : "";
+      body_str.insert(val_end, separator + neon_option);
+      options_found = true;
+      break;
+    }
+
+    i = val_end + 1;
+  }
+
+  if (!options_found) {
+    // No "options" key found — add a new key-value pair: "options\0neon_log_id:<value>\0"
+    body_str += std::string(kOptionsKey);
+    body_str += '\0';
+    body_str += neon_option;
+    body_str += '\0';
+  }
+
+  // 3. Re-add the final \0 terminator (end of parameter list).
+  body_str += '\0';
+
+  // 4. Reconstruct the full packet: length + proto + body.
+  const int32_t new_msg_len =
+      static_cast<int32_t>(PostgresConstants::MIN_STARTUP_MESSAGE_LENGTH + body_str.size());
+
+  ASSERT(temp_startup_packet_.length() == 0);
+  temp_startup_packet_.writeBEInt<int32_t>(new_msg_len);
+  temp_startup_packet_.writeBEInt<uint32_t>(original_proto);
+  temp_startup_packet_.add(body_str);
+
+  // Update the buffered stat to reflect the size change.
+  const uint64_t new_len = temp_startup_packet_.length();
+  if (new_len > original_len) {
+    config_->stats().buffered_first_message_.adjust(new_len - original_len, 0);
+  }
+}
+
+// Removes space-separated tokens matching "prefix:<value>" from an options string.
+// Modifies the string in place. Returns true if any tokens were removed.
+bool stripOptionTokensByPrefix(std::string& options_value, absl::string_view prefix) {
+  const std::string prefix_with_sep = absl::StrCat(prefix, ":");
+
+  std::vector<absl::string_view> tokens = absl::StrSplit(options_value, ' ', absl::SkipEmpty());
+  std::vector<absl::string_view> kept;
+  kept.reserve(tokens.size());
+
+  for (const auto& token : tokens) {
+    if (!absl::StartsWith(token, prefix_with_sep)) {
+      kept.push_back(token);
+    }
+  }
+
+  if (kept.size() == tokens.size()) {
+    return false;
+  }
+  options_value = absl::StrJoin(kept, " ");
+  return true;
+}
+
+// Strip any neon_log_id:<value> tokens injected by an upstream proxy from the
+// "options" startup parameter so that downstream PostgreSQL does not reject them.
+void PostgresProxy::stripNeonLogIdFromStartupPacket() {
+  const uint64_t original_len = temp_startup_packet_.length();
+  const uint32_t original_proto = temp_startup_packet_.peekBEInt<uint32_t>(sizeof(int32_t));
+
+  temp_startup_packet_.drain(PostgresConstants::MIN_STARTUP_MESSAGE_LENGTH);
+  const uint64_t remaining = temp_startup_packet_.length();
+  if (remaining == 0) {
+    temp_startup_packet_.writeBEInt<int32_t>(static_cast<int32_t>(original_len));
+    temp_startup_packet_.writeBEInt<uint32_t>(original_proto);
+    return;
+  }
+
+  std::string body_str(static_cast<char*>(temp_startup_packet_.linearize(remaining)), remaining);
+  temp_startup_packet_.drain(remaining);
+
+  // The body is a sequence of null-separated tokens: key, value, key, value, ..., ""
+  // Split into tokens — the last empty string marks the end of the parameter list.
+  std::vector<absl::string_view> parts =
+      absl::StrSplit(absl::string_view(body_str.data(), body_str.size()), absl::ByChar('\0'));
+
+  static constexpr absl::string_view kOptionsKey = "options";
+  bool modified = false;
+  std::string new_body;
+
+  for (size_t idx = 0; idx + 1 < parts.size(); idx += 2) {
+    absl::string_view key = parts[idx];
+    if (key.empty()) {
+      break;
+    }
+
+    absl::string_view value_sv = parts[idx + 1];
+    std::string value(value_sv);
+
+    if (key == kOptionsKey && !modified) {
+      modified = stripOptionTokensByPrefix(value, CommonConstants::NEON_LOG_ID_KEY);
+      // even after we've found the right key we still need to stay in the loop to populate new_body
+      if (value.empty()) {
+        continue;
+      }
+    }
+
+    new_body += std::string(key);
+    new_body += '\0';
+    new_body += value;
+    new_body += '\0';
+  }
+  new_body += '\0';
+
+  if (!modified) {
+    // Nothing changed — reconstruct the original packet unchanged.
+    ASSERT(temp_startup_packet_.length() == 0);
+    temp_startup_packet_.writeBEInt<int32_t>(static_cast<int32_t>(original_len));
+    temp_startup_packet_.writeBEInt<uint32_t>(original_proto);
+    temp_startup_packet_.add(body_str);
+    return;
+  }
+
+  const int32_t new_msg_len =
+      static_cast<int32_t>(PostgresConstants::MIN_STARTUP_MESSAGE_LENGTH + new_body.size());
+
+  ASSERT(temp_startup_packet_.length() == 0);
+  temp_startup_packet_.writeBEInt<int32_t>(new_msg_len);
+  temp_startup_packet_.writeBEInt<uint32_t>(original_proto);
+  temp_startup_packet_.add(new_body);
+
+  const uint64_t new_len = temp_startup_packet_.length();
+  if (new_len < original_len) {
+    config_->stats().buffered_first_message_.adjust(0, original_len - new_len);
+  }
 }
 
 /**

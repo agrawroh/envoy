@@ -56,6 +56,7 @@ public:
       postgres_config:
         read_parameter_status_upstream_ip: true
         store_cancellation_key: true
+        inject_neon_log_id: true
     )EOF";
 
     DatabricksSqlProxyProto proto_config;
@@ -828,6 +829,339 @@ TEST_F(PostgresProxyTest, OutputConnectionStringToDynamicMetadata) {
             fields.at("connection_string_options").struct_value().fields().at("cd").string_value());
   read_callbacks_.connection_.stream_info_.metadata_.clear_filter_metadata();
   data.drain(8);
+}
+
+// Helper: drive the filter through ext_authz → upstream connected → SSL handshake, then
+// return the startup packet that would be injected to upstream via the final
+// injectReadDataToFilterChain call. |conn_opts| is the raw connection string body
+// (including trailing \0 terminator). |upstream_conn_id| is the mocked upstream connection ID
+// (nullopt to simulate unavailable).
+template <typename T>
+void verifyStartupPacketInjection(
+    T& t, const std::string& conn_opts, absl::optional<uint64_t> upstream_conn_id,
+    std::function<void(Buffer::Instance& data)> verify_injected_packet) {
+  t.filter_->onNewConnection();
+
+  Buffer::OwnedImpl postgres_startup_message;
+  postgres_startup_message.writeBEInt<int32_t>(PostgresConstants::MIN_STARTUP_MESSAGE_LENGTH +
+                                               conn_opts.length());
+  postgres_startup_message.writeBEInt<uint32_t>(PostgresConstants::PROTOCOL_VERSION);
+  postgres_startup_message.add(conn_opts);
+
+  t.read_callbacks_.connection_.read_enabled_ = true;
+
+  EXPECT_CALL(*t.client_, check(_, _, _, _));
+  EXPECT_EQ(Envoy::Network::FilterStatus::StopIteration,
+            t.filter_->onData(postgres_startup_message, false));
+
+  // Injecting empty buffer to initiate upstream connection after ext_authz.
+  EXPECT_CALL(t.read_callbacks_, injectReadDataToFilterChain(_, _))
+      .WillOnce(Invoke([](Buffer::Instance& data, bool end_stream) {
+        EXPECT_EQ(data.length(), 0);
+        EXPECT_FALSE(end_stream);
+      }));
+
+  Filters::Common::ExtAuthz::Response response{};
+  response.status = Filters::Common::ExtAuthz::CheckStatus::OK;
+  Protobuf::Value target_cluster_value;
+  target_cluster_value.set_string_value("some_target_cluster");
+  (*response.dynamic_metadata.mutable_fields())[CommonConstants::TARGET_CLUSTER_KEY] =
+      target_cluster_value;
+  t.filter_->onComplete(std::make_unique<Filters::Common::ExtAuthz::Response>(response));
+
+  t.read_callbacks_.connection_.read_enabled_ = true;
+
+  // Mock the upstream connection ID.
+  auto upstream_info = std::dynamic_pointer_cast<testing::NiceMock<StreamInfo::MockUpstreamInfo>>(
+      t.read_callbacks_.connection_.stream_info_.upstream_info_);
+  EXPECT_CALL(*upstream_info, upstreamConnectionId()).WillRepeatedly(Return(upstream_conn_id));
+
+  // Expect SSL request first.
+  EXPECT_CALL(t.read_callbacks_, injectReadDataToFilterChain(_, _))
+      .WillOnce(Invoke([](Buffer::Instance& data, bool end_stream) {
+        EXPECT_EQ(data.length(), PostgresConstants::SSL_REQUEST_MESSAGE_LENGTH);
+        EXPECT_FALSE(end_stream);
+      }));
+
+  t.filter_->pollForUpstreamConnected();
+
+  EXPECT_CALL(t.read_callbacks_, startUpstreamSecureTransport()).WillOnce(testing::Return(true));
+
+  // Capture and verify the injected startup message.
+  EXPECT_CALL(t.read_callbacks_, injectReadDataToFilterChain(_, _))
+      .WillOnce(Invoke([&verify_injected_packet](Buffer::Instance& data, bool end_stream) {
+        EXPECT_FALSE(end_stream);
+        verify_injected_packet(data);
+      }));
+
+  Buffer::OwnedImpl ssl_response;
+  ssl_response.writeByte(PostgresConstants::POSTGRES_SUPPORT_SSL);
+  EXPECT_EQ(Envoy::Network::FilterStatus::StopIteration, t.filter_->onWrite(ssl_response, false));
+
+  EXPECT_EQ(0, t.config_->stats().buffered_first_message_.value());
+}
+
+// Test that neon_log_id is injected as a startup parameter with the correct upstream connection ID.
+TEST_F(PostgresProxyTest, NeonLogIdInjectedIntoStartupMessage) {
+  const std::string conn_opts{"user\0testuser\0database\0testdb\0\0", 31};
+  const uint64_t expected_conn_id = 12345;
+
+  verifyStartupPacketInjection(
+      *this, conn_opts, absl::make_optional(expected_conn_id), [&](Buffer::Instance& data) {
+        // Length field must match actual packet size.
+        EXPECT_EQ(static_cast<int32_t>(data.length()), data.peekBEInt<int32_t>(0));
+        // Protocol version must be preserved.
+        EXPECT_EQ(PostgresConstants::PROTOCOL_VERSION, data.peekBEInt<uint32_t>(4));
+
+        std::string packet(static_cast<char*>(data.linearize(data.length())), data.length());
+
+        // Original params must be intact.
+        EXPECT_NE(packet.find(std::string("user\0testuser\0", 14), 8), std::string::npos);
+        EXPECT_NE(packet.find(std::string("database\0testdb\0", 16), 8), std::string::npos);
+
+        // neon_log_id must be inside the "options" startup parameter as
+        // "options\0neon_log_id:<value>\0".
+        std::string options_key_search = std::string("options") + '\0';
+        auto options_pos = packet.find(options_key_search, 8);
+        ASSERT_NE(options_pos, std::string::npos);
+
+        // Extract the options value and verify it contains neon_log_id:<conn_id>.
+        size_t options_val_start = options_pos + options_key_search.size();
+        size_t options_val_end = packet.find('\0', options_val_start);
+        ASSERT_NE(options_val_end, std::string::npos);
+        std::string options_val =
+            packet.substr(options_val_start, options_val_end - options_val_start);
+        std::string expected_neon =
+            std::string(CommonConstants::NEON_LOG_ID_KEY) + ":" + std::to_string(expected_conn_id);
+        EXPECT_EQ(expected_neon, options_val);
+
+        // Packet must end with \0 (parameter list terminator).
+        EXPECT_EQ('\0', packet.back());
+      });
+}
+
+// Test that neon_log_id is injected even when the startup message has no connection string params
+// (just the 8-byte header).
+TEST_F(PostgresProxyTest, NeonLogIdInjectedIntoMinimalStartupMessage) {
+  // Empty connection string — just header.
+  const std::string conn_opts;
+  const uint64_t expected_conn_id = 99999;
+
+  verifyStartupPacketInjection(
+      *this, conn_opts, absl::make_optional(expected_conn_id), [&](Buffer::Instance& data) {
+        EXPECT_EQ(static_cast<int32_t>(data.length()), data.peekBEInt<int32_t>(0));
+        EXPECT_EQ(PostgresConstants::PROTOCOL_VERSION, data.peekBEInt<uint32_t>(4));
+
+        std::string packet(static_cast<char*>(data.linearize(data.length())), data.length());
+
+        // neon_log_id must be inside the "options" startup parameter.
+        std::string options_key_search = std::string("options") + '\0';
+        auto options_pos = packet.find(options_key_search, 8);
+        ASSERT_NE(options_pos, std::string::npos);
+
+        size_t options_val_start = options_pos + options_key_search.size();
+        size_t options_val_end = packet.find('\0', options_val_start);
+        ASSERT_NE(options_val_end, std::string::npos);
+        std::string options_val =
+            packet.substr(options_val_start, options_val_end - options_val_start);
+        std::string expected_neon =
+            std::string(CommonConstants::NEON_LOG_ID_KEY) + ":" + std::to_string(expected_conn_id);
+        EXPECT_EQ(expected_neon, options_val);
+
+        EXPECT_EQ('\0', packet.back());
+      });
+}
+
+// Test that neon_log_id injection is skipped when upstream connection ID is unavailable,
+// and the original startup packet is forwarded unchanged.
+TEST_F(PostgresProxyTest, NeonLogIdSkippedWhenUpstreamConnIdUnavailable) {
+  const std::string conn_opts{"user\0testuser\0database\0testdb\0\0", 31};
+  const int32_t original_msg_len =
+      PostgresConstants::MIN_STARTUP_MESSAGE_LENGTH + conn_opts.length();
+
+  verifyStartupPacketInjection(
+      *this, conn_opts, absl::nullopt, // upstream conn ID unavailable
+      [&](Buffer::Instance& data) {
+        // Packet should be unchanged — no neon_log_id injected.
+        EXPECT_EQ(original_msg_len, data.peekBEInt<int32_t>(0));
+        EXPECT_EQ(static_cast<uint64_t>(original_msg_len), data.length());
+        EXPECT_EQ(PostgresConstants::PROTOCOL_VERSION, data.peekBEInt<uint32_t>(4));
+
+        std::string packet(static_cast<char*>(data.linearize(data.length())), data.length());
+
+        // neon_log_id must NOT be present.
+        std::string neon_key(CommonConstants::NEON_LOG_ID_KEY.data(),
+                             CommonConstants::NEON_LOG_ID_KEY.size());
+        EXPECT_EQ(packet.find(neon_key, 8), std::string::npos);
+
+        // Original params must be intact.
+        EXPECT_NE(packet.find(std::string("user\0testuser\0", 14), 8), std::string::npos);
+        EXPECT_NE(packet.find(std::string("database\0testdb\0", 16), 8), std::string::npos);
+      });
+}
+
+class PostgresProxyNoNeonLogIdTest : public testing::Test {
+public:
+  PostgresProxyNoNeonLogIdTest() {
+    const std::string yaml = R"EOF(
+      stat_prefix: "test"
+      protocol: POSTGRES
+      enable_upstream_tls: true
+      destination_cluster_source: SIDECAR_SERVICE
+      ext_authz_service:
+        envoy_grpc:
+          cluster_name: ext_authz_server
+      postgres_config:
+        read_parameter_status_upstream_ip: true
+        store_cancellation_key: true
+        inject_neon_log_id: false
+    )EOF";
+
+    DatabricksSqlProxyProto proto_config;
+    TestUtility::loadFromYaml(yaml, proto_config);
+
+    client_ = new Filters::Common::ExtAuthz::MockClient();
+    config_ = std::make_shared<Config>(proto_config, context_, stat_prefix_);
+    filter_ = std::make_unique<Filter>(config_, ExtAuthzClientPtr{client_});
+    ssl_ = std::make_shared<Ssl::MockConnectionInfo>();
+
+    filter_->initializeReadFilterCallbacks(read_callbacks_);
+    filter_->initializeWriteFilterCallbacks(write_callbacks_);
+
+    ON_CALL(read_callbacks_.connection_, ssl()).WillByDefault(Return(ssl_));
+    ON_CALL(read_callbacks_.connection_, readDisable(_)).WillByDefault(Invoke([this](bool disable) {
+      read_callbacks_.connection_.read_enabled_ = !disable;
+
+      if (disable) {
+        return Network::Connection::ReadDisableStatus::TransitionedToReadDisabled;
+      } else {
+        return Network::Connection::ReadDisableStatus::TransitionedToReadEnabled;
+      }
+    }));
+    ON_CALL(read_callbacks_.connection_.stream_info_, setDynamicMetadata(_, _))
+        .WillByDefault(Invoke([this](const std::string& name, const Protobuf::Struct& obj) {
+          (*read_callbacks_.connection_.stream_info_.metadata_.mutable_filter_metadata())[name]
+              .MergeFrom(obj);
+        }));
+
+    EXPECT_CALL(*ssl_, sni()).WillRepeatedly(ReturnRef(sni_));
+    const std::vector<std::string> uriSan{"someSan"};
+    EXPECT_CALL(*ssl_, uriSanPeerCertificate()).WillRepeatedly(Return(uriSan));
+    EXPECT_CALL(*ssl_, uriSanLocalCertificate()).WillRepeatedly(Return(uriSan));
+  }
+
+  const std::string stat_prefix_{"test."};
+  const std::string sni_{"brickstore.database.databricks.com"};
+  NiceMock<Server::Configuration::MockFactoryContext> context_;
+  std::unique_ptr<Filter> filter_;
+  ConfigSharedPtr config_;
+  NiceMock<Network::MockReadFilterCallbacks> read_callbacks_;
+  NiceMock<Network::MockWriteFilterCallbacks> write_callbacks_;
+  std::shared_ptr<Ssl::MockConnectionInfo> ssl_;
+  Filters::Common::ExtAuthz::MockClient* client_;
+};
+
+// When inject_neon_log_id is false and the packet has no neon_log_id,
+// the packet should pass through unchanged.
+TEST_F(PostgresProxyNoNeonLogIdTest, NeonLogIdSkippedWhenConfigDisabled) {
+  const std::string conn_opts{"user\0testuser\0database\0testdb\0\0", 31};
+  const int32_t original_msg_len =
+      PostgresConstants::MIN_STARTUP_MESSAGE_LENGTH + conn_opts.length();
+  const uint64_t available_conn_id = 42;
+
+  verifyStartupPacketInjection(
+      *this, conn_opts, absl::make_optional(available_conn_id), [&](Buffer::Instance& data) {
+        EXPECT_EQ(original_msg_len, data.peekBEInt<int32_t>(0));
+        EXPECT_EQ(static_cast<uint64_t>(original_msg_len), data.length());
+        EXPECT_EQ(PostgresConstants::PROTOCOL_VERSION, data.peekBEInt<uint32_t>(4));
+
+        std::string packet(static_cast<char*>(data.linearize(data.length())), data.length());
+
+        std::string neon_key(CommonConstants::NEON_LOG_ID_KEY.data(),
+                             CommonConstants::NEON_LOG_ID_KEY.size());
+        EXPECT_EQ(packet.find(neon_key, 8), std::string::npos);
+
+        EXPECT_NE(packet.find(std::string("user\0testuser\0", 14), 8), std::string::npos);
+        EXPECT_NE(packet.find(std::string("database\0testdb\0", 16), 8), std::string::npos);
+      });
+}
+
+// When inject_neon_log_id is false and the packet contains neon_log_id in the options
+// (injected by an upstream proxy like storage-proxy), the filter should strip it.
+TEST_F(PostgresProxyNoNeonLogIdTest, NeonLogIdStrippedFromOptions) {
+  // Build conn_opts with options\0neon_log_id:999\0 followed by the final \0 terminator.
+  std::string conn_opts;
+  conn_opts += std::string("user\0testuser\0", 14);
+  conn_opts += std::string("database\0testdb\0", 16);
+  conn_opts += std::string("options\0neon_log_id:999\0", 24);
+  conn_opts += '\0'; // parameter list terminator
+
+  // After stripping, the "options" key-value pair should be removed entirely.
+  const int32_t expected_msg_len =
+      PostgresConstants::MIN_STARTUP_MESSAGE_LENGTH + 14 + 16 + 1; // user+database+terminator
+  const uint64_t available_conn_id = 42;
+
+  verifyStartupPacketInjection(
+      *this, conn_opts, absl::make_optional(available_conn_id), [&](Buffer::Instance& data) {
+        EXPECT_EQ(expected_msg_len, data.peekBEInt<int32_t>(0));
+        EXPECT_EQ(static_cast<uint64_t>(expected_msg_len), data.length());
+        EXPECT_EQ(PostgresConstants::PROTOCOL_VERSION, data.peekBEInt<uint32_t>(4));
+
+        std::string packet(static_cast<char*>(data.linearize(data.length())), data.length());
+
+        // neon_log_id must have been stripped.
+        std::string neon_key(CommonConstants::NEON_LOG_ID_KEY.data(),
+                             CommonConstants::NEON_LOG_ID_KEY.size());
+        EXPECT_EQ(packet.find(neon_key, 8), std::string::npos);
+        // "options" key should also be removed since it had no other value.
+        EXPECT_EQ(packet.find("options", 8), std::string::npos);
+
+        // Original params must be intact.
+        EXPECT_NE(packet.find(std::string("user\0testuser\0", 14), 8), std::string::npos);
+        EXPECT_NE(packet.find(std::string("database\0testdb\0", 16), 8), std::string::npos);
+      });
+}
+
+// When inject_neon_log_id is false and the options contain neon_log_id alongside other values,
+// only neon_log_id should be stripped; other options should be preserved.
+TEST_F(PostgresProxyNoNeonLogIdTest, NeonLogIdStrippedPreservesOtherOptions) {
+  std::string conn_opts;
+  conn_opts += std::string("user\0testuser\0", 14);
+  conn_opts += std::string("database\0testdb\0", 16);
+  conn_opts += std::string("options\0", 8);
+  conn_opts += std::string("-c statement_timeout=30000 neon_log_id:42");
+  conn_opts += '\0'; // options value terminator
+  conn_opts += '\0'; // parameter list terminator
+
+  const uint64_t available_conn_id = 42;
+
+  verifyStartupPacketInjection(
+      *this, conn_opts, absl::make_optional(available_conn_id), [&](Buffer::Instance& data) {
+        EXPECT_EQ(static_cast<int32_t>(data.length()), data.peekBEInt<int32_t>(0));
+        EXPECT_EQ(PostgresConstants::PROTOCOL_VERSION, data.peekBEInt<uint32_t>(4));
+
+        std::string packet(static_cast<char*>(data.linearize(data.length())), data.length());
+
+        // neon_log_id must have been stripped.
+        std::string neon_key(CommonConstants::NEON_LOG_ID_KEY.data(),
+                             CommonConstants::NEON_LOG_ID_KEY.size());
+        EXPECT_EQ(packet.find(neon_key, 8), std::string::npos);
+
+        // "options" key should still exist with the remaining value.
+        std::string options_key_search = std::string("options") + '\0';
+        auto options_pos = packet.find(options_key_search, 8);
+        ASSERT_NE(options_pos, std::string::npos);
+        size_t options_val_start = options_pos + options_key_search.size();
+        size_t options_val_end = packet.find('\0', options_val_start);
+        ASSERT_NE(options_val_end, std::string::npos);
+        std::string options_val =
+            packet.substr(options_val_start, options_val_end - options_val_start);
+        EXPECT_EQ("-c statement_timeout=30000", options_val);
+
+        // Original params must be intact.
+        EXPECT_NE(packet.find(std::string("user\0testuser\0", 14), 8), std::string::npos);
+        EXPECT_NE(packet.find(std::string("database\0testdb\0", 16), 8), std::string::npos);
+      });
 }
 
 } // namespace DatabricksSqlProxy
