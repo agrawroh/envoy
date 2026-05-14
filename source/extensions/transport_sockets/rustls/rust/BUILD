@@ -31,10 +31,19 @@ envoy_dynamic_module_prefix_symbols(
 
 # Unit tests for the pure-Rust helpers (record tracking, IV split, errno mapping, backpressure
 # constants). These run without Envoy ABI dependencies.
+#
+# `no_tsan`/`nocoverage`: matches the convention in test/extensions/dynamic_modules/BUILD —
+# the Rust toolchain has known false positives under TSAN
+# (https://github.com/rust-lang/rust/issues/39608) and coverage instrumentation of Rust
+# artifacts is unsupported.
 rust_test(
     name = "rustls_ktls_unit_tests",
     crate = ":rustls_ktls_static_lib",
     edition = "2021",
+    tags = [
+        "no_tsan",
+        "nocoverage",
+    ],
 )
 
 rustfmt_test(

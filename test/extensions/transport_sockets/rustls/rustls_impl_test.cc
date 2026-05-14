@@ -938,6 +938,49 @@ TEST_F(TransportSocketAbiCallbackTest, FlushWriteBufferWithCallbacks) {
   envoy_dynamic_module_callback_transport_socket_flush_write_buffer(socketPtr());
 }
 
+// ===========================================================================
+// NotReadyRustlsSocket + factory fail-loud guard.
+// ===========================================================================
+
+TEST(NotReadyRustlsSocketTest, DoReadAndDoWriteReturnClose) {
+  NotReadyRustlsSocket socket("rustls: test reason");
+  Buffer::OwnedImpl buffer;
+  auto read_result = socket.doRead(buffer);
+  EXPECT_EQ(read_result.action_, Network::PostIoAction::Close);
+  EXPECT_EQ(read_result.bytes_processed_, 0);
+  auto write_result = socket.doWrite(buffer, false);
+  EXPECT_EQ(write_result.action_, Network::PostIoAction::Close);
+  EXPECT_EQ(write_result.bytes_processed_, 0);
+  EXPECT_EQ(socket.failureReason(), "rustls: test reason");
+  EXPECT_TRUE(socket.canFlushClose());
+}
+
+TEST_F(RustlsImplTest, UpstreamCreateTransportSocketReturnsNotReadyOnSniOverride) {
+  RustlsUpstreamTransportSocketConfigFactory factory;
+  envoy::extensions::transport_sockets::rustls::v3::RustlsUpstreamTlsContext config;
+  config.set_sni("static.example.com");
+  auto factory_or = factory.createTransportSocketFactory(config, context_);
+  ASSERT_TRUE(factory_or.ok()) << factory_or.status().message();
+
+  // Build TransportSocketOptions that sets a per-connection SNI override — this should be
+  // rejected by the upstream factory until per-connection options are plumbed through the
+  // dynamic-modules SDK.
+  auto options = std::make_shared<Network::TransportSocketOptionsImpl>(
+      /*server_name=*/"override.example.com", /*verify_san_list=*/std::vector<std::string>{},
+      /*alpn_list=*/std::vector<std::string>{}, /*alpn_fallback=*/std::vector<std::string>{});
+
+  auto socket = factory_or.value()->createTransportSocket(options, nullptr);
+  ASSERT_NE(socket, nullptr) << "createTransportSocket must NEVER return nullptr; it must "
+                                "return a NotReady stub instead (ConnectionImpl dereferences "
+                                "the returned pointer without a null-check).";
+  // The socket should report a clear failure reason and close on any I/O.
+  EXPECT_THAT(std::string(socket->failureReason()),
+              testing::HasSubstr("per-connection SNI"));
+  Buffer::OwnedImpl buf;
+  EXPECT_EQ(socket->doRead(buf).action_, Network::PostIoAction::Close);
+  EXPECT_EQ(socket->doWrite(buf, false).action_, Network::PostIoAction::Close);
+}
+
 } // namespace
 } // namespace Rustls
 } // namespace TransportSockets

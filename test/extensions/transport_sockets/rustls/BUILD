@@ -43,6 +43,7 @@ envoy_extension_cc_test(
     deps = [
         "//source/common/buffer:buffer_lib",
         "//source/common/network:io_socket_error_lib",
+        "//source/common/network:transport_socket_options_lib",
         "//source/extensions/dynamic_modules/abi",
         "//source/extensions/transport_sockets/rustls:config",
         "//test/mocks/network:io_handle_mocks",

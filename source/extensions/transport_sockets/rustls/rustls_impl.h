@@ -144,6 +144,39 @@ private:
   mutable std::string failure_reason_storage_;
 };
 
+/**
+ * Stub transport socket returned by the rustls factories when a per-connection feature is
+ * requested but not yet supported (e.g. SNI override) or when the rust module rejects allocation.
+ * Every I/O is `Close`; `failureReason()` is a fixed human-readable string so the connection
+ * layer surfaces a clean `upstream_cx_connect_fail` with operator-visible context.
+ *
+ * Mirrors `Tls::NotReadySslSocket` / `Tls::ErrorSslSocket` from the standard TLS transport socket.
+ */
+class NotReadyRustlsSocket : public Network::TransportSocket {
+public:
+  explicit NotReadyRustlsSocket(std::string failure_reason)
+      : failure_reason_(std::move(failure_reason)) {}
+
+  void setTransportSocketCallbacks(Network::TransportSocketCallbacks&) override {}
+  std::string protocol() const override { return {}; }
+  absl::string_view failureReason() const override { return failure_reason_; }
+  bool canFlushClose() override { return true; }
+  void closeSocket(Network::ConnectionEvent) override {}
+  void onConnected() override {}
+  Network::IoResult doRead(Buffer::Instance&) override {
+    return {Network::PostIoAction::Close, 0, false, absl::nullopt};
+  }
+  Network::IoResult doWrite(Buffer::Instance&, bool) override {
+    return {Network::PostIoAction::Close, 0, false, absl::nullopt};
+  }
+  Ssl::ConnectionInfoConstSharedPtr ssl() const override { return nullptr; }
+  bool startSecureTransport() override { return false; }
+  void configureInitialCongestionWindow(uint64_t, std::chrono::microseconds) override {}
+
+private:
+  const std::string failure_reason_;
+};
+
 class RustlsUpstreamTransportSocketFactory : public Network::CommonUpstreamTransportSocketFactory {
 public:
   RustlsUpstreamTransportSocketFactory(RustlsTransportSocketConfigSharedPtr config,

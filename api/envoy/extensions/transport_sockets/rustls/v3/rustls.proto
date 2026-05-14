@@ -90,6 +90,15 @@ message RustlsUpstreamTlsContext {
 // Configuration for downstream TLS listeners using the ``rustls`` library with optional
 // kernel TLS (``kTLS``) offload on Linux. Both ``cert_chain`` and ``private_key`` are
 // required for downstream listeners.
+//
+// .. warning::
+//   This extension is **alpha** and does not yet support the full configuration surface of
+//   :ref:`envoy.transport_sockets.tls
+//   <envoy_v3_api_msg_extensions.transport_sockets.tls.v3.DownstreamTlsContext>`. Not yet
+//   supported: SDS-managed certificate rotation, multi-cert (SNI-based selection) listeners,
+//   client certificate revocation (CRL / OCSP), fine-grained ``TlsParameters`` (cipher /
+//   version restrictions), and ``require_client_certificate``. Use the standard TLS extension
+//   if you need any of these.
 // [#next-free-field: 7]
 message RustlsDownstreamTlsContext {
   // PEM-encoded certificate chain presented to connecting clients. Can be inline PEM content

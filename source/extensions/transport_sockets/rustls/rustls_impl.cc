@@ -239,31 +239,33 @@ Network::TransportSocketPtr RustlsUpstreamTransportSocketFactory::createTranspor
     Upstream::HostDescriptionConstSharedPtr host) const {
   // The current rustls socket builds one rustls `ClientConfig` per factory and clones it into
   // every connection — so per-connection TransportSocketOptions overrides for SNI, ALPN, and SAN
-  // match list cannot be honored yet. Fail-CLOSED (return nullptr) when any override is set so
-  // operators see `upstream_cx_connect_fail` with a clear log line, rather than a silent
-  // handshake against the wrong server name. Full per-connection plumbing requires extending the
-  // dynamic-modules SDK and is tracked separately.
+  // match list cannot be honored yet. Return a `NotReadyRustlsSocket` stub when any override is
+  // set; the connection layer surfaces this as `upstream_cx_connect_fail` with the failure
+  // reason in `failureReason()`. (Returning a real nullptr is NOT safe here — `ConnectionImpl`
+  // dereferences `transport_socket_` without a null-check at construction time, see
+  // `source/common/network/connection_impl.cc:110`.)
   if (options != nullptr) {
     const bool has_sni_override = options->serverNameOverride().has_value() &&
                                   !options->serverNameOverride()->empty();
     const bool has_alpn_override = !options->applicationProtocolListOverride().empty();
     const bool has_san_override = !options->verifySubjectAltNameListOverride().empty();
     if (has_sni_override || has_alpn_override || has_san_override) {
-      ENVOY_LOG_PERIODIC(warn, std::chrono::seconds(30),
-                        "rustls upstream transport socket received per-connection options "
-                        "(sni_override={}, alpn_override={}, san_override={}); these are not yet "
-                        "supported and the connection will be refused. Use the standard "
-                        "envoy.transport_sockets.tls extension if you need auto_sni / "
-                        "match_typed_subject_alt_names / ALPN override.",
-                        has_sni_override, has_alpn_override, has_san_override);
-      return nullptr;
+      ENVOY_LOG_PERIODIC_MISC(
+          warn, std::chrono::seconds(30),
+          "rustls upstream transport socket received per-connection options "
+          "(sni_override={}, alpn_override={}, san_override={}); these are not yet supported and "
+          "the connection will fail. Use envoy.transport_sockets.tls if you need auto_sni / "
+          "match_typed_subject_alt_names / ALPN override.",
+          has_sni_override, has_alpn_override, has_san_override);
+      return std::make_unique<NotReadyRustlsSocket>(
+          "rustls: per-connection SNI/ALPN/SAN overrides are not supported by this extension");
     }
   }
   auto socket = std::make_unique<RustlsTransportSocket>(config_, std::move(options), std::move(host));
   if (!socket->socketModuleAllocated()) {
-    // Module-side allocation failed (e.g. OOM). Refuse to hand back a dead socket — the connection
-    // layer will surface this as a normal `upstream_cx_connect_fail`.
-    return nullptr;
+    // Module-side allocation failed (e.g. process OOM).
+    return std::make_unique<NotReadyRustlsSocket>(
+        "rustls: per-socket allocation in the Rust module returned nullptr");
   }
   return socket;
 }
@@ -312,7 +314,8 @@ RustlsDownstreamTransportSocketFactory::createDownstreamTransportSocket() const 
   auto socket = std::make_unique<RustlsTransportSocket>(config_, /*options=*/nullptr,
                                                         /*host=*/nullptr);
   if (!socket->socketModuleAllocated()) {
-    return nullptr;
+    return std::make_unique<NotReadyRustlsSocket>(
+        "rustls: per-socket allocation in the Rust module returned nullptr");
   }
   return socket;
 }
