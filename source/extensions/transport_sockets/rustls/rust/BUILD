@@ -1,5 +1,5 @@
 load("@envoy_rust_crate_index//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_clippy", "rust_static_library", "rustfmt_test")
+load("@rules_rust//rust:defs.bzl", "rust_clippy", "rust_static_library", "rust_test", "rustfmt_test")
 load("//bazel:envoy_build_system.bzl", "envoy_extension_package")
 load("//source/extensions/dynamic_modules:dynamic_modules.bzl", "envoy_dynamic_module_prefix_symbols")
 
@@ -27,6 +27,14 @@ envoy_dynamic_module_prefix_symbols(
     visibility = [
         "//source/extensions/transport_sockets/rustls:__pkg__",
     ],
+)
+
+# Unit tests for the pure-Rust helpers (record tracking, IV split, errno mapping, backpressure
+# constants). These run without Envoy ABI dependencies.
+rust_test(
+    name = "rustls_ktls_unit_tests",
+    crate = ":rustls_ktls_static_lib",
+    edition = "2021",
 )
 
 rustfmt_test(

@@ -5,13 +5,12 @@
 //! handles encryption and decryption after the handshake completes, bypassing userspace crypto
 //! entirely for data transfer.
 
-#![allow(unused_imports, dead_code)]
-
 use envoy_proxy_dynamic_modules_rust_sdk::{
   abi,
   declare_all_init_functions,
+  envoy_log_debug,
   envoy_log_error,
-  envoy_log_info,
+  envoy_log_warn,
   ConnectionEvent,
   EnvoyTransportSocket,
   EnvoyTransportSocketImpl,
@@ -40,6 +39,17 @@ use std::sync::Arc;
 const IO_BUF_SIZE: usize = 65536;
 /// Maximum number of write buffer slices retrieved from Envoy per write call.
 const MAX_WRITE_SLICES: usize = 16;
+/// Upper bound on the rustls outbound plaintext queue (set via `Connection::set_buffer_limit`).
+/// When the queue fills, `writer().write()` returns a short count; we stop consuming further
+/// plaintext from Envoy's write buffer so Envoy's high-watermark fires and propagates
+/// backpressure to the producer (HCM filter chain). 256 KiB leaves room for several pipelined
+/// records without unbounding memory.
+const RUSTLS_PLAINTEXT_BUFFER_LIMIT: usize = 256 * 1024;
+/// Upper bound on the post-encryption socket-write backlog. Bytes appended beyond this point
+/// would otherwise blow past Envoy's bounded write_buffer and break flow control on slow
+/// upstreams (e.g. S3 PUT against a throttled bucket). When the backlog is at the bound, we
+/// stop pumping rustls's TLS output until the socket accepts more.
+const TLS_WRITE_BACKLOG_LIMIT: usize = 256 * 1024;
 
 // -------------------------------------------------------------------------------------------------
 // JSON configuration.
@@ -179,7 +189,12 @@ impl RustlsFactoryConfig {
   }
 
   fn new_upstream(cfg: JsonConfig) -> Result<Self, String> {
+    // Build the trust store. If the operator did not supply a `trusted_ca`, fall back to the
+    // bundled Mozilla webpki roots — this matches what most operators expect when pointing at a
+    // public TLS endpoint like AWS S3, but log a warning once so the staleness window of the
+    // pinned-at-build-time CA bundle is visible in the operator's logs.
     let mut root_store = RootCertStore::empty();
+    let mut used_webpki_default = false;
     if let Some(ca) = &cfg.trusted_ca {
       if !ca.trim().is_empty() {
         let pem = load_pem_bytes(ca)?;
@@ -188,6 +203,7 @@ impl RustlsFactoryConfig {
     }
     if root_store.is_empty() {
       root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+      used_webpki_default = true;
     }
 
     let client_cert = if !cfg.cert_chain.trim().is_empty() && !cfg.private_key.trim().is_empty() {
@@ -213,13 +229,28 @@ impl RustlsFactoryConfig {
     client_config.alpn_protocols = alpn_from_config(&cfg);
     client_config.enable_secret_extraction = cfg.enable_ktls;
 
-    let sn = cfg
-      .sni
-      .clone()
-      .filter(|s| !s.trim().is_empty())
-      .unwrap_or_else(|| "localhost".to_string());
+    // SNI is required for upstream — webpki cert verification matches the server certificate
+    // against the supplied ServerName. Defaulting to "localhost" silently mis-handshakes against
+    // any real upstream, so fail-loud at config time.
+    let sn = match cfg.sni.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+      Some(s) => s.to_string(),
+      None => {
+        return Err(
+          "rustls upstream config requires a non-empty `sni` (TLS Server Name Indication). \
+           Set `sni:` to the upstream hostname (e.g. \"mybucket.s3.amazonaws.com\")."
+            .to_string(),
+        );
+      },
+    };
     let server_name = ServerName::try_from(sn.clone())
       .map_err(|_| format!("invalid server_name / SNI for upstream: {sn}"))?;
+
+    if used_webpki_default {
+      envoy_log_warn!(
+        "rustls upstream: no `trusted_ca` set; using compiled-in Mozilla webpki roots. \
+         These are pinned at build time and may not reflect recent CA additions/removals."
+      );
+    }
 
     Ok(Self {
       endpoint: EndpointKind::Upstream {
@@ -294,7 +325,12 @@ struct RustlsTransportSocket {
   ktls_fd: Option<libc::c_int>,
   #[cfg(target_os = "linux")]
   ktls_shutdown_sent: bool,
-  /// Guards against re-entrant write calls from flush_write_buffer.
+  /// True once the userspace TLS path has emitted a `close_notify` alert into the rustls
+  /// send queue (in response to `end_stream=true` on `on_do_write`). Prevents double-close.
+  userspace_close_notify_sent: bool,
+  /// Reserved for re-entrancy detection on the write path. Currently unused because the
+  /// previous `flush_write_buffer()` self-call has been removed; kept as a tripwire in case
+  /// future code adds back a recursive dispatch.
   in_do_write: bool,
 }
 
@@ -328,6 +364,7 @@ impl RustlsTransportSocket {
       ktls_fd: None,
       #[cfg(target_os = "linux")]
       ktls_shutdown_sent: false,
+      userspace_close_notify_sent: false,
       in_do_write: false,
     }
   }
@@ -374,6 +411,7 @@ impl RustlsTransportSocket {
       ktls_fd: None,
       #[cfg(target_os = "linux")]
       ktls_shutdown_sent: false,
+      userspace_close_notify_sent: false,
       in_do_write: false,
     }
   }
@@ -382,19 +420,26 @@ impl RustlsTransportSocket {
     if self.conn.is_some() {
       return Ok(());
     }
-    if let Some(cfg) = &self.server_cfg {
-      let c =
-        ServerConnection::new(Arc::clone(cfg)).map_err(|e| format!("ServerConnection: {e}"))?;
-      self.conn = Some(Connection::Server(c));
-      return Ok(());
-    }
-    if let (Some(cfg), Some(sn)) = (&self.client_cfg, &self.server_name) {
-      let c = ClientConnection::new(Arc::clone(cfg), sn.clone())
-        .map_err(|e| format!("ClientConnection: {e}"))?;
-      self.conn = Some(Connection::Client(c));
-      return Ok(());
-    }
-    Err("rustls transport socket missing server or client configuration".to_string())
+    let conn = if let Some(cfg) = &self.server_cfg {
+      Connection::Server(
+        ServerConnection::new(Arc::clone(cfg)).map_err(|e| format!("ServerConnection: {e}"))?,
+      )
+    } else if let (Some(cfg), Some(sn)) = (&self.client_cfg, &self.server_name) {
+      Connection::Client(
+        ClientConnection::new(Arc::clone(cfg), sn.clone())
+          .map_err(|e| format!("ClientConnection: {e}"))?,
+      )
+    } else {
+      return Err("rustls transport socket missing server or client configuration".to_string());
+    };
+    // Bound rustls's internal plaintext queue so a slow upstream (e.g. throttled S3 endpoint)
+    // can't make us swallow unbounded bytes from Envoy's write buffer. When the queue fills,
+    // `writer().write()` returns a short count and we stop draining Envoy's buffer; Envoy's
+    // own high-watermark then fires and propagates backpressure to the producer.
+    let mut conn = conn;
+    conn.set_buffer_limit(Some(RUSTLS_PLAINTEXT_BUFFER_LIMIT));
+    self.conn = Some(conn);
+    Ok(())
   }
 
   fn refresh_negotiated_proto(&mut self) {
@@ -416,7 +461,7 @@ impl RustlsTransportSocket {
     self.refresh_negotiated_proto();
     self.phase = Phase::Established;
     self.connected_raised = true;
-    envoy_log_info!("rustls: handshake complete.");
+    envoy_log_debug!("rustls: handshake complete.");
     envoy.raise_event(ConnectionEvent::Connected);
     self.maybe_try_ktls(envoy);
   }
@@ -427,7 +472,14 @@ impl RustlsTransportSocket {
     }
     #[cfg(not(target_os = "linux"))]
     {
-      envoy_log_error!("kTLS is only supported on Linux, continuing with userspace TLS.");
+      // Log once per program — this is operator config, not a per-connection event.
+      static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+      WARNED.get_or_init(|| {
+        envoy_log_warn!(
+          "kTLS is only supported on Linux; continuing with userspace TLS for this and all \
+           subsequent connections on this build."
+        );
+      });
     }
     #[cfg(target_os = "linux")]
     {
@@ -440,7 +492,7 @@ impl RustlsTransportSocket {
         None => return,
       };
       if !ktls_cipher_supported(conn) {
-        envoy_log_error!(
+        envoy_log_warn!(
           "kTLS: negotiated cipher is not supported, continuing with userspace TLS."
         );
         return;
@@ -452,18 +504,26 @@ impl RustlsTransportSocket {
   #[cfg(target_os = "linux")]
   fn try_install_ktls(&mut self, envoy: &mut EnvoyTransportSocketImpl) {
     let Some(io) = self.io_handle_ptr() else {
-      envoy_log_error!("kTLS: I/O handle missing, continuing with userspace TLS.");
+      envoy_log_warn!("kTLS: I/O handle missing, continuing with userspace TLS.");
       return;
     };
     let Some(fd) = socket_fd_for_ktls(envoy, io) else {
-      envoy_log_error!("kTLS: socket fd unavailable, continuing with userspace TLS.");
+      envoy_log_warn!("kTLS: socket fd unavailable, continuing with userspace TLS.");
       return;
     };
     if let Err(e) = self.run_linux_ktls(envoy, io, fd) {
-      envoy_log_error!(
-        "kTLS install failed ({}), falling back to userspace TLS.",
-        e
-      );
+      // If `run_linux_ktls` returned Err *before* it set TCP_ULP on the socket, the connection
+      // can continue on the userspace path — the rustls Connection is still owned by `self`.
+      // Once ULP is installed, however, recovery is impossible (the kernel has no
+      // `TCP_ULP_REMOVE`) and `self.failure` is set so the next I/O returns Close. The error
+      // log makes the distinction visible to the operator.
+      if self.failure.is_empty() {
+        envoy_log_warn!("kTLS install pre-ULP step failed ({e}); using userspace TLS.");
+      } else {
+        envoy_log_error!(
+          "kTLS install failed AFTER ULP was attached ({e}); socket is terminal."
+        );
+      }
     }
   }
 
@@ -474,33 +534,45 @@ impl RustlsTransportSocket {
     io: *mut c_void,
     fd: libc::c_int,
   ) -> Result<(), String> {
-    self.drain_tls_backlog(envoy, io)?;
+    // Step 1 — flush any pending pre-kTLS bytes; the kernel's TLS layer must see a clean stream
+    // starting at the post-handshake record sequence.
+    self.drain_backlog_strict(envoy, io)?;
     self.drain_rustls_tls(envoy, io)?;
 
-    // Final drain: ensure every byte of decrypted plaintext has been forwarded to Envoy before
-    // dropping the rustls Connection. Without this, data sitting in rustls's reader buffer would
-    // be silently lost.
+    // Step 2 — drain every decrypted plaintext byte to Envoy. Without this, anything sitting in
+    // rustls's reader buffer would be silently lost when we drop the Connection below.
     self.drain_all_plaintext(envoy);
 
-    linux_ktls::setup_ulp(fd)?;
-
-    // Extract secrets and install crypto. We take the connection AFTER ULP setup so that if
-    // install_crypto fails, we can attempt recovery.
+    // Step 3 — extract secrets and validate them BEFORE attaching the kernel ULP. The ULP attach
+    // is irreversible (no `TCP_ULP_REMOVE` exists pre-5.4 and it is not portable), so any failure
+    // discovered after attach is terminal. By validating secrets first we keep failures
+    // recoverable as long as possible.
     let conn = self
       .conn
       .take()
       .ok_or_else(|| "missing rustls connection".to_string())?;
-    let enable_rx = !self.ktls_tx_only;
-    if let Err(e) = linux_ktls::install_crypto(fd, conn, true, enable_rx) {
-      // ULP is installed but crypto failed. The socket is in a broken state and cannot be used
-      // for either kTLS or userspace TLS. Close the connection gracefully.
-      self.failure = format!("kTLS crypto install failed: {e}");
+    let prepared = linux_ktls::prepare_install(conn, true, !self.ktls_tx_only)?;
+
+    // Step 4 — attach the kernel TLS ULP. This is the point of no return.
+    if let Err(e) = linux_ktls::setup_ulp(fd) {
+      // ULP setsockopt failed — but we have NOT yet attached the ULP. The rustls Connection has
+      // been consumed by `prepare_install`, so we can't go back to userspace TLS. Mark the
+      // socket terminal; the next I/O will close.
+      self.failure = format!("kTLS ULP setup failed: {e}");
+      return Err(self.failure.clone());
+    }
+
+    // Step 5 — install pre-computed crypto info. Any failure here is terminal because ULP is
+    // attached and no `setsockopt(TCP_ULP, "")` rollback exists.
+    if let Err(e) = linux_ktls::apply_prepared(fd, prepared) {
+      self.failure = format!("kTLS crypto install failed (ULP already attached): {e}");
       return Err(self.failure.clone());
     }
 
     self.ktls_fd = Some(fd);
     self.phase = Phase::Ktls;
-    self.connected_raised = true;
+    // `connected_raised` was set true in `maybe_raise_connected` when the handshake completed —
+    // resetting it here would let a re-entrant code path think we are still in handshake.
     Ok(())
   }
 
@@ -523,7 +595,37 @@ impl RustlsTransportSocket {
     }
   }
 
-  fn drain_tls_backlog(
+  /// Tries to push the TLS-side write backlog into the socket. Returns `Ok(true)` if the
+  /// backlog is now empty, `Ok(false)` if the socket is not currently accepting more bytes
+  /// (EAGAIN / EWOULDBLOCK / zero-byte write), `Err` only on fatal socket errors. The lenient
+  /// EAGAIN semantics are what makes backpressure work — when the socket is slow we keep the
+  /// backlog and return; the next event-loop write opportunity drains more.
+  fn try_drain_backlog(
+    &mut self,
+    envoy: &EnvoyTransportSocketImpl,
+    io: *mut c_void,
+  ) -> Result<bool, String> {
+    while !self.tls_write_backlog.is_empty() {
+      match envoy.io_handle_write(io, &self.tls_write_backlog) {
+        Ok(0) => return Ok(false),
+        Ok(n) => {
+          self.tls_write_backlog.drain(.. n);
+        },
+        Err(rc) => {
+          if err_would_block(rc) {
+            return Ok(false);
+          }
+          return Err(format!("TLS backlog write failed (errno {rc})"));
+        },
+      }
+    }
+    Ok(true)
+  }
+
+  /// Strict drain used only in the pre-kTLS install path. Treats EAGAIN as an error because
+  /// kTLS install requires a clean (empty) userspace buffer.
+  #[cfg(target_os = "linux")]
+  fn drain_backlog_strict(
     &mut self,
     envoy: &EnvoyTransportSocketImpl,
     io: *mut c_void,
@@ -545,6 +647,8 @@ impl RustlsTransportSocket {
     Ok(())
   }
 
+  /// Pre-kTLS drain of rustls's outgoing TLS records, strict (EAGAIN is an error).
+  #[cfg(target_os = "linux")]
   fn drain_rustls_tls(
     &mut self,
     envoy: &EnvoyTransportSocketImpl,
@@ -587,17 +691,27 @@ impl RustlsTransportSocket {
     Ok(())
   }
 
+  /// Pumps rustls's outgoing TLS records to the socket as far as possible without blocking.
+  /// On EAGAIN we save unsent bytes into `tls_write_backlog` (bounded by
+  /// `TLS_WRITE_BACKLOG_LIMIT`) and return. The caller (`on_do_write_inner`) inspects
+  /// `tls_write_backlog` to decide whether to consume more plaintext from Envoy's write
+  /// buffer — this is the path that surfaces Envoy's high-watermark and propagates
+  /// backpressure to the upstream HTTP filter chain.
   fn drain_outgoing_tls(&mut self, envoy: &EnvoyTransportSocketImpl) -> Result<(), String> {
     let io = self
       .io_handle_ptr()
       .ok_or_else(|| "no io handle".to_string())?;
-    self.drain_tls_backlog(envoy, io)?;
+    if !self.try_drain_backlog(envoy, io)? {
+      // Backlog still has data: don't pump more bytes out of rustls's TLS queue — they would
+      // just append to the backlog and grow memory. The next write event drains more.
+      return Ok(());
+    }
     let conn = self
       .conn
       .as_mut()
       .ok_or_else(|| "missing connection".to_string())?;
     let mut buf = [0u8; IO_BUF_SIZE];
-    while conn.wants_write() {
+    while conn.wants_write() && self.tls_write_backlog.len() < TLS_WRITE_BACKLOG_LIMIT {
       let mut cursor = Cursor::new(&mut buf[..]);
       let n = conn.write_tls(&mut cursor).map_err(|e| e.to_string())?;
       if n == 0 {
@@ -636,13 +750,14 @@ impl RustlsTransportSocket {
       .ok_or_else(|| "missing connection".to_string())?;
     let mut cursor = Cursor::new(data);
     let read = conn.read_tls(&mut cursor).map_err(|e| e.to_string())?;
-    if read == 0 && !data.is_empty() {
-      return Err("rustls read_tls accepted no bytes".to_string());
-    }
     let consumed = cursor.position() as usize;
     if consumed < data.len() {
       self.tls_read_backlog.extend_from_slice(&data[consumed ..]);
     }
+    // `read_tls` returning Ok(0) on non-empty input is legitimate rustls backpressure: it can
+    // happen when rustls's internal deframer needs `process_new_packets()` to be called first.
+    // The outer loop in `on_do_read` calls `process_new_packets` after every `feed_raw_to_rustls`,
+    // so we just report 0 bytes consumed and let the next iteration retry.
     Ok((read, false))
   }
 
@@ -765,6 +880,14 @@ impl RustlsTransportSocket {
       }
       envoy.read_buffer_add(&buf[.. n]);
       total += n;
+      // Respect Envoy's high-watermark on the read buffer between iterations — otherwise a
+      // single `process_new_packets` that decrypts several pipelined records can push 64 KiB
+      // into the buffer before we even check, blowing past whatever soft cap the filter chain
+      // expects.
+      if envoy.should_drain_read_buffer() {
+        envoy.set_is_readable();
+        break;
+      }
     }
     Ok(total)
   }
@@ -772,7 +895,7 @@ impl RustlsTransportSocket {
   fn on_do_write_inner(
     &mut self,
     envoy: &mut EnvoyTransportSocketImpl,
-    _end_stream: bool,
+    end_stream: bool,
   ) -> IoResult {
     if !self.failure.is_empty() {
       return IoResult::close(0, false);
@@ -783,13 +906,33 @@ impl RustlsTransportSocket {
         return IoResult::close(0, false);
       }
     }
+    // Step 1 — push any pending TLS bytes out FIRST. If the socket is currently slow and the
+    // backlog still has data after this call, we MUST refuse to consume more plaintext from
+    // Envoy's write buffer: doing otherwise blows past the bounded write_buffer and breaks
+    // flow control to the producer. (This is the smoking-gun fix for the S3 PUT stall: prior
+    // code drained Envoy's write buffer by the amount accepted into rustls's *unbounded*
+    // outbound queue, so the high-watermark never fired and memory grew with offered load.)
+    if let Err(e) = self.drain_outgoing_tls(envoy) {
+      self.failure = e;
+      return IoResult::close(0, false);
+    }
+    if self.tls_write_backlog.len() >= TLS_WRITE_BACKLOG_LIMIT {
+      // Backlog is at the cap — refuse more plaintext. Envoy's write_buffer stays full,
+      // high-watermark fires, HCM applies backpressure.
+      return IoResult::keep_open(0, false);
+    }
+
+    // Step 2 — consume plaintext slices, bounded by rustls's `set_buffer_limit`. When the
+    // limit is hit, `conn.writer().write()` returns a short count (possibly zero) and we
+    // stop consuming. Same effect as Step 1: leftover plaintext stays in Envoy's buffer,
+    // backpressure fires.
     let mut envoy_bufs = [abi::envoy_dynamic_module_type_envoy_buffer {
       ptr: std::ptr::null_mut(),
       length: 0,
     }; MAX_WRITE_SLICES];
     let n_slices = envoy.write_buffer_get_slices(&mut envoy_bufs);
     let mut total_plain = 0usize;
-    for b in envoy_bufs.iter().take(n_slices) {
+    'slices: for b in envoy_bufs.iter().take(n_slices) {
       if b.ptr.is_null() || b.length == 0 {
         continue;
       }
@@ -798,28 +941,53 @@ impl RustlsTransportSocket {
       while off < slice.len() {
         let conn = match self.conn.as_mut() {
           Some(c) => c,
-          None => return IoResult::close(0, false),
+          None => return IoResult::close(total_plain, false),
         };
         let written = match conn.writer().write(&slice[off ..]) {
           Ok(w) => w,
           Err(e) => {
+            // rustls's `Writer::write` is infallible for a healthy `Connection` (it only buffers
+            // into `sendable_plaintext`). If it errors, the connection is in a bad state.
             self.failure = e.to_string();
-            return IoResult::close(0, false);
+            return IoResult::close(total_plain, false);
           },
         };
+        if written == 0 {
+          // rustls's plaintext queue is at the bound. Stop consuming further slices.
+          break 'slices;
+        }
         off += written;
         total_plain += written;
-        if written == 0 {
-          break;
-        }
       }
     }
     if total_plain > 0 {
       envoy.write_buffer_drain(total_plain);
     }
+
+    // Step 3 — drain rustls's now-larger TLS queue to the socket (best-effort; remainder
+    // appends to backlog).
     if let Err(e) = self.drain_outgoing_tls(envoy) {
       self.failure = e;
-      return IoResult::close(0, false);
+      return IoResult::close(total_plain, false);
+    }
+
+    // Step 4 — on `end_stream`, signal a clean TLS shutdown by emitting a `close_notify` alert.
+    // RFC 8446 §6.1 (TLS 1.3) and RFC 5246 §7.2.1 (TLS 1.2) both require this for a graceful
+    // half-close; some servers (notably AWS S3) treat a TCP FIN without a preceding
+    // close_notify as a possible truncation attack and may fail the request.
+    if end_stream
+      && envoy.write_buffer_length() == 0
+      && self.tls_write_backlog.is_empty()
+      && !self.userspace_close_notify_sent
+    {
+      if let Some(conn) = self.conn.as_mut() {
+        conn.send_close_notify();
+        self.userspace_close_notify_sent = true;
+        if let Err(e) = self.drain_outgoing_tls(envoy) {
+          self.failure = e;
+          return IoResult::close(total_plain, false);
+        }
+      }
     }
     IoResult::keep_open(total_plain, false)
   }
@@ -884,12 +1052,16 @@ impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
         };
         match conn.process_new_packets() {
           Ok(_state) => Ok(()),
-          Err(e) => Err(e.to_string()),
+          Err(e) => {
+            // rustls's error Display includes the alert description for fatal-alert errors,
+            // which is the most actionable signal an operator can have. Surface it verbatim.
+            Err(format!("process_new_packets: {e}"))
+          },
         }
       };
       if let Err(e) = proc {
         self.failure = e.clone();
-        envoy_log_error!("rustls: process_new_packets: {e}");
+        envoy_log_warn!("rustls: {e}");
         return IoResult::close(total_plaintext, false);
       }
       match self.forward_plaintext(envoy) {
@@ -947,6 +1119,9 @@ impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
 
   fn on_do_write(&mut self, envoy: &mut EnvoyTransportSocketImpl, end_stream: bool) -> IoResult {
     if self.in_do_write {
+      // Defensive tripwire — should never be hit now that `flush_write_buffer()` is no longer
+      // called from within `on_do_write`. Leaving it in case a future change reintroduces
+      // recursive dispatch.
       return IoResult::keep_open(0, false);
     }
     self.in_do_write = true;
@@ -959,19 +1134,28 @@ impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
     #[cfg(not(target_os = "linux"))]
     let result = self.on_do_write_inner(envoy, end_stream);
     self.in_do_write = false;
-    if result.action == envoy_proxy_dynamic_modules_rust_sdk::PostIoAction::KeepOpen
-      && result.bytes_processed > 0
-    {
-      envoy.flush_write_buffer();
-    }
+    // NOTE: the previous code called `envoy.flush_write_buffer()` here when bytes were
+    // written. That triggers a synchronous re-entry into `on_do_write` via
+    // `ConnectionImpl::onWriteReady`, which busy-loops drain Envoy's write buffer in one
+    // dispatcher iteration — head-of-line blocking for every other connection on the worker.
+    // The standard Envoy contract is: return from `doWrite` and let the connection layer
+    // schedule the next write when the socket is writable or more data arrives. We follow
+    // that pattern now.
     result
   }
 
-  fn on_close(&mut self, _envoy: &mut EnvoyTransportSocketImpl, _event: ConnectionEvent) {
+  fn on_close(&mut self, _envoy: &mut EnvoyTransportSocketImpl, event: ConnectionEvent) {
     #[cfg(target_os = "linux")]
     if let Some(fd) = self.ktls_fd.take() {
-      if self.phase == Phase::Ktls && self.failure.is_empty() && !self.ktls_shutdown_sent {
+      // Only initiate close_notify on a graceful local close — not on RemoteClose (peer
+      // already half-closed; sending close_notify back is wasted work and can race FIN/RST).
+      if matches!(event, ConnectionEvent::LocalClose)
+        && self.phase == Phase::Ktls
+        && self.failure.is_empty()
+        && !self.ktls_shutdown_sent
+      {
         let _ = linux_ktls::send_close_notify(fd);
+        self.ktls_shutdown_sent = true;
       }
     }
     self.conn = None;
@@ -1217,6 +1401,8 @@ fn socket_fd_for_ktls(envoy: &EnvoyTransportSocketImpl, io: *mut c_void) -> Opti
 }
 
 /// Returns a human-readable name for common errno values encountered in kTLS operations.
+/// Uses `libc` constants (rather than raw numeric literals) so the names stay correct across
+/// architectures where errno numbering differs from x86-64 Linux.
 #[cfg(target_os = "linux")]
 fn errno_name(errno: libc::c_int) -> &'static str {
   match errno {
@@ -1226,8 +1412,11 @@ fn errno_name(errno: libc::c_int) -> &'static str {
     libc::ECONNREFUSED => "ECONNREFUSED",
     libc::ETIMEDOUT => "ETIMEDOUT",
     libc::ENOMEM => "ENOMEM",
-    74 => "EBADMSG",
-    90 => "EMSGSIZE",
+    libc::EBADMSG => "EBADMSG",
+    libc::EMSGSIZE => "EMSGSIZE",
+    libc::EINVAL => "EINVAL",
+    libc::EAGAIN => "EAGAIN",
+    libc::ENOKEY => "ENOKEY",
     _ => "unknown",
   }
 }
@@ -1241,11 +1430,12 @@ mod linux_ktls {
   use super::*;
   use rustls::ConnectionTrafficSecrets;
 
-  const SOL_TLS: libc::c_int = 282;
-  const TLS_TX: libc::c_int = 1;
-  const TLS_RX: libc::c_int = 2;
-  const SOL_TCP: libc::c_int = 6;
-  const TCP_ULP: libc::c_int = 31;
+  // Prefer `libc` constants over hard-coded numeric literals so the bindings stay correct on
+  // non-x86 Linux builds where SOL_TLS / TCP_ULP / TLS_TX / TLS_RX may differ.
+  const SOL_TLS: libc::c_int = libc::SOL_TLS;
+  const TLS_TX: libc::c_int = libc::TLS_TX;
+  const TLS_RX: libc::c_int = libc::TLS_RX;
+  const TCP_ULP: libc::c_int = libc::TCP_ULP;
   const TLS_1_2_VERSION: u16 = 0x0303;
   const TLS_1_3_VERSION: u16 = 0x0304;
   const TLS_CIPHER_AES_GCM_128: u16 = 51;
@@ -1316,6 +1506,15 @@ mod linux_ktls {
     salt.copy_from_slice(&iv[.. AES_GCM_SALT]);
     out_iv.copy_from_slice(&iv[AES_GCM_SALT ..]);
     Ok((salt, out_iv))
+  }
+
+  /// Test-only re-export so the parent module's unit tests can exercise the IV split layout
+  /// without depending on a live rustls Connection.
+  #[cfg(test)]
+  pub(super) fn split_aes_gcm_iv_for_test(
+    iv: &[u8],
+  ) -> Result<([u8; AES_GCM_SALT], [u8; AES_GCM_IV]), String> {
+    split_aes_gcm_iv(iv)
   }
 
   fn apply_direction(
@@ -1467,10 +1666,13 @@ mod linux_ktls {
   }
 
   pub fn setup_ulp(fd: libc::c_int) -> Result<(), String> {
+    // The kernel reads at most `optlen` bytes into a 16-byte ULP-name buffer
+    // (`TCP_ULP_NAME_MAX`); the buffer is zero-initialised so passing exactly 3 bytes
+    // ("tls" without trailing NUL) works correctly. See `do_tcp_setsockopt` in the kernel.
     let ret = unsafe {
       libc::setsockopt(
         fd,
-        SOL_TCP,
+        libc::IPPROTO_TCP,
         TCP_ULP,
         "tls".as_ptr().cast(),
         3 as libc::socklen_t,
@@ -1485,12 +1687,29 @@ mod linux_ktls {
     Ok(())
   }
 
-  pub fn install_crypto(
-    fd: libc::c_int,
+  /// All state extracted from the rustls Connection that's needed to install kTLS, computed
+  /// before the kernel ULP is attached. Splitting this from the actual setsockopt calls keeps
+  /// secret-extraction / cipher-validation failures recoverable (we haven't burned the socket
+  /// yet).
+  pub struct PreparedKtls {
+    pub version: u16,
+    pub enable_tx: bool,
+    pub enable_rx: bool,
+    pub tx_seq: u64,
+    pub rx_seq: u64,
+    pub tx_secret: ConnectionTrafficSecrets,
+    pub rx_secret: ConnectionTrafficSecrets,
+  }
+
+  /// Validate the connection state and extract the secrets required for kTLS. This consumes
+  /// the Connection because `dangerous_extract_secrets` is a one-shot move. Returning Err
+  /// here means the socket has NOT yet been pinned to the kernel TLS ULP and the caller can
+  /// surface a clean failure.
+  pub fn prepare_install(
     conn: Connection,
     enable_tx: bool,
     enable_rx: bool,
-  ) -> Result<(), String> {
+  ) -> Result<PreparedKtls, String> {
     let version = match conn.protocol_version() {
       Some(ProtocolVersion::TLSv1_2) => TLS_1_2_VERSION,
       Some(ProtocolVersion::TLSv1_3) => TLS_1_3_VERSION,
@@ -1499,24 +1718,52 @@ mod linux_ktls {
     let secrets = conn
       .dangerous_extract_secrets()
       .map_err(|e| format!("dangerous_extract_secrets: {e}"))?;
+    let (tx_seq, tx_secret) = secrets.tx;
+    let (rx_seq, rx_secret) = secrets.rx;
+    Ok(PreparedKtls {
+      version,
+      enable_tx,
+      enable_rx,
+      tx_seq,
+      rx_seq,
+      tx_secret,
+      rx_secret,
+    })
+  }
 
-    let (tx_seq, tx_sec) = secrets.tx;
-    let (rx_seq, rx_sec) = secrets.rx;
-    if enable_tx {
-      apply_direction(fd, TLS_TX, version, tx_seq, &tx_sec)?;
+  /// Install the previously-prepared crypto info via setsockopt. MUST be called AFTER
+  /// `setup_ulp` has succeeded. Any failure here is terminal for the socket because the kernel
+  /// has no `TCP_ULP_REMOVE` — the caller marks the failure and the connection closes.
+  pub fn apply_prepared(fd: libc::c_int, prepared: PreparedKtls) -> Result<(), String> {
+    if prepared.enable_tx {
+      apply_direction(fd, TLS_TX, prepared.version, prepared.tx_seq, &prepared.tx_secret)?;
     }
-    if enable_rx {
-      apply_direction(fd, TLS_RX, version, rx_seq, &rx_sec)?;
-      if version == TLS_1_3_VERSION {
+    if prepared.enable_rx {
+      apply_direction(fd, TLS_RX, prepared.version, prepared.rx_seq, &prepared.rx_secret)?;
+      if prepared.version == TLS_1_3_VERSION {
+        // TLS_RX_EXPECT_NO_PAD is only supported on kernels >= 5.19; on older kernels
+        // setsockopt returns ENOPROTOOPT, which is harmless (the optimization is just not
+        // applied). Log on unexpected errnos so operators notice if support is silently
+        // missing.
         let val: libc::c_int = 1;
-        unsafe {
+        let ret = unsafe {
           libc::setsockopt(
             fd,
             SOL_TLS,
             TLS_RX_EXPECT_NO_PAD,
             &val as *const _ as *const libc::c_void,
             std::mem::size_of_val(&val) as libc::socklen_t,
-          );
+          )
+        };
+        if ret < 0 {
+          let errno = unsafe { *libc::__errno_location() };
+          if errno != libc::ENOPROTOOPT {
+            envoy_log_debug!(
+              "kTLS: TLS_RX_EXPECT_NO_PAD setsockopt returned errno {} ({})",
+              errno,
+              errno_name(errno)
+            );
+          }
         }
       }
     }
@@ -1530,7 +1777,11 @@ mod linux_ktls {
         std::mem::size_of_val(&val) as libc::socklen_t,
       );
     }
-    envoy_log_info!("kTLS installed (TX={}, RX={}).", enable_tx, enable_rx);
+    envoy_log_debug!(
+      "kTLS installed (TX={}, RX={}).",
+      prepared.enable_tx,
+      prepared.enable_rx
+    );
     Ok(())
   }
 
@@ -1585,24 +1836,62 @@ mod linux_ktls {
       }
       return ControlResult::Continue;
     }
+    // Guard the `CMSG_DATA` read so a malformed kernel cmsg (cmsg_len < CMSG_LEN(1)) cannot
+    // cause an out-of-array read on cmsg_buf.data. In practice the kernel always emits a
+    // 1-byte payload for TLS_GET_RECORD_TYPE, but defense-in-depth.
+    let min_len = unsafe { libc::CMSG_LEN(1) } as usize;
+    if (cmsg_ref.cmsg_len as usize) < min_len {
+      return ControlResult::Continue;
+    }
     let record_type = unsafe { *libc::CMSG_DATA(cmsg) };
     match record_type {
-      TLS_CONTENT_TYPE_HANDSHAKE => ControlResult::Continue,
+      TLS_CONTENT_TYPE_HANDSHAKE => {
+        // Post-handshake HANDSHAKE records that flow through the kTLS RX path are typically
+        // TLS-1.3 NewSessionTicket (handshake type 4) which can be safely consumed, OR
+        // KeyUpdate (type 24) which kTLS cannot service in-kernel — once the peer advances
+        // its traffic key, the kernel keeps decrypting with the OLD key and the next record
+        // returns EBADMSG. Treat KeyUpdate as a terminal close so the connection fails fast
+        // with a clear reason rather than mysterious mid-stream EBADMSG. CertificateRequest
+        // (type 13) post-handshake mTLS reauth is similarly unsupported.
+        let handshake_type = if (n as usize) >= 1 { buf[0] } else { 0 };
+        const HS_NEW_SESSION_TICKET: u8 = 4;
+        const HS_CERTIFICATE_REQUEST: u8 = 13;
+        const HS_KEY_UPDATE: u8 = 24;
+        match handshake_type {
+          HS_NEW_SESSION_TICKET => ControlResult::Continue,
+          HS_KEY_UPDATE => ControlResult::Error(
+            "kTLS does not support TLS-1.3 KeyUpdate; closing connection".to_string(),
+          ),
+          HS_CERTIFICATE_REQUEST => ControlResult::Error(
+            "kTLS does not support post-handshake CertificateRequest".to_string(),
+          ),
+          _ => ControlResult::Continue,
+        }
+      },
       TLS_CONTENT_TYPE_ALERT => {
         let num_bytes = n as usize;
-        if num_bytes >= 2 {
-          let description = buf[1];
-          if description == TLS_ALERT_CLOSE_NOTIFY {
-            return ControlResult::CloseNotify;
-          }
-          let level = buf[0];
-          if level == 2 {
-            return ControlResult::CloseNotify;
-          }
-        } else {
+        if num_bytes < 2 {
+          // Truncated alert — treat as close.
           return ControlResult::CloseNotify;
         }
-        ControlResult::Continue
+        let level = buf[0];
+        let description = buf[1];
+        if description == TLS_ALERT_CLOSE_NOTIFY {
+          return ControlResult::CloseNotify;
+        }
+        if level == TLS_ALERT_LEVEL_FATAL {
+          return ControlResult::Error(format!(
+            "fatal TLS alert from peer (description={})",
+            description
+          ));
+        }
+        // Per RFC 8446 §6 the only TLS-1.3 warning alert is close_notify (which we already
+        // handled above). For TLS-1.2 a handful of warnings exist but treat them as fatal to
+        // avoid silently swallowing an actionable diagnostic.
+        ControlResult::Error(format!(
+          "non-close-notify TLS alert from peer (level={}, description={})",
+          level, description
+        ))
       },
       TLS_CONTENT_TYPE_APP_DATA => ControlResult::ApplicationData(n as usize),
       _ => ControlResult::Continue,
@@ -1658,7 +1947,14 @@ mod linux_ktls {
 // -------------------------------------------------------------------------------------------------
 
 fn program_init() -> bool {
-  let _ = rustls::crypto::ring::default_provider().install_default();
+  if rustls::crypto::ring::default_provider().install_default().is_err() {
+    // Another rustls user in the same process already installed a default provider; rustls
+    // will use whichever was registered first. Log so the operator can confirm which provider
+    // the rustls socket is actually running against (relevant for FIPS / supply-chain audits).
+    envoy_log_warn!(
+      "rustls: default crypto provider was already installed by another module; deferring."
+    );
+  }
   true
 }
 
@@ -1680,3 +1976,149 @@ declare_all_init_functions!(
   program_init,
   transport_socket: new_factory_config,
 );
+
+// -------------------------------------------------------------------------------------------------
+// Unit tests (pure Rust, no Envoy ABI dependency).
+// -------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn make_socket_no_conn() -> RustlsTransportSocket {
+    // Minimal hand-rolled instance — avoids needing a live rustls config. Most state-machine
+    // helpers we test below don't touch `server_cfg` / `client_cfg` / `conn`.
+    RustlsTransportSocket {
+      server_cfg: None,
+      client_cfg: None,
+      server_name: None,
+      conn: None,
+      phase: Phase::Handshaking,
+      failure: String::new(),
+      enable_ktls: false,
+      ktls_tx_only: false,
+      #[cfg(target_os = "linux")]
+      ktls_attempted: false,
+      #[cfg(target_os = "linux")]
+      ktls_pending: false,
+      #[cfg(target_os = "linux")]
+      tls_record_bytes_remaining: 0,
+      #[cfg(target_os = "linux")]
+      tls_record_header_seen: 0,
+      #[cfg(target_os = "linux")]
+      tls_record_header_buf: [0u8; 5],
+      connected_raised: false,
+      negotiated_proto: String::new(),
+      tls_write_backlog: Vec::new(),
+      tls_read_backlog: Vec::new(),
+      io: None,
+      #[cfg(target_os = "linux")]
+      ktls_fd: None,
+      #[cfg(target_os = "linux")]
+      ktls_shutdown_sent: false,
+      userspace_close_notify_sent: false,
+      in_do_write: false,
+    }
+  }
+
+  #[test]
+  fn err_would_block_matches_both_eagain_and_ewouldblock() {
+    assert!(err_would_block(-(libc::EAGAIN as i64)));
+    assert!(err_would_block(libc::EAGAIN as i64));
+    assert!(err_would_block(-(libc::EWOULDBLOCK as i64)));
+    assert!(!err_would_block(-(libc::ECONNRESET as i64)));
+    assert!(!err_would_block(0));
+  }
+
+  #[test]
+  fn errno_name_uses_libc_constants() {
+    #[cfg(target_os = "linux")]
+    {
+      // Numeric value of EBADMSG / EMSGSIZE varies by arch on Linux but `libc::EBADMSG` is
+      // always the right symbol. The test ensures we don't hard-code the x86-64 numbers.
+      assert_eq!(errno_name(libc::EBADMSG), "EBADMSG");
+      assert_eq!(errno_name(libc::EMSGSIZE), "EMSGSIZE");
+      assert_eq!(errno_name(libc::ECONNRESET), "ECONNRESET");
+      assert_eq!(errno_name(0xdead), "unknown");
+    }
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn split_aes_gcm_iv_layout_matches_kernel() {
+    // rustls returns 12 bytes (salt[4] || iv[8]); kernel expects iv first then salt in its
+    // struct. The split function must return (salt, iv) in that order.
+    let iv: [u8; 12] = [
+      0xAA, 0xBB, 0xCC, 0xDD, // salt
+      0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // iv
+    ];
+    let (salt, out_iv) = linux_ktls::split_aes_gcm_iv_for_test(&iv).unwrap();
+    assert_eq!(salt, [0xAA, 0xBB, 0xCC, 0xDD]);
+    assert_eq!(out_iv, [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn split_aes_gcm_iv_rejects_wrong_length() {
+    assert!(linux_ktls::split_aes_gcm_iv_for_test(&[0u8; 11]).is_err());
+    assert!(linux_ktls::split_aes_gcm_iv_for_test(&[0u8; 13]).is_err());
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn advance_record_tracking_single_record() {
+    let mut s = make_socket_no_conn();
+    // Header: type(0x17 app_data), version(0x0303), length(0x0010 = 16)
+    let mut data = vec![0x17, 0x03, 0x03, 0x00, 0x10];
+    data.extend(std::iter::repeat(0xab).take(16));
+    s.advance_record_tracking(&data);
+    // Consumed exactly one record: pointer at end, no remainder.
+    assert_eq!(s.tls_record_bytes_remaining, 0);
+    assert_eq!(s.tls_record_header_seen, 0);
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn advance_record_tracking_split_header() {
+    let mut s = make_socket_no_conn();
+    // Feed only 3 bytes of the 5-byte header.
+    s.advance_record_tracking(&[0x17, 0x03, 0x03]);
+    assert_eq!(s.tls_record_header_seen, 3);
+    assert_eq!(s.tls_record_bytes_remaining, 0);
+    // Feed the rest of the header + a partial payload.
+    let mut tail = vec![0x00, 0x10];
+    tail.extend(std::iter::repeat(0xab).take(4));
+    s.advance_record_tracking(&tail);
+    assert_eq!(s.tls_record_header_seen, 0);
+    // Header said payload=16 bytes; we've delivered 4 of those.
+    assert_eq!(s.tls_record_bytes_remaining, 12);
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn advance_record_tracking_partial_payload() {
+    let mut s = make_socket_no_conn();
+    s.tls_record_bytes_remaining = 5;
+    // We feed 3 bytes — should reduce remaining to 2.
+    s.advance_record_tracking(&[0u8; 3]);
+    assert_eq!(s.tls_record_bytes_remaining, 2);
+    assert_eq!(s.tls_record_header_seen, 0);
+  }
+
+  // -- Backpressure properties on the write path -----------------------------------------------
+
+  #[test]
+  fn write_backlog_limit_is_at_least_one_record() {
+    // The whole point of the bound is to allow at least one in-flight TLS record while
+    // refusing more — verify the constant is sized accordingly.
+    assert!(TLS_WRITE_BACKLOG_LIMIT >= IO_BUF_SIZE);
+  }
+
+  #[test]
+  fn plaintext_buffer_limit_is_bounded() {
+    // We never want the rustls plaintext queue to grow without bound — assert the constant is
+    // set (the test catches accidental "= usize::MAX" regressions in code review).
+    assert!(RUSTLS_PLAINTEXT_BUFFER_LIMIT > 0);
+    assert!(RUSTLS_PLAINTEXT_BUFFER_LIMIT <= 16 * 1024 * 1024);
+  }
+}

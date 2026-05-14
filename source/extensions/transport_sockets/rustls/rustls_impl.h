@@ -95,11 +95,18 @@ using RustlsTransportSocketConfigSharedPtr = std::shared_ptr<RustlsTransportSock
 
 /**
  * Transport socket implementation that delegates to the Rust module via the transport socket ABI.
+ *
+ * On construction, the Rust module is asked for a per-socket state object. If that allocation
+ * fails (e.g. process OOM), the factory returns nullptr and the connection is short-circuited at
+ * `Connection::initialize`, surfacing a clean `upstream_cx_connect_fail` rather than a half-alive
+ * socket that silently no-ops every I/O.
  */
 class RustlsTransportSocket : public Network::TransportSocket,
-                              public Logger::Loggable<Logger::Id::dynamic_modules> {
+                              public Logger::Loggable<Logger::Id::connection> {
 public:
-  RustlsTransportSocket(RustlsTransportSocketConfigSharedPtr config, bool is_upstream);
+  RustlsTransportSocket(RustlsTransportSocketConfigSharedPtr config,
+                        Network::TransportSocketOptionsConstSharedPtr options,
+                        Upstream::HostDescriptionConstSharedPtr host);
   ~RustlsTransportSocket() override;
 
   // Network::TransportSocket.
@@ -122,6 +129,7 @@ public:
   Network::TransportSocketCallbacks* transportCallbacks() { return callbacks_; }
   Buffer::Instance* activeReadBuffer() { return active_read_buffer_; }
   Buffer::Instance* activeWriteBuffer() { return active_write_buffer_; }
+  bool socketModuleAllocated() const { return socket_module_ != nullptr; }
 
 private:
   void refreshProtocolString() const;

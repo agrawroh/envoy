@@ -19,6 +19,24 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 //
 // When ``kTLS`` is enabled, the kernel handles symmetric encryption and decryption after
 // the TLS handshake completes, reducing CPU usage for bulk data transfer.
+//
+// .. warning::
+//   This extension is **alpha** and intentionally does not yet support the full configuration
+//   surface of :ref:`envoy.transport_sockets.tls
+//   <envoy_v3_api_msg_extensions.transport_sockets.tls.v3.UpstreamTlsContext>`. The following
+//   are not supported and connections that require them will be refused at
+//   ``createTransportSocket`` time (visible as ``upstream_cx_connect_fail`` with a warn log):
+//
+//   * Per-connection SNI override (e.g. ``auto_sni: true``).
+//   * Per-connection ALPN override.
+//   * Per-connection SAN match list override (``match_typed_subject_alt_names`` /
+//     ``verify_subject_alt_name``).
+//   * Certificate revocation (CRL / OCSP).
+//   * SDS-managed certificate rotation.
+//   * Fine-grained ``TlsParameters`` (cipher / version restrictions).
+//
+//   For any of these, use :ref:`envoy.transport_sockets.tls
+//   <envoy_v3_api_msg_extensions.transport_sockets.tls.v3.UpstreamTlsContext>` instead.
 // [#next-free-field: 8]
 message RustlsUpstreamTlsContext {
   // PEM-encoded certificate chain for client authentication (mTLS). Can be inline PEM content
@@ -44,7 +62,11 @@ message RustlsUpstreamTlsContext {
 
   // Server Name Indication (SNI) hostname used for TLS server certificate verification.
   //
-  // Defaults to ``localhost`` when not specified.
+  // **Required.** rustls verifies the server certificate's SAN list against this value, so it
+  // must match the expected upstream hostname (e.g. ``mybucket.s3.amazonaws.com``). A factory
+  // built without a non-empty ``sni`` will be rejected at config-load time. Per-connection SNI
+  // overrides (e.g. cluster ``auto_sni: true``) are not yet plumbed through — see the
+  // limitation note at the top of this message.
   string sni = 5;
 
   // Enables kernel TLS (``kTLS``) offload after the TLS handshake completes on Linux. When

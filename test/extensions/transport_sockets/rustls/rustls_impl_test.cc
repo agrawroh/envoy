@@ -459,14 +459,13 @@ public:
   RustlsTransportSocketConfigSharedPtr config_ = createNullModuleConfig();
 };
 
-TEST_F(RustlsTransportSocketNullModuleTest, ConstructorLogsError) {
-  EXPECT_LOG_CONTAINS("error",
-                      "dynamic module transport socket: on_transport_socket_new returned nullptr",
-                      { auto socket = std::make_unique<RustlsTransportSocket>(config_, true); });
+TEST_F(RustlsTransportSocketNullModuleTest, ConstructorReportsAllocationFailure) {
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
+  EXPECT_FALSE(socket->socketModuleAllocated());
 }
 
 TEST_F(RustlsTransportSocketNullModuleTest, DoReadReturnsCloseAction) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   Buffer::OwnedImpl buffer;
   auto result = socket->doRead(buffer);
   EXPECT_EQ(result.action_, Network::PostIoAction::Close);
@@ -475,7 +474,7 @@ TEST_F(RustlsTransportSocketNullModuleTest, DoReadReturnsCloseAction) {
 }
 
 TEST_F(RustlsTransportSocketNullModuleTest, DoWriteReturnsCloseAction) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   Buffer::OwnedImpl buffer;
   auto result = socket->doWrite(buffer, false);
   EXPECT_EQ(result.action_, Network::PostIoAction::Close);
@@ -483,49 +482,49 @@ TEST_F(RustlsTransportSocketNullModuleTest, DoWriteReturnsCloseAction) {
 }
 
 TEST_F(RustlsTransportSocketNullModuleTest, CloseSocketIsNoOp) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   socket->closeSocket(Network::ConnectionEvent::LocalClose);
 }
 
 TEST_F(RustlsTransportSocketNullModuleTest, OnConnectedIsNoOp) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   socket->onConnected();
 }
 
 TEST_F(RustlsTransportSocketNullModuleTest, SetCallbacksStoresCallbacks) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   NiceMock<Network::MockTransportSocketCallbacks> callbacks;
   socket->setTransportSocketCallbacks(callbacks);
   EXPECT_EQ(socket->transportCallbacks(), &callbacks);
 }
 
 TEST_F(RustlsTransportSocketNullModuleTest, ProtocolReturnsEmpty) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   EXPECT_TRUE(socket->protocol().empty());
 }
 
 TEST_F(RustlsTransportSocketNullModuleTest, FailureReasonReturnsEmpty) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   EXPECT_TRUE(socket->failureReason().empty());
 }
 
 TEST_F(RustlsTransportSocketNullModuleTest, CanFlushCloseReturnsTrue) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   EXPECT_TRUE(socket->canFlushClose());
 }
 
 TEST_F(RustlsTransportSocketNullModuleTest, SslReturnsNullptr) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   EXPECT_EQ(socket->ssl(), nullptr);
 }
 
 TEST_F(RustlsTransportSocketNullModuleTest, StartSecureTransportReturnsFalse) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   EXPECT_FALSE(socket->startSecureTransport());
 }
 
 TEST_F(RustlsTransportSocketNullModuleTest, ConfigureInitialCongestionWindowIsNoOp) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   socket->configureInitialCongestionWindow(100, std::chrono::microseconds(1000));
 }
 
@@ -539,7 +538,7 @@ public:
 };
 
 TEST_F(RustlsTransportSocketValidModuleTest, DoReadKeepOpen) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   Buffer::OwnedImpl buffer;
   auto result = socket->doRead(buffer);
   EXPECT_EQ(result.action_, Network::PostIoAction::KeepOpen);
@@ -549,7 +548,7 @@ TEST_F(RustlsTransportSocketValidModuleTest, DoReadKeepOpen) {
 
 TEST_F(RustlsTransportSocketValidModuleTest, DoReadCloseAction) {
   config_->on_do_read_ = stub::doReadClose;
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   Buffer::OwnedImpl buffer;
   auto result = socket->doRead(buffer);
   EXPECT_EQ(result.action_, Network::PostIoAction::Close);
@@ -558,7 +557,7 @@ TEST_F(RustlsTransportSocketValidModuleTest, DoReadCloseAction) {
 }
 
 TEST_F(RustlsTransportSocketValidModuleTest, DoWriteKeepOpen) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   Buffer::OwnedImpl buffer("hello");
   auto result = socket->doWrite(buffer, false);
   EXPECT_EQ(result.action_, Network::PostIoAction::KeepOpen);
@@ -567,7 +566,7 @@ TEST_F(RustlsTransportSocketValidModuleTest, DoWriteKeepOpen) {
 
 TEST_F(RustlsTransportSocketValidModuleTest, DoWriteCloseAction) {
   config_->on_do_write_ = stub::doWriteClose;
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   Buffer::OwnedImpl buffer("hello");
   auto result = socket->doWrite(buffer, true);
   EXPECT_EQ(result.action_, Network::PostIoAction::Close);
@@ -575,50 +574,50 @@ TEST_F(RustlsTransportSocketValidModuleTest, DoWriteCloseAction) {
 }
 
 TEST_F(RustlsTransportSocketValidModuleTest, OnConnectedCallsModule) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   socket->onConnected();
 }
 
 TEST_F(RustlsTransportSocketValidModuleTest, CloseSocketCallsModule) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   socket->closeSocket(Network::ConnectionEvent::LocalClose);
 }
 
 TEST_F(RustlsTransportSocketValidModuleTest, ProtocolReturnsValue) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   EXPECT_EQ(socket->protocol(), "h2");
 }
 
 TEST_F(RustlsTransportSocketValidModuleTest, ProtocolReturnsEmptyWhenModuleReturnsEmpty) {
   config_->on_get_protocol_ = stub::getProtocolEmpty;
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   EXPECT_TRUE(socket->protocol().empty());
 }
 
 TEST_F(RustlsTransportSocketValidModuleTest, FailureReasonReturnsValue) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   EXPECT_EQ(socket->failureReason(), "handshake failed");
 }
 
 TEST_F(RustlsTransportSocketValidModuleTest, FailureReasonReturnsEmptyWhenModuleReturnsEmpty) {
   config_->on_get_failure_reason_ = stub::getFailureReasonEmpty;
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   EXPECT_TRUE(socket->failureReason().empty());
 }
 
 TEST_F(RustlsTransportSocketValidModuleTest, CanFlushCloseReturnsTrue) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   EXPECT_TRUE(socket->canFlushClose());
 }
 
 TEST_F(RustlsTransportSocketValidModuleTest, CanFlushCloseReturnsFalse) {
   config_->on_can_flush_close_ = stub::canFlushCloseFalse;
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   EXPECT_FALSE(socket->canFlushClose());
 }
 
 TEST_F(RustlsTransportSocketValidModuleTest, SetCallbacksCallsModule) {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, true);
+  auto socket = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   NiceMock<Network::MockTransportSocketCallbacks> callbacks;
   socket->setTransportSocketCallbacks(callbacks);
   EXPECT_EQ(socket->transportCallbacks(), &callbacks);
@@ -723,7 +722,7 @@ class TransportSocketAbiCallbackTest : public testing::Test {
 public:
   void SetUp() override {
     config_ = createStubConfig(/*is_upstream=*/true);
-    socket_ = std::make_unique<RustlsTransportSocket>(config_, true);
+    socket_ = std::make_unique<RustlsTransportSocket>(config_, nullptr, nullptr);
   }
 
   envoy_dynamic_module_type_transport_socket_envoy_ptr socketPtr() {
