@@ -261,16 +261,24 @@ Network::TransportSocketPtr RustlsUpstreamTransportSocketFactory::createTranspor
         options->serverNameOverride().has_value() && !options->serverNameOverride()->empty();
     const bool has_alpn_override = !options->applicationProtocolListOverride().empty();
     const bool has_san_override = !options->verifySubjectAltNameListOverride().empty();
-    if (has_sni_override || has_alpn_override || has_san_override) {
+    // `applicationProtocolFallback` is set by the HTTP/2 connection pool (e.g. `{"h2",
+    // "http/1.1"}`) when the static ALPN list is empty. Without honoring it, a cluster that
+    // expects ALPN-driven protocol selection would silently negotiate an ALPN-empty handshake
+    // and downgrade — surfaced as a stealth protocol mismatch. Refuse the connection so the
+    // operator gets a clear `upstream_cx_connect_fail` instead.
+    const bool has_alpn_fallback_unbacked =
+        !options->applicationProtocolFallback().empty() && alpn_protocols_.empty();
+    if (has_sni_override || has_alpn_override || has_san_override || has_alpn_fallback_unbacked) {
       ENVOY_LOG_PERIODIC_MISC(
           warn, std::chrono::seconds(30),
-          "rustls upstream transport socket received per-connection options "
-          "(sni_override={}, alpn_override={}, san_override={}); these are not yet supported and "
-          "the connection will fail. Use envoy.transport_sockets.tls if you need auto_sni / "
-          "match_typed_subject_alt_names / ALPN override.",
-          has_sni_override, has_alpn_override, has_san_override);
+          "rustls upstream transport socket received per-connection options (sni_override={}, "
+          "alpn_override={}, san_override={}, alpn_fallback_unbacked={}); these are not yet "
+          "supported and the connection will fail. Use envoy.transport_sockets.tls if you need "
+          "auto_sni / match_typed_subject_alt_names / ALPN override / ALPN fallback.",
+          has_sni_override, has_alpn_override, has_san_override, has_alpn_fallback_unbacked);
       return std::make_unique<NotReadyRustlsSocket>(
-          "rustls: per-connection SNI/ALPN/SAN overrides are not supported by this extension");
+          "rustls: per-connection SNI/ALPN/SAN overrides (and ALPN fallback without a static "
+          "alpn_protocols list) are not supported by this extension");
     }
   }
   auto socket =

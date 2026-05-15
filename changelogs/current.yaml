@@ -442,7 +442,12 @@ new_features:
     kernel TLS (``kTLS``) offload on Linux. This extension is **alpha**; per-connection
     SNI / ALPN / SAN overrides (e.g. cluster ``auto_sni: true``), SDS-managed certificate
     rotation, certificate revocation (CRL / OCSP), and fine-grained ``TlsParameters`` are not yet
-    supported — use ``envoy.transport_sockets.tls`` for those.
+    supported. Additionally, ``Network::Connection::ssl()`` returns ``nullptr`` for this socket,
+    so RBAC ``AuthenticatedMatcher`` / URI-SAN / DNS-SAN principals, ext_authz peer-cert
+    propagation, and access-log operators ``%DOWNSTREAM_TLS_*%`` / ``%UPSTREAM_TLS_*%`` /
+    ``%DOWNSTREAM_PEER_CERT*%`` will behave as if the connection were plaintext — do not route
+    through this socket from a listener whose filter chain depends on TLS-derived principals or
+    audit fields. Use ``envoy.transport_sockets.tls`` for any of the above.
 - area: ext_authz
   change: |
     Added :ref:`path_override <envoy_v3_api_field_extensions.filters.http.ext_authz.v3.HttpService.path_override>`

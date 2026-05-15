@@ -1123,6 +1123,11 @@ impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
           // rustls's error Display includes the alert description for fatal-alert errors.
           self.failure = format!("process_new_packets: {e}");
           envoy_log_warn!("rustls: {}", self.failure);
+          // Best-effort: rustls may have queued a fatal alert in its outbound TLS queue.
+          // Drain it to the wire BEFORE returning Close so the peer sees the alert rather
+          // than a bare TCP FIN. Failure to drain is non-fatal (the connection is closing
+          // anyway), but the operator-side diagnostic is preserved on the peer.
+          let _ = self.drain_outgoing_tls(envoy);
           return IoResult::close(total_plaintext, false);
         }
       }
@@ -1224,6 +1229,13 @@ impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
     #[cfg(not(target_os = "linux"))]
     let result = self.on_do_write_inner(envoy, end_stream);
     self.in_do_write = false;
+    // Panic-stuck-flag note: if `on_do_write_inner`/`on_do_write_ktls` panics, the SDK's
+    // `catch_unwind` at the FFI boundary intercepts and surfaces a fail-closed sentinel to
+    // Envoy; the connection is torn down and this socket instance is dropped, so the stuck
+    // `in_do_write = true` never affects another call. An RAII Drop guard would be belt-and-
+    // suspenders, but the borrow-checker forbids holding `&mut self.in_do_write` across the
+    // `self.on_do_write_*` calls that themselves take `&mut self` — and the realized failure
+    // mode is already neutralized by socket teardown.
     // INVARIANT: do NOT call `envoy.flush_write_buffer()` here. `flush_write_buffer` triggers
     // a synchronous re-entry into `on_do_write` via `ConnectionImpl::onWriteReady`, which
     // busy-loops draining Envoy's write buffer in a single dispatcher iteration — head-of-line
@@ -1272,6 +1284,12 @@ impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
     self.conn = None;
     self.tls_write_backlog.clear();
     self.tls_read_backlog.clear();
+    // Clear the cached io-handle pointer. ConnectionImpl tears down the underlying socket FD
+    // after delivering on_close; if a hypothetical future code path calls `io_handle_ptr()`
+    // post-close it would reference a closed FD inside a still-live IoHandle object. Pin to
+    // None so any such use is a clean None-arm fall-through rather than a stealth EBADF.
+    self.io = None;
+    self.end_stream_pending = false;
   }
 
   fn get_protocol(&self, _envoy: &mut EnvoyTransportSocketImpl) -> String {
@@ -2454,11 +2472,10 @@ mod tests {
     assert!(RUSTLS_PLAINTEXT_BUFFER_LIMIT <= 16 * 1024 * 1024);
   }
 
-  /// Regression guard against the iter-N-fix-misses-a-call-site failure mode: every TX
-  /// close_notify call site must consult both `userspace_close_notify_sent` and
-  /// `ktls_shutdown_sent` so the peer never sees two alerts back-to-back. The test pins the
-  /// flag-shape invariant; if a future refactor adds a new close-notify producer that forgets
-  /// to update at least one flag, this test will surface the gap.
+  /// Regression guard for future refactors that add a new close-notify emit site but forget
+  /// one of the dedup flags. Every TX close_notify call site must consult both
+  /// `userspace_close_notify_sent` and `ktls_shutdown_sent` so the peer never sees two alerts
+  /// back-to-back; this test pins the flag-shape invariant at the type level.
   #[test]
   fn close_notify_dedup_flags_default_false_on_fresh_socket() {
     let s = make_socket_no_conn();
