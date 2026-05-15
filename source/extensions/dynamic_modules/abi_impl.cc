@@ -4,6 +4,8 @@
 // all dynamic modules. These are the "Common Callbacks" declared in abi.h and are available
 // regardless of which extension point is being used (HTTP/Network/Listener/UDP/Bootstrap/etc).
 
+#include <atomic>
+#include <cstdint>
 #include <string>
 
 #include "envoy/server/factory_context.h"
@@ -29,7 +31,34 @@ absl::Mutex shared_data_registry_mutex;
 absl::flat_hash_map<std::string, void*>
     shared_data_registry ABSL_GUARDED_BY(shared_data_registry_mutex);
 
+// Process-wide count of panics caught at the FFI boundary, incremented by the SDK from inside
+// `catch_unwind`'s recovery arm. Kept as a free-standing atomic (not a `Stats::Counter`) because
+// (a) panics may originate on any worker thread, while `Stats::Counter` access requires the main
+// thread's stats scope, and (b) the recovery arm must not allocate or take locks — a secondary
+// panic inside the metric path would abort the process. The atomic is drained into
+// `dynamic_modules.module_panics_total` on the main thread; see TODO below.
+std::atomic<uint64_t> g_module_panics_total{0};
+
 } // namespace
+
+namespace Envoy {
+namespace Extensions {
+namespace DynamicModules {
+
+// Test-only accessor for the process-wide panic counter. Exposed so unit tests can verify the
+// counter increments without depending on the main-thread stats drain (which is not yet wired —
+// see TODO in `envoy_dynamic_module_callback_record_panic`).
+uint64_t moduleAbiPanicCountForTest() {
+  return g_module_panics_total.load(std::memory_order_relaxed);
+}
+
+void resetModuleAbiPanicCountForTest() {
+  g_module_panics_total.store(0, std::memory_order_relaxed);
+}
+
+} // namespace DynamicModules
+} // namespace Extensions
+} // namespace Envoy
 
 extern "C" {
 
@@ -65,6 +94,27 @@ void envoy_dynamic_module_callback_log(envoy_dynamic_module_type_log_level level
   default:
     break;
   }
+}
+
+void envoy_dynamic_module_callback_record_panic(const char* function_name_ptr,
+                                                size_t function_name_length) {
+  // Called from inside `catch_unwind`'s recovery arm, possibly on a worker thread. Must not
+  // allocate or take locks — a secondary panic here would abort the process. The increment is
+  // the only required side effect; the function name is logged separately by the SDK via
+  // `envoy_dynamic_module_callback_log`. Memory order is `relaxed`: per-panic ordering against
+  // other state is not required since the counter is observed asynchronously by the drain.
+  g_module_panics_total.fetch_add(1, std::memory_order_relaxed);
+
+  // Silence "unused parameter" warnings without inspecting the borrowed buffer; the host does
+  // not retain it past the call. The SDK is expected to log the name through the existing
+  // logging callback before calling this function.
+  (void)function_name_ptr;
+  (void)function_name_length;
+
+  // TODO(agrawroh): Drain `g_module_panics_total` into the Envoy stats scope as
+  // `dynamic_modules.module_panics_total` on a main-thread timer (or on admin scrape) so
+  // operators can alert on this from Prometheus. The drain must run on the main thread because
+  // `Stats::Counter` mutation is not safe from workers. Tracking issue: follow-up PR.
 }
 
 uint32_t envoy_dynamic_module_callback_get_concurrency() {

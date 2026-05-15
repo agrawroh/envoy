@@ -484,6 +484,25 @@ void envoy_dynamic_module_callback_log(envoy_dynamic_module_type_log_level level
  */
 bool envoy_dynamic_module_callback_log_enabled(envoy_dynamic_module_type_log_level level);
 
+/**
+ * envoy_dynamic_module_callback_record_panic is called by the SDK from inside `catch_unwind`'s
+ * recovery arm to increment a process-wide counter of FFI-boundary panics. This makes module
+ * panics observable from operator dashboards instead of being silently swallowed.
+ *
+ * Safe to call from any thread: the counter is a `std::atomic<uint64_t>` and the implementation
+ * does not allocate or take locks. `function_name_ptr` is a borrowed pointer; the host does not
+ * retain it past the call. Passing a zero-length name is allowed and records an anonymous panic.
+ *
+ * Wired into Envoy stats as `dynamic_modules.module_panics_total` via a periodic main-thread
+ * drain — see TODO in source/extensions/dynamic_modules/abi_impl.cc.
+ *
+ * @param function_name_ptr is the pointer to the panicking function name (UTF-8, not
+ *        null-terminated).
+ * @param function_name_length is the length of `function_name_ptr` in bytes.
+ */
+void envoy_dynamic_module_callback_record_panic(const char* function_name_ptr,
+                                                size_t function_name_length);
+
 // --------------------------------- Threading -----------------------------------
 
 /**

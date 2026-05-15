@@ -65,16 +65,40 @@ pub fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
   }
 }
 
-/// Log a panic caught at an FFI boundary. Exposed via `#[doc(hidden)]` so SDK-provided macros
-/// such as `declare_matcher!` and `declare_init_functions!` can call it from user crates after
-/// expansion.
+/// Log a panic caught at an FFI boundary and bump the process-wide panic counter. Exposed via
+/// `#[doc(hidden)]` so SDK-provided macros such as `declare_matcher!` and `declare_init_functions!`
+/// can call it from user crates after expansion.
+///
+/// The counter increment runs FIRST and uses no allocation, so the panic remains observable from
+/// operator dashboards even if the subsequent log path panics during formatting.
+///
+/// `function_name` is `&'static str` so that the SDK-generated callers cannot pass a
+/// heap-allocated `String` — the recovery arm of `catch_unwind` must not depend on a healthy
+/// allocator. The borrowed pointer passed to the host is not retained past the call.
 ///
 /// Logging runs after `catch_unwind` has already captured the original panic, so a secondary
 /// panic inside `format!` or `envoy_log_error!` would unwind into `libc::abort` rather than
 /// across the FFI boundary. That is intentional: a recursive panic in the log path indicates
 /// the process is too broken to continue safely.
 #[doc(hidden)]
-pub fn log_ffi_panic(function_name: &str, payload: Box<dyn Any + Send>) {
+pub fn log_ffi_panic(function_name: &'static str, payload: Box<dyn Any + Send>) {
+  // Bump the host-side panic counter before logging. Gated on `cfg(not(test))` to match the
+  // surrounding `envoy_log!` macro pattern — the FFI symbol is provided by the Envoy host and is
+  // not linked in the SDK's own unit tests.
+  //
+  // SAFETY: the host implementation only reads `function_name.len()` bytes from the pointer and
+  // does not retain it past the call. See `envoy_dynamic_module_callback_record_panic` in
+  // `source/extensions/dynamic_modules/abi_impl.cc`.
+  #[cfg(not(test))]
+  unsafe {
+    crate::abi::envoy_dynamic_module_callback_record_panic(
+      function_name.as_ptr() as *const std::os::raw::c_char,
+      function_name.len(),
+    );
+  }
+
+  // Best-effort log; may itself panic and abort. The counter above is already incremented, so
+  // the operator-visible signal survives even if formatting fails under allocator stress.
   crate::envoy_log_error!(
     "{}: caught panic at FFI boundary: {}",
     function_name,

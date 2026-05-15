@@ -1,4 +1,6 @@
+#include <cstdint>
 #include <thread>
+#include <vector>
 
 #include "source/extensions/dynamic_modules/abi/abi.h"
 
@@ -12,6 +14,12 @@ using testing::Return;
 namespace Envoy {
 namespace Extensions {
 namespace DynamicModules {
+
+// Test-only accessors for the process-wide panic counter, defined in
+// source/extensions/dynamic_modules/abi_impl.cc.
+uint64_t moduleAbiPanicCountForTest();
+void resetModuleAbiPanicCountForTest();
+
 namespace {
 
 // =============================================================================
@@ -94,6 +102,53 @@ TEST(CommonAbiImplTest, GetConcurrencyBeforeServerContextFailsClosed) {
   EXPECT_ENVOY_BUG(EXPECT_EQ(0u, envoy_dynamic_module_callback_get_concurrency()),
                    "envoy_dynamic_module_callback_get_concurrency called before the server "
                    "context was initialized");
+}
+
+// =============================================================================
+// Panic Counter Tests
+// =============================================================================
+
+// Verifies that `record_panic` increments the process-wide counter. Resets the counter first so
+// the test does not depend on prior test order.
+TEST(CommonAbiImplTest, RecordPanicIncrementsCounter) {
+  resetModuleAbiPanicCountForTest();
+  EXPECT_EQ(0u, moduleAbiPanicCountForTest());
+
+  const char name[] = "test_panic_site";
+  envoy_dynamic_module_callback_record_panic(name, sizeof(name) - 1);
+  EXPECT_EQ(1u, moduleAbiPanicCountForTest());
+
+  envoy_dynamic_module_callback_record_panic(name, sizeof(name) - 1);
+  EXPECT_EQ(2u, moduleAbiPanicCountForTest());
+}
+
+// Verifies that `record_panic` is safe to call with a zero-length name (anonymous panic).
+TEST(CommonAbiImplTest, RecordPanicAcceptsEmptyName) {
+  resetModuleAbiPanicCountForTest();
+  envoy_dynamic_module_callback_record_panic(nullptr, 0);
+  EXPECT_EQ(1u, moduleAbiPanicCountForTest());
+}
+
+// Verifies that `record_panic` is safe to call concurrently from multiple threads — the counter
+// is atomic so there is no torn write.
+TEST(CommonAbiImplTest, RecordPanicConcurrent) {
+  resetModuleAbiPanicCountForTest();
+  constexpr size_t kThreads = 8;
+  constexpr size_t kPerThread = 100;
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (size_t i = 0; i < kThreads; ++i) {
+    threads.emplace_back([] {
+      const char name[] = "concurrent";
+      for (size_t j = 0; j < kPerThread; ++j) {
+        envoy_dynamic_module_callback_record_panic(name, sizeof(name) - 1);
+      }
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+  EXPECT_EQ(kThreads * kPerThread, moduleAbiPanicCountForTest());
 }
 
 // =============================================================================

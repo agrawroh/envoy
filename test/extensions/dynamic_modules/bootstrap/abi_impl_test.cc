@@ -1318,6 +1318,128 @@ TEST_F(BootstrapAbiImplTest, TimerDeleteOffMainThreadFailsClosed) {
       "thread");
 }
 
+// Verifies that the remaining timer ABIs are safe no-ops off the main thread. The release-mode
+// guard short-circuits before any pointer dereference, so passing a null timer is safe.
+TEST_F(BootstrapAbiImplTest, TimerEnableOffMainThreadFailsClosed) {
+  EXPECT_ENVOY_BUG(
+      {
+        std::thread t(
+            [] { envoy_dynamic_module_callback_bootstrap_extension_timer_enable(nullptr, 50); });
+        t.join();
+      },
+      "envoy_dynamic_module_callback_bootstrap_extension_timer_enable must be called on the main "
+      "thread");
+}
+
+TEST_F(BootstrapAbiImplTest, TimerDisableOffMainThreadFailsClosed) {
+  EXPECT_ENVOY_BUG(
+      {
+        std::thread t(
+            [] { envoy_dynamic_module_callback_bootstrap_extension_timer_disable(nullptr); });
+        t.join();
+      },
+      "envoy_dynamic_module_callback_bootstrap_extension_timer_disable must be called on the main "
+      "thread");
+}
+
+TEST_F(BootstrapAbiImplTest, TimerEnabledOffMainThreadFailsClosed) {
+  EXPECT_ENVOY_BUG(
+      {
+        std::thread t([] {
+          EXPECT_FALSE(envoy_dynamic_module_callback_bootstrap_extension_timer_enabled(nullptr));
+        });
+        t.join();
+      },
+      "envoy_dynamic_module_callback_bootstrap_extension_timer_enabled must be called on the main "
+      "thread");
+}
+
+// Verifies that `bootstrap_extension_file_watcher_add_watch` is a safe no-op off the main thread.
+TEST_F(BootstrapAbiImplTest, FileWatcherAddWatchOffMainThreadFailsClosed) {
+  envoy_dynamic_module_type_module_buffer path = {"/tmp/x", 6};
+  EXPECT_ENVOY_BUG(
+      {
+        std::thread t([&] {
+          EXPECT_FALSE(envoy_dynamic_module_callback_bootstrap_extension_file_watcher_add_watch(
+              nullptr, path, 0));
+        });
+        t.join();
+      },
+      "envoy_dynamic_module_callback_bootstrap_extension_file_watcher_add_watch must be called on "
+      "the main thread");
+}
+
+// Verifies that `bootstrap_extension_register_admin_handler` is a safe no-op off the main thread.
+TEST_F(BootstrapAbiImplTest, RegisterAdminHandlerOffMainThreadFailsClosed) {
+  envoy_dynamic_module_type_module_buffer prefix = {"/stats", 6};
+  envoy_dynamic_module_type_module_buffer help = {"help", 4};
+  EXPECT_ENVOY_BUG(
+      {
+        std::thread t([&] {
+          EXPECT_FALSE(envoy_dynamic_module_callback_bootstrap_extension_register_admin_handler(
+              nullptr, prefix, help, false, false));
+        });
+        t.join();
+      },
+      "envoy_dynamic_module_callback_bootstrap_extension_register_admin_handler must be called on "
+      "the main thread");
+}
+
+// Verifies that `bootstrap_extension_remove_admin_handler` is a safe no-op off the main thread.
+TEST_F(BootstrapAbiImplTest, RemoveAdminHandlerOffMainThreadFailsClosed) {
+  envoy_dynamic_module_type_module_buffer prefix = {"/stats", 6};
+  EXPECT_ENVOY_BUG(
+      {
+        std::thread t([&] {
+          EXPECT_FALSE(envoy_dynamic_module_callback_bootstrap_extension_remove_admin_handler(
+              nullptr, prefix));
+        });
+        t.join();
+      },
+      "envoy_dynamic_module_callback_bootstrap_extension_remove_admin_handler must be called on "
+      "the main thread");
+}
+
+// Verifies that the lifecycle and init delegate ABIs are safe no-ops off the main thread. The
+// release-mode guard short-circuits before forwarding to the underlying main-thread-only state.
+TEST_F(BootstrapAbiImplTest, SignalInitCompleteOffMainThreadFailsClosed) {
+  EXPECT_ENVOY_BUG(
+      {
+        std::thread t([] {
+          envoy_dynamic_module_callback_bootstrap_extension_config_signal_init_complete(nullptr);
+        });
+        t.join();
+      },
+      "envoy_dynamic_module_callback_bootstrap_extension_config_signal_init_complete must be "
+      "called on the main thread");
+}
+
+TEST_F(BootstrapAbiImplTest, EnableClusterLifecycleOffMainThreadFailsClosed) {
+  EXPECT_ENVOY_BUG(
+      {
+        std::thread t([] {
+          EXPECT_FALSE(envoy_dynamic_module_callback_bootstrap_extension_enable_cluster_lifecycle(
+              nullptr));
+        });
+        t.join();
+      },
+      "envoy_dynamic_module_callback_bootstrap_extension_enable_cluster_lifecycle must be called "
+      "on the main thread");
+}
+
+TEST_F(BootstrapAbiImplTest, EnableListenerLifecycleOffMainThreadFailsClosed) {
+  EXPECT_ENVOY_BUG(
+      {
+        std::thread t([] {
+          EXPECT_FALSE(envoy_dynamic_module_callback_bootstrap_extension_enable_listener_lifecycle(
+              nullptr));
+        });
+        t.join();
+      },
+      "envoy_dynamic_module_callback_bootstrap_extension_enable_listener_lifecycle must be called "
+      "on the main thread");
+}
+
 // Test that the timer callback safely handles a destroyed config via weak_ptr.
 TEST_F(BootstrapAbiImplTest, TimerFiredAfterConfigDestroyed) {
   Event::TimerCb captured_timer_cb;

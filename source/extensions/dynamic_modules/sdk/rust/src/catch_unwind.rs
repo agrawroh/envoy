@@ -49,7 +49,11 @@ impl<F> CatchUnwind<F> {
   /// If the filter was already poisoned by a prior panic, panics immediately — a
   /// status-returning callback on a poisoned filter means the fail-closed mechanism
   /// didn't terminate the stream as expected.
-  fn catch<R>(&mut self, name: &str, f: impl FnOnce(&mut F) -> R) -> Result<R, ()> {
+  ///
+  /// `name` is `&'static str` so a panic in the recovery arm cannot depend on a heap
+  /// allocation for the function-name argument; it is routed through `log_ffi_panic`
+  /// which both bumps `dynamic_modules.module_panics_total` and logs the payload.
+  fn catch<R>(&mut self, name: &'static str, f: impl FnOnce(&mut F) -> R) -> Result<R, ()> {
     let mut filter = self
       .filter
       .take()
@@ -63,11 +67,7 @@ impl<F> CatchUnwind<F> {
         Ok(val)
       },
       Err(panic) => {
-        crate::envoy_log_error!(
-          "{}: caught panic: {}",
-          name,
-          crate::panic_payload_to_string(panic)
-        );
+        crate::log_ffi_panic(name, panic);
         Err(())
       },
     }
@@ -84,7 +84,9 @@ impl<F> CatchUnwind<F> {
   ///   fail-closed action.
   /// - `Err(CatchError::Poisoned)` if the wrapper was already poisoned and the callback was
   ///   skipped.
-  fn catch_or_skip<R>(&mut self, name: &str, f: impl FnOnce(&mut F) -> R) -> Result<R, CatchError> {
+  fn catch_or_skip<R>(
+    &mut self, name: &'static str, f: impl FnOnce(&mut F) -> R,
+  ) -> Result<R, CatchError> {
     let Some(mut filter) = self.filter.take() else {
       return Err(CatchError::Poisoned);
     };
@@ -95,11 +97,7 @@ impl<F> CatchUnwind<F> {
         Ok(val)
       },
       Err(panic) => {
-        crate::envoy_log_error!(
-          "{}: caught panic: {}",
-          name,
-          crate::panic_payload_to_string(panic)
-        );
+        crate::log_ffi_panic(name, panic);
         Err(CatchError::Panicked)
       },
     }

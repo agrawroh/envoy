@@ -44,6 +44,16 @@ void envoy_dynamic_module_callback_bootstrap_extension_config_scheduler_commit(
 
 void envoy_dynamic_module_callback_bootstrap_extension_config_signal_init_complete(
     envoy_dynamic_module_type_bootstrap_extension_config_envoy_ptr extension_config_envoy_ptr) {
+  using namespace Envoy;
+  // `Init::Target::ready()` mutates the init manager which is main-thread-only; the delegate
+  // itself has no guard. Guard at the ABI entry point and fail closed (no-op) so a worker that
+  // mis-invokes this callback cannot race the init manager and start the server prematurely.
+  if (!Thread::MainThread::isMainOrTestThread()) {
+    IS_ENVOY_BUG(
+        "envoy_dynamic_module_callback_bootstrap_extension_config_signal_init_complete must be "
+        "called on the main thread");
+    return;
+  }
   auto* config = static_cast<DynamicModuleBootstrapExtensionConfig*>(extension_config_envoy_ptr);
   config->signalInitComplete();
 }
@@ -488,18 +498,46 @@ envoy_dynamic_module_callback_bootstrap_extension_timer_new(
 void envoy_dynamic_module_callback_bootstrap_extension_timer_enable(
     envoy_dynamic_module_type_bootstrap_extension_timer_module_ptr timer_ptr,
     uint64_t delay_milliseconds) {
+  using namespace Envoy;
+  // `Event::Timer::enableTimer` mutates the dispatcher's timer list and is only safe on the
+  // dispatcher thread. The previous `ASSERT_IS_MAIN_OR_TEST_THREAD` is compiled out under NDEBUG,
+  // so guard explicitly and skip the call to avoid racing on the timer list.
+  if (!Thread::MainThread::isMainOrTestThread()) {
+    IS_ENVOY_BUG("envoy_dynamic_module_callback_bootstrap_extension_timer_enable must be called "
+                 "on the main thread");
+    return;
+  }
   auto* timer = static_cast<DynamicModuleBootstrapExtensionTimer*>(timer_ptr);
   timer->timer().enableTimer(std::chrono::milliseconds(delay_milliseconds));
 }
 
 void envoy_dynamic_module_callback_bootstrap_extension_timer_disable(
     envoy_dynamic_module_type_bootstrap_extension_timer_module_ptr timer_ptr) {
+  using namespace Envoy;
+  // `Event::Timer::disableTimer` mutates the dispatcher's timer list and is only safe on the
+  // dispatcher thread. The previous `ASSERT_IS_MAIN_OR_TEST_THREAD` is compiled out under NDEBUG,
+  // so guard explicitly and skip the call to avoid racing on the timer list.
+  if (!Thread::MainThread::isMainOrTestThread()) {
+    IS_ENVOY_BUG("envoy_dynamic_module_callback_bootstrap_extension_timer_disable must be called "
+                 "on the main thread");
+    return;
+  }
   auto* timer = static_cast<DynamicModuleBootstrapExtensionTimer*>(timer_ptr);
   timer->timer().disableTimer();
 }
 
 bool envoy_dynamic_module_callback_bootstrap_extension_timer_enabled(
     envoy_dynamic_module_type_bootstrap_extension_timer_module_ptr timer_ptr) {
+  using namespace Envoy;
+  // `Event::Timer::enabled` reads dispatcher-owned state that is mutated by enable/disable on the
+  // dispatcher thread; reading from a worker is a torn-read and racey. Guard explicitly because
+  // the previous `ASSERT_IS_MAIN_OR_TEST_THREAD` is compiled out under NDEBUG; fail closed by
+  // reporting "not enabled".
+  if (!Thread::MainThread::isMainOrTestThread()) {
+    IS_ENVOY_BUG("envoy_dynamic_module_callback_bootstrap_extension_timer_enabled must be called "
+                 "on the main thread");
+    return false;
+  }
   auto* timer = static_cast<DynamicModuleBootstrapExtensionTimer*>(timer_ptr);
   return timer->timer().enabled();
 }
@@ -524,6 +562,17 @@ void envoy_dynamic_module_callback_bootstrap_extension_timer_delete(
 bool envoy_dynamic_module_callback_bootstrap_extension_file_watcher_add_watch(
     envoy_dynamic_module_type_bootstrap_extension_config_envoy_ptr extension_config_envoy_ptr,
     envoy_dynamic_module_type_module_buffer path, uint32_t events) {
+  using namespace Envoy;
+  // The filesystem watcher and the `file_watchers_` vector are owned by the main-thread
+  // dispatcher; mutating either off the main thread races. The previous
+  // `ASSERT_IS_MAIN_OR_TEST_THREAD` is compiled out under NDEBUG, so guard explicitly and fail
+  // closed by reporting that the watch was not installed.
+  if (!Thread::MainThread::isMainOrTestThread()) {
+    IS_ENVOY_BUG(
+        "envoy_dynamic_module_callback_bootstrap_extension_file_watcher_add_watch must be called "
+        "on the main thread");
+    return false;
+  }
   auto* config = static_cast<DynamicModuleBootstrapExtensionConfig*>(extension_config_envoy_ptr);
 
   // Create a new filesystem watcher for this path. Envoy owns the watcher lifetime.
@@ -563,6 +612,16 @@ bool envoy_dynamic_module_callback_bootstrap_extension_register_admin_handler(
     envoy_dynamic_module_type_bootstrap_extension_config_envoy_ptr extension_config_envoy_ptr,
     envoy_dynamic_module_type_module_buffer path_prefix,
     envoy_dynamic_module_type_module_buffer help_text, bool removable, bool mutates_server_state) {
+  using namespace Envoy;
+  // `Admin::addHandler` mutates the admin handler registry which is only safe from the main
+  // thread. The previous `ASSERT_IS_MAIN_OR_TEST_THREAD` is compiled out under NDEBUG, so guard
+  // explicitly and fail closed by reporting registration failure.
+  if (!Thread::MainThread::isMainOrTestThread()) {
+    IS_ENVOY_BUG(
+        "envoy_dynamic_module_callback_bootstrap_extension_register_admin_handler must be called "
+        "on the main thread");
+    return false;
+  }
   auto* config = static_cast<DynamicModuleBootstrapExtensionConfig*>(extension_config_envoy_ptr);
   Envoy::OptRef<Envoy::Server::Admin> admin = config->context_.admin();
   if (!admin.has_value()) {
@@ -619,6 +678,16 @@ bool envoy_dynamic_module_callback_bootstrap_extension_register_admin_handler(
 bool envoy_dynamic_module_callback_bootstrap_extension_remove_admin_handler(
     envoy_dynamic_module_type_bootstrap_extension_config_envoy_ptr extension_config_envoy_ptr,
     envoy_dynamic_module_type_module_buffer path_prefix) {
+  using namespace Envoy;
+  // `Admin::removeHandler` mutates the admin handler registry which is only safe from the main
+  // thread. The previous `ASSERT_IS_MAIN_OR_TEST_THREAD` is compiled out under NDEBUG, so guard
+  // explicitly and fail closed by reporting the handler was not removed.
+  if (!Thread::MainThread::isMainOrTestThread()) {
+    IS_ENVOY_BUG(
+        "envoy_dynamic_module_callback_bootstrap_extension_remove_admin_handler must be called "
+        "on the main thread");
+    return false;
+  }
   auto* config = static_cast<DynamicModuleBootstrapExtensionConfig*>(extension_config_envoy_ptr);
   Envoy::OptRef<Envoy::Server::Admin> admin = config->context_.admin();
   if (!admin.has_value()) {
@@ -633,6 +702,16 @@ bool envoy_dynamic_module_callback_bootstrap_extension_remove_admin_handler(
 
 bool envoy_dynamic_module_callback_bootstrap_extension_enable_cluster_lifecycle(
     envoy_dynamic_module_type_bootstrap_extension_config_envoy_ptr extension_config_envoy_ptr) {
+  using namespace Envoy;
+  // `ClusterManager::addThreadLocalClusterUpdateCallbacks` and lifecycle-notifier registration
+  // both run on the main thread; the delegate itself has no guard. Guard at the ABI entry point
+  // and fail closed by reporting the lifecycle was not enabled.
+  if (!Thread::MainThread::isMainOrTestThread()) {
+    IS_ENVOY_BUG(
+        "envoy_dynamic_module_callback_bootstrap_extension_enable_cluster_lifecycle must be "
+        "called on the main thread");
+    return false;
+  }
   auto* config = static_cast<DynamicModuleBootstrapExtensionConfig*>(extension_config_envoy_ptr);
   return config->enableClusterLifecycle();
 }
@@ -641,6 +720,16 @@ bool envoy_dynamic_module_callback_bootstrap_extension_enable_cluster_lifecycle(
 
 bool envoy_dynamic_module_callback_bootstrap_extension_enable_listener_lifecycle(
     envoy_dynamic_module_type_bootstrap_extension_config_envoy_ptr extension_config_envoy_ptr) {
+  using namespace Envoy;
+  // `ListenerManager::addListenerUpdateCallbacks` and lifecycle-notifier registration both run
+  // on the main thread; the delegate itself has no guard. Guard at the ABI entry point and fail
+  // closed by reporting the lifecycle was not enabled.
+  if (!Thread::MainThread::isMainOrTestThread()) {
+    IS_ENVOY_BUG(
+        "envoy_dynamic_module_callback_bootstrap_extension_enable_listener_lifecycle must be "
+        "called on the main thread");
+    return false;
+  }
   auto* config = static_cast<DynamicModuleBootstrapExtensionConfig*>(extension_config_envoy_ptr);
   return config->enableListenerLifecycle();
 }
