@@ -39,16 +39,20 @@ use std::sync::Arc;
 const IO_BUF_SIZE: usize = 65536;
 /// Maximum number of write buffer slices retrieved from Envoy per write call.
 const MAX_WRITE_SLICES: usize = 16;
-/// Upper bound on the rustls outbound plaintext queue (set via `Connection::set_buffer_limit`).
-/// When the queue fills, `writer().write()` returns a short count; we stop consuming further
-/// plaintext from Envoy's write buffer so Envoy's high-watermark fires and propagates
-/// backpressure to the producer (HCM filter chain). 256 KiB leaves room for several pipelined
-/// records without unbounding memory.
+/// Upper bound on the rustls outbound plaintext queue (set via `Connection::set_buffer_limit`,
+/// which caps `sendable_plaintext`). When the queue fills, `writer().write()` returns a short
+/// count; we stop consuming further plaintext from Envoy's write buffer so Envoy's
+/// high-watermark fires and propagates backpressure to the producer (HCM filter chain).
 const RUSTLS_PLAINTEXT_BUFFER_LIMIT: usize = 256 * 1024;
-/// Upper bound on the post-encryption socket-write backlog. Bytes appended beyond this point
-/// would otherwise blow past Envoy's bounded write_buffer and break flow control on slow
-/// upstreams (e.g. S3 PUT against a throttled bucket). When the backlog is at the bound, we
-/// stop pumping rustls's TLS output until the socket accepts more.
+/// Upper bound on the post-encryption socket-write backlog held in `tls_write_backlog`. Bytes
+/// appended beyond this point would otherwise blow past Envoy's bounded write_buffer and
+/// break flow control on slow upstreams (e.g. S3 PUT against a throttled bucket). When the
+/// backlog reaches the bound (or exceeds it by up to one record on the loop boundary — soft
+/// cap), we stop pumping rustls's TLS output until the socket accepts more.
+///
+/// Worst-case per-connection memory budget for the write path is roughly
+/// `RUSTLS_PLAINTEXT_BUFFER_LIMIT` (plaintext queue) + a single in-flight TLS record's worth
+/// of post-encryption buffering inside rustls + `TLS_WRITE_BACKLOG_LIMIT` (drained-but-unsent).
 const TLS_WRITE_BACKLOG_LIMIT: usize = 256 * 1024;
 
 // -------------------------------------------------------------------------------------------------
@@ -328,9 +332,9 @@ struct RustlsTransportSocket {
   /// True once the userspace TLS path has emitted a `close_notify` alert into the rustls
   /// send queue (in response to `end_stream=true` on `on_do_write`). Prevents double-close.
   userspace_close_notify_sent: bool,
-  /// Reserved for re-entrancy detection on the write path. Currently unused because the
-  /// previous `flush_write_buffer()` self-call has been removed; kept as a tripwire in case
-  /// future code adds back a recursive dispatch.
+  /// Re-entrancy tripwire on the write path. Defense-in-depth against a future change that
+  /// reintroduces a recursive `flush_write_buffer()`/`on_do_write` self-call: if `on_do_write`
+  /// detects it is already running, it short-circuits with `keep_open(0, false)`.
   in_do_write: bool,
 }
 
@@ -492,9 +496,16 @@ impl RustlsTransportSocket {
         None => return,
       };
       if !ktls_cipher_supported(conn) {
-        envoy_log_warn!(
-          "kTLS: negotiated cipher is not supported, continuing with userspace TLS."
-        );
+        // Log once per program — the set of kTLS-eligible ciphers is fixed at build time, so
+        // a misconfigured cluster will see this fire on every connection. Per-connection warn
+        // logs would flood operator dashboards under load.
+        static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        WARNED.get_or_init(|| {
+          envoy_log_warn!(
+            "kTLS: negotiated cipher is not in the supported set; continuing with userspace TLS \
+             for this and all subsequent connections that negotiate this cipher."
+          );
+        });
         return;
       }
       self.ktls_pending = true;
@@ -756,7 +767,12 @@ impl RustlsTransportSocket {
     Ok(())
   }
 
-  fn feed_raw_to_rustls(&mut self, data: &[u8]) -> Result<(usize, bool), String> {
+  /// Feeds raw bytes into rustls's deframer. Returns the number of bytes rustls actually
+  /// consumed; any unconsumed tail is appended to `tls_read_backlog` for a retry on the next
+  /// iteration. Returning `Ok(0)` is legitimate rustls backpressure (deframer needs
+  /// `process_new_packets()` to drain first) — the outer loop in `on_do_read` always runs
+  /// `process_new_packets` after this call, so the next iteration's retry will make progress.
+  fn feed_raw_to_rustls(&mut self, data: &[u8]) -> Result<usize, String> {
     let conn = self
       .conn
       .as_mut()
@@ -767,11 +783,7 @@ impl RustlsTransportSocket {
     if consumed < data.len() {
       self.tls_read_backlog.extend_from_slice(&data[consumed ..]);
     }
-    // `read_tls` returning Ok(0) on non-empty input is legitimate rustls backpressure: it can
-    // happen when rustls's internal deframer needs `process_new_packets()` to be called first.
-    // The outer loop in `on_do_read` calls `process_new_packets` after every `feed_raw_to_rustls`,
-    // so we just report 0 bytes consumed and let the next iteration retry.
-    Ok((read, false))
+    Ok(read)
   }
 
   #[cfg(target_os = "linux")]
@@ -821,8 +833,7 @@ impl RustlsTransportSocket {
 
     if !self.tls_read_backlog.is_empty() {
       let backlog = std::mem::take(&mut self.tls_read_backlog);
-      let result = self.feed_raw_to_rustls(&backlog);
-      return result;
+      return self.feed_raw_to_rustls(&backlog).map(|n| (n, false));
     }
 
     #[cfg(target_os = "linux")]
@@ -841,7 +852,7 @@ impl RustlsTransportSocket {
         Ok(0) => return Ok((0, true)),
         Ok(n) => {
           self.advance_record_tracking(&raw[.. n]);
-          return self.feed_raw_to_rustls(&raw[.. n]);
+          return self.feed_raw_to_rustls(&raw[.. n]).map(|m| (m, false));
         },
         Err(rc) => {
           if err_would_block(rc) {
@@ -860,7 +871,7 @@ impl RustlsTransportSocket {
         if self.enable_ktls {
           self.advance_record_tracking(&raw[.. n]);
         }
-        self.feed_raw_to_rustls(&raw[.. n])
+        self.feed_raw_to_rustls(&raw[.. n]).map(|m| (m, false))
       },
       Err(rc) => {
         if err_would_block(rc) {
@@ -989,7 +1000,12 @@ impl RustlsTransportSocket {
     // RFC 8446 §6.1 (TLS 1.3) and RFC 5246 §7.2.1 (TLS 1.2) both require this for a graceful
     // half-close; some servers (notably AWS S3) treat a TCP FIN without a preceding
     // close_notify as a possible truncation attack and may fail the request.
+    //
+    // Only emit on an established connection — calling `send_close_notify` mid-handshake
+    // queues an alert that may be malformed for the current record layer (pre-Finished records
+    // are unencrypted on TLS 1.3 and the peer would treat it as a handshake-state-violation).
     if end_stream
+      && self.phase == Phase::Established
       && envoy.write_buffer_length() == 0
       && self.tls_write_backlog.is_empty()
       && !self.userspace_close_notify_sent
@@ -1080,7 +1096,13 @@ impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
         },
         Ok((0, false)) => {
           // No new raw bytes AND we already gave `process_new_packets` + `forward_plaintext`
-          // a chance. Safe to stop and wait for the next read event.
+          // a chance. If unconsumed bytes are sitting in `tls_read_backlog` (rustls's deframer
+          // briefly refused them), schedule another read so they get retried — the kernel
+          // won't generate a readable event by itself since no new bytes arrive on the
+          // wire. Otherwise just wait for the next epoll edge.
+          if !self.tls_read_backlog.is_empty() {
+            envoy.set_is_readable();
+          }
           break;
         },
         Ok((_, _)) => {
@@ -1088,7 +1110,9 @@ impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
         },
         Err(e) => {
           self.failure.clone_from(&e);
-          envoy_log_error!("rustls: read_tls path failed: {e}");
+          // Connection resets / EPIPE / ETIMEDOUT are routine on a busy proxy; reserve
+          // `error!` for invariant violations and use `warn!` for transport-level errors.
+          envoy_log_warn!("rustls: read_tls path failed: {e}");
           return IoResult::close(total_plaintext, false);
         },
       }
@@ -1106,9 +1130,15 @@ impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
     #[cfg(target_os = "linux")]
     if self.ktls_pending
       && self.tls_read_backlog.is_empty()
+      && self.tls_write_backlog.is_empty()
       && self.tls_record_bytes_remaining == 0
       && self.tls_record_header_seen == 0
     {
+      // `tls_write_backlog.is_empty()` is required because `drain_backlog_strict` (Step 1 of
+      // `run_linux_ktls`) treats EAGAIN as fatal — if the socket is currently busy and we have
+      // outgoing TLS bytes pending, the install attempt would error and `ktls_attempted`
+      // latches to true, permanently disabling kTLS for this connection. The check defers the
+      // attempt to a later `on_do_read` after the next `drain_outgoing_tls` succeeds.
       self.ktls_pending = false;
       self.try_install_ktls(envoy);
       if self.phase == Phase::Ktls {
@@ -1145,13 +1175,12 @@ impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
     #[cfg(not(target_os = "linux"))]
     let result = self.on_do_write_inner(envoy, end_stream);
     self.in_do_write = false;
-    // NOTE: the previous code called `envoy.flush_write_buffer()` here when bytes were
-    // written. That triggers a synchronous re-entry into `on_do_write` via
-    // `ConnectionImpl::onWriteReady`, which busy-loops drain Envoy's write buffer in one
-    // dispatcher iteration — head-of-line blocking for every other connection on the worker.
-    // The standard Envoy contract is: return from `doWrite` and let the connection layer
-    // schedule the next write when the socket is writable or more data arrives. We follow
-    // that pattern now.
+    // INVARIANT: do NOT call `envoy.flush_write_buffer()` here. `flush_write_buffer` triggers
+    // a synchronous re-entry into `on_do_write` via `ConnectionImpl::onWriteReady`, which
+    // busy-loops draining Envoy's write buffer in a single dispatcher iteration — head-of-line
+    // blocking every other connection on the worker. The standard Envoy contract is: return
+    // from `doWrite` and let the connection layer schedule the next write when the socket
+    // becomes writable or more data arrives.
     result
   }
 
@@ -1326,7 +1355,11 @@ impl RustlsTransportSocket {
       iov_count += 1;
     }
     if iov_count == 0 || total_requested == 0 {
-      if end_stream && !self.ktls_shutdown_sent {
+      // Cross-phase de-dup: if the userspace TLS path already emitted a close_notify (e.g.
+      // before kTLS install completed and a subsequent on_do_write fired with end_stream),
+      // don't emit a second one over kTLS. The peer would see two alerts back-to-back, which
+      // strict servers (S3) may reject.
+      if end_stream && !self.ktls_shutdown_sent && !self.userspace_close_notify_sent {
         let _ = linux_ktls::send_close_notify(fd);
         unsafe {
           libc::shutdown(fd, libc::SHUT_WR);
@@ -1391,7 +1424,7 @@ impl RustlsTransportSocket {
     if total > 0 {
       envoy.write_buffer_drain(total);
     }
-    if end_stream && iov_count == 0 && !self.ktls_shutdown_sent {
+    if end_stream && iov_count == 0 && !self.ktls_shutdown_sent && !self.userspace_close_notify_sent {
       let _ = linux_ktls::send_close_notify(fd);
       unsafe {
         libc::shutdown(fd, libc::SHUT_WR);
@@ -1490,13 +1523,11 @@ mod linux_ktls {
 
   const TLS_SET_RECORD_TYPE: libc::c_int = 1;
   const TLS_GET_RECORD_TYPE: libc::c_int = 2;
-  #[allow(dead_code)]
   const TLS_RX_EXPECT_NO_PAD: libc::c_int = 3;
   const TLS_CONTENT_TYPE_ALERT: u8 = 21;
   const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 22;
   const TLS_CONTENT_TYPE_APP_DATA: u8 = 23;
 
-  #[allow(dead_code)]
   const TLS_ALERT_LEVEL_FATAL: u8 = 2;
   const TLS_ALERT_CLOSE_NOTIFY: u8 = 0;
 

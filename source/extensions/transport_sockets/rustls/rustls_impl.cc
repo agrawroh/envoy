@@ -123,10 +123,16 @@ RustlsTransportSocket::RustlsTransportSocket(RustlsTransportSocketConfigSharedPt
                                              Network::TransportSocketOptionsConstSharedPtr /*options*/,
                                              Upstream::HostDescriptionConstSharedPtr /*host*/)
     : config_(std::move(config)) {
+  // `options` and `host` are accepted for forward-compatibility with the
+  // `Network::TransportSocketFactory::createTransportSocket` interface, but they are
+  // intentionally not consumed here: per-connection SNI / ALPN / SAN-match-list overrides are
+  // pre-screened in `RustlsUpstreamTransportSocketFactory::createTransportSocket` and routed
+  // through `NotReadyRustlsSocket`. If a future change adds true per-connection plumbing
+  // (extending the dynamic-modules SDK ABI), wire `options`/`host` into the rustls module here.
   socket_module_ = config_->on_socket_new_(config_->in_module_factory_config_, thisAsEnvoyPtr());
   // Allocation failure (e.g. process OOM) is surfaced via `socketModuleAllocated()`. The factory
-  // returns nullptr in that case so the connection layer reports a clean connect failure rather
-  // than carrying a dead socket forward — see RustlsUpstream/DownstreamTransportSocketFactory.
+  // returns a `NotReadyRustlsSocket` in that case so the connection layer reports a clean
+  // connect failure rather than carrying a dead socket forward.
 }
 
 RustlsTransportSocket::~RustlsTransportSocket() {
