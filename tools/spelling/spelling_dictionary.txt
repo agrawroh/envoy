@@ -1011,6 +1011,7 @@ keepalives
 keyset
 ketama
 keyder
+kTLS
 kqueue
 kubernetes
 kv
@@ -1368,6 +1369,7 @@ ruleset
 runfiles
 runtime
 runtimes
+rustls
 rver
 rxhash
 sandboxed
@@ -1582,6 +1584,7 @@ useragent
 userdata
 userinfo
 username
+userspace
 usr
 util
 utils

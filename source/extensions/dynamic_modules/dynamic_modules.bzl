@@ -59,6 +59,19 @@ def envoy_dynamic_module_prefix_symbols(name, module_name, archive, tags = [], *
     # the archive target's outputs (cc_library may produce both .a and .pic.a);
     # falls back to any .a if all archives are PIC-suffixed.
     #
+    # --weaken converts all global symbols to weak binding. This prevents duplicate
+    # symbol errors when multiple Rust static archives are linked into the same
+    # binary, since each archive bundles identical LLVM compiler-rt builtins. The
+    # prefixed hook symbols remain in the symbol table as weak globals and are still
+    # exported via the version script pattern in bazel/exported_symbols.txt.
+    #
+    # CROSS-EXTENSION NOTE: this macro is shared by every consumer of
+    # `envoy_dynamic_module_prefix_symbols` (today: hickory_dns_static under
+    # source/extensions/dynamic_modules/builtin_extensions, rustls_ktls_static under
+    # source/extensions/transport_sockets/rustls/rust). Changing the weaken policy here
+    # affects ALL of them; if you need narrower scope per consumer, pass an opt-in
+    # `weaken = True/False` argument and gate the flag.
+    #
     # NOTE: The case statement is kept outside $() command substitution for
     # compatibility with bash 3.2 (macOS default), which cannot parse case
     # pattern delimiters inside $().
@@ -75,11 +88,11 @@ def envoy_dynamic_module_prefix_symbols(name, module_name, archive, tags = [], *
         cmd = archive_select_cmd + select({
             "@envoy_repo//:use_local_llvm": (
                 "%s/bin/llvm-objcopy " % LLVM_PATH +
-                "--redefine-syms=$(location :" + redefine_syms_name + ") $$ARCH $@"
+                "--redefine-syms=$(location :" + redefine_syms_name + ") --weaken $$ARCH $@"
             ),
             "//conditions:default": (
                 "$(location @llvm_toolchain_llvm//:objcopy) " +
-                "--redefine-syms=$(location :" + redefine_syms_name + ") $$ARCH $@"
+                "--redefine-syms=$(location :" + redefine_syms_name + ") --weaken $$ARCH $@"
             ),
         }),
         tools = select({

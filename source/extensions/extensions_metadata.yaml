@@ -1638,6 +1638,15 @@ envoy.transport_sockets.raw_buffer:
   status: stable
   type_urls:
   - envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer
+envoy.transport_sockets.rustls:
+  categories:
+  - envoy.transport_sockets.downstream
+  - envoy.transport_sockets.upstream
+  security_posture: requires_trusted_downstream_and_upstream
+  status: alpha
+  type_urls:
+  - envoy.extensions.transport_sockets.rustls.v3.RustlsUpstreamTlsContext
+  - envoy.extensions.transport_sockets.rustls.v3.RustlsDownstreamTlsContext
 envoy.transport_sockets.starttls:
   categories:
   - envoy.transport_sockets.downstream
