@@ -11,6 +11,48 @@ namespace Envoy {
 namespace Server {
 namespace Configuration {
 
+namespace {
+
+// Reconciles the listener-filter ownership contract with `enable_shared_from_this`.
+//
+// `Network::ListenerFilterManager::addAcceptFilter` accepts a
+// `std::unique_ptr<Network::ListenerFilter>`, but `DynamicModuleListenerFilter` derives from
+// `std::enable_shared_from_this` and relies on `shared_from_this()` (in `sendHttpCallout`) and
+// `weak_from_this()` (in the scheduler ABIs) to safely hand the filter's lifetime out to async
+// machinery (HTTP callouts, cross-thread schedulers). Constructing the filter via
+// `std::make_unique` would not create a `shared_ptr` control block, so `shared_from_this()` would
+// throw `std::bad_weak_ptr` across the Rust `extern "C"` boundary (UB / abort), and
+// `weak_from_this()` would return an already-expired weak_ptr (scheduler callbacks silently never
+// fire).
+//
+// This adapter owns a `shared_ptr<DynamicModuleListenerFilter>` and forwards the four
+// `Network::ListenerFilter` virtuals to it. The framework still receives a `unique_ptr<>`, but the
+// underlying filter is shared-pointer-owned, matching the HTTP and network filter implementations
+// (which use APIs that natively accept `shared_ptr`).
+// `final` on the class and each override lets the compiler de-virtualize through the adapter,
+// keeping the forwarding overhead at a single virtual call into `DynamicModuleListenerFilter`
+// (matching the pre-fix dispatch count).
+class ListenerFilterSharedAdapter final : public Network::ListenerFilter {
+public:
+  explicit ListenerFilterSharedAdapter(
+      Extensions::DynamicModules::ListenerFilters::DynamicModuleListenerFilterSharedPtr filter)
+      : filter_(std::move(filter)) {}
+
+  Network::FilterStatus onAccept(Network::ListenerFilterCallbacks& cb) final {
+    return filter_->onAccept(cb);
+  }
+  Network::FilterStatus onData(Network::ListenerFilterBuffer& buffer) final {
+    return filter_->onData(buffer);
+  }
+  void onClose() final { filter_->onClose(); }
+  size_t maxReadBytes() const final { return filter_->maxReadBytes(); }
+
+private:
+  const Extensions::DynamicModules::ListenerFilters::DynamicModuleListenerFilterSharedPtr filter_;
+};
+
+} // namespace
+
 Network::ListenerFilterFactoryCb
 DynamicModuleListenerFilterConfigFactory::createListenerFilterFactoryFromProto(
     const Protobuf::Message& message,
@@ -66,10 +108,15 @@ DynamicModuleListenerFilterConfigFactory::createListenerFilterFactoryFromProto(
 
   return [filter_cfg = filter_config.value(),
           listener_filter_matcher](Network::ListenerFilterManager& filter_manager) -> void {
+    // Construct via `make_shared` so the filter has a live shared_ptr control block, then wrap in
+    // a thin adapter to satisfy the framework's `unique_ptr<ListenerFilter>` API. See
+    // `ListenerFilterSharedAdapter` above.
     auto filter =
-        std::make_unique<Extensions::DynamicModules::ListenerFilters::DynamicModuleListenerFilter>(
+        std::make_shared<Extensions::DynamicModules::ListenerFilters::DynamicModuleListenerFilter>(
             filter_cfg);
-    filter_manager.addAcceptFilter(listener_filter_matcher, std::move(filter));
+    filter_manager.addAcceptFilter(
+        listener_filter_matcher,
+        std::make_unique<ListenerFilterSharedAdapter>(std::move(filter)));
   };
 }
 

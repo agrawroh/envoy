@@ -42,6 +42,7 @@ envoy_cc_test(
         "//source/common/stats:custom_stat_namespaces_lib",
         "//source/extensions/filters/listener/dynamic_modules:config",
         "//test/extensions/dynamic_modules:util",
+        "//test/mocks/event:event_mocks",
         "//test/mocks/network:network_mocks",
         "//test/mocks/server:listener_factory_context_mocks",
         "//test/test_common:test_runtime_lib",

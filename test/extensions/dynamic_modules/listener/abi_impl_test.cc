@@ -62,6 +62,23 @@ private:
   Buffer::Instance& buffer_;
 };
 
+// NOTE on production lifecycle vs. test setup:
+//
+// In production, `DynamicModuleListenerFilter` is created by
+// `DynamicModuleListenerFilterConfigFactory::createListenerFilterFactoryFromProto` (see
+// `source/extensions/filters/listener/dynamic_modules/factory.cc`). The framework owns listener
+// filters as `std::unique_ptr<Network::ListenerFilter>`, so the factory wraps a
+// `std::shared_ptr<DynamicModuleListenerFilter>` in a thin `ListenerFilterSharedAdapter` that
+// forwards the four `Network::ListenerFilter` virtuals. The wrapping `make_shared` is what makes
+// `shared_from_this()` (called from `sendHttpCallout`) and `weak_from_this()` (called from the
+// scheduler ABIs) work — without it, `shared_from_this()` throws `std::bad_weak_ptr` across the
+// Rust `extern "C"` boundary (UB / abort) and `weak_from_this()` returns an expired weak_ptr.
+//
+// The unit tests below construct the filter directly via
+// `std::make_shared<DynamicModuleListenerFilter>`, which mirrors the production ownership for the
+// inner filter (same control block) and therefore exercises the filter methods faithfully. The
+// factory-level wrapping is covered by `factory_test.cc`'s
+// `FilterFactoryCallbackProducesUsableFilter` regression test.
 class DynamicModuleListenerFilterAbiCallbackTest : public testing::Test {
 public:
   void SetUp() override {

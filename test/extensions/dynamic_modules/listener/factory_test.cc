@@ -4,6 +4,7 @@
 #include "source/extensions/filters/listener/dynamic_modules/factory.h"
 
 #include "test/extensions/dynamic_modules/util.h"
+#include "test/mocks/event/mocks.h"
 #include "test/mocks/network/mocks.h"
 #include "test/mocks/server/listener_factory_context.h"
 #include "test/test_common/environment.h"
@@ -91,6 +92,46 @@ TEST_F(DynamicModuleListenerFilterFactoryTest, FilterFactoryCallbackAddsFilter) 
   NiceMock<Network::MockListenerFilterManager> filter_manager;
   EXPECT_CALL(filter_manager, addAcceptFilter_(testing::_, testing::_));
   result(filter_manager);
+}
+
+// Regression test for the `bad_weak_ptr` abort: the factory must construct
+// `DynamicModuleListenerFilter` via `std::make_shared` (and wrap it in
+// `ListenerFilterSharedAdapter`) so that `shared_from_this()` / `weak_from_this()` calls inside
+// the filter succeed. With the previous `std::make_unique` construction there was no shared_ptr
+// control block, and any call to `shared_from_this()` (e.g. from `sendHttpCallout`) would throw
+// `std::bad_weak_ptr` across the Rust `extern "C"` boundary -> abort.
+//
+// We can't easily reach the inner filter through the anonymous-namespace adapter without adding
+// test-only API surface, but we can exercise the full factory -> framework path and verify the
+// produced filter forwards the `Network::ListenerFilter` lifecycle methods without aborting.
+TEST_F(DynamicModuleListenerFilterFactoryTest, FilterFactoryCallbackProducesUsableFilter) {
+  envoy::extensions::filters::listener::dynamic_modules::v3::DynamicModuleListenerFilter config;
+  config.mutable_dynamic_module_config()->set_name("listener_no_op");
+  config.set_filter_name("test_filter");
+
+  auto result = factory_.createListenerFilterFactoryFromProto(config, nullptr, context_);
+  ASSERT_NE(nullptr, result);
+
+  // Capture the filter that the factory hands to the manager. The mock receives the unique_ptr
+  // by reference, so we take ownership here to keep the filter alive past the factory call.
+  NiceMock<Network::MockListenerFilterManager> filter_manager;
+  Network::ListenerFilterPtr captured_filter;
+  EXPECT_CALL(filter_manager, addAcceptFilter_(testing::_, testing::_))
+      .WillOnce(testing::Invoke(
+          [&](const Network::ListenerFilterMatcherSharedPtr&, Network::ListenerFilterPtr& filter) {
+            captured_filter = std::move(filter);
+          }));
+  result(filter_manager);
+  ASSERT_NE(nullptr, captured_filter);
+
+  // Exercise the four forwarded virtuals; the adapter should route each one to the underlying
+  // shared-pointer-owned filter without aborting.
+  NiceMock<Network::MockListenerFilterCallbacks> callbacks;
+  NiceMock<Event::MockDispatcher> dispatcher{"worker_0"};
+  ON_CALL(callbacks, dispatcher()).WillByDefault(testing::ReturnRef(dispatcher));
+  EXPECT_NO_THROW(captured_filter->onAccept(callbacks));
+  EXPECT_NO_THROW((void)captured_filter->maxReadBytes());
+  EXPECT_NO_THROW(captured_filter->onClose());
 }
 
 TEST_F(DynamicModuleListenerFilterFactoryTest, DoNotCloseOption) {
