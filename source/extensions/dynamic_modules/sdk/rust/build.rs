@@ -17,8 +17,11 @@ fn main() {
   let bindings = bindgen::Builder::default()
     .header("../../abi/abi.h")
     .clang_arg("-v")
+    // non_exhaustive=true so adding a new variant on the C side cannot silently turn
+    // an otherwise-exhaustive `match` on a bindgen-generated enum into undefined behavior.
+    // Every match on these enums must have a `_ =>` arm returning a safe sentinel.
     .default_enum_style(bindgen::EnumVariation::Rust {
-      non_exhaustive: false,
+      non_exhaustive: true,
     })
     .derive_partialeq(true)
     .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))

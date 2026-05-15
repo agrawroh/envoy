@@ -307,6 +307,9 @@ impl AccessLogType {
   /// Convert from the ABI enum value. Used internally by the macro.
   #[doc(hidden)]
   pub fn from_abi(value: abi::envoy_dynamic_module_type_access_log_type) -> Self {
+    // See dns_resolver::on_dns_resolve for why #[allow(unreachable_patterns)] is needed
+    // alongside the safety wildcard for bindgen #[non_exhaustive] enums consumed in-crate.
+    #[allow(unreachable_patterns)]
     match value {
       abi::envoy_dynamic_module_type_access_log_type::TcpUpstreamConnected => {
         AccessLogType::TcpUpstreamConnected

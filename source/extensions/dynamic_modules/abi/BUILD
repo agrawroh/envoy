@@ -8,6 +8,7 @@ exports_files(["abi.h"])
 
 cc_library(
     name = "abi",
+    srcs = ["abi_layout_asserts.cc"],
     hdrs = ["abi.h"],
     visibility = ["//visibility:public"],
     alwayslink = True,

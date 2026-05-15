@@ -390,12 +390,18 @@ pub enum TraceReason {
 
 impl From<abi::envoy_dynamic_module_type_trace_reason> for TraceReason {
   fn from(reason: abi::envoy_dynamic_module_type_trace_reason) -> Self {
+    // See dns_resolver::on_dns_resolve for why #[allow(unreachable_patterns)] is needed
+    // alongside the safety wildcard for bindgen #[non_exhaustive] enums consumed in-crate.
+    #[allow(unreachable_patterns)]
     match reason {
       abi::envoy_dynamic_module_type_trace_reason::NotTraceable => TraceReason::NotTraceable,
       abi::envoy_dynamic_module_type_trace_reason::HealthCheck => TraceReason::HealthCheck,
       abi::envoy_dynamic_module_type_trace_reason::Sampling => TraceReason::Sampling,
       abi::envoy_dynamic_module_type_trace_reason::ServiceForced => TraceReason::ServiceForced,
       abi::envoy_dynamic_module_type_trace_reason::ClientForced => TraceReason::ClientForced,
+      // Unknown future variant: fall back to NotTraceable rather than guess at a sampling
+      // semantic — false-positive traces are cheaper than mislabelled traces.
+      _ => TraceReason::NotTraceable,
     }
   }
 }

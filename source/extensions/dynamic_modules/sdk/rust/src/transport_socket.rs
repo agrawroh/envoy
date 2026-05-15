@@ -80,11 +80,17 @@ impl From<PostIoAction> for abi::envoy_dynamic_module_type_transport_socket_post
 
 impl From<abi::envoy_dynamic_module_type_transport_socket_post_io_action> for PostIoAction {
   fn from(value: abi::envoy_dynamic_module_type_transport_socket_post_io_action) -> Self {
+    // See dns_resolver::on_dns_resolve for why #[allow(unreachable_patterns)] is needed
+    // alongside the safety wildcard for bindgen #[non_exhaustive] enums consumed in-crate.
+    #[allow(unreachable_patterns)]
     match value {
       abi::envoy_dynamic_module_type_transport_socket_post_io_action::KeepOpen => {
         PostIoAction::KeepOpen
       },
       abi::envoy_dynamic_module_type_transport_socket_post_io_action::Close => PostIoAction::Close,
+      // Unknown future variant: fail closed by closing the connection. Treating an unknown
+      // post-IO action as KeepOpen could leak a half-broken socket back to the worker loop.
+      _ => PostIoAction::Close,
     }
   }
 }
@@ -119,6 +125,9 @@ impl From<ConnectionEvent> for abi::envoy_dynamic_module_type_network_connection
 
 impl From<abi::envoy_dynamic_module_type_network_connection_event> for ConnectionEvent {
   fn from(value: abi::envoy_dynamic_module_type_network_connection_event) -> Self {
+    // See dns_resolver::on_dns_resolve for why #[allow(unreachable_patterns)] is needed
+    // alongside the safety wildcard for bindgen #[non_exhaustive] enums consumed in-crate.
+    #[allow(unreachable_patterns)]
     match value {
       abi::envoy_dynamic_module_type_network_connection_event::RemoteClose => {
         ConnectionEvent::RemoteClose
@@ -132,6 +141,10 @@ impl From<abi::envoy_dynamic_module_type_network_connection_event> for Connectio
       abi::envoy_dynamic_module_type_network_connection_event::ConnectedZeroRtt => {
         ConnectionEvent::ConnectedZeroRtt
       },
+      // Unknown future variant: treat as a remote close. Modules typically tear down
+      // per-connection state on RemoteClose, which is the safest interpretation of an
+      // event we can't classify.
+      _ => ConnectionEvent::RemoteClose,
     }
   }
 }

@@ -73,13 +73,31 @@ newDynamicModule(const std::filesystem::path& object_file_absolute_path, const b
     return absl::InvalidArgumentError(
         absl::StrCat("Failed to initialize dynamic module: ", object_file_absolute_path.c_str()));
   }
-  // We log a warning if the ABI version does not match exactly.
-  if (absl::string_view(abi_version) != absl::string_view(ENVOY_DYNAMIC_MODULES_ABI_VERSION)) {
+  // ABI version is "major.minor.patch" (see ENVOY_DYNAMIC_MODULES_ABI_VERSION in abi.h).
+  // Until v1.0 we only guarantee in-minor compatibility (STYLE.md); cross-minor drift
+  // is rejected by default because a struct-layout change in the SDK against an older
+  // Envoy is silently UB at the C ABI boundary (worst case: cert_validator_validation_result
+  // layout drift = TLS auth bypass). The build-time escape
+  // ENVOY_DYNAMIC_MODULES_ALLOW_VERSION_MISMATCH downgrades the check to a warning for
+  // staged rollouts that intentionally span minor versions.
+  const absl::string_view module_version_string(abi_version);
+  const absl::string_view envoy_version_string(ENVOY_DYNAMIC_MODULES_ABI_VERSION);
+  if (module_version_string != envoy_version_string) {
+#ifdef ENVOY_DYNAMIC_MODULES_ALLOW_VERSION_MISMATCH
     ENVOY_LOG_TO_LOGGER(
         Envoy::Logger::Registry::getLog(Envoy::Logger::Id::dynamic_modules), warn,
-        "Dynamic module ABI version {} is deprecated. Please recompile the module against the "
-        "SDK with the exact Envoy version used by the main program.",
-        abi_version);
+        "Dynamic module \"{}\" was built against ABI {} but Envoy provides ABI {}. "
+        "ENVOY_DYNAMIC_MODULES_ALLOW_VERSION_MISMATCH is set so the module is being loaded "
+        "anyway; ABI struct layout drift may silently corrupt memory.",
+        object_file_absolute_path.c_str(), module_version_string, envoy_version_string);
+#else
+    return absl::FailedPreconditionError(absl::StrCat(
+        "Dynamic module \"", object_file_absolute_path.c_str(), "\" was built against ABI ",
+        module_version_string, " but Envoy provides ABI ", envoy_version_string,
+        ". ABI minor-version drift is rejected by default; rebuild the module against the "
+        "current ABI or set ENVOY_DYNAMIC_MODULES_ALLOW_VERSION_MISMATCH at build time to "
+        "override (see STYLE.md)."));
+#endif
   } else {
     ENVOY_LOG_TO_LOGGER(Envoy::Logger::Registry::getLog(Envoy::Logger::Id::dynamic_modules), info,
                         "Dynamic module ABI version {} matched.", abi_version);
@@ -274,12 +292,26 @@ absl::StatusOr<DynamicModulePtr> newStaticModule(const absl::string_view module_
     return absl::InvalidArgumentError(
         absl::StrCat("Failed to initialize static module: ", module_name));
   }
-  if (absl::string_view(abi_version) != absl::string_view(ENVOY_DYNAMIC_MODULES_ABI_VERSION)) {
+  // See newDynamicModule for the rationale; we reject minor-version drift here for the
+  // same reason (struct layout drift is silent UB at the C ABI boundary).
+  const absl::string_view module_version_string(abi_version);
+  const absl::string_view envoy_version_string(ENVOY_DYNAMIC_MODULES_ABI_VERSION);
+  if (module_version_string != envoy_version_string) {
+#ifdef ENVOY_DYNAMIC_MODULES_ALLOW_VERSION_MISMATCH
     ENVOY_LOG_TO_LOGGER(
         Envoy::Logger::Registry::getLog(Envoy::Logger::Id::dynamic_modules), warn,
-        "Static module ABI version {} is deprecated. Please recompile the module against the "
-        "SDK with the exact Envoy version used by the main program.",
-        abi_version);
+        "Static module \"{}\" was built against ABI {} but Envoy provides ABI {}. "
+        "ENVOY_DYNAMIC_MODULES_ALLOW_VERSION_MISMATCH is set so the module is being loaded "
+        "anyway; ABI struct layout drift may silently corrupt memory.",
+        module_name, module_version_string, envoy_version_string);
+#else
+    return absl::FailedPreconditionError(
+        absl::StrCat("Static module \"", module_name, "\" was built against ABI ",
+                     module_version_string, " but Envoy provides ABI ", envoy_version_string,
+                     ". ABI minor-version drift is rejected by default; rebuild the module "
+                     "against the current ABI or set ENVOY_DYNAMIC_MODULES_ALLOW_VERSION_MISMATCH "
+                     "at build time to override (see STYLE.md)."));
+#endif
   } else {
     ENVOY_LOG_TO_LOGGER(Envoy::Logger::Registry::getLog(Envoy::Logger::Id::dynamic_modules), info,
                         "Static module ABI version {} matched.", abi_version);

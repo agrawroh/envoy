@@ -1328,6 +1328,9 @@ impl EnvoyNetworkFilter for EnvoyNetworkFilterImpl {
     options
       .into_iter()
       .map(|opt| {
+        // See dns_resolver::on_dns_resolve for why #[allow(unreachable_patterns)] is needed
+        // alongside the safety wildcard for bindgen #[non_exhaustive] enums consumed in-crate.
+        #[allow(unreachable_patterns)]
         let value = match opt.value_type {
           abi::envoy_dynamic_module_type_socket_option_value_type::Int => {
             SocketOptionValue::Int(opt.int_value)
@@ -1346,6 +1349,9 @@ impl EnvoyNetworkFilter for EnvoyNetworkFilterImpl {
               SocketOptionValue::Bytes(Vec::new())
             }
           },
+          // Unknown future variant: surface an empty bytes value rather than dereference
+          // a buffer whose interpretation we don't know.
+          _ => SocketOptionValue::Bytes(Vec::new()),
         };
         SocketOption {
           level: opt.level,

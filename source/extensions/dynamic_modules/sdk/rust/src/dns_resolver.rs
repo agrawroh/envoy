@@ -713,12 +713,24 @@ pub unsafe extern "C" fn envoy_dynamic_module_on_dns_resolve(
     let name_str =
       unsafe { crate::ffi_helpers::str_lossy_from_raw(dns_name.ptr as *const u8, dns_name.length) };
 
+    // The wildcard arm guards against future #[non_exhaustive] ABI variants from the
+    // C side. Rust's exhaustiveness check considers the bindgen-generated enum exhaustive
+    // within this crate (the #[non_exhaustive] attribute only carries semantic weight for
+    // external crates), so we suppress the unreachable-pattern lint locally rather than
+    // remove the safety net.
+    #[allow(unreachable_patterns)]
     let family = match lookup_family {
       abi::envoy_dynamic_module_type_dns_lookup_family::V4Only => DnsLookupFamily::V4Only,
       abi::envoy_dynamic_module_type_dns_lookup_family::V6Only => DnsLookupFamily::V6Only,
       abi::envoy_dynamic_module_type_dns_lookup_family::Auto => DnsLookupFamily::Auto,
       abi::envoy_dynamic_module_type_dns_lookup_family::V4Preferred => DnsLookupFamily::V4Preferred,
       abi::envoy_dynamic_module_type_dns_lookup_family::All => DnsLookupFamily::All,
+      // Future C-side variant. Caller is wrapped in `catch_unwind` and returns a null
+      // module ptr on panic; abort the query rather than guess an address family.
+      _ => panic!(
+        "envoy_dynamic_module: unknown dns_lookup_family discriminant from Envoy ABI: {:?}",
+        lookup_family
+      ),
     };
 
     match wrapper

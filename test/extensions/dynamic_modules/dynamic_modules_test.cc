@@ -121,11 +121,19 @@ TEST_P(DynamicModuleTestLanguages, ProgramInitFail) {
 }
 
 TEST_P(DynamicModuleTestLanguages, ABIVersionMismatch) {
-  // We expect a warning log for ABI version mismatch but still load the module successfully.
+  // ABI minor-version drift is rejected by default; the loader must return
+  // FailedPrecondition with a message that points to the override knob. (The previous
+  // behavior — log-and-continue — silently exposed the process to struct-layout drift
+  // at the C ABI boundary.)
   std::string language = GetParam();
   absl::StatusOr<DynamicModulePtr> result =
       newDynamicModule(testSharedObjectPath("abi_version_mismatch", language), false);
-  EXPECT_TRUE(result.ok());
+  EXPECT_FALSE(result.ok());
+  EXPECT_EQ(result.status().code(), absl::StatusCode::kFailedPrecondition);
+  EXPECT_THAT(result.status().message(),
+              testing::HasSubstr("ABI minor-version drift is rejected by default"));
+  EXPECT_THAT(result.status().message(),
+              testing::HasSubstr("ENVOY_DYNAMIC_MODULES_ALLOW_VERSION_MISMATCH"));
 }
 
 TEST(CreateDynamicModulesByName, EnvoyDynamicModulesSearchPathSet) {
