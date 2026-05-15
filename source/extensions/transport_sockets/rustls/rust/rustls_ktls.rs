@@ -158,7 +158,31 @@ struct RustlsFactoryConfig {
 }
 
 impl RustlsFactoryConfig {
+  /// Validates kTLS-related config invariants shared by both factory directions. Currently
+  /// rejects `disable_ktls_rx: true` because TX-only kTLS is not safely implemented yet —
+  /// once the kernel TLS ULP is attached and we install only TX crypto, all RX `recv()` calls
+  /// fall back to plain-TCP semantics (the kernel has no RX TLS context). The PR consumes the
+  /// rustls `Connection` during install regardless of `ktls_tx_only`, so userspace decrypt is
+  /// also gone — the next RX read would feed raw TLS ciphertext into Envoy's plaintext buffer
+  /// and silently corrupt the stream. Until a proper `Phase::KtlsTxOnly` variant keeps the
+  /// rustls Connection alive for RX decrypt while TX runs in-kernel, refuse the config at
+  /// load time so operators get a clear failure rather than a stealth data-corruption bug.
+  fn validate_ktls_options(cfg: &JsonConfig) -> Result<(), String> {
+    if cfg.enable_ktls && cfg.disable_ktls_rx {
+      return Err(
+        "`disable_ktls_rx: true` is not yet supported in this alpha extension. The current \
+         implementation cannot route RX through userspace TLS while TX is offloaded to the \
+         kernel (the rustls Connection is consumed during install). Set `enable_ktls: false` \
+         to use full userspace TLS, or `enable_ktls: true` with `disable_ktls_rx: false` to \
+         use kTLS for both directions."
+          .to_string(),
+      );
+    }
+    Ok(())
+  }
+
   fn new_downstream(cfg: JsonConfig) -> Result<Self, String> {
+    Self::validate_ktls_options(&cfg)?;
     if cfg.cert_chain.trim().is_empty() || cfg.private_key.trim().is_empty() {
       return Err("downstream requires non-empty cert_chain and private_key".to_string());
     }
@@ -194,6 +218,7 @@ impl RustlsFactoryConfig {
   }
 
   fn new_upstream(cfg: JsonConfig) -> Result<Self, String> {
+    Self::validate_ktls_options(&cfg)?;
     // Build the trust store. If the operator did not supply a `trusted_ca`, fall back to the
     // bundled Mozilla webpki roots — this matches what most operators expect when pointing at a
     // public TLS endpoint like AWS S3, but log a warning once so the staleness window of the
@@ -2498,10 +2523,12 @@ mod tests {
   fn all_send_close_notify_sites_check_both_dedup_flags() {
     let source = include_str!("rustls_ktls.rs");
     let pattern = "let _ = linux_ktls::send_close_notify(fd);";
+    let mut matches_found = 0usize;
     for (idx, line) in source.lines().enumerate() {
       if !line.contains(pattern) || line.trim_start().starts_with("//") {
         continue;
       }
+      matches_found += 1;
       // Look back at most 20 lines for the dedup gate.
       let window_start = idx.saturating_sub(20);
       let window: String =
@@ -2516,6 +2543,63 @@ mod tests {
         line.trim()
       );
     }
+    // Floor-pin against the "refactor changes the form, test becomes vacuously true" failure
+    // mode. There are currently 4 emit sites — `on_close` kTLS arm, `on_do_read_ktls` echo,
+    // `on_do_write_ktls` no-iov arm, `on_do_write_ktls` post-write arm. If a refactor changes
+    // `let _ = send_close_notify(fd);` to `match send_close_notify(fd) { ... }` or similar,
+    // this count drops below 4 and the test fails loudly rather than silently passing.
+    assert!(
+      matches_found >= 4,
+      "expected at least 4 `let _ = linux_ktls::send_close_notify(fd);` call sites; found {}. \
+       If a refactor changed the call form, update the search pattern in this test.",
+      matches_found
+    );
+  }
+
+  #[test]
+  fn validate_ktls_options_rejects_disable_ktls_rx_with_enable_ktls() {
+    // Round-3 fix: until a proper TX-only-kTLS-with-userspace-RX phase exists, accepting
+    // `disable_ktls_rx: true` would consume the rustls Connection during install and then
+    // route all reads to the kTLS path on a socket with no kernel RX context — feeding raw
+    // ciphertext into Envoy's plaintext buffer. Pin the fail-loud rejection at config-load.
+    let bad_cfg = JsonConfig {
+      cert_chain: String::new(),
+      private_key: String::new(),
+      trusted_ca: None,
+      alpn_protocols: None,
+      enable_ktls: true,
+      disable_ktls_rx: true,
+      sni: None,
+    };
+    let result = RustlsFactoryConfig::validate_ktls_options(&bad_cfg);
+    assert!(result.is_err(), "disable_ktls_rx: true must be rejected");
+    let msg = result.unwrap_err();
+    assert!(msg.contains("disable_ktls_rx"), "error must name the offending field: {msg}");
+    assert!(msg.contains("not yet supported"), "error must clarify the limitation: {msg}");
+
+    // Sanity: the same config with disable_ktls_rx=false is accepted.
+    let ok_cfg = JsonConfig {
+      cert_chain: String::new(),
+      private_key: String::new(),
+      trusted_ca: None,
+      alpn_protocols: None,
+      enable_ktls: true,
+      disable_ktls_rx: false,
+      sni: None,
+    };
+    assert!(RustlsFactoryConfig::validate_ktls_options(&ok_cfg).is_ok());
+
+    // And disable_ktls_rx=true is fine when enable_ktls=false (no-op).
+    let benign_cfg = JsonConfig {
+      cert_chain: String::new(),
+      private_key: String::new(),
+      trusted_ca: None,
+      alpn_protocols: None,
+      enable_ktls: false,
+      disable_ktls_rx: true,
+      sni: None,
+    };
+    assert!(RustlsFactoryConfig::validate_ktls_options(&benign_cfg).is_ok());
   }
 
   #[test]

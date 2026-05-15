@@ -86,10 +86,14 @@ message RustlsUpstreamTlsContext {
   // Defaults to ``false``.
   bool enable_ktls = 6;
 
-  // When ``true`` together with ``enable_ktls``, disables ``kTLS`` offload for the receive (RX)
-  // direction. The RX path remains in userspace via ``rustls`` while TX is still offloaded to
-  // the kernel. This can be useful when the kernel's RX path has compatibility issues with
-  // certain workloads.
+  // When ``true`` together with ``enable_ktls``, would disable ``kTLS`` offload for the receive
+  // (RX) direction so the RX path remains in userspace via ``rustls`` while TX is still
+  // offloaded to the kernel.
+  //
+  // **Not yet supported in this alpha extension.** Setting this to ``true`` together with
+  // ``enable_ktls: true`` will be rejected at config-load time. Until a proper TX-only path
+  // lands (which requires keeping the rustls ``Connection`` alive after install so RX bytes
+  // can be decrypted in userspace), enable ``kTLS`` for both directions or not at all.
   //
   // Has no effect when ``enable_ktls`` is ``false``.
   //
@@ -149,10 +153,14 @@ message RustlsDownstreamTlsContext {
   // Defaults to ``false``.
   bool enable_ktls = 5;
 
-  // When ``true`` together with ``enable_ktls``, disables ``kTLS`` offload for the receive (RX)
-  // direction. The RX path remains in userspace via ``rustls`` while TX is still offloaded to
-  // the kernel. This can be useful when the kernel's RX path has compatibility issues with
-  // certain workloads.
+  // When ``true`` together with ``enable_ktls``, would disable ``kTLS`` offload for the receive
+  // (RX) direction so the RX path remains in userspace via ``rustls`` while TX is still
+  // offloaded to the kernel.
+  //
+  // **Not yet supported in this alpha extension.** Setting this to ``true`` together with
+  // ``enable_ktls: true`` will be rejected at config-load time. Until a proper TX-only path
+  // lands (which requires keeping the rustls ``Connection`` alive after install so RX bytes
+  // can be decrypted in userspace), enable ``kTLS`` for both directions or not at all.
   //
   // Has no effect when ``enable_ktls`` is ``false``.
   //
