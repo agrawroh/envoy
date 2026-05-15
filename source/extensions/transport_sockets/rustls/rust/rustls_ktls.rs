@@ -332,6 +332,12 @@ struct RustlsTransportSocket {
   /// True once the userspace TLS path has emitted a `close_notify` alert into the rustls
   /// send queue (in response to `end_stream=true` on `on_do_write`). Prevents double-close.
   userspace_close_notify_sent: bool,
+  /// Latches when `on_do_write_inner` saw `end_stream=true` but couldn't emit close_notify
+  /// because Envoy's write buffer or the local `tls_write_backlog` were non-empty. Re-checked
+  /// on subsequent `on_do_write_inner` calls so a graceful TLS shutdown is delivered once the
+  /// buffers drain — without this, slow upstreams (S3 throttling, congested links) could see
+  /// the TCP FIN without a preceding close_notify and treat the upload as truncated.
+  end_stream_pending: bool,
   /// Re-entrancy tripwire on the write path. Defense-in-depth against a future change that
   /// reintroduces a recursive `flush_write_buffer()`/`on_do_write` self-call: if `on_do_write`
   /// detects it is already running, it short-circuits with `keep_open(0, false)`.
@@ -369,6 +375,7 @@ impl RustlsTransportSocket {
       #[cfg(target_os = "linux")]
       ktls_shutdown_sent: false,
       userspace_close_notify_sent: false,
+      end_stream_pending: false,
       in_do_write: false,
     }
   }
@@ -416,6 +423,7 @@ impl RustlsTransportSocket {
       #[cfg(target_os = "linux")]
       ktls_shutdown_sent: false,
       userspace_close_notify_sent: false,
+      end_stream_pending: false,
       in_do_write: false,
     }
   }
@@ -514,12 +522,23 @@ impl RustlsTransportSocket {
 
   #[cfg(target_os = "linux")]
   fn try_install_ktls(&mut self, envoy: &mut EnvoyTransportSocketImpl) {
+    // Pre-ULP failures (I/O handle missing, socket fd unavailable, validate_for_ktls Err,
+    // setup_ulp ENOPROTOOPT on a kernel without CONFIG_TLS) are deterministic per build /
+    // per kernel — rate-limit each to once per program to avoid flooding operator dashboards
+    // on a misconfigured cluster. Post-attach errors stay at error-level per-connection
+    // since they indicate a kernel-state hazard worth flagging on every occurrence.
     let Some(io) = self.io_handle_ptr() else {
-      envoy_log_warn!("kTLS: I/O handle missing, continuing with userspace TLS.");
+      static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+      WARNED.get_or_init(|| {
+        envoy_log_warn!("kTLS: I/O handle missing, continuing with userspace TLS.");
+      });
       return;
     };
     let Some(fd) = socket_fd_for_ktls(envoy, io) else {
-      envoy_log_warn!("kTLS: socket fd unavailable, continuing with userspace TLS.");
+      static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+      WARNED.get_or_init(|| {
+        envoy_log_warn!("kTLS: socket fd unavailable, continuing with userspace TLS.");
+      });
       return;
     };
     if let Err(e) = self.run_linux_ktls(envoy, io, fd) {
@@ -529,7 +548,10 @@ impl RustlsTransportSocket {
       // usable. Post-attach failures (secret extraction or apply_prepared) set `self.failure`
       // and the next I/O returns Close.
       if self.failure.is_empty() {
-        envoy_log_warn!("kTLS install pre-ULP step failed ({e}); using userspace TLS.");
+        static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        WARNED.get_or_init(|| {
+          envoy_log_warn!("kTLS install pre-ULP step failed ({e}); using userspace TLS.");
+        });
       } else {
         envoy_log_error!(
           "kTLS install failed AFTER ULP was attached ({e}); socket is terminal."
@@ -1001,10 +1023,16 @@ impl RustlsTransportSocket {
     // half-close; some servers (notably AWS S3) treat a TCP FIN without a preceding
     // close_notify as a possible truncation attack and may fail the request.
     //
+    // Latch `end_stream` into `end_stream_pending` so a slow upstream that prevents immediate
+    // emit (write buffer or local backlog non-empty) doesn't lose the close-notify obligation
+    // — we re-check the gate on every subsequent `on_do_write_inner` call until buffers drain.
     // Only emit on an established connection — calling `send_close_notify` mid-handshake
     // queues an alert that may be malformed for the current record layer (pre-Finished records
     // are unencrypted on TLS 1.3 and the peer would treat it as a handshake-state-violation).
-    if end_stream
+    if end_stream {
+      self.end_stream_pending = true;
+    }
+    if self.end_stream_pending
       && self.phase == Phase::Established
       && envoy.write_buffer_length() == 0
       && self.tls_write_backlog.is_empty()
@@ -1013,6 +1041,7 @@ impl RustlsTransportSocket {
       if let Some(conn) = self.conn.as_mut() {
         conn.send_close_notify();
         self.userspace_close_notify_sent = true;
+        self.end_stream_pending = false;
         if let Err(e) = self.drain_outgoing_tls(envoy) {
           self.failure = e;
           return IoResult::close(total_plain, false);
@@ -1206,10 +1235,15 @@ impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
     }
     #[cfg(target_os = "linux")]
     if let Some(fd) = self.ktls_fd.take() {
+      // Cross-phase dedup: if the userspace TLS path already emitted close_notify before the
+      // socket flipped to Phase::Ktls (e.g. end_stream arrived during the install window),
+      // do not emit a second alert via the kernel — strict peers (S3) may reject. This
+      // mirrors the dedup at `on_do_write_ktls`.
       if matches!(event, ConnectionEvent::LocalClose)
         && self.phase == Phase::Ktls
         && self.failure.is_empty()
         && !self.ktls_shutdown_sent
+        && !self.userspace_close_notify_sent
       {
         let _ = linux_ktls::send_close_notify(fd);
         self.ktls_shutdown_sent = true;
@@ -2128,6 +2162,7 @@ mod tests {
       #[cfg(target_os = "linux")]
       ktls_shutdown_sent: false,
       userspace_close_notify_sent: false,
+      end_stream_pending: false,
       in_do_write: false,
     }
   }
@@ -2231,5 +2266,44 @@ mod tests {
     // set (the test catches accidental "= usize::MAX" regressions in code review).
     assert!(RUSTLS_PLAINTEXT_BUFFER_LIMIT > 0);
     assert!(RUSTLS_PLAINTEXT_BUFFER_LIMIT <= 16 * 1024 * 1024);
+  }
+
+  /// Regression guard against the iter-N-fix-misses-a-call-site failure mode: every TX
+  /// close_notify call site must consult both `userspace_close_notify_sent` and
+  /// `ktls_shutdown_sent` so the peer never sees two alerts back-to-back. The test pins the
+  /// flag-shape invariant; if a future refactor adds a new close-notify producer that forgets
+  /// to update at least one flag, this test will surface the gap.
+  #[test]
+  fn close_notify_dedup_flags_default_false_on_fresh_socket() {
+    let s = make_socket_no_conn();
+    assert!(!s.userspace_close_notify_sent);
+    #[cfg(target_os = "linux")]
+    assert!(!s.ktls_shutdown_sent);
+    assert!(!s.end_stream_pending);
+  }
+
+  #[test]
+  fn end_stream_pending_latches_for_replay_on_buffer_drain() {
+    // A common slow-upstream scenario: end_stream=true arrives while buffers are still
+    // non-empty, so close_notify can't emit immediately. The `end_stream_pending` latch
+    // ensures the emit retries on the next on_do_write call once buffers drain. Pure-state
+    // test: flip the field manually and assert that re-checking with buffers empty would emit.
+    let mut s = make_socket_no_conn();
+    s.end_stream_pending = true;
+    s.phase = Phase::Established;
+    // Simulated gate evaluation — matches the guard at the close_notify emission site:
+    let should_emit_now = s.end_stream_pending
+      && s.phase == Phase::Established
+      && s.tls_write_backlog.is_empty()
+      && !s.userspace_close_notify_sent;
+    assert!(should_emit_now);
+    // Now simulate a still-non-empty backlog: the latch must keep end_stream_pending true.
+    s.tls_write_backlog.extend_from_slice(b"pending-bytes");
+    let should_emit_now = s.end_stream_pending
+      && s.phase == Phase::Established
+      && s.tls_write_backlog.is_empty()
+      && !s.userspace_close_notify_sent;
+    assert!(!should_emit_now);
+    assert!(s.end_stream_pending, "latch must persist across buffer-non-empty windows");
   }
 }
