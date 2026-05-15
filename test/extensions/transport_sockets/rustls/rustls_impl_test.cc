@@ -974,8 +974,7 @@ TEST_F(RustlsImplTest, UpstreamCreateTransportSocketReturnsNotReadyOnSniOverride
                                 "return a NotReady stub instead (ConnectionImpl dereferences "
                                 "the returned pointer without a null-check).";
   // The socket should report a clear failure reason and close on any I/O.
-  EXPECT_THAT(std::string(socket->failureReason()),
-              testing::HasSubstr("per-connection SNI"));
+  EXPECT_THAT(std::string(socket->failureReason()), testing::HasSubstr("per-connection SNI"));
   Buffer::OwnedImpl buf;
   EXPECT_EQ(socket->doRead(buf).action_, Network::PostIoAction::Close);
   EXPECT_EQ(socket->doWrite(buf, false).action_, Network::PostIoAction::Close);

@@ -10,8 +10,9 @@
 #include "envoy/extensions/transport_sockets/rustls/v3/rustls.pb.validate.h"
 #include "envoy/network/io_handle.h"
 
-#include "absl/strings/str_cat.h"
 #include "source/common/protobuf/utility.h"
+
+#include "absl/strings/str_cat.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -42,8 +43,8 @@ RustlsTransportSocketConfig::create(const bool is_upstream, const absl::string_v
   // bug doesn't crash the proxy on first config push.
   auto module_or = DynamicModules::newDynamicModuleByName(RustlsModuleName, /*do_not_close=*/true);
   if (!module_or.ok()) {
-    return absl::InternalError(absl::StrCat("rustls: failed to load static module: ",
-                                            module_or.status().message()));
+    return absl::InternalError(
+        absl::StrCat("rustls: failed to load static module: ", module_or.status().message()));
   }
 
   auto config = std::make_shared<RustlsTransportSocketConfig>(is_upstream, std::string(socket_name),
@@ -119,9 +120,10 @@ RustlsTransportSocketConfig::~RustlsTransportSocketConfig() {
 
 // -- RustlsTransportSocket ----------------------------------------------------
 
-RustlsTransportSocket::RustlsTransportSocket(RustlsTransportSocketConfigSharedPtr config,
-                                             Network::TransportSocketOptionsConstSharedPtr /*options*/,
-                                             Upstream::HostDescriptionConstSharedPtr /*host*/)
+RustlsTransportSocket::RustlsTransportSocket(
+    RustlsTransportSocketConfigSharedPtr config,
+    Network::TransportSocketOptionsConstSharedPtr /*options*/,
+    Upstream::HostDescriptionConstSharedPtr /*host*/)
     : config_(std::move(config)) {
   // `options` and `host` are accepted for forward-compatibility with the
   // `Network::TransportSocketFactory::createTransportSocket` interface, but they are
@@ -251,8 +253,8 @@ Network::TransportSocketPtr RustlsUpstreamTransportSocketFactory::createTranspor
   // dereferences `transport_socket_` without a null-check at construction time, see
   // `source/common/network/connection_impl.cc:110`.)
   if (options != nullptr) {
-    const bool has_sni_override = options->serverNameOverride().has_value() &&
-                                  !options->serverNameOverride()->empty();
+    const bool has_sni_override =
+        options->serverNameOverride().has_value() && !options->serverNameOverride()->empty();
     const bool has_alpn_override = !options->applicationProtocolListOverride().empty();
     const bool has_san_override = !options->verifySubjectAltNameListOverride().empty();
     if (has_sni_override || has_alpn_override || has_san_override) {
@@ -267,7 +269,8 @@ Network::TransportSocketPtr RustlsUpstreamTransportSocketFactory::createTranspor
           "rustls: per-connection SNI/ALPN/SAN overrides are not supported by this extension");
     }
   }
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, std::move(options), std::move(host));
+  auto socket =
+      std::make_unique<RustlsTransportSocket>(config_, std::move(options), std::move(host));
   if (!socket->socketModuleAllocated()) {
     // Module-side allocation failed (e.g. process OOM).
     return std::make_unique<NotReadyRustlsSocket>(
