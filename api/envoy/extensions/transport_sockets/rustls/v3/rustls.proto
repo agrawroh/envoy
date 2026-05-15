@@ -35,7 +35,17 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 //   * SDS-managed certificate rotation.
 //   * Fine-grained ``TlsParameters`` (cipher / version restrictions).
 //
-//   For any of these, use :ref:`envoy.transport_sockets.tls
+//   **Authorization / observability gap**: ``Network::Connection::ssl()`` returns ``nullptr``
+//   for this transport socket. Filters and access-log formatters that consume TLS metadata —
+//   notably ``envoy.filters.http.rbac`` / ``envoy.filters.network.rbac`` (the
+//   ``AuthenticatedMatcher`` and URI/DNS-SAN principal matchers), ``envoy.filters.http.ext_authz``
+//   (peer-cert subject/SAN propagation), and access-log operators ``%DOWNSTREAM_TLS_VERSION%``
+//   / ``%DOWNSTREAM_TLS_CIPHER%`` / ``%DOWNSTREAM_PEER_CERT*%`` / ``%UPSTREAM_TLS_*%`` — will
+//   behave as if the connection were plaintext. **Do not route through this socket from a
+//   listener whose filter chain depends on TLS-derived principals or audit fields** until the
+//   ``Ssl::ConnectionInfo`` plumbing lands.
+//
+//   For any of the above gaps, use :ref:`envoy.transport_sockets.tls
 //   <envoy_v3_api_msg_extensions.transport_sockets.tls.v3.UpstreamTlsContext>` instead.
 // [#next-free-field: 8]
 message RustlsUpstreamTlsContext {
@@ -99,6 +109,13 @@ message RustlsUpstreamTlsContext {
 //   client certificate revocation (CRL / OCSP), fine-grained ``TlsParameters`` (cipher /
 //   version restrictions), and ``require_client_certificate``. Use the standard TLS extension
 //   if you need any of these.
+//
+//   **Authorization / observability gap**: ``Network::Connection::ssl()`` returns ``nullptr``
+//   on the downstream side as well. Listeners whose filter chains rely on mTLS-authenticated
+//   principals (RBAC ``AuthenticatedMatcher``, ext_authz peer-cert propagation) or on TLS
+//   access-log fields will see those fields empty/unauthenticated. **Do not route untrusted
+//   downstream clients through this socket** until the ``Ssl::ConnectionInfo`` plumbing
+//   lands.
 // [#next-free-field: 7]
 message RustlsDownstreamTlsContext {
   // PEM-encoded certificate chain presented to connecting clients. Can be inline PEM content

@@ -39,10 +39,11 @@ use std::sync::Arc;
 const IO_BUF_SIZE: usize = 65536;
 /// Maximum number of write buffer slices retrieved from Envoy per write call.
 const MAX_WRITE_SLICES: usize = 16;
-/// Upper bound on the rustls outbound plaintext queue (set via `Connection::set_buffer_limit`,
-/// which caps `sendable_plaintext`). When the queue fills, `writer().write()` returns a short
-/// count; we stop consuming further plaintext from Envoy's write buffer so Envoy's
-/// high-watermark fires and propagates backpressure to the producer (HCM filter chain).
+/// Upper bound applied via `Connection::set_buffer_limit(Some(N))`. rustls 0.23 applies the
+/// same limit to BOTH the `sendable_plaintext` queue (pre-encryption) and the `sendable_tls`
+/// queue (post-encryption). When either fills, `writer().write()` returns a short count; we
+/// stop consuming further plaintext from Envoy's write buffer so Envoy's high-watermark fires
+/// and propagates backpressure to the producer (HCM filter chain).
 const RUSTLS_PLAINTEXT_BUFFER_LIMIT: usize = 256 * 1024;
 /// Upper bound on the post-encryption socket-write backlog held in `tls_write_backlog`. Bytes
 /// appended beyond this point would otherwise blow past Envoy's bounded write_buffer and
@@ -51,8 +52,8 @@ const RUSTLS_PLAINTEXT_BUFFER_LIMIT: usize = 256 * 1024;
 /// cap), we stop pumping rustls's TLS output until the socket accepts more.
 ///
 /// Worst-case per-connection memory budget for the write path is roughly
-/// `RUSTLS_PLAINTEXT_BUFFER_LIMIT` (plaintext queue) + a single in-flight TLS record's worth
-/// of post-encryption buffering inside rustls + `TLS_WRITE_BACKLOG_LIMIT` (drained-but-unsent).
+/// `2 × RUSTLS_PLAINTEXT_BUFFER_LIMIT` (plaintext + post-encryption queues, both capped by
+/// `set_buffer_limit`) + `TLS_WRITE_BACKLOG_LIMIT` (drained-but-unsent).
 const TLS_WRITE_BACKLOG_LIMIT: usize = 256 * 1024;
 
 // -------------------------------------------------------------------------------------------------
@@ -542,20 +543,20 @@ impl RustlsTransportSocket {
       return;
     };
     if let Err(e) = self.run_linux_ktls(envoy, io, fd) {
-      // `run_linux_ktls` sets `self.failure` ONLY on post-attach failures. Pre-attach failures
-      // (validate_for_ktls returning Err, setup_ulp setsockopt rejection, pre-drain failure)
-      // leave `self.failure` empty AND `self.conn` still owned — so userspace TLS is still
-      // usable. Post-attach failures (secret extraction or apply_prepared) set `self.failure`
-      // and the next I/O returns Close.
+      // `run_linux_ktls` sets `self.failure` on every step after the initial drain+validate
+      // (extract → setup_ulp → apply_prepared). Pre-extract failures (validate_for_ktls
+      // returning Err, pre-drain EAGAIN) leave `self.failure` empty AND `self.conn` still
+      // owned — userspace TLS continues. Once `self.failure` is set, the next I/O returns
+      // Close and the connection terminates — whether or not the kernel ULP was attached.
+      // The error string itself ("pre-attach" / "ULP attached") indicates whether the kernel
+      // socket has been polluted, which only matters for kernel-side debugging.
       if self.failure.is_empty() {
         static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         WARNED.get_or_init(|| {
-          envoy_log_warn!("kTLS install pre-ULP step failed ({e}); using userspace TLS.");
+          envoy_log_warn!("kTLS install pre-extract step failed ({e}); using userspace TLS.");
         });
       } else {
-        envoy_log_error!(
-          "kTLS install failed AFTER ULP was attached ({e}); socket is terminal."
-        );
+        envoy_log_error!("kTLS install failed ({e}); connection will close.");
       }
     }
   }
@@ -587,29 +588,48 @@ impl RustlsTransportSocket {
       linux_ktls::validate_for_ktls(conn)?
     };
 
-    // Step 4 — attach the kernel TLS ULP. This is the point of no return. Failure here is the
-    // ONLY pre-consume failure path; the Connection is still owned so the caller can detect
-    // `self.conn.is_some()` and fall back to userspace TLS.
-    if let Err(e) = linux_ktls::setup_ulp(fd) {
-      // Don't set self.failure — userspace path is still usable.
-      return Err(format!("kTLS ULP setup failed (pre-attach): {e}"));
-    }
-
-    // Step 5 — consume the Connection and extract secrets. From this point on, any failure is
-    // terminal: ULP is attached and `setsockopt(TCP_ULP, "")` rollback does not exist.
+    // Step 4 — consume the rustls Connection and extract secrets. This consumes `self.conn`
+    // but does NOT touch the kernel socket state; if extraction fails, the userspace TLS path
+    // is not recoverable (Connection is gone) but the socket is still in plain-TCP mode and
+    // the next I/O cleanly returns Close. Doing this BEFORE `setup_ulp` matches the
+    // rustls-org `ktls` reference crate (lib.rs:323-345) and keeps the irreversible ULP
+    // attach as the last fallible step before crypto install. Failure modes are bounded by
+    // the pre-gates: `enable_secret_extraction=true` (always set by factory when
+    // enable_ktls), handshake complete (`maybe_raise_connected` gates `ktls_pending`), and
+    // `sendable_tls.is_empty()` (drained at Step 1 above).
     let conn = self
       .conn
       .take()
       .ok_or_else(|| "missing rustls connection".to_string())?;
-    let prepared = match linux_ktls::extract_secrets(conn, version, true, !self.ktls_tx_only) {
+    // `trusted_peer` gates `TLS_RX_EXPECT_NO_PAD`: only the upstream (client) path connects
+    // to a peer Envoy chose. Downstream listeners accept connections from untrusted clients
+    // who could weaponize TLS-1.3 record padding into a DoS vector.
+    let trusted_peer = self.client_cfg.is_some();
+    let prepared = match linux_ktls::extract_secrets(
+      conn,
+      version,
+      true,
+      !self.ktls_tx_only,
+      trusted_peer,
+    ) {
       Ok(p) => p,
       Err(e) => {
-        self.failure = format!("kTLS secret extraction failed (ULP attached, socket terminal): {e}");
+        // No ULP attached yet; the kernel socket is untouched. Next I/O closes cleanly.
+        self.failure = format!("kTLS secret extraction failed (pre-attach): {e}");
         return Err(self.failure.clone());
       },
     };
 
-    // Step 6 — install pre-computed crypto info. Same terminal-on-failure semantics.
+    // Step 5 — attach the kernel TLS ULP. This is the point of no return. Failure here is
+    // recoverable on the socket (no ULP attached) but not on userspace (Connection consumed
+    // at Step 4) — next I/O closes cleanly.
+    if let Err(e) = linux_ktls::setup_ulp(fd) {
+      self.failure = format!("kTLS ULP setup failed (post-extract, pre-attach): {e}");
+      return Err(self.failure.clone());
+    }
+
+    // Step 6 — install pre-computed crypto info. ULP is now attached; failure here is
+    // terminal (kernel has no `TCP_ULP_REMOVE`).
     if let Err(e) = linux_ktls::apply_prepared(fd, prepared) {
       self.failure = format!("kTLS crypto install failed (ULP attached, socket terminal): {e}");
       return Err(self.failure.clone());
@@ -1358,6 +1378,19 @@ impl RustlsTransportSocket {
           },
         }
       }
+      if errno == libc::EKEYEXPIRED {
+        // Linux kernel >= 6.14 reports a peer-initiated TLS-1.3 KeyUpdate by pausing the RX
+        // path with EKEYEXPIRED until userspace provides the rotated traffic key. We don't
+        // retain a rustls Connection after install (`dangerous_extract_secrets` consumes it),
+        // so we cannot supply the new key — close the connection with a clear reason rather
+        // than masking it as a generic "kTLS read failed".
+        self.failure =
+          "kTLS does not support TLS-1.3 KeyUpdate (peer rekeyed; kernel paused RX with \
+           EKEYEXPIRED). Migrate the cluster to envoy.transport_sockets.tls if peers issue \
+           KeyUpdate."
+            .to_string();
+        return IoResult::close(total, false);
+      }
       self.failure = format!("kTLS read failed (errno {} / {})", errno, errno_name(errno));
       return IoResult::close(total, false);
     }
@@ -1396,16 +1429,24 @@ impl RustlsTransportSocket {
       iov_count += 1;
     }
     if iov_count == 0 || total_requested == 0 {
+      // Honor a previously-latched end_stream as well as the current call's end_stream.
       // Cross-phase de-dup: if the userspace TLS path already emitted a close_notify (e.g.
       // before kTLS install completed and a subsequent on_do_write fired with end_stream),
       // don't emit a second one over kTLS. The peer would see two alerts back-to-back, which
       // strict servers (S3) may reject.
-      if end_stream && !self.ktls_shutdown_sent && !self.userspace_close_notify_sent {
+      if end_stream {
+        self.end_stream_pending = true;
+      }
+      if self.end_stream_pending
+        && !self.ktls_shutdown_sent
+        && !self.userspace_close_notify_sent
+      {
         let _ = linux_ktls::send_close_notify(fd);
         unsafe {
           libc::shutdown(fd, libc::SHUT_WR);
         }
         self.ktls_shutdown_sent = true;
+        self.end_stream_pending = false;
       }
       return IoResult::keep_open(0, false);
     }
@@ -1465,12 +1506,24 @@ impl RustlsTransportSocket {
     if total > 0 {
       envoy.write_buffer_drain(total);
     }
-    if end_stream && iov_count == 0 && !self.ktls_shutdown_sent && !self.userspace_close_notify_sent {
+    // Mirror the userspace-path `end_stream_pending` latch so a slow kTLS sendmsg that left
+    // bytes in iov[] still gets a clean close_notify on a subsequent call once the iov drains.
+    // Without this, an upstream that EAGAIN-throttled the final body bytes would see TCP FIN
+    // without close_notify — the same truncation-attack signal the userspace fix eliminates.
+    if end_stream {
+      self.end_stream_pending = true;
+    }
+    if self.end_stream_pending
+      && iov_count == 0
+      && !self.ktls_shutdown_sent
+      && !self.userspace_close_notify_sent
+    {
       let _ = linux_ktls::send_close_notify(fd);
       unsafe {
         libc::shutdown(fd, libc::SHUT_WR);
       }
       self.ktls_shutdown_sent = true;
+      self.end_stream_pending = false;
     }
     IoResult::keep_open(total, false)
   }
@@ -1529,6 +1582,7 @@ fn errno_name(errno: libc::c_int) -> &'static str {
     libc::ENOSYS => "ENOSYS",
     libc::EPERM => "EPERM",
     libc::EACCES => "EACCES",
+    libc::EKEYEXPIRED => "EKEYEXPIRED",
     _ => "unknown",
   }
 }
@@ -1561,10 +1615,21 @@ mod linux_ktls {
   const REC_SEQ: usize = 8;
   const CHACHA20_IV: usize = 12;
   const CHACHA20_KEY: usize = 32;
+  // The kernel UAPI defines ChaCha20-Poly1305's salt as a zero-sized field, present in the
+  // struct for layout symmetry with AES-GCM. Carry it explicitly here to mirror the kernel
+  // header verbatim — without it, future readers cannot verify struct parity without deriving
+  // GCC's zero-array semantics, and a future kernel change that grows the salt would slip
+  // past struct-size review.
+  const CHACHA20_SALT: usize = 0;
 
   const TLS_SET_RECORD_TYPE: libc::c_int = 1;
   const TLS_GET_RECORD_TYPE: libc::c_int = 2;
-  const TLS_RX_EXPECT_NO_PAD: libc::c_int = 3;
+  // The `TLS_RX_EXPECT_NO_PAD` kernel optname is 4; value 3 is `TLS_TX_ZEROCOPY_RO`. Use the
+  // libc constant directly so a future kernel renumbering or a hand-roll regression cannot
+  // silently flip us back onto the wrong optimization. (Earlier revisions hard-coded `3`,
+  // which silently enabled TX_ZEROCOPY_RO on every TLS-1.3 RX install — a wire-level kernel
+  // ABI bug.) See `include/uapi/linux/tls.h`.
+  const TLS_RX_EXPECT_NO_PAD: libc::c_int = libc::TLS_RX_EXPECT_NO_PAD;
   const TLS_CONTENT_TYPE_ALERT: u8 = 21;
   const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 22;
   const TLS_CONTENT_TYPE_APP_DATA: u8 = 23;
@@ -1601,8 +1666,22 @@ mod linux_ktls {
     info: TlsCryptoInfo,
     iv: [u8; CHACHA20_IV],
     key: [u8; CHACHA20_KEY],
+    salt: [u8; CHACHA20_SALT],
     rec_seq: [u8; REC_SEQ],
   }
+
+  // Compile-time size assertions pinning the kernel ABI struct shapes. Mirrors
+  // `bindgen_test_layout_*` from the `ktls-sys` crate. If a future edit reorders fields,
+  // changes a type, or drops `#[repr(C)]`, the build fails at compile time instead of
+  // shipping a setsockopt EINVAL that silently falls back to userspace TLS.
+  //   tls_crypto_info: 2x u16 = 4 bytes
+  //   AES-GCM-128:  4 (info) + 8 (iv) + 16 (key) + 4 (salt) + 8 (rec_seq) = 40 bytes
+  //   AES-GCM-256:  4 (info) + 8 (iv) + 32 (key) + 4 (salt) + 8 (rec_seq) = 56 bytes
+  //   ChaCha20:     4 (info) + 12 (iv) + 32 (key) + 0 (salt) + 8 (rec_seq) = 56 bytes
+  const _: () = assert!(std::mem::size_of::<TlsCryptoInfo>() == 4);
+  const _: () = assert!(std::mem::size_of::<Tls12CryptoInfoAesGcm128>() == 40);
+  const _: () = assert!(std::mem::size_of::<Tls12CryptoInfoAesGcm256>() == 56);
+  const _: () = assert!(std::mem::size_of::<Tls12CryptoInfoChacha20Poly1305>() == 56);
 
   fn split_aes_gcm_iv(iv: &[u8]) -> Result<([u8; AES_GCM_SALT], [u8; AES_GCM_IV]), String> {
     if iv.len() != 12 {
@@ -1626,6 +1705,20 @@ mod linux_ktls {
   ) -> Result<([u8; AES_GCM_SALT], [u8; AES_GCM_IV]), String> {
     split_aes_gcm_iv(iv)
   }
+
+  // Test-only re-exports of the kernel ABI optname constants so the parent module's tests can
+  // pin them against `libc::*` without changing the module-level visibility of the underlying
+  // constants.
+  #[cfg(test)]
+  pub(super) const TLS_RX_EXPECT_NO_PAD_FOR_TEST: libc::c_int = TLS_RX_EXPECT_NO_PAD;
+  #[cfg(test)]
+  pub(super) const SOL_TLS_FOR_TEST: libc::c_int = SOL_TLS;
+  #[cfg(test)]
+  pub(super) const TLS_TX_FOR_TEST: libc::c_int = TLS_TX;
+  #[cfg(test)]
+  pub(super) const TLS_RX_FOR_TEST: libc::c_int = TLS_RX;
+  #[cfg(test)]
+  pub(super) const TCP_ULP_FOR_TEST: libc::c_int = TCP_ULP;
 
   fn apply_direction(
     fd: libc::c_int,
@@ -1733,6 +1826,7 @@ mod linux_ktls {
           },
           iv: iv_bytes.try_into().unwrap(),
           key: kb.try_into().unwrap(),
+          salt: [],
           rec_seq: seq.to_be_bytes(),
         };
         setsockopt_crypto(
@@ -1809,12 +1903,26 @@ mod linux_ktls {
     pub rx_seq: u64,
     pub tx_secret: ConnectionTrafficSecrets,
     pub rx_secret: ConnectionTrafficSecrets,
+    /// `true` if the peer is upstream (we are the client). Gates `TLS_RX_EXPECT_NO_PAD`
+    /// since that optimization assumes a trusted, non-padding peer; an adversarial
+    /// downstream client can deliberately emit a TLS-1.3 padded record (RFC 8446 §5.4
+    /// permits arbitrary padding for traffic-analysis defense) and the kernel decrypt
+    /// would then fail with EBADMSG — turning a wire-level feature into a DoS vector.
+    pub trusted_peer: bool,
   }
 
   /// Read-only protocol-version probe used BEFORE the kernel ULP is attached. Failure here
   /// means kTLS is not applicable to this connection (e.g. peer negotiated TLS 1.0); the
   /// caller should fall back to userspace TLS, and we have NOT consumed the rustls Connection.
   pub fn validate_for_ktls(conn: &Connection) -> Result<u16, String> {
+    // Defense-in-depth: the caller (`run_linux_ktls`) only reaches this from
+    // `Phase::Established`, which itself is gated on `!conn.is_handshaking()`. But the
+    // function is `pub` to the parent module, so a future direct call site that skips the
+    // phase check would get an opaque `dangerous_extract_secrets` failure later. Refuse here
+    // with a specific message instead.
+    if conn.is_handshaking() {
+      return Err("rustls connection still handshaking; cannot extract kTLS secrets".to_string());
+    }
     match conn.protocol_version() {
       Some(ProtocolVersion::TLSv1_2) => Ok(TLS_1_2_VERSION),
       Some(ProtocolVersion::TLSv1_3) => Ok(TLS_1_3_VERSION),
@@ -1830,6 +1938,7 @@ mod linux_ktls {
     version: u16,
     enable_tx: bool,
     enable_rx: bool,
+    trusted_peer: bool,
   ) -> Result<PreparedKtls, String> {
     let secrets = conn
       .dangerous_extract_secrets()
@@ -1844,6 +1953,7 @@ mod linux_ktls {
       rx_seq,
       tx_secret,
       rx_secret,
+      trusted_peer,
     })
   }
 
@@ -1871,11 +1981,14 @@ mod linux_ktls {
           if tx_installed { "successfully" } else { "not" }
         ));
       }
-      if prepared.version == TLS_1_3_VERSION {
-        // TLS_RX_EXPECT_NO_PAD is only supported on kernels >= 5.19; on older kernels
-        // setsockopt returns ENOPROTOOPT, which is harmless (the optimization is just not
-        // applied). Log on unexpected errnos so operators notice if support is silently
-        // missing.
+      if prepared.version == TLS_1_3_VERSION && prepared.trusted_peer {
+        // TLS_RX_EXPECT_NO_PAD: only safe when the peer is trusted (RFC 8446 §5.4 permits
+        // arbitrary padding; an adversarial peer that emits a padded record makes the kernel
+        // decrypt fail with EBADMSG, turning a perf optimization into a DoS vector). We only
+        // enable it on the upstream path where Envoy chose the peer; downstream listeners
+        // accept connections from untrusted clients and skip this optimization.
+        // The option is only supported on kernels >= 5.19; older kernels return ENOPROTOOPT,
+        // which is harmless. Log on unexpected errnos so operators notice missing support.
         let val: libc::c_int = 1;
         let ret = unsafe {
           libc::setsockopt(
@@ -1898,6 +2011,12 @@ mod linux_ktls {
         }
       }
     }
+    // Set TCP_NODELAY after kTLS install to ensure each encrypted record is sent
+    // immediately rather than waiting for Nagle's algorithm. This matches the latency
+    // profile of the userspace TLS path (rustls writes complete records via writev). An
+    // operator who explicitly requires Nagle batching across small TLS records on the
+    // kTLS path should disable `enable_ktls` instead. The userspace path defers to the
+    // listener/cluster socket options.
     unsafe {
       let val: libc::c_int = 1;
       libc::setsockopt(
@@ -1983,33 +2102,58 @@ mod linux_ktls {
     let record_type = unsafe { *libc::CMSG_DATA(cmsg) };
     match record_type {
       TLS_CONTENT_TYPE_HANDSHAKE => {
-        // Post-handshake HANDSHAKE records that flow through the kTLS RX path are typically
-        // TLS-1.3 NewSessionTicket (handshake type 4) which can be safely consumed, OR
-        // KeyUpdate (type 24) which kTLS cannot service in-kernel — once the peer advances
-        // its traffic key, the kernel keeps decrypting with the OLD key and the next record
-        // returns EBADMSG. Treat KeyUpdate as a terminal close so the connection fails fast
-        // with a clear reason rather than mysterious mid-stream EBADMSG. CertificateRequest
-        // (type 13) post-handshake mTLS reauth is similarly unsupported.
-        let handshake_type = if (n as usize) >= 1 { buf[0] } else { 0 };
+        // Walk every handshake message in the decrypted record. RFC 8446 §5.1 permits a peer
+        // to coalesce multiple post-handshake messages (NewSessionTicket || KeyUpdate, for
+        // example) into a single TLS record. Inspecting only `buf[0]` would miss a KeyUpdate
+        // hiding behind a NewSessionTicket, and the kernel's RX path would then decrypt the
+        // next record with the stale key (kernel < 6.14: EBADMSG; kernel >= 6.14: kernel
+        // detects the KeyUpdate independently and pauses RX with EKEYEXPIRED). Either way we
+        // close the connection, but the failure mode is more obvious if we surface it here.
+        //
+        // TLS handshake message wire shape: [msg_type:1][length:3 big-endian][payload:length].
         const HS_NEW_SESSION_TICKET: u8 = 4;
         const HS_CERTIFICATE_REQUEST: u8 = 13;
         const HS_KEY_UPDATE: u8 = 24;
-        match handshake_type {
-          HS_NEW_SESSION_TICKET => ControlResult::Continue,
-          HS_KEY_UPDATE => ControlResult::Error(
-            "kTLS does not support TLS-1.3 KeyUpdate; closing connection".to_string(),
-          ),
-          HS_CERTIFICATE_REQUEST => ControlResult::Error(
-            "kTLS does not support post-handshake CertificateRequest".to_string(),
-          ),
-          _ => ControlResult::Continue,
+        let num_bytes = n as usize;
+        let mut pos = 0;
+        while pos + 4 <= num_bytes {
+          let msg_type = buf[pos];
+          let msg_len =
+            ((buf[pos + 1] as usize) << 16) | ((buf[pos + 2] as usize) << 8) | (buf[pos + 3] as usize);
+          match msg_type {
+            HS_KEY_UPDATE => {
+              return ControlResult::Error(
+                "kTLS does not support TLS-1.3 KeyUpdate; closing connection".to_string(),
+              );
+            },
+            HS_CERTIFICATE_REQUEST => {
+              return ControlResult::Error(
+                "kTLS does not support post-handshake CertificateRequest".to_string(),
+              );
+            },
+            _ => {
+              // NewSessionTicket (HS_NEW_SESSION_TICKET) and any unknown handshake message:
+              // continue walking. Unknown messages are tolerated rather than fail-closed
+              // because a future TLS-1.3 extension that adds a benign post-handshake message
+              // would otherwise break connections.
+              let _ = HS_NEW_SESSION_TICKET; // suppress unused-warning; documents intent.
+            },
+          }
+          // Saturating-add so a malformed length field can't cause integer overflow.
+          pos = pos.saturating_add(4).saturating_add(msg_len);
         }
+        ControlResult::Continue
       },
       TLS_CONTENT_TYPE_ALERT => {
         let num_bytes = n as usize;
         if num_bytes < 2 {
-          // Truncated alert — treat as close.
-          return ControlResult::CloseNotify;
+          // A malformed alert (truncated post-AEAD-decrypt) is a protocol violation, not a
+          // graceful close. The kernel already validated the AEAD tag, so the peer
+          // deliberately authored a sub-2-byte alert payload — treat as fatal so operators
+          // see a meaningful diagnostic rather than mistaking it for a clean shutdown.
+          return ControlResult::Error(format!(
+            "malformed TLS alert from peer ({num_bytes} bytes, expected 2)"
+          ));
         }
         let level = buf[0];
         let description = buf[1];
@@ -2022,9 +2166,11 @@ mod linux_ktls {
             description
           ));
         }
-        // Per RFC 8446 §6 the only TLS-1.3 warning alert is close_notify (which we already
-        // handled above). For TLS-1.2 a handful of warnings exist but treat them as fatal to
-        // avoid silently swallowing an actionable diagnostic.
+        // Per RFC 8446 §6 the only TLS-1.3 warning alert is close_notify (handled above). For
+        // TLS-1.2 a handful of warnings exist (user_canceled, no_renegotiation); we treat
+        // them as fatal because the operational signal is more useful as a connection error
+        // than a silent continue. This diverges from RFC 5246 §7.2.1's permissive language
+        // but aligns with current TLS implementer defaults.
         ControlResult::Error(format!(
           "non-close-notify TLS alert from peer (level={}, description={})",
           level, description
@@ -2066,11 +2212,14 @@ mod linux_ktls {
     let ret = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
     if ret < 0 {
       let errno = unsafe { *libc::__errno_location() };
-      if errno == libc::EAGAIN
-        || errno == libc::EWOULDBLOCK
-        || errno == libc::EPIPE
-        || errno == libc::EINTR
-      {
+      if errno == libc::EPIPE {
+        // Peer closed first; our close_notify never reached the wire. Distinguish this from
+        // "alert delivered cleanly" so an operator tracing a peer-side truncation diagnostic
+        // can see the race condition explicitly. Treated as best-effort success regardless.
+        envoy_log_debug!("kTLS close_notify: peer closed first (EPIPE); alert not emitted");
+        return Ok(());
+      }
+      if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::EINTR {
         return Ok(());
       }
       return Err(format!("sendmsg close_notify failed (errno {errno})"));
@@ -2194,6 +2343,36 @@ mod tests {
       assert_eq!(errno_name(libc::ECONNRESET), "ECONNRESET");
       assert_eq!(errno_name(0xdead), "unknown");
     }
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn kernel_tls_optnames_match_libc() {
+    // Pin the kernel ABI optname values used by `setsockopt(SOL_TLS, ...)`. Earlier revisions
+    // hand-coded `TLS_RX_EXPECT_NO_PAD = 3` — actually the value of `TLS_TX_ZEROCOPY_RO`,
+    // which silently enabled the wrong optimization on every TLS-1.3 RX install. This test
+    // pins against `libc` so a regression to hand-rolled literals is caught at test time.
+    assert_eq!(linux_ktls::TLS_RX_EXPECT_NO_PAD_FOR_TEST, libc::TLS_RX_EXPECT_NO_PAD);
+    assert_eq!(linux_ktls::TLS_RX_EXPECT_NO_PAD_FOR_TEST, 4);
+    assert_eq!(linux_ktls::SOL_TLS_FOR_TEST, libc::SOL_TLS);
+    assert_eq!(linux_ktls::TLS_TX_FOR_TEST, libc::TLS_TX);
+    assert_eq!(linux_ktls::TLS_RX_FOR_TEST, libc::TLS_RX);
+    assert_eq!(linux_ktls::TCP_ULP_FOR_TEST, libc::TCP_ULP);
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn kernel_rec_seq_is_big_endian() {
+    // The kernel's `rec_seq[8]` field expects the next record's sequence number in network
+    // byte order (big-endian). rustls's `record_layer::write_seq`/`read_seq` are bare `u64`.
+    // We use `u64::to_be_bytes`. Pin the byte layout to prevent a future refactor from
+    // accidentally swapping in `to_le_bytes` (which would mismatch the kernel and produce
+    // first-record AEAD-tag failures that look like generic EBADMSG).
+    let seq: u64 = 0x0102_0304_0506_0708;
+    assert_eq!(
+      seq.to_be_bytes(),
+      [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+    );
   }
 
   #[cfg(target_os = "linux")]

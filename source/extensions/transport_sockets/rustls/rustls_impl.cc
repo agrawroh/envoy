@@ -167,7 +167,11 @@ void RustlsTransportSocket::refreshProtocolString() const {
 
 void RustlsTransportSocket::refreshFailureReasonString() const {
   auto* mutable_this = const_cast<RustlsTransportSocket*>(this);
-  mutable_this->failure_reason_storage_.clear();
+  // Don't `clear()` aggressively: the canonical TLS socket retains its failure_reason_ for
+  // the socket's lifetime (BoringSSL's `SslSocket::failureReason()` appends, never replaces).
+  // If the Rust module is gone or returns an empty buffer, keep the last reason so
+  // post-mortem callers like `ConnectionImpl::transportFailureReason()` still get a useful
+  // string. Only overwrite when the module hands back a non-empty new reason.
   if (socket_module_ == nullptr) {
     return;
   }
@@ -281,8 +285,15 @@ Network::TransportSocketPtr RustlsUpstreamTransportSocketFactory::createTranspor
 
 void RustlsUpstreamTransportSocketFactory::hashKey(
     std::vector<uint8_t>& key, Network::TransportSocketOptionsConstSharedPtr options) const {
+  // Mix the factory-static bits only: socket name + a NUL separator + serialized proto config +
+  // a NUL separator + default SNI + ALPN list. The NUL between name and cfg prevents
+  // prefix-attack collisions on configs whose concatenated bytes happen to overlap. The base
+  // class call below handles per-connection options (SNI/SAN/ALPN overrides, ALPN fallback,
+  // shared filter-state objects); duplicating those bits here would create case-sensitivity
+  // and encoding mismatches with the base class and silently re-partition the connection pool.
   const absl::string_view name = config_->socketName();
   key.insert(key.end(), name.begin(), name.end());
+  key.push_back('\0');
   const absl::string_view cfg = config_->socketConfigBytes();
   key.insert(key.end(), cfg.begin(), cfg.end());
   key.push_back('\0');
@@ -290,24 +301,6 @@ void RustlsUpstreamTransportSocketFactory::hashKey(
   for (const auto& alpn : alpn_protocols_) {
     key.push_back('\0');
     key.insert(key.end(), alpn.begin(), alpn.end());
-  }
-  // Connection-pool key MUST partition by per-request overrides so a route that pins SNI to bucket
-  // A does not share a connection with a route pinning SNI to bucket B. The base class mixes some
-  // override bits, but we add the SNI/SAN/ALPN ones explicitly to be defensive against future base
-  // class refactors.
-  if (options != nullptr) {
-    if (const auto& sni = options->serverNameOverride(); sni.has_value()) {
-      key.push_back('\1');
-      key.insert(key.end(), sni->begin(), sni->end());
-    }
-    for (const auto& san : options->verifySubjectAltNameListOverride()) {
-      key.push_back('\2');
-      key.insert(key.end(), san.begin(), san.end());
-    }
-    for (const auto& alpn : options->applicationProtocolListOverride()) {
-      key.push_back('\3');
-      key.insert(key.end(), alpn.begin(), alpn.end());
-    }
   }
   Network::CommonUpstreamTransportSocketFactory::hashKey(key, options);
 }
