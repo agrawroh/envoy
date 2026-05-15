@@ -1339,10 +1339,17 @@ impl RustlsTransportSocket {
             continue;
           },
           linux_ktls::ControlResult::CloseNotify => {
-            if !self.ktls_shutdown_sent {
+            // Peer closed first — reflect a close_notify only if we have not already emitted
+            // one via either the userspace or kTLS shutdown paths. Without the
+            // `!userspace_close_notify_sent` guard, the userspace→kTLS handover sequence
+            // (userspace emits on `end_stream`, then install fires, then peer echoes their
+            // close_notify back) would produce a second alert on the wire — strict peers (S3)
+            // may reject. Latch `ktls_shutdown_sent` unconditionally so the on_close path
+            // doesn't try again.
+            if !self.ktls_shutdown_sent && !self.userspace_close_notify_sent {
               let _ = linux_ktls::send_close_notify(fd);
-              self.ktls_shutdown_sent = true;
             }
+            self.ktls_shutdown_sent = true;
             return IoResult::close(total, true);
           },
           linux_ktls::ControlResult::Error(e) => {
@@ -2280,6 +2287,39 @@ mod tests {
     #[cfg(target_os = "linux")]
     assert!(!s.ktls_shutdown_sent);
     assert!(!s.end_stream_pending);
+  }
+
+  /// Static-coverage check: every TX `send_close_notify(fd)` call site in this file must be
+  /// preceded by BOTH `!self.ktls_shutdown_sent` AND `!self.userspace_close_notify_sent`
+  /// guards. This test reads the source at compile time and asserts the invariant, catching
+  /// the "fix-misses-a-call-site" failure mode where a future change adds a new close-notify
+  /// emit site but forgets one of the dedup flags.
+  ///
+  /// We match the exact form `let _ = linux_ktls::send_close_notify(fd);` so the assertion's
+  /// own format string (which mentions `send_close_notify(fd)` for diagnostic purposes) is
+  /// not itself counted as a call site.
+  #[test]
+  fn all_send_close_notify_sites_check_both_dedup_flags() {
+    let source = include_str!("rustls_ktls.rs");
+    let pattern = "let _ = linux_ktls::send_close_notify(fd);";
+    for (idx, line) in source.lines().enumerate() {
+      if !line.contains(pattern) || line.trim_start().starts_with("//") {
+        continue;
+      }
+      // Look back at most 20 lines for the dedup gate.
+      let window_start = idx.saturating_sub(20);
+      let window: String =
+        source.lines().take(idx).skip(window_start).collect::<Vec<_>>().join("\n");
+      assert!(
+        window.contains("!self.ktls_shutdown_sent")
+          && window.contains("!self.userspace_close_notify_sent"),
+        "TX kTLS shutdown site at 1-indexed line {} lacks one of the dedup guards in \
+         the preceding 20 lines. Both flags are required to prevent back-to-back alerts on \
+         the wire. Line content: {:?}",
+        idx + 1,
+        line.trim()
+      );
+    }
   }
 
   #[test]
