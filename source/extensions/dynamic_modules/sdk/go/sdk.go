@@ -9,6 +9,7 @@ import (
 // For built-in plugin factories in the host binary directly. DO NOT use this for independently
 // compiled module or plugins.
 var httpFilterConfigFactoryRegistry = make(map[string]shared.HttpFilterConfigFactory)
+var statSinkConfigFactoryRegistry = make(map[string]shared.StatSinkConfigFactory)
 
 // NewHttpFilterFactory creates a new plugin factory for the given plugin name and unparsed config.
 func NewHttpFilterFactory(handle shared.HttpFilterConfigHandle, name string,
@@ -34,5 +35,31 @@ func RegisterHttpFilterConfigFactories(factories map[string]shared.HttpFilterCon
 			panic("plugin config factory already registered: " + name)
 		}
 		httpFilterConfigFactoryRegistry[name] = factory
+	}
+}
+
+// NewStatSink creates a new StatSink for the given sink name and unparsed config bytes.
+func NewStatSink(handle shared.StatSinkHandle, name string,
+	unparsedConfig []byte) (shared.StatSink, error) {
+	configFactory := statSinkConfigFactoryRegistry[name]
+	if configFactory == nil {
+		return nil, fmt.Errorf("failed to get stat sink config factory for %s", name)
+	}
+	return configFactory.Create(handle, unparsedConfig)
+}
+
+// GetStatSinkConfigFactory gets the stat sink config factory for the given sink name.
+func GetStatSinkConfigFactory(name string) shared.StatSinkConfigFactory {
+	return statSinkConfigFactoryRegistry[name]
+}
+
+// RegisterStatSinkConfigFactories registers stat sink config factories for plugins in the
+// composer binary itself. This function MUST only be called from init() functions.
+func RegisterStatSinkConfigFactories(factories map[string]shared.StatSinkConfigFactory) {
+	for name, factory := range factories {
+		if _, ok := statSinkConfigFactoryRegistry[name]; ok {
+			panic("stat sink config factory already registered: " + name)
+		}
+		statSinkConfigFactoryRegistry[name] = factory
 	}
 }

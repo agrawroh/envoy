@@ -56,6 +56,8 @@ go_library(
     srcs = [
         "sdk/go/shared/api.go",
         "sdk/go/shared/base.go",
+        "sdk/go/shared/stats_sink.go",
+        "sdk/go/shared/stats_sink_api.go",
     ],
     cgo = True,
     importpath = "github.com/envoyproxy/envoy/source/extensions/dynamic_modules/sdk/go/shared",

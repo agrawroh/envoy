@@ -9,6 +9,7 @@ package(default_visibility = [
     "//test/extensions/dynamic_modules/bootstrap:__pkg__",
     "//test/extensions/dynamic_modules/http:__pkg__",
     "//test/extensions/dynamic_modules/network:__pkg__",
+    "//test/extensions/dynamic_modules/stat_sink:__pkg__",
     "//test/extensions/upstreams/http/dynamic_modules:__pkg__",
 ])
 
@@ -61,3 +62,5 @@ test_program(name = "upstream_http_tcp_bridge")
 test_program(name = "cluster_integration_test")
 
 test_program(name = "cluster_filter_state_test")
+
+test_program(name = "stat_sink_integration_test")
