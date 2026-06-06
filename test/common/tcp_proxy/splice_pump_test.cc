@@ -134,7 +134,7 @@ public:
         down_.pump_end, up_.pump_end, /*up_is_ktls=*/false, *dispatcher_,
         [this](Network::ConnectionEvent) { completed_ = true; },
         [this](uint64_t n) { u2d_bytes_ += n; }, [this](uint64_t n) { d2u_bytes_ += n; });
-    ASSERT_TRUE(pump_->prepare(initial_downstream));
+    ASSERT_TRUE(pump_->prepare(initial_downstream, /*initial_d2u=*/""));
     pump_->arm();
   }
 

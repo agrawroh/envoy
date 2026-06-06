@@ -6,6 +6,7 @@
 
 #include "envoy/buffer/buffer.h"
 #include "envoy/common/platform.h"
+#include "envoy/event/file_event.h"
 #include "envoy/extensions/transport_sockets/rustls/v3/rustls.pb.h"
 #include "envoy/extensions/transport_sockets/rustls/v3/rustls.pb.validate.h"
 #include "envoy/network/io_handle.h"
@@ -587,6 +588,17 @@ void envoy_dynamic_module_callback_transport_socket_set_is_readable(
     return;
   }
   socket->transportCallbacks()->setTransportSocketIsReadable();
+}
+
+void envoy_dynamic_module_callback_transport_socket_set_is_writable(
+    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr) {
+  auto* socket = static_cast<RustlsTransportSocket*>(transport_socket_envoy_ptr);
+  if (socket->transportCallbacks() == nullptr) {
+    return;
+  }
+  // Re-arm the writable event so ConnectionImpl re-drives doWrite when the socket drains. This is
+  // the same primitive ConnectionImpl uses to self-schedule a write after a partial flush.
+  socket->transportCallbacks()->ioHandle().activateFileEvents(Envoy::Event::FileReadyType::Write);
 }
 
 void envoy_dynamic_module_callback_transport_socket_flush_write_buffer(

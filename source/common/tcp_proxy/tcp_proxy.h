@@ -703,7 +703,10 @@ protected:
   // Tries to engage the L4 kernel-splice fast-path. Sets up the pump (fallible) before detaching.
   // On success it drains `data`, removes both socket FileEvents, arms the pump and returns true.
   // On failure it leaves `data` untouched and returns false so the buffered path handles it.
-  bool maybeEngageSplice(Buffer::Instance& data);
+  // `from_upstream` selects the engaging direction: true means `data` is the upstream chunk bound
+  // downstream (a GET/HEAD response); false means `data` is the downstream chunk bound upstream (a
+  // PUT request and upload body). It queues `data` to its destination as the pre-engage chunk.
+  bool maybeEngageSplice(Buffer::Instance& data, bool from_upstream);
   // Resets the splice pump and force-closes the hijacked upstream connection so the pool and drain
   // manager discard it rather than reuse a socket whose FileEvents the pump removed. A no-op when
   // no splice is engaged.
@@ -749,6 +752,10 @@ protected:
   // Kernel splice() fast-path pump for the L4 kTLS bytestream. Declared after upstream_ so it
   // destructs first and its FileEvents and pipes are torn down before the upstream fd is closed.
   SplicePumpPtr splice_pump_;
+  // True once any downstream byte has been sent to the upstream (encodeData or the early-data
+  // flush). The upload-direction splice can only engage while this is false, which guarantees the
+  // upstream write buffer is empty so spliced bytes cannot reorder ahead of buffered ones.
+  bool upstream_write_started_{false};
   // Deferred teardown of a completed/aborted splice. Member-owned so it is cancelled if the Filter
   // is destroyed first (avoids a use-after-free from a deferred completion).
   Event::SchedulableCallbackPtr splice_complete_schedulable_;

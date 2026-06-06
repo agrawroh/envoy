@@ -1498,6 +1498,7 @@ impl RustlsTransportSocket {
     }
 
     let mut total = 0usize;
+    let mut hit_eagain = false;
     loop {
       if iov_count == 0 {
         break;
@@ -1534,6 +1535,7 @@ impl RustlsTransportSocket {
       }
       let errno = unsafe { *libc::__errno_location() };
       if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+        hit_eagain = true;
         break;
       }
       if errno == libc::EINTR {
@@ -1551,6 +1553,14 @@ impl RustlsTransportSocket {
     }
     if total > 0 {
       envoy.write_buffer_drain(total);
+    }
+    // If the kTLS socket send buffer filled (EAGAIN) with bytes still queued in Envoy's write
+    // buffer, re-arm the writable notification. The edge-triggered EPOLLOUT is not redelivered on
+    // its own, so without this the buffered write stalls between the low and high watermark and a
+    // large upload (e.g. a PUT body) deadlocks: downstream stays read-disabled and the upstream
+    // never receives the rest of the object.
+    if hit_eagain && total < total_requested {
+      envoy.set_is_writable();
     }
     // Mirror the userspace-path `end_stream_pending` latch so a slow kTLS sendmsg that left
     // bytes in iov[] still gets a clean close_notify on a subsequent call once the iov drains.

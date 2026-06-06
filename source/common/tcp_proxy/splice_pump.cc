@@ -66,9 +66,6 @@ namespace {
 // /proc/sys/fs/pipe-max-size. The pre-engage chunk goes straight to the downstream socket, so the
 // pipe size does not bound it.
 constexpr size_t kPipeCapacity = 1024 * 1024;
-// Userspace relay chunk for the downstream-to-upstream direction. The request direction is small,
-// so a modest buffer keeps the copy cheap. A larger request or upload is relayed in chunks.
-constexpr size_t kD2uChunk = 64 * 1024;
 // Upper bound on non-DATA kTLS control records drained in one pump pass. A trusted upstream sends
 // a handful of NewSessionTickets, so a large run signals a misbehaving peer and we close.
 constexpr int kMaxControlRecordsPerPass = 1024;
@@ -86,32 +83,37 @@ SplicePump::SplicePump(os_fd_t down_fd, os_fd_t up_fd, bool up_is_ktls,
 SplicePump::~SplicePump() {
   // Close only our own pipe fds. The socket fds are borrowed and stay owned by their
   // ConnectionImpls, which close them in their own teardown.
-  for (int fd : {u2d_.read_fd, u2d_.write_fd}) {
+  for (int fd : {u2d_.read_fd, u2d_.write_fd, d2u_.read_fd, d2u_.write_fd}) {
     if (fd >= 0) {
       ::close(fd);
     }
   }
 }
 
-bool SplicePump::prepare(std::string initial_downstream_data) {
+bool SplicePump::prepare(std::string initial_u2d, std::string initial_d2u) {
   int u2d[2];
   if (::pipe2(u2d, O_NONBLOCK | O_CLOEXEC) != 0) {
-    ENVOY_LOG(warn, "splice pump pipe2 failed, {}", std::strerror(errno));
+    ENVOY_LOG(warn, "splice pump u2d pipe2 failed, {}", std::strerror(errno));
     return false;
   }
   u2d_.read_fd = u2d[0];
   u2d_.write_fd = u2d[1];
-  d2u_buf_.resize(kD2uChunk);
+  int d2u[2];
+  if (::pipe2(d2u, O_NONBLOCK | O_CLOEXEC) != 0) {
+    ENVOY_LOG(warn, "splice pump d2u pipe2 failed, {}", std::strerror(errno));
+    return false;
+  }
+  d2u_.read_fd = d2u[0];
+  d2u_.write_fd = d2u[1];
 
-  // Write the pre-engage decrypted chunk straight to the downstream socket so it precedes any
-  // spliced bytes and ordering is preserved. It can exceed the pipe capacity, so it goes to the
-  // socket rather than the bounded pipe. Whatever the send buffer cannot take now is stashed and
-  // flushed by the pump.
-  if (!initial_downstream_data.empty()) {
+  // Write the pre-engage decrypted upstream chunk straight to the downstream socket so it precedes
+  // any spliced u2d bytes and ordering is preserved. It can exceed the pipe capacity, so it goes to
+  // the socket rather than the bounded pipe. Whatever the send buffer cannot take now is stashed
+  // and flushed by the pump.
+  if (!initial_u2d.empty()) {
     size_t off = 0;
-    while (off < initial_downstream_data.size()) {
-      const ssize_t w = ::write(down_fd_, initial_downstream_data.data() + off,
-                                initial_downstream_data.size() - off);
+    while (off < initial_u2d.size()) {
+      const ssize_t w = ::write(down_fd_, initial_u2d.data() + off, initial_u2d.size() - off);
       if (w > 0) {
         off += static_cast<size_t>(w);
         on_u2d_bytes_(static_cast<uint64_t>(w));
@@ -127,18 +129,48 @@ bool SplicePump::prepare(std::string initial_downstream_data) {
         break; // some bytes already delivered, stash the rest and let the pump surface the error
       }
     }
-    if (off < initial_downstream_data.size()) {
-      pending_down_ = std::move(initial_downstream_data);
+    if (off < initial_u2d.size()) {
+      pending_down_ = std::move(initial_u2d);
       pending_down_off_ = off;
+    }
+  }
+
+  // Symmetric for the upload direction. Write the pre-engage downstream chunk straight to the
+  // upstream socket so it precedes any spliced d2u bytes. On a kTLS-TX socket write() frames TLS
+  // records correctly. Stash whatever the send buffer cannot take for the pump to flush.
+  if (!initial_d2u.empty()) {
+    size_t off = 0;
+    while (off < initial_d2u.size()) {
+      const ssize_t w = ::write(up_fd_, initial_d2u.data() + off, initial_d2u.size() - off);
+      if (w > 0) {
+        off += static_cast<size_t>(w);
+        on_d2u_bytes_(static_cast<uint64_t>(w));
+      } else if (w < 0 && errno == EINTR) {
+        continue;
+      } else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        break; // socket full, stash the rest below
+      } else {
+        ENVOY_LOG(warn, "splice pump initial upstream write error, {}", std::strerror(errno));
+        if (off == 0) {
+          return false; // nothing delivered yet, let the buffered path handle the broken socket
+        }
+        break;
+      }
+    }
+    if (off < initial_d2u.size()) {
+      pending_up_ = std::move(initial_d2u);
+      pending_up_off_ = off;
     }
   }
   return true;
 }
 
 void SplicePump::arm() {
-  // Best-effort enlarge the u2d pipe. On failure the kernel keeps the default size.
+  // Best-effort enlarge both pipes. On failure the kernel keeps the default size.
   ::fcntl(u2d_.write_fd, F_SETPIPE_SZ, static_cast<int>(kPipeCapacity));
   u2d_.capacity = kPipeCapacity;
+  ::fcntl(d2u_.write_fd, F_SETPIPE_SZ, static_cast<int>(kPipeCapacity));
+  d2u_.capacity = kPipeCapacity;
 
   up_file_event_ = dispatcher_.createFileEvent(
       up_fd_, [this](uint32_t events) { return onUpReady(events); }, Event::FileTriggerType::Edge,
@@ -275,12 +307,36 @@ void SplicePump::pump() {
       }
     }
 
-    // (3) Write buffered d2u bytes to the upstream socket. kTLS TX encrypts them through the
-    // kernel sendmsg path. This carries the request and any upload.
-    while (up_writable_ && d2u_off_ < d2u_len_) {
-      const ssize_t n = ::write(up_fd_, d2u_buf_.data() + d2u_off_, d2u_len_ - d2u_off_);
+    // (3a) Flush any stashed pre-engage upstream-bound chunk FIRST so the request and upload body
+    // leave in order, ahead of any d2u pipe bytes.
+    while (up_writable_ && pending_up_off_ < pending_up_.size()) {
+      const ssize_t w = ::write(up_fd_, pending_up_.data() + pending_up_off_,
+                                pending_up_.size() - pending_up_off_);
+      if (w > 0) {
+        pending_up_off_ += static_cast<size_t>(w);
+        on_d2u_bytes_(static_cast<uint64_t>(w));
+        progress = true;
+      } else if (w == 0) {
+        complete(Network::ConnectionEvent::RemoteClose);
+        return;
+      } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        up_writable_ = false;
+        break;
+      } else if (errno == EINTR) {
+        continue;
+      } else {
+        complete(Network::ConnectionEvent::RemoteClose);
+        return;
+      }
+    }
+
+    // (3b) Drain d2u pipe -> upstream kTLS socket (the request and upload body). splice() into the
+    // kTLS-TX socket encrypts in-kernel and the kernel frames the spliced bytes into TLS records.
+    // Only after the stashed chunk is fully delivered, so ordering holds.
+    while (up_writable_ && d2u_.in_pipe > 0 && pending_up_off_ >= pending_up_.size()) {
+      const ssize_t n = ::splice(d2u_.read_fd, nullptr, up_fd_, nullptr, d2u_.in_pipe, flags);
       if (n > 0) {
-        d2u_off_ += static_cast<size_t>(n);
+        d2u_.in_pipe -= static_cast<size_t>(n);
         on_d2u_bytes_(static_cast<uint64_t>(n));
         progress = true;
       } else if (n == 0) {
@@ -297,17 +353,14 @@ void SplicePump::pump() {
         return;
       }
     }
-    if (d2u_off_ >= d2u_len_) {
-      d2u_len_ = d2u_off_ = 0;
-    }
 
-    // (4) Read more d2u bytes from the downstream socket once the buffer is fully drained, so
-    // bytes leave in order.
-    while (down_readable_ && !down_read_eof_ && d2u_len_ == 0) {
-      const ssize_t n = ::read(down_fd_, d2u_buf_.data(), d2u_buf_.size());
+    // (4) Fill d2u pipe <- downstream socket (read the plaintext request and upload body), only
+    // after draining toward the upstream so the bounded pipe releases backpressure first.
+    while (down_readable_ && !down_read_eof_ && d2u_.in_pipe < d2u_.capacity) {
+      const ssize_t n =
+          ::splice(down_fd_, nullptr, d2u_.write_fd, nullptr, d2u_.capacity - d2u_.in_pipe, flags);
       if (n > 0) {
-        d2u_len_ = static_cast<size_t>(n);
-        d2u_off_ = 0;
+        d2u_.in_pipe += static_cast<size_t>(n);
         progress = true;
       } else if (n == 0) {
         down_read_eof_ = true;
@@ -438,7 +491,8 @@ void SplicePump::maybeHalfCloseOrComplete() {
   }
   const bool u2d_drained =
       up_read_eof_ && u2d_.in_pipe == 0 && pending_down_off_ >= pending_down_.size();
-  const bool d2u_drained = down_read_eof_ && d2u_off_ >= d2u_len_;
+  const bool d2u_drained =
+      down_read_eof_ && d2u_.in_pipe == 0 && pending_up_off_ >= pending_up_.size();
   // Half-close the downstream write once the upstream is done and everything is flushed, which
   // gives the client its EOF.
   if (u2d_drained && !down_write_shutdown_) {
@@ -488,7 +542,7 @@ SplicePump::SplicePump(os_fd_t down_fd, os_fd_t up_fd, bool up_is_ktls,
       on_d2u_bytes_(std::move(on_downstream_to_upstream)) {}
 
 SplicePump::~SplicePump() = default;
-bool SplicePump::prepare(std::string) { return false; }
+bool SplicePump::prepare(std::string, std::string) { return false; }
 void SplicePump::arm() {}
 absl::Status SplicePump::onUpReady(uint32_t) { return absl::OkStatus(); }
 absl::Status SplicePump::onDownReady(uint32_t) { return absl::OkStatus(); }

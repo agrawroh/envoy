@@ -12212,6 +12212,18 @@ void envoy_dynamic_module_callback_transport_socket_set_is_readable(
     envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr);
 
 /**
+ * envoy_dynamic_module_callback_transport_socket_set_is_writable re-arms the writable notification
+ * so a write is scheduled on a future event loop iteration. A module that left bytes unsent on
+ * EAGAIN (e.g. a kTLS sendmsg that filled the socket send buffer) must call this, because the
+ * edge-triggered writable event is not redelivered on its own and the buffered write would
+ * otherwise stall between the low and high watermark.
+ *
+ * @param transport_socket_envoy_ptr is the pointer to the Envoy transport socket object.
+ */
+void envoy_dynamic_module_callback_transport_socket_set_is_writable(
+    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr);
+
+/**
  * envoy_dynamic_module_callback_transport_socket_flush_write_buffer attempts to drain a non-empty
  * write buffer to the underlying transport.
  *

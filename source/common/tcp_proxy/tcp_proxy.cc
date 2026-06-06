@@ -1081,11 +1081,30 @@ Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
   if (splice_pump_ != nullptr) {
     return Network::FilterStatus::StopIteration;
   }
+  // L4 kernel-splice fast-path for the upload direction. Engage on the first downstream data once
+  // the upstream rustls socket has installed kTLS and before any byte has been written upstream, so
+  // the request and a PUT body move in-kernel like a GET response. The upstream_write_started_
+  // guard guarantees the upstream write buffer is empty, so spliced bytes cannot reorder ahead of
+  // buffered ones; on a connection where kTLS is not yet installed at the first data the buffered
+  // path below carries the upload instead. maybeEngageSplice drains `data` into the pump on
+  // success.
+  if (upstream_ != nullptr && !upstream_write_started_ && !end_stream && data.length() > 0) {
+    OptRef<Network::Connection> up = upstream_->upstreamConnection();
+    if (up.has_value()) {
+      OptRef<const Network::KtlsBytestreamInfo> info = up->ktlsBytestreamInfo();
+      if (info.has_value() && info->installed && info->trusted_peer &&
+          read_callbacks_->connection().state() == Network::Connection::State::Open &&
+          maybeEngageSplice(data, /*from_upstream=*/false)) {
+        return Network::FilterStatus::StopIteration;
+      }
+    }
+  }
   getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(data.length());
 
   if (upstream_) {
     getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(data.length());
     upstream_->encodeData(data, end_stream);
+    upstream_write_started_ = true;
     resetIdleTimer(); // TODO(ggreenway) PERF: do we need to reset timer on both send and receive?
   } else if (receive_before_connect_) {
     // Buffer data received before upstream connection exists.
@@ -1285,7 +1304,7 @@ void Filter::onUpstreamData(Buffer::Instance& data, bool end_stream) {
       OptRef<const Network::KtlsBytestreamInfo> info = up->ktlsBytestreamInfo();
       if (info.has_value() && info->installed && info->trusted_peer &&
           read_callbacks_->connection().state() == Network::Connection::State::Open &&
-          maybeEngageSplice(data)) {
+          maybeEngageSplice(data, /*from_upstream=*/true)) {
         // Engaged. The pump now owns both sockets and accounts the bytes including this chunk.
         return;
       }
@@ -1314,7 +1333,7 @@ void Filter::maybeCloseDownstreamForDrainClose() {
                                       StreamInfo::LocalCloseReasons::get().TcpProxyDrainClose);
 }
 
-bool Filter::maybeEngageSplice(Buffer::Instance& data) {
+bool Filter::maybeEngageSplice(Buffer::Instance& data, bool from_upstream) {
   Network::Connection& down = read_callbacks_->connection();
   OptRef<Network::Connection> up = upstream_->upstreamConnection();
   ASSERT(up.has_value());
@@ -1349,11 +1368,21 @@ bool Filter::maybeEngageSplice(Buffer::Instance& data) {
       },
       [this](uint64_t n) {
         getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(n);
+        getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(n);
         resetIdleTimer();
       });
   // Phase 1 is fallible setup, the pipe and the queued pre-engage chunk, run before detaching
-  // anything. On failure the connection stays on the buffered path with `data` untouched.
-  if (!pump->prepare(data.toString())) {
+  // anything. On failure the connection stays on the buffered path with `data` untouched. Route
+  // the pre-engage chunk to its destination by direction.
+  std::string initial = data.toString();
+  std::string init_u2d;
+  std::string init_d2u;
+  if (from_upstream) {
+    init_u2d = std::move(initial);
+  } else {
+    init_d2u = std::move(initial);
+  }
+  if (!pump->prepare(std::move(init_u2d), std::move(init_d2u))) {
     ENVOY_CONN_LOG(warn, "L4 splice setup failed, staying on buffered path", down);
     return false;
   }
@@ -1509,6 +1538,9 @@ void Filter::onUpstreamConnection() {
       getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(early_data_buffer_.length());
     }
     upstream_->encodeData(early_data_buffer_, early_data_end_stream_);
+    // Early data went upstream on the buffered path, so the upload-splice can no longer engage
+    // without risking reordering ahead of these bytes.
+    upstream_write_started_ = true;
     ASSERT(0 == early_data_buffer_.length());
   }
 

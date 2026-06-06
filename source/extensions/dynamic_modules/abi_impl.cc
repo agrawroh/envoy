@@ -3411,6 +3411,12 @@ __attribute__((weak)) void envoy_dynamic_module_callback_transport_socket_set_is
                "not implemented in this context");
 }
 
+__attribute__((weak)) void envoy_dynamic_module_callback_transport_socket_set_is_writable(
+    envoy_dynamic_module_type_transport_socket_envoy_ptr) {
+  IS_ENVOY_BUG("envoy_dynamic_module_callback_transport_socket_set_is_writable: "
+               "not implemented in this context");
+}
+
 __attribute__((weak)) void envoy_dynamic_module_callback_transport_socket_flush_write_buffer(
     envoy_dynamic_module_type_transport_socket_envoy_ptr) {
   IS_ENVOY_BUG("envoy_dynamic_module_callback_transport_socket_flush_write_buffer: "

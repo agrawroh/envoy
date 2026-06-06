@@ -54,11 +54,13 @@ public:
   ~SplicePump();
 
   // Phase 1, called before detaching the ConnectionImpl FileEvents. Creates the pipes and queues
-  // `initial_downstream_data`, the already-decrypted upstream chunk the buffered path read just
-  // before engage, for delivery to the downstream socket ahead of any spliced bytes. Returns false
-  // only on unrecoverable setup failure such as pipe creation, in which case the caller must not
-  // detach and should re-deliver the chunk on the buffered path.
-  bool prepare(std::string initial_downstream_data);
+  // the pre-engage chunks the buffered path already read just before engage, so they precede any
+  // spliced bytes and ordering is preserved. `initial_u2d` is the decrypted upstream chunk bound
+  // for the downstream socket (the download engage, e.g. a GET response). `initial_d2u` is the
+  // downstream chunk bound for the upstream socket (the upload engage, e.g. a PUT body); exactly
+  // one is non-empty per engage. Returns false only on unrecoverable setup failure such as pipe
+  // creation, in which case the caller must not detach and should re-deliver on the buffered path.
+  bool prepare(std::string initial_u2d, std::string initial_d2u);
   // Phase 2, called after detaching the ConnectionImpl FileEvents. Installs the pump's FileEvents
   // and primes the first pass.
   void arm();
@@ -87,15 +89,13 @@ private:
   BytesCb on_u2d_bytes_;
   BytesCb on_d2u_bytes_;
 
-  Pipe u2d_; // upstream to downstream, the download bulk, moved in-kernel by splice
-  // The downstream-to-upstream direction (request or upload) is copied through userspace rather
-  // than spliced. It is the small direction, and write() into a kTLS-TX socket uses the kernel
-  // sendmsg path that frames TLS records correctly, whereas splice() into kTLS-TX (sendpage)
-  // misframes on some kernels. This mirrors OSD's zerocopy proxy, which reads requests in
-  // userspace and splices only the response body.
-  std::vector<char> d2u_buf_;
-  size_t d2u_len_{0}; // valid bytes currently in d2u_buf_
-  size_t d2u_off_{0}; // bytes of d2u_buf_ already written to the upstream socket
+  Pipe u2d_; // upstream to downstream, the download body, moved in-kernel by splice
+  // The downstream-to-upstream direction (request and upload body) is also moved in-kernel by
+  // splice through its own pipe. splice() into a kTLS-TX socket on a modern kernel (verified on
+  // 6.17, matching OSD's zerocopy proxy) frames TLS records correctly, the kernel auto-chunks the
+  // spliced bytes into 16 KiB application-data records, so the upload gets the same zero-copy
+  // treatment as the download rather than a per-byte userspace copy.
+  Pipe d2u_;
   Event::FileEventPtr up_file_event_;
   Event::FileEventPtr down_file_event_;
 
@@ -104,6 +104,11 @@ private:
   // the pipe capacity, so it is held here rather than routed through the pipe.
   std::string pending_down_;
   size_t pending_down_off_{0};
+  // Symmetric to pending_down_ for the upload direction. The pre-engage downstream chunk that did
+  // not fit the upstream socket send buffer at prepare() time. It flushes to up_fd_ ahead of any
+  // d2u pipe bytes so the request and upload body leave in order.
+  std::string pending_up_;
+  size_t pending_up_off_{0};
 
   // Readiness latches set by FileEvents and cleared on EAGAIN, mirroring transfer.rs loop state.
   bool up_readable_{false};

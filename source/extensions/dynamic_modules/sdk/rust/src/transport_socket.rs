@@ -168,6 +168,9 @@ pub trait EnvoyTransportSocket {
   fn should_drain_read_buffer(&self) -> bool;
   /// Requests that a future event-loop iteration schedules a read.
   fn set_is_readable(&self);
+  /// Requests that a future event-loop iteration schedules a write. Call this after leaving bytes
+  /// unsent on EAGAIN so the buffered write is re-driven once the socket drains.
+  fn set_is_writable(&self);
   /// Flushes pending write data toward the transport.
   fn flush_write_buffer(&self);
 }
@@ -319,6 +322,12 @@ impl EnvoyTransportSocket for EnvoyTransportSocketImpl {
   fn set_is_readable(&self) {
     unsafe {
       abi::envoy_dynamic_module_callback_transport_socket_set_is_readable(self.raw);
+    }
+  }
+
+  fn set_is_writable(&self) {
+    unsafe {
+      abi::envoy_dynamic_module_callback_transport_socket_set_is_writable(self.raw);
     }
   }
 
