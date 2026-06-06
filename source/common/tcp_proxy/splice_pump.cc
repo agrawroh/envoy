@@ -508,6 +508,19 @@ void SplicePump::maybeHalfCloseOrComplete() {
   }
   if (u2d_drained && d2u_drained) {
     complete(Network::ConnectionEvent::RemoteClose);
+    return;
+  }
+  // The client closed its send side (d2u_drained), the request was fully relayed, and the upstream
+  // write was half-closed. A keep-alive upstream such as S3 does not send EOF, so waiting for
+  // up_read_eof_ would hold both sockets and the two pipes open forever. Under connection churn (a
+  // high rate of keep-alive PUTs the client retires after each response) that leaks fds and pipe
+  // memory without bound until the worker wedges. Once the response is fully drained downstream
+  // (u2d pipe empty, pre-engage chunk flushed) and the upstream has no more readable data this
+  // pass, the proxied exchange is finished, so tear down and free the resources. The downstream
+  // read-EOF means the client is done, so completing here does not cut off a response it awaits.
+  if (d2u_drained && up_write_shutdown_ && !up_readable_ && u2d_.in_pipe == 0 &&
+      pending_down_off_ >= pending_down_.size()) {
+    complete(Network::ConnectionEvent::RemoteClose);
   }
 }
 
