@@ -359,9 +359,8 @@ pub trait TransportSocket<ETS: EnvoyTransportSocket + ?Sized>: Send {
   fn get_failure_reason(&self, envoy: &mut ETS) -> String;
   /// Returns whether the socket may flush and close.
   fn can_flush_close(&self, envoy: &mut ETS) -> bool;
-  /// Reports `(ktls_installed, raw_fd)` for a kernel-TLS socket so a higher layer such as tcp_proxy
-  /// can `splice()` directly on the fd. The default reports not a kTLS socket. Only the rustls and
-  /// kTLS socket overrides this.
+  /// Reports `(ktls_installed, raw_fd)` so a higher layer such as tcp_proxy can `splice()` on the
+  /// fd. Defaults to `(false, -1)`. Only the rustls kTLS socket overrides it.
   fn ktls_state(&self, _envoy: &mut ETS) -> (bool, i32) {
     (false, -1)
   }

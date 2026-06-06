@@ -45,6 +45,9 @@ ControlAction classifyKtlsControlRecord(uint8_t record_type, const uint8_t* data
       const size_t msg_len = (static_cast<size_t>(data[pos + 1]) << 16) |
                              (static_cast<size_t>(data[pos + 2]) << 8) |
                              static_cast<size_t>(data[pos + 3]);
+      if (msg_len > len - pos - 4) {
+        return ControlAction::Close; // declared length overruns the record
+      }
       pos += 4 + msg_len;
     }
     return ControlAction::Retry;
@@ -69,6 +72,8 @@ constexpr size_t kD2uChunk = 64 * 1024;
 // Upper bound on non-DATA kTLS control records drained in one pump pass. A trusted upstream sends
 // a handful of NewSessionTickets, so a large run signals a misbehaving peer and we close.
 constexpr int kMaxControlRecordsPerPass = 1024;
+// TLS 1.3 max record, 16384 plaintext plus AEAD and header overhead.
+constexpr size_t kMaxTlsRecordSize = 16640;
 } // namespace
 
 SplicePump::SplicePump(os_fd_t down_fd, os_fd_t up_fd, bool up_is_ktls,
@@ -325,7 +330,7 @@ void SplicePump::pump() {
 bool SplicePump::drainUpstreamControlMessage() {
   // splice() cannot deliver a non-DATA TLS record into a pipe, so consume it with recvmsg() and
   // read its type from the TLS_GET_RECORD_TYPE control message.
-  uint8_t buf[16640];
+  uint8_t buf[kMaxTlsRecordSize];
   alignas(struct cmsghdr) char cmsg_space[CMSG_SPACE(sizeof(uint8_t))];
   struct iovec iov;
   iov.iov_base = buf;
@@ -384,8 +389,8 @@ bool SplicePump::drainUpstreamControlMessage() {
     return false;
   case ControlAction::Close:
     if (record_type == kTlsRecordAlert) {
-      ENVOY_LOG(debug, "splice pump upstream fatal TLS alert level {} desc {}",
-                n >= 1 ? buf[0] : 0xFF, n >= 2 ? buf[1] : 0xFF);
+      ENVOY_LOG(debug, "splice pump upstream fatal TLS alert level {} desc {}", buf[0],
+                n >= 2 ? buf[1] : 0xFF);
     } else {
       ENVOY_LOG(debug, "splice pump closing on TLS record type {}", record_type);
     }

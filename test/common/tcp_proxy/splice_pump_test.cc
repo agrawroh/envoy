@@ -22,6 +22,7 @@ constexpr uint8_t kChangeCipherSpec = 20;
 constexpr uint8_t kAlert = 21;
 constexpr uint8_t kHandshake = 22;
 constexpr uint8_t kNewSessionTicket = 4;
+constexpr uint8_t kKeyUpdate = 24;
 
 // Builds a handshake record body of `count` NewSessionTicket messages, each with a `body_len`-byte
 // body, so the classifier's coalesced-message walk can be exercised.
@@ -75,7 +76,7 @@ TEST(ClassifyKtlsControlRecord, NonTicketHandshakeIsClose) {
 
 TEST(ClassifyKtlsControlRecord, TicketThenRekeyIsClose) {
   std::vector<uint8_t> hs = newSessionTickets(1, 4);
-  hs.push_back(8); // KeyUpdate type, must force a close
+  hs.push_back(kKeyUpdate); // must force a close
   hs.push_back(0);
   hs.push_back(0);
   hs.push_back(1);
@@ -86,6 +87,12 @@ TEST(ClassifyKtlsControlRecord, TicketThenRekeyIsClose) {
 TEST(ClassifyKtlsControlRecord, UnknownRecordTypeIsClose) {
   const uint8_t data[] = {0};
   EXPECT_EQ(ControlAction::Close, classifyKtlsControlRecord(99, data, sizeof(data)));
+}
+
+TEST(ClassifyKtlsControlRecord, HandshakeWithOverlongLengthIsClose) {
+  // A NewSessionTicket whose declared length (~16M) runs past the 5-byte record is malformed.
+  const uint8_t hs[] = {kNewSessionTicket, 0xFF, 0xFF, 0xFF, 0x00};
+  EXPECT_EQ(ControlAction::Close, classifyKtlsControlRecord(kHandshake, hs, sizeof(hs)));
 }
 
 #ifdef __linux__

@@ -272,10 +272,10 @@ Network::TransportSocketPtr RustlsUpstreamTransportSocketFactory::createTranspor
     Network::TransportSocketOptionsConstSharedPtr options,
     Upstream::HostDescriptionConstSharedPtr host) const {
   // The current rustls socket builds one rustls `ClientConfig` per factory and clones it into
-  // every connection — so per-connection TransportSocketOptions overrides for SNI, ALPN, and SAN
+  // every connection. Per-connection TransportSocketOptions overrides for SNI, ALPN, and SAN
   // match list cannot be honored yet. Return a `NotReadyRustlsSocket` stub when any override is
   // set; the connection layer surfaces this as `upstream_cx_connect_fail` with the failure
-  // reason in `failureReason()`. (Returning a real nullptr is NOT safe here — `ConnectionImpl`
+  // reason in `failureReason()`. (Returning a real nullptr is NOT safe here. `ConnectionImpl`
   // dereferences `transport_socket_` without a null-check at construction time, see
   // `source/common/network/connection_impl.cc:110`.)
   if (options != nullptr) {
@@ -286,7 +286,7 @@ Network::TransportSocketPtr RustlsUpstreamTransportSocketFactory::createTranspor
     // `applicationProtocolFallback` is set by the HTTP/2 connection pool (e.g. `{"h2",
     // "http/1.1"}`) when the static ALPN list is empty. Without honoring it, a cluster that
     // expects ALPN-driven protocol selection would silently negotiate an ALPN-empty handshake
-    // and downgrade — surfaced as a stealth protocol mismatch. Refuse the connection so the
+    // and downgrade, surfaced as a stealth protocol mismatch. Refuse the connection so the
     // operator gets a clear `upstream_cx_connect_fail` instead.
     const bool has_alpn_fallback_unbacked =
         !options->applicationProtocolFallback().empty() && alpn_protocols_.empty();
