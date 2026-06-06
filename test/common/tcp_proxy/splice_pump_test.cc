@@ -266,6 +266,77 @@ TEST_F(SplicePumpIoTest, BothPeersCloseCompletes) {
   runUntil([&]() { return completed_; });
   EXPECT_TRUE(completed_);
 }
+
+// The upstream finishes its response and closes (EOF / close_notify) while the downstream client
+// keeps its connection open, as a keep-alive client does when it returns the connection to its pool
+// without closing. The pump must deliver the full response and then complete, freeing its fds and
+// pipes, rather than leak them waiting for a downstream close that never comes. Regression for the
+// dominant connection leak observed under PUT churn (engaged greatly exceeding torndown): before
+// the upstream-finished completion arm, this state satisfied neither the both-closed path nor the
+// client-close path, so the pump held its resources until the worker recycled.
+TEST_F(SplicePumpIoTest, UpstreamCloseCompletesWhileDownstreamStaysOpen) {
+  buildAndArm();
+  const std::string response(8192, 'z');
+  ASSERT_EQ(static_cast<ssize_t>(response.size()),
+            ::write(up_.test_end, response.data(), response.size()));
+  ::close(up_.test_end);
+  up_.test_end = -1;
+  // The downstream end is deliberately left open for the whole test.
+  std::string received;
+  runUntil([&]() {
+    received += readAll(down_.test_end);
+    return completed_;
+  });
+  EXPECT_TRUE(completed_);
+  EXPECT_EQ(response, received);
+}
+
+// A large upstream response is fully buffered before the client closes. On the client close the
+// pump must deliver every buffered upstream byte before completing, never closing the upstream
+// while response bytes remain unread. Regression for the truncation that a stale readiness latch
+// could cause: completion now waits for an authoritative in-pass upstream drain, and the
+// client-close arm re-arms the upstream read so that final drain happens.
+TEST_F(SplicePumpIoTest, DownstreamCloseDeliversBufferedUpstreamBytes) {
+  buildAndArm();
+  const std::string response(200000, 'r');
+  ASSERT_EQ(static_cast<ssize_t>(response.size()),
+            ::write(up_.test_end, response.data(), response.size()));
+  ::close(up_.test_end);
+  up_.test_end = -1;
+  // The client closes its connection right after, the typical keep-alive retire.
+  ::shutdown(down_.test_end, SHUT_WR);
+  std::string received;
+  runUntil(
+      [&]() {
+        received += readAll(down_.test_end);
+        return completed_;
+      },
+      2000);
+  EXPECT_TRUE(completed_);
+  EXPECT_EQ(response.size(), received.size());
+  EXPECT_EQ(response, received);
+}
+
+// A keep-alive upstream that never sends EOF: the client sends its request, reads the full
+// response, and closes its connection (retiring it). The pump must complete via the client-close
+// path rather than wait forever for an upstream EOF that a keep-alive peer never sends.
+TEST_F(SplicePumpIoTest, ClientCloseCompletesWithKeepAliveUpstream) {
+  buildAndArm();
+  const std::string response(8192, 'r');
+  ASSERT_EQ(static_cast<ssize_t>(response.size()),
+            ::write(up_.test_end, response.data(), response.size()));
+  std::string received;
+  runUntil([&]() {
+    received += readAll(down_.test_end);
+    return received.size() >= response.size();
+  });
+  EXPECT_EQ(response, received);
+  // The client closes fully while the upstream stays open (keep-alive).
+  ::close(down_.test_end);
+  down_.test_end = -1;
+  runUntil([&]() { return completed_; });
+  EXPECT_TRUE(completed_);
+}
 #endif
 
 } // namespace

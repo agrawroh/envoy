@@ -1396,6 +1396,8 @@ bool Filter::maybeEngageSplice(Buffer::Instance& data, bool from_upstream) {
   up->getSocket()->ioHandle().resetFileEvents();
   splice_pump_ = std::move(pump);
   splice_pump_->arm();
+  config_->stats().splice_pump_active_.inc();
+  config_->stats().splice_pump_engaged_total_.inc();
   ENVOY_CONN_LOG(debug, "L4 kernel-splice fast-path engaged (down_fd={}, up_fd={})", down, down_fd,
                  up_fd);
   return true;
@@ -1407,6 +1409,8 @@ void Filter::tearDownSplice() {
   }
   // Reset the pump first so its FileEvents and pipes are gone before the socket fds close.
   splice_pump_.reset();
+  config_->stats().splice_pump_active_.dec();
+  config_->stats().splice_pump_torndown_total_.inc();
   if (upstream_ == nullptr) {
     return;
   }

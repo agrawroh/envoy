@@ -192,6 +192,9 @@ absl::Status SplicePump::onUpReady(uint32_t events) {
   if (completed_) {
     return absl::OkStatus();
   }
+  if (events & Event::FileReadyType::Closed) {
+    up_closed_ = true;
+  }
   if (events & (Event::FileReadyType::Read | Event::FileReadyType::Closed)) {
     up_readable_ = true;
   }
@@ -205,6 +208,9 @@ absl::Status SplicePump::onUpReady(uint32_t events) {
 absl::Status SplicePump::onDownReady(uint32_t events) {
   if (completed_) {
     return absl::OkStatus();
+  }
+  if (events & Event::FileReadyType::Closed) {
+    down_closed_ = true;
   }
   if (events & (Event::FileReadyType::Read | Event::FileReadyType::Closed)) {
     down_readable_ = true;
@@ -220,6 +226,19 @@ void SplicePump::pump() {
   if (completed_) {
     return;
   }
+  // Reset each pass. Set true only by a real upstream EAGAIN below, so completion can tell "the
+  // upstream is drained right now" from a stale cross-pass readiness latch.
+  up_eagain_this_pass_ = false;
+  // Assume both sockets are writable at the start of every pass and let an actual splice/write
+  // EAGAIN re-clear the latch within the pass. The cross-pass writable latches otherwise sit
+  // stale-false after a transient EAGAIN while the socket is in fact writable (Send-Q drained to
+  // empty), with no further EPOLLOUT edge to re-arm them because the socket never went un-writable
+  // at the epoll level. That deadlocks a pump that still has buffered upload to push to the
+  // upstream (and the symmetric download case): d2u stays full, the downstream read stalls, and the
+  // peer close is never seen. Re-testing each pass costs at most one extra EAGAIN syscall under
+  // genuine backpressure.
+  up_writable_ = true;
+  down_writable_ = true;
   // SPLICE_F_MOVE is advisory. SPLICE_F_MORE is not set so the downstream write is not corked.
   const unsigned flags = SPLICE_F_NONBLOCK | SPLICE_F_MOVE;
   int control_records = 0;
@@ -283,6 +302,12 @@ void SplicePump::pump() {
         break;
       } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
         up_readable_ = false;
+        up_eagain_this_pass_ = true; // upstream RX is empty right now, authoritative for completion
+        // A prior Closed event (EPOLLRDHUP) plus a drained read side is the real EOF; splice() on a
+        // half-closed socket returns EAGAIN, never 0, so this is the only way we learn it closed.
+        if (up_closed_) {
+          up_read_eof_ = true;
+        }
         break;
       } else if (errno == EINTR) {
         continue;
@@ -364,9 +389,31 @@ void SplicePump::pump() {
         progress = true;
       } else if (n == 0) {
         down_read_eof_ = true;
+        // The client closed its send side. A keep-alive upstream (S3) never sends EOF, so
+        // completion for this connection will rely on an authoritative upstream drain. If the
+        // up_readable_ latch is stale-false from an earlier pass, section (2) would be skipped and
+        // we could either leak (never confirm the upstream is empty) or truncate (complete while
+        // bytes sit unread). Re-arm the upstream read and loop once more so section (2) runs,
+        // delivers any buffered response, and then observes a real EAGAIN or EOF.
+        if (!up_read_eof_ && !up_readable_) {
+          up_readable_ = true;
+          progress = true;
+        }
         break;
       } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
         down_readable_ = false;
+        // A prior Closed event (EPOLLRDHUP) plus a drained read side is the real client EOF.
+        // splice() on a half-closed socket returns EAGAIN, not 0, so without this the pump never
+        // learns the client closed and leaks the connection under keep-alive churn. Re-arm the
+        // upstream read so section (2) performs a final authoritative drain (delivering any
+        // buffered response) before completion gates on it, exactly as the n==0 arm does.
+        if (down_closed_ && !down_read_eof_) {
+          down_read_eof_ = true;
+          if (!up_read_eof_ && !up_readable_) {
+            up_readable_ = true;
+            progress = true;
+          }
+        }
         break;
       } else if (errno == EINTR) {
         continue;
@@ -403,6 +450,7 @@ bool SplicePump::drainUpstreamControlMessage() {
   if (n < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
       up_readable_ = false;
+      up_eagain_this_pass_ = true; // upstream RX is empty right now, authoritative for completion
       return false;
     }
     ENVOY_LOG(debug, "splice pump kTLS control recvmsg error, {}", std::strerror(errno));
@@ -510,15 +558,27 @@ void SplicePump::maybeHalfCloseOrComplete() {
     complete(Network::ConnectionEvent::RemoteClose);
     return;
   }
+  // Upstream finished: it sent a real EOF or close_notify (u2d_drained requires up_read_eof_) and
+  // its full response has been delivered downstream. A kTLS upstream that closed its send side
+  // cannot carry another keep-alive request, so the exchange is over even if the client has not
+  // closed its own write side. Without this arm a keep-alive client that received its response but
+  // left the connection open (returned it to its pool) keeps d2u_drained false forever, so neither
+  // the both-drained path above nor the client-close path below fires, and the pump holds both
+  // sockets and the two pipes until the worker recycles. This is the dominant leak under PUT churn.
+  if (u2d_drained && down_write_shutdown_) {
+    complete(Network::ConnectionEvent::RemoteClose);
+    return;
+  }
   // The client closed its send side (d2u_drained), the request was fully relayed, and the upstream
   // write was half-closed. A keep-alive upstream such as S3 does not send EOF, so waiting for
-  // up_read_eof_ would hold both sockets and the two pipes open forever. Under connection churn (a
-  // high rate of keep-alive PUTs the client retires after each response) that leaks fds and pipe
-  // memory without bound until the worker wedges. Once the response is fully drained downstream
-  // (u2d pipe empty, pre-engage chunk flushed) and the upstream has no more readable data this
-  // pass, the proxied exchange is finished, so tear down and free the resources. The downstream
-  // read-EOF means the client is done, so completing here does not cut off a response it awaits.
-  if (d2u_drained && up_write_shutdown_ && !up_readable_ && u2d_.in_pipe == 0 &&
+  // up_read_eof_ would hold both sockets and the two pipes open forever. We complete only once the
+  // upstream has been AUTHORITATIVELY drained this pass (up_eagain_this_pass_ -- a real EAGAIN
+  // observed now), never off the cross-pass up_readable_ latch whose false value can be stale and
+  // does not prove the RX buffer is empty. Completing off the stale latch would close the upstream
+  // NoFlush while response bytes still sit unread and truncate them. The section (4) EOF arm
+  // re-arms up_readable_ so the pump performs that final authoritative drain (delivering any
+  // buffered response downstream) before reaching here.
+  if (d2u_drained && up_write_shutdown_ && up_eagain_this_pass_ && u2d_.in_pipe == 0 &&
       pending_down_off_ >= pending_down_.size()) {
     complete(Network::ConnectionEvent::RemoteClose);
   }

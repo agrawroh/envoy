@@ -71,9 +71,12 @@ constexpr absl::string_view ReceiveBeforeConnectKey = "envoy.tcp_proxy.receive_b
   COUNTER(idle_timeout)                                                                            \
   COUNTER(max_downstream_connection_duration)                                                      \
   COUNTER(upstream_flush_total)                                                                    \
+  COUNTER(splice_pump_engaged_total)                                                               \
+  COUNTER(splice_pump_torndown_total)                                                              \
   GAUGE(downstream_cx_rx_bytes_buffered, Accumulate)                                               \
   GAUGE(downstream_cx_tx_bytes_buffered, Accumulate)                                               \
-  GAUGE(upstream_flush_active, Accumulate)
+  GAUGE(upstream_flush_active, Accumulate)                                                         \
+  GAUGE(splice_pump_active, Accumulate)
 
 /**
  * Tcp proxy stats for on-demand. These stats are generated only if the tcp proxy enables on demand.

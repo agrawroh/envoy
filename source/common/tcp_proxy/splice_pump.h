@@ -120,6 +120,21 @@ private:
   bool down_write_shutdown_{false};
   bool up_write_shutdown_{false};
   bool completed_{false};
+  // True only when the current pump() pass observed a real EAGAIN reading the upstream, proving the
+  // upstream RX buffer is drained right now. Reset at the top of every pass. Completion on the
+  // keep-alive path gates on THIS rather than the cross-pass up_readable_ latch, whose false value
+  // can be stale from an earlier pass and does not prove the socket is empty. Gating completion on
+  // a stale latch would close the upstream with NoFlush while response bytes still sit unread and
+  // truncate them.
+  bool up_eagain_this_pass_{false};
+  // Set when the FileEvent reports Closed (EPOLLRDHUP), i.e. the peer half-closed its write side.
+  // splice() from a half-closed TCP socket returns EAGAIN, not 0, so it never surfaces the EOF the
+  // way read() would. We therefore treat a Closed event plus a subsequent read EAGAIN (read side
+  // fully drained) as the authoritative read-EOF, instead of waiting for a splice() 0 that a
+  // half-closed socket never delivers. Without this the pump never learns the peer closed and leaks
+  // the connection under keep-alive churn.
+  bool down_closed_{false};
+  bool up_closed_{false};
 };
 
 using SplicePumpPtr = std::unique_ptr<SplicePump>;
