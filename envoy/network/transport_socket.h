@@ -36,6 +36,17 @@ namespace Network {
 class Connection;
 enum class ConnectionEvent;
 
+// Reports kernel-TLS (kTLS) installation state plus the raw socket fd, so a higher layer such as
+// the TCP proxy splice fast-path can splice() directly on the kTLS socket without routing bytes
+// through Envoy's userspace buffers. `installed` is true only when both TX and RX are offloaded to
+// the kernel and the connection is healthy. `trusted_peer` is true when the peer is one Envoy
+// connected to, which is the gate the splice path uses to avoid splicing from untrusted clients.
+struct KtlsBytestreamInfo {
+  bool installed{false};
+  int fd{-1};
+  bool trusted_peer{false};
+};
+
 /**
  * Result of each I/O event.
  */
@@ -190,6 +201,12 @@ public:
    * @return the const SSL connection data if this is an SSL connection, or nullptr if it is not.
    */
   virtual Ssl::ConnectionInfoConstSharedPtr ssl() const PURE;
+
+  /**
+   * @return kTLS bytestream info (installed + raw fd) if this transport socket has installed
+   * kernel TLS and can be spliced on directly, otherwise an empty OptRef. The base returns empty.
+   */
+  virtual OptRef<const KtlsBytestreamInfo> ktlsBytestreamInfo() const { return {}; }
 
   /**
    * Instructs a transport socket to start using secure transport.

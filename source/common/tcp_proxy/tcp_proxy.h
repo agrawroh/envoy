@@ -34,6 +34,7 @@
 #include "source/common/network/hash_policy.h"
 #include "source/common/network/utility.h"
 #include "source/common/stream_info/stream_info_impl.h"
+#include "source/common/tcp_proxy/splice_pump.h"
 #include "source/common/tcp_proxy/upstream.h"
 #include "source/common/upstream/load_balancer_context_base.h"
 #include "source/common/upstream/od_cds_api_impl.h"
@@ -699,6 +700,17 @@ protected:
   void onUpstreamEvent(Network::ConnectionEvent event);
   void maybeCloseDownstreamForDrainClose();
   void onUpstreamConnection();
+  // Tries to engage the L4 kernel-splice fast-path. Sets up the pump (fallible) before detaching.
+  // On success it drains `data`, removes both socket FileEvents, arms the pump and returns true.
+  // On failure it leaves `data` untouched and returns false so the buffered path handles it.
+  bool maybeEngageSplice(Buffer::Instance& data);
+  // Resets the splice pump and force-closes the hijacked upstream connection so the pool and drain
+  // manager discard it rather than reuse a socket whose FileEvents the pump removed. A no-op when
+  // no splice is engaged.
+  void tearDownSplice();
+  // SplicePump completion callback. Schedules deferred teardown via a member callback so a Filter
+  // destroyed before it fires cancels it.
+  void onSpliceComplete(Network::ConnectionEvent event);
   void onIdleTimeout();
   void resetIdleTimer();
   void disableIdleTimer();
@@ -734,6 +746,13 @@ protected:
   // The upstream handle (either TCP or HTTP). This is set in onGenericPoolReady and should persist
   // until either the upstream or downstream connection is terminated.
   std::unique_ptr<GenericUpstream> upstream_;
+  // Kernel splice() fast-path pump for the L4 kTLS bytestream. Declared after upstream_ so it
+  // destructs first and its FileEvents and pipes are torn down before the upstream fd is closed.
+  SplicePumpPtr splice_pump_;
+  // Deferred teardown of a completed/aborted splice. Member-owned so it is cancelled if the Filter
+  // is destroyed first (avoids a use-after-free from a deferred completion).
+  Event::SchedulableCallbackPtr splice_complete_schedulable_;
+  Network::ConnectionEvent splice_complete_event_{Network::ConnectionEvent::LocalClose};
   // The connection pool used to set up |upstream_|.
   // This will be non-null from when an upstream connection is attempted until
   // it either succeeds or fails.

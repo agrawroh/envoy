@@ -356,6 +356,39 @@ TEST_P(TcpProxyTest, ExplicitFactory) {
   upstream_callbacks_->onEvent(Network::ConnectionEvent::LocalClose);
 }
 
+// The L4 splice engage gate rejects when the upstream reports kTLS not installed, so upstream data
+// stays on the buffered path.
+TEST_P(TcpProxyTest, SpliceNotEngagedWhenKtlsNotInstalled) {
+  setup(1);
+  raiseEventUpstreamConnected(0);
+
+  Network::KtlsBytestreamInfo ktls_info{/*installed=*/false, /*fd=*/-1, /*trusted_peer=*/true};
+  ON_CALL(*upstream_connections_.at(0), ktlsBytestreamInfo())
+      .WillByDefault(
+          testing::Return(makeOptRefFromPtr<const Network::KtlsBytestreamInfo>(&ktls_info)));
+
+  Buffer::OwnedImpl response("world");
+  EXPECT_CALL(filter_callbacks_.connection_, write(BufferEqual(&response), _));
+  upstream_callbacks_->onUpstreamData(response, false);
+}
+
+// The L4 splice engage gate rejects an untrusted peer, so upstream data stays on the buffered
+// path. Only the upstream leg is ever queried, so a downstream-style untrusted socket cannot be
+// spliced.
+TEST_P(TcpProxyTest, SpliceNotEngagedWhenPeerUntrusted) {
+  setup(1);
+  raiseEventUpstreamConnected(0);
+
+  Network::KtlsBytestreamInfo ktls_info{/*installed=*/true, /*fd=*/0, /*trusted_peer=*/false};
+  ON_CALL(*upstream_connections_.at(0), ktlsBytestreamInfo())
+      .WillByDefault(
+          testing::Return(makeOptRefFromPtr<const Network::KtlsBytestreamInfo>(&ktls_info)));
+
+  Buffer::OwnedImpl response("world");
+  EXPECT_CALL(filter_callbacks_.connection_, write(BufferEqual(&response), _));
+  upstream_callbacks_->onUpstreamData(response, false);
+}
+
 // Test nothing bad happens if an invalid factory is configured.
 TEST_P(TcpProxyTest, BadFactory) {
   auto& info = factory_context_.server_factory_context_.cluster_manager_.thread_local_cluster_

@@ -520,6 +520,12 @@ void Filter::onInitFailure(UpstreamFailureReason reason) {
 }
 
 void Filter::readDisableUpstream(bool disable) {
+  // The splice fast-path removed the connection FileEvents, so readDisable would touch a null
+  // file_event_ and hit an ENVOY_BUG. The watermark callbacks that drive it cannot fire while
+  // spliced because no buffered write feeds them, so this guard also future-proofs other callers.
+  if (splice_pump_ != nullptr) {
+    return;
+  }
   bool success = false;
   if (upstream_) {
     success = upstream_->readDisable(disable);
@@ -541,6 +547,10 @@ void Filter::readDisableUpstream(bool disable) {
 }
 
 void Filter::readDisableDownstream(bool disable) {
+  // See readDisableUpstream. The spliced connection has no FileEvents to toggle.
+  if (splice_pump_ != nullptr) {
+    return;
+  }
   if (read_callbacks_->connection().state() != Network::Connection::State::Open) {
     // During idle timeouts, we close both upstream and downstream with NoFlush.
     // Envoy still does a best-effort flush which can case readDisableDownstream to be called
@@ -1067,6 +1077,10 @@ Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
                  "receive_before_connect_={}, connect_mode_={}",
                  read_callbacks_->connection(), data.length(), end_stream, upstream_ != nullptr,
                  receive_before_connect_, static_cast<int>(connect_mode_));
+  // Once the splice fast-path owns the sockets, the buffered path must not touch them.
+  if (splice_pump_ != nullptr) {
+    return Network::FilterStatus::StopIteration;
+  }
   getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(data.length());
 
   if (upstream_) {
@@ -1211,6 +1225,14 @@ void Filter::onDownstreamEvent(Network::ConnectionEvent event) {
     return;
   }
 
+  // A downstream close while a splice is engaged tears the pump down and force-closes the hijacked
+  // upstream before its fd is released, so the code below discards it instead of draining it.
+  if ((event == Network::ConnectionEvent::RemoteClose ||
+       event == Network::ConnectionEvent::LocalClose) &&
+      splice_pump_ != nullptr) {
+    tearDownSplice();
+  }
+
   if (event == Network::ConnectionEvent::LocalClose ||
       event == Network::ConnectionEvent::RemoteClose) {
     downstream_closed_ = true;
@@ -1250,6 +1272,27 @@ void Filter::onDownstreamEvent(Network::ConnectionEvent event) {
 void Filter::onUpstreamData(Buffer::Instance& data, bool end_stream) {
   ENVOY_CONN_LOG(trace, "upstream connection received {} bytes, end_stream={}",
                  read_callbacks_->connection(), data.length(), end_stream);
+  // L4 kernel-splice fast-path. On the first upstream data, once the upstream rustls socket has
+  // installed kTLS, which happens lazily on its first read, detach both sockets and hand them to a
+  // SplicePump that moves bytes in-kernel and bypasses the userspace buffers and filter chain.
+  // Engaging here rather than at pool-ready guarantees kTLS is installed. Falls back transparently
+  // when ineligible.
+  if (splice_pump_ == nullptr && !end_stream && upstream_ != nullptr) {
+    OptRef<Network::Connection> up = upstream_->upstreamConnection();
+    if (up.has_value()) {
+      // We only ever query the upstream leg, so info->trusted_peer is always true here. It is kept
+      // as a defensive invariant so a future caller cannot splice an untrusted downstream socket.
+      OptRef<const Network::KtlsBytestreamInfo> info = up->ktlsBytestreamInfo();
+      if (info.has_value() && info->installed && info->trusted_peer &&
+          read_callbacks_->connection().state() == Network::Connection::State::Open &&
+          maybeEngageSplice(data)) {
+        // Engaged. The pump now owns both sockets and accounts the bytes including this chunk.
+        return;
+      }
+      // Not engaged because it is ineligible or setup failed. `data` is untouched and the buffered
+      // path below handles it.
+    }
+  }
   getStreamInfo().getUpstreamBytesMeter()->addWireBytesReceived(data.length());
   getStreamInfo().getDownstreamBytesMeter()->addWireBytesSent(data.length());
   read_callbacks_->connection().write(data, end_stream);
@@ -1271,9 +1314,114 @@ void Filter::maybeCloseDownstreamForDrainClose() {
                                       StreamInfo::LocalCloseReasons::get().TcpProxyDrainClose);
 }
 
+bool Filter::maybeEngageSplice(Buffer::Instance& data) {
+  Network::Connection& down = read_callbacks_->connection();
+  OptRef<Network::Connection> up = upstream_->upstreamConnection();
+  ASSERT(up.has_value());
+  // Both legs must be real OS sockets. An internal-listener connection uses a user-space IoHandle
+  // with no fd to splice on, so fall back to the buffered path before touching the fds.
+  if (down.connectionInfoProvider().localAddress()->type() ==
+          Network::Address::Type::EnvoyInternal ||
+      up->connectionInfoProvider().localAddress()->type() ==
+          Network::Address::Type::EnvoyInternal) {
+    return false;
+  }
+  const os_fd_t down_fd = down.getSocket()->ioHandle().fdDoNotUse();
+  const os_fd_t up_fd = up->getSocket()->ioHandle().fdDoNotUse();
+  if (down_fd == INVALID_SOCKET || up_fd == INVALID_SOCKET) {
+    return false;
+  }
+  // Do not engage while the upstream write buffer is backed up. The pump relays the request and
+  // upload direction straight from the downstream socket and cannot see bytes still queued in the
+  // upstream connection write buffer, so engaging under write backpressure would strand them. The
+  // download pattern this targets flushes the request before the response arrives.
+  if (up->aboveHighWatermark()) {
+    return false;
+  }
+  auto pump = std::make_unique<SplicePump>(
+      down_fd, up_fd, /*up_is_ktls=*/true, down.dispatcher(),
+      [this](Network::ConnectionEvent event) { onSpliceComplete(event); },
+      [this](uint64_t n) {
+        getStreamInfo().getUpstreamBytesMeter()->addWireBytesReceived(n);
+        getStreamInfo().getDownstreamBytesMeter()->addWireBytesSent(n);
+        resetIdleTimer();
+      },
+      [this](uint64_t n) {
+        getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(n);
+        resetIdleTimer();
+      });
+  // Phase 1 is fallible setup, the pipe and the queued pre-engage chunk, run before detaching
+  // anything. On failure the connection stays on the buffered path with `data` untouched.
+  if (!pump->prepare(data.toString())) {
+    ENVOY_CONN_LOG(warn, "L4 splice setup failed, staying on buffered path", down);
+    return false;
+  }
+  // Commit. Consume the chunk the pump now owns, then remove both ConnectionImpl FileEvents so the
+  // pump is the only FileEvent on each fd. Removing rather than disabling matters because a
+  // disabled second registration drops the next connection's edges after fd reuse and wedges its
+  // handshake. Nulling file_event_ is safe because tearDownSplice closes with NoFlush and never
+  // enters the write path that would touch it.
+  data.drain(data.length());
+  down.getSocket()->ioHandle().resetFileEvents();
+  up->getSocket()->ioHandle().resetFileEvents();
+  splice_pump_ = std::move(pump);
+  splice_pump_->arm();
+  ENVOY_CONN_LOG(debug, "L4 kernel-splice fast-path engaged (down_fd={}, up_fd={})", down, down_fd,
+                 up_fd);
+  return true;
+}
+
+void Filter::tearDownSplice() {
+  if (splice_pump_ == nullptr) {
+    return;
+  }
+  // Reset the pump first so its FileEvents and pipes are gone before the socket fds close.
+  splice_pump_.reset();
+  if (upstream_ == nullptr) {
+    return;
+  }
+  // The pump hijacked the upstream socket with raw fds and removed its FileEvents, so the
+  // connection must not be reused. Force it closed with NoFlush. That marks it Closed before the
+  // pool or drain manager inspects it, so both discard it instead of re-arming the removed event,
+  // and NoFlush keeps the close off the write path. A spliced connection therefore always closes
+  // gracefully, so an upstream RST is reported downstream as a normal close rather than a reset.
+  OptRef<Network::Connection> up = upstream_->upstreamConnection();
+  if (up.has_value() && up->state() != Network::Connection::State::Closed) {
+    up->close(Network::ConnectionCloseType::NoFlush);
+  }
+}
+
+void Filter::onSpliceComplete(Network::ConnectionEvent event) {
+  ENVOY_CONN_LOG(debug, "L4 splice complete, scheduling teardown", read_callbacks_->connection());
+  splice_complete_event_ = event;
+  // Defer teardown via a member callback. It must not destroy the pump synchronously from inside
+  // the pump's own FileEvent callback, and a Filter destroyed before it fires cancels it.
+  if (splice_complete_schedulable_ == nullptr) {
+    splice_complete_schedulable_ =
+        read_callbacks_->connection().dispatcher().createSchedulableCallback([this]() {
+          tearDownSplice();
+          // tearDownSplice closed the upstream, whose close event drives onUpstreamEvent and
+          // resets upstream_. If the upstream was already gone it did not, so drive teardown here.
+          if (upstream_ != nullptr) {
+            onUpstreamEvent(splice_complete_event_);
+          }
+        });
+  }
+  splice_complete_schedulable_->scheduleCallbackNextIteration();
+}
+
 void Filter::onUpstreamEvent(Network::ConnectionEvent event) {
   if (event == Network::ConnectionEvent::ConnectedZeroRtt) {
     return;
+  }
+  // Defensive. If a splice is still engaged when an upstream close arrives, reset the pump before
+  // the fd is released below so its FileEvents never outlive the socket. The normal teardown paths
+  // already reset the pump first, so this only matters if some other path closes the upstream
+  // directly. tearDownSplice is idempotent and a no-op when no splice is engaged.
+  if ((event == Network::ConnectionEvent::RemoteClose ||
+       event == Network::ConnectionEvent::LocalClose) &&
+      splice_pump_ != nullptr) {
+    tearDownSplice();
   }
   // Update the connecting flag before processing the event because we may start a new connection
   // attempt in establishUpstreamConnection.
@@ -1407,7 +1555,8 @@ void Filter::onIdleTimeout() {
   ENVOY_CONN_LOG(debug, "Session timed out", read_callbacks_->connection());
   config_->stats().idle_timeout_.inc();
 
-  // This results in also closing the upstream connection.
+  // Closing the downstream also closes the upstream. When a splice is engaged onDownstreamEvent
+  // tears the pump down and force-closes the hijacked upstream.
   read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush,
                                       StreamInfo::LocalCloseReasons::get().TcpSessionIdleTimeout);
 }
@@ -1416,6 +1565,7 @@ void Filter::onMaxDownstreamConnectionDuration() {
   ENVOY_CONN_LOG(debug, "max connection duration reached", read_callbacks_->connection());
   getStreamInfo().setResponseFlag(StreamInfo::CoreResponseFlag::DurationTimeout);
   config_->stats().max_downstream_connection_duration_.inc();
+  // Closing the downstream tears down an engaged splice via onDownstreamEvent (see onIdleTimeout).
   read_callbacks_->connection().close(
       Network::ConnectionCloseType::NoFlush,
       StreamInfo::LocalCloseReasons::get().MaxConnectionDurationReached);

@@ -74,6 +74,7 @@ RustlsTransportSocketConfig::create(const bool is_upstream, const absl::string_v
   RESOLVE_SYMBOL(on_get_failure_reason_,
                  "envoy_dynamic_module_on_transport_socket_get_failure_reason");
   RESOLVE_SYMBOL(on_can_flush_close_, "envoy_dynamic_module_on_transport_socket_can_flush_close");
+  RESOLVE_SYMBOL(on_ktls_state_, "envoy_dynamic_module_on_transport_socket_ktls_state");
 
   // Resolve the factory config new symbol separately (only needed during create).
   auto on_factory_new_or =
@@ -199,7 +200,28 @@ bool RustlsTransportSocket::canFlushClose() {
   return config_->on_can_flush_close_(thisAsEnvoyPtr(), socket_module_);
 }
 
-void RustlsTransportSocket::closeSocket(const Network::ConnectionEvent event) {
+OptRef<const Network::KtlsBytestreamInfo> RustlsTransportSocket::ktlsBytestreamInfo() const {
+  // Hand out nothing on a failed or closing socket so a higher layer never splices on it.
+  if (socket_module_ == nullptr || !failureReason().empty()) {
+    return {};
+  }
+  int fd = -1;
+  const bool installed = config_->on_ktls_state_(
+      const_cast<RustlsTransportSocket*>(this)->thisAsEnvoyPtr(), socket_module_, &fd);
+  if (!installed || fd < 0) {
+    return {};
+  }
+  // trusted_peer follows the socket direction. Only the upstream leg connects to a peer Envoy
+  // chose, while downstream listeners may face untrusted clients. It gates TLS_RX_EXPECT_NO_PAD.
+  ktls_info_storage_ = {/*installed=*/true, fd, /*trusted_peer=*/config_->isUpstream()};
+  return ktls_info_storage_;
+}
+
+void RustlsTransportSocket::closeSocket(const Network::ConnectionEvent event,
+                                        bool /*abort_reset*/) {
+  // TODO(rust-ktls B2): thread `abort_reset` through the on_close ABI so the Rust side can
+  // suppress the TLS close_notify / kTLS shutdown alert on a RST teardown (mirrors
+  // SslSocket::closeSocket gated on ssl_socket_report_connection_reset).
   if (socket_module_ == nullptr) {
     return;
   }

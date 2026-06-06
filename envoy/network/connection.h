@@ -23,6 +23,8 @@ class Dispatcher;
 
 namespace Network {
 
+struct KtlsBytestreamInfo;
+
 /**
  * Events that occur on a connection.
  */
@@ -284,6 +286,12 @@ public:
    */
   // TODO(snowp): Remove this in favor of StreamInfo::downstreamSslConnection.
   virtual Ssl::ConnectionInfoConstSharedPtr ssl() const PURE;
+
+  /**
+   * @return kTLS bytestream info (installed + raw fd) for this connection's transport socket if
+   * kernel TLS is installed and the connection can be spliced on directly, else an empty OptRef.
+   */
+  virtual OptRef<const KtlsBytestreamInfo> ktlsBytestreamInfo() const { return {}; }
 
   /**
    * @return requested server name (e.g. SNI in TLS), if any.

@@ -41,9 +41,11 @@ envoy_cc_library(
 envoy_cc_library(
     name = "tcp_proxy",
     srcs = [
+        "splice_pump.cc",
         "tcp_proxy.cc",
     ],
     hdrs = [
+        "splice_pump.h",
         "tcp_proxy.h",
     ],
     deps = [

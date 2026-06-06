@@ -96,6 +96,9 @@ public:
     // SSL info may be overwritten by a filter in the provider.
     return socket_->connectionInfoProvider().sslConnection();
   }
+  OptRef<const KtlsBytestreamInfo> ktlsBytestreamInfo() const override {
+    return transport_socket_->ktlsBytestreamInfo();
+  }
   State state() const override;
   bool connecting() const override {
     ENVOY_CONN_LOG_EVENT(debug, "connection_connecting_state", "current connecting state: {}",

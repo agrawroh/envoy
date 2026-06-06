@@ -78,6 +78,18 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "splice_pump_test",
+    srcs = ["splice_pump_test.cc"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/common/api:api_lib",
+        "//source/common/event:dispatcher_lib",
+        "//source/common/tcp_proxy",
+        "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_cc_test(
     name = "upstream_test",
     srcs = ["upstream_test.cc"],
     rbe_pool = "6gig",

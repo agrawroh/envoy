@@ -12042,6 +12042,20 @@ bool envoy_dynamic_module_on_transport_socket_can_flush_close(
     envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr,
     envoy_dynamic_module_type_transport_socket_module_ptr transport_socket_module_ptr);
 
+/**
+ * envoy_dynamic_module_on_transport_socket_ktls_state reports whether kernel TLS (kTLS) is
+ * installed on this socket and, if so, the raw file descriptor, so a higher layer (e.g. the
+ * TCP proxy splice fast-path) can splice() directly on the kTLS socket.
+ *
+ * @param transport_socket_envoy_ptr is the pointer to the Envoy transport socket object.
+ * @param transport_socket_module_ptr is the pointer to the in-module transport socket.
+ * @param fd_out receives the raw socket fd when kTLS is installed (may be null).
+ * @return true if kTLS (TX+RX) is installed and the connection is healthy, false otherwise.
+ */
+bool envoy_dynamic_module_on_transport_socket_ktls_state(
+    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr,
+    envoy_dynamic_module_type_transport_socket_module_ptr transport_socket_module_ptr, int* fd_out);
+
 // =============================================================================
 // Transport Socket Callbacks
 // =============================================================================

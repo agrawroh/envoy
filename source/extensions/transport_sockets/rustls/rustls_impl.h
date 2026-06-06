@@ -40,6 +40,8 @@ using OnTransportSocketGetFailureReasonType =
     decltype(&envoy_dynamic_module_on_transport_socket_get_failure_reason);
 using OnTransportSocketCanFlushCloseType =
     decltype(&envoy_dynamic_module_on_transport_socket_can_flush_close);
+using OnTransportSocketKtlsStateType =
+    decltype(&envoy_dynamic_module_on_transport_socket_ktls_state);
 
 /**
  * Holds the loaded dynamic module, resolved ABI entry points, and in-module factory configuration
@@ -79,6 +81,7 @@ public:
   OnTransportSocketGetProtocolType on_get_protocol_{nullptr};
   OnTransportSocketGetFailureReasonType on_get_failure_reason_{nullptr};
   OnTransportSocketCanFlushCloseType on_can_flush_close_{nullptr};
+  OnTransportSocketKtlsStateType on_ktls_state_{nullptr};
 
   bool isUpstream() const { return is_upstream_; }
   const std::string& socketName() const { return socket_name_; }
@@ -114,11 +117,13 @@ public:
   std::string protocol() const override;
   absl::string_view failureReason() const override;
   bool canFlushClose() override;
-  void closeSocket(Network::ConnectionEvent event) override;
+  void closeSocket(Network::ConnectionEvent event, bool abort_reset) override;
   void onConnected() override;
   Network::IoResult doRead(Buffer::Instance& buffer) override;
   Network::IoResult doWrite(Buffer::Instance& buffer, bool end_stream) override;
   Ssl::ConnectionInfoConstSharedPtr ssl() const override { return nullptr; }
+  // Reports kTLS install state + raw fd so tcp_proxy can splice() on the kTLS socket.
+  OptRef<const Network::KtlsBytestreamInfo> ktlsBytestreamInfo() const override;
   bool startSecureTransport() override { return false; }
   void configureInitialCongestionWindow(uint64_t, std::chrono::microseconds) override {}
 
@@ -138,6 +143,8 @@ private:
   RustlsTransportSocketConfigSharedPtr config_;
   Network::TransportSocketCallbacks* callbacks_{nullptr};
   envoy_dynamic_module_type_transport_socket_module_ptr socket_module_{nullptr};
+  // Backing storage for the OptRef returned by ktlsBytestreamInfo() (refreshed per call).
+  mutable Network::KtlsBytestreamInfo ktls_info_storage_;
   Buffer::Instance* active_read_buffer_{nullptr};
   Buffer::Instance* active_write_buffer_{nullptr};
   mutable std::string protocol_storage_;
@@ -161,7 +168,7 @@ public:
   std::string protocol() const override { return {}; }
   absl::string_view failureReason() const override { return failure_reason_; }
   bool canFlushClose() override { return true; }
-  void closeSocket(Network::ConnectionEvent) override {}
+  void closeSocket(Network::ConnectionEvent, bool) override {}
   void onConnected() override {}
   Network::IoResult doRead(Buffer::Instance&) override {
     return {Network::PostIoAction::Close, 0, false, absl::nullopt};

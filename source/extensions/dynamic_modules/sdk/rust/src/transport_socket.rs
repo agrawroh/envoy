@@ -359,6 +359,12 @@ pub trait TransportSocket<ETS: EnvoyTransportSocket + ?Sized>: Send {
   fn get_failure_reason(&self, envoy: &mut ETS) -> String;
   /// Returns whether the socket may flush and close.
   fn can_flush_close(&self, envoy: &mut ETS) -> bool;
+  /// Reports `(ktls_installed, raw_fd)` for a kernel-TLS socket so a higher layer such as tcp_proxy
+  /// can `splice()` directly on the fd. The default reports not a kTLS socket. Only the rustls and
+  /// kTLS socket overrides this.
+  fn ktls_state(&self, _envoy: &mut ETS) -> (bool, i32) {
+    (false, -1)
+  }
 }
 
 // -- Internal Implementation Types --
@@ -681,6 +687,35 @@ pub unsafe extern "C" fn envoy_dynamic_module_on_transport_socket_can_flush_clos
       "envoy_dynamic_module_on_transport_socket_can_flush_close",
       panic,
     );
+    false
+  })
+}
+
+/// Reports `(ktls_installed, raw_fd)`. Returns true when kernel TLS (TX and RX) is installed on
+/// this socket and writes the raw fd to `*fd_out`, so a higher layer can `splice()` on the fd.
+///
+/// # Safety
+///
+/// This is an FFI function called by Envoy. All pointer arguments must be valid as guaranteed
+/// by the Envoy dynamic module ABI. `fd_out` may be null, in which case only the bool is returned.
+#[no_mangle]
+pub unsafe extern "C" fn envoy_dynamic_module_on_transport_socket_ktls_state(
+  transport_socket_envoy_ptr: abi::envoy_dynamic_module_type_transport_socket_envoy_ptr,
+  transport_socket_module_ptr: abi::envoy_dynamic_module_type_transport_socket_module_ptr,
+  fd_out: *mut core::ffi::c_int,
+) -> bool {
+  catch_unwind(AssertUnwindSafe(|| {
+    let wrapper = unsafe { &*(transport_socket_module_ptr as *const TransportSocketWrapper) };
+    let mut envoy = EnvoyTransportSocketImpl::new(transport_socket_envoy_ptr);
+    let (installed, fd) = wrapper.socket.ktls_state(&mut envoy);
+    // Write the out-param inside the unwind boundary so a panic can never leave it half-written.
+    if !fd_out.is_null() {
+      unsafe { *fd_out = fd };
+    }
+    installed
+  }))
+  .unwrap_or_else(|panic| {
+    crate::log_ffi_panic("envoy_dynamic_module_on_transport_socket_ktls_state", panic);
     false
   })
 }

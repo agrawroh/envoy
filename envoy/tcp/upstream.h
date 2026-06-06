@@ -172,6 +172,13 @@ public:
   virtual Ssl::ConnectionInfoConstSharedPtr getUpstreamConnectionSslInfo() PURE;
 
   /**
+   * @return the upstream Network::Connection if this is a raw TCP upstream (so the L4 kernel-splice
+   * fast-path can splice() directly on its socket), or an empty OptRef for tunneled/HTTP upstreams
+   * where body framing would be lost.
+   */
+  virtual OptRef<Network::Connection> upstreamConnection() PURE;
+
+  /**
    * Called when upstream connection is closed.
    * @return the detected close type from socket.
    */

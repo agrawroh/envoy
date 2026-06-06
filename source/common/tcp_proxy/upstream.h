@@ -179,6 +179,12 @@ public:
                                                          absl::string_view details = "") override;
   bool startUpstreamSecureTransport() override;
   Ssl::ConnectionInfoConstSharedPtr getUpstreamConnectionSslInfo() override;
+  OptRef<Network::Connection> upstreamConnection() override {
+    if (upstream_conn_data_ == nullptr) {
+      return {};
+    }
+    return upstream_conn_data_->connection();
+  }
   StreamInfo::DetectedCloseType detectedCloseType() const override;
   absl::string_view localCloseReason() const override;
 
@@ -222,6 +228,8 @@ public:
     conn_pool_callbacks_ = std::move(callbacks);
   }
   Ssl::ConnectionInfoConstSharedPtr getUpstreamConnectionSslInfo() override { return nullptr; }
+  // Tunneled/HTTP upstreams are ineligible for L4 splice (body framing would be lost).
+  OptRef<Network::Connection> upstreamConnection() override { return {}; }
   StreamInfo::DetectedCloseType detectedCloseType() const override;
 
 protected:
@@ -310,6 +318,8 @@ public:
   // socket from non-secure to secure mode.
   bool startUpstreamSecureTransport() override { return false; }
   Ssl::ConnectionInfoConstSharedPtr getUpstreamConnectionSslInfo() override { return nullptr; }
+  // Tunneled/HTTP upstreams are ineligible for L4 splice (body framing would be lost).
+  OptRef<Network::Connection> upstreamConnection() override { return {}; }
   StreamInfo::DetectedCloseType detectedCloseType() const override;
 
   // Router::RouterFilterInterface

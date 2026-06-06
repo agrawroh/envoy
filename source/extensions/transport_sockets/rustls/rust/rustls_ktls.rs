@@ -626,9 +626,9 @@ impl RustlsTransportSocket {
       .conn
       .take()
       .ok_or_else(|| "missing rustls connection".to_string())?;
-    // `trusted_peer` gates `TLS_RX_EXPECT_NO_PAD`: only the upstream (client) path connects
-    // to a peer Envoy chose. Downstream listeners accept connections from untrusted clients
-    // who could weaponize TLS-1.3 record padding into a DoS vector.
+    // `trusted_peer` gates `TLS_RX_EXPECT_NO_PAD`. Only the upstream (client) path connects to a
+    // peer Envoy chose. Downstream listeners accept connections from untrusted clients who could
+    // weaponize TLS-1.3 record padding into a DoS vector.
     let trusted_peer = self.client_cfg.is_some();
     let prepared = match linux_ktls::extract_secrets(
       conn,
@@ -1333,6 +1333,20 @@ impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
       None => true,
       Some(c) => !c.is_handshaking(),
     }
+  }
+
+  // Reports `(ktls_installed, raw_fd)` so a higher layer such as tcp_proxy can `splice()` directly
+  // on the kernel-TLS socket. `installed` is true only when both TX and RX are live. The module
+  // rejects `disable_ktls_rx`, so `Phase::Ktls` implies RX, and the check also requires that no
+  // post-install failure occurred. On non-Linux targets kTLS never installs so this stays
+  // `(false, -1)`.
+  #[cfg(target_os = "linux")]
+  fn ktls_state(&self, _envoy: &mut EnvoyTransportSocketImpl) -> (bool, i32) {
+    (self.phase == Phase::Ktls && self.failure.is_empty(), self.ktls_fd.unwrap_or(-1))
+  }
+  #[cfg(not(target_os = "linux"))]
+  fn ktls_state(&self, _envoy: &mut EnvoyTransportSocketImpl) -> (bool, i32) {
+    (false, -1)
   }
 }
 
