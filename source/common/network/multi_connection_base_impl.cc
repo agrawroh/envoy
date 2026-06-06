@@ -207,6 +207,14 @@ Ssl::ConnectionInfoConstSharedPtr MultiConnectionBaseImpl::ssl() const {
   return connections_[0]->ssl();
 }
 
+// Delegate to the active connection so a higher layer such as tcp_proxy can discover the inner
+// kTLS socket and splice() on its fd. Without this, the Happy Eyeballs wrapper used for DNS
+// clusters reports the base default "not kTLS" and the L4 splice fast-path never engages on a
+// hostname upstream.
+OptRef<const KtlsBytestreamInfo> MultiConnectionBaseImpl::ktlsBytestreamInfo() const {
+  return connections_[0]->ktlsBytestreamInfo();
+}
+
 Connection::State MultiConnectionBaseImpl::state() const {
   if (!connect_finished_) {
     ASSERT(connections_[0]->state() == Connection::State::Open);

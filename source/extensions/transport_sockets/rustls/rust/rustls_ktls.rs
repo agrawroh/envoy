@@ -879,9 +879,23 @@ impl RustlsTransportSocket {
       return self.feed_raw_to_rustls(&backlog).map(|n| (n, false));
     }
 
+    // kTLS record-boundary cork. To install kTLS the kernel must take over decryption at a clean
+    // TLS record boundary, so we must not pull application-data bytes into userspace past the
+    // handshake. While the handshake is in progress (and while an install is pending) read the
+    // socket one record at a time, capped at the current record's boundary. When the handshake
+    // completes we are then parked exactly at a boundary with the response still in the kernel
+    // socket buffer, so the install fires cleanly and the kernel decrypts the response. Without this
+    // a single large recv() pulls the handshake-final record AND streamed response records (peers
+    // like S3 send the response back-to-back with the handshake) into userspace, and the install
+    // gate never finds a clean boundary again, so kTLS and the splice fast-path never engage.
     #[cfg(target_os = "linux")]
-    if self.ktls_pending {
-      if self.tls_record_bytes_remaining == 0 && self.tls_record_header_seen == 0 {
+    if self.enable_ktls && (self.phase == Phase::Handshaking || self.ktls_pending) {
+      if self.tls_record_bytes_remaining == 0
+        && self.tls_record_header_seen == 0
+        && self.ktls_pending
+      {
+        // Handshake done, install pending, parked at a clean boundary: stop so the install fires
+        // before any application data is read into userspace.
         return Ok((0, false));
       }
       let limit = if self.tls_record_bytes_remaining > 0 {

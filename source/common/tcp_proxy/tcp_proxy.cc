@@ -1336,6 +1336,7 @@ bool Filter::maybeEngageSplice(Buffer::Instance& data) {
   // upstream connection write buffer, so engaging under write backpressure would strand them. The
   // download pattern this targets flushes the request before the response arrives.
   if (up->aboveHighWatermark()) {
+    ENVOY_CONN_LOG(debug, "L4 splice skip: upstream above high watermark", down);
     return false;
   }
   auto pump = std::make_unique<SplicePump>(
