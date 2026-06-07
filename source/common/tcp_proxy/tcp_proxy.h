@@ -746,6 +746,21 @@ protected:
   // then on. On NotPoolable, abandon pooling for this connection (it is dropped by the normal
   // teardown). Safe to call repeatedly; only acts on a state transition.
   void maybeCheckinPooledUpstream();
+  // maybePickPoolRoute: on the first request bytes of a fresh, pool-eligible connection, decide --
+  // once the frame tracker has parsed the request line -- whether this exchange stays on the
+  // buffered, returnable pool path (a small framable PUT/POST upload, where amortizing the TLS+kTLS
+  // handshake across reused connections is the win) or routes to the L4 splice fast-path (GET/HEAD,
+  // a zero-body request, or a large upload, where in-kernel zero-copy wins and 1:1 connection churn
+  // is negligible). Idempotent: a no-op once the route is decided or the pool path is inactive.
+  // This is what lets the pool bootstrap from empty -- the first small-upload connection takes the
+  // buffered path instead of splicing, completes a framed exchange, and checks in.
+  void maybePickPoolRoute();
+  // splicePermitted: whether the L4 splice fast-path may engage on this connection. A connection
+  // the pool feature never armed (feature off, tunneling, no pooled host) splices exactly as it did
+  // before Phase 2. An adopted warm connection never splices (it must stay returnable). A fresh
+  // pool-eligible connection holds the splice off until maybePickPoolRoute has run, then splices
+  // only if it routed away from the buffered pool path.
+  bool splicePermitted() const;
   // SplicePump completion callback. Schedules deferred teardown via a member callback so a Filter
   // destroyed before it fires cancels it.
   void onSpliceComplete(Network::ConnectionEvent event);
@@ -851,13 +866,22 @@ protected:
   bool pool_eligible_{false};
   // True when upstream_ was adopted from the warm pool (vs. freshly opened). An adopted connection
   // must stay on the buffered path so it remains returnable, so splice is suppressed for it. A
-  // fresh connection may still splice opportunistically (preserving the large-GET win); if it does,
-  // feedFrameTracker drops the tracker and it is simply not pooled. Either way a given connection
-  // is EITHER spliced OR pooled, never both -- the clean XOR.
+  // fresh pool-eligible connection routes by its first request (maybePickPoolRoute): a small upload
+  // stays buffered and poolable; a GET/HEAD or large upload splices and feedFrameTracker drops the
+  // tracker so it is simply not pooled. Either way a given connection is EITHER spliced OR pooled,
+  // never both
+  // -- the clean XOR.
   bool adopted_from_pool_{false};
   // True once upstream_ has been handed to the pool, so ~Filter must not close it (the pool owns
   // the close). Guards against a double check-in / double-close.
   bool checked_in_to_pool_{false};
+  // Phase-2 pool route decision for a fresh connection. pool_route_decided_ flips true once the
+  // first request has been framed enough to choose a path (see maybePickPoolRoute);
+  // route_buffered_for_pool_ then records which path was chosen. Until decided, splicePermitted()
+  // holds the splice off so a small upload is never spliced before its size is known. Both stay
+  // false on an adopted or never-eligible connection, which splicePermitted() handles directly.
+  bool pool_route_decided_{false};
+  bool route_buffered_for_pool_{false};
 
   // Connection establishment mode configuration.
   envoy::extensions::filters::network::tcp_proxy::v3::UpstreamConnectMode connect_mode_{

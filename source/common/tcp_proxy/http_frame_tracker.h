@@ -83,6 +83,20 @@ public:
   // Human-readable reason a connection was marked NotPoolable, for stats/debug. Empty otherwise.
   absl::string_view notPoolableReason() const { return not_poolable_reason_; }
 
+  // True once the request header block has been fully parsed, so requestMethod() and
+  // requestContentLength() are known. False while still buffering the request headers, and false if
+  // the request was already rejected (NotPoolable). The Phase-2 pool router uses this to decide --
+  // per request, before any byte is spliced -- whether to keep an exchange on the buffered,
+  // returnable path (a small upload) or hand it to the L4 splice fast-path.
+  bool requestHeadersParsed() const {
+    return request_.phase != Phase::Headers && verdict_ != Verdict::NotPoolable;
+  }
+  // The upper-cased request method (e.g. "PUT"). Empty until requestHeadersParsed() is true.
+  absl::string_view requestMethod() const { return request_method_; }
+  // The request body length from Content-Length (0 if absent). Unlike the internal body counter
+  // this does not decrement as body bytes arrive. Valid once requestHeadersParsed() is true.
+  uint64_t requestContentLength() const { return request_content_length_; }
+
 private:
   // One direction's parse state. The request and the response are framed identically (header block
   // terminated by CRLFCRLF, then a fixed-length body), differing only in how the body length is
@@ -136,6 +150,10 @@ private:
   // The request method, upper-cased, captured from the request line. Used to apply the bodyless-
   // response rule for HEAD and to reject HEAD/DELETE from the pool path.
   std::string request_method_;
+  // The request Content-Length captured at parse time (0 if absent), exposed for the pool router. A
+  // stable copy of the declared body length; request_.body_remaining decrements as body bytes
+  // arrive.
+  uint64_t request_content_length_{0};
 };
 
 } // namespace TcpProxy

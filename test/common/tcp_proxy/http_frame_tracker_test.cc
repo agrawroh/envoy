@@ -439,6 +439,65 @@ TEST(HttpFrameTracker, NotPoolableIsSticky) {
   EXPECT_EQ(Verdict::NotPoolable, tracker.verdict());
 }
 
+// -------------------------------------------------------------------------------------------------
+// Request method / Content-Length accessors that the Phase-2 pool router routes on.
+// -------------------------------------------------------------------------------------------------
+
+TEST(HttpFrameTracker, RequestAccessorsBeforeHeadersParsed) {
+  HttpFrameTracker tracker;
+  // A partial request line: the header block is not yet terminated, so nothing is parsed.
+  EXPECT_EQ(Verdict::InProgress, tracker.onRequestData("PUT /key HTTP/1.1\r\nHost: b.s3.a"));
+  EXPECT_FALSE(tracker.requestHeadersParsed());
+  EXPECT_TRUE(tracker.requestMethod().empty());
+  EXPECT_EQ(0, tracker.requestContentLength());
+}
+
+TEST(HttpFrameTracker, RequestAccessorsPutWithContentLength) {
+  HttpFrameTracker tracker;
+  const std::string req =
+      "PUT /key HTTP/1.1\r\nHost: b.s3.amazonaws.com\r\nContent-Length: 262144\r\n\r\n";
+  EXPECT_EQ(Verdict::InProgress, tracker.onRequestData(req));
+  EXPECT_TRUE(tracker.requestHeadersParsed());
+  EXPECT_EQ("PUT", tracker.requestMethod());
+  EXPECT_EQ(262144, tracker.requestContentLength());
+}
+
+TEST(HttpFrameTracker, RequestContentLengthStableAsBodyArrives) {
+  HttpFrameTracker tracker;
+  // Headers + 2 of 4 body bytes in the first feed; the declared length must not decrement with the
+  // internal body counter as the router reads it across feeds.
+  EXPECT_EQ(Verdict::InProgress,
+            tracker.onRequestData("POST /k HTTP/1.1\r\nHost: h.a\r\nContent-Length: 4\r\n\r\nab"));
+  EXPECT_EQ("POST", tracker.requestMethod());
+  EXPECT_EQ(4, tracker.requestContentLength());
+  EXPECT_EQ(Verdict::InProgress, tracker.onRequestData("cd"));
+  EXPECT_EQ(4, tracker.requestContentLength());
+}
+
+TEST(HttpFrameTracker, RequestContentLengthAbsentIsZero) {
+  HttpFrameTracker tracker;
+  EXPECT_EQ(Verdict::InProgress, tracker.onRequestData(kGetReq));
+  EXPECT_TRUE(tracker.requestHeadersParsed());
+  EXPECT_EQ("GET", tracker.requestMethod());
+  EXPECT_EQ(0, tracker.requestContentLength());
+}
+
+TEST(HttpFrameTracker, RequestMethodUpperCased) {
+  HttpFrameTracker tracker;
+  const std::string req = "put /key HTTP/1.1\r\nHost: h.a\r\nContent-Length: 0\r\n\r\n";
+  EXPECT_EQ(Verdict::InProgress, tracker.onRequestData(req));
+  EXPECT_EQ("PUT", tracker.requestMethod());
+}
+
+TEST(HttpFrameTracker, RequestHeadersParsedFalseWhenRejected) {
+  HttpFrameTracker tracker;
+  // A rejected (NotPoolable) request must not report parsed headers, so the router never routes a
+  // rejected request to the pool on stale method/length.
+  const std::string bad = "PUT /key HTTP/1.1\r\nHost: h.a\r\nContent-Length: 007\r\n\r\n";
+  EXPECT_EQ(Verdict::NotPoolable, tracker.onRequestData(bad));
+  EXPECT_FALSE(tracker.requestHeadersParsed());
+}
+
 } // namespace
 } // namespace TcpProxy
 } // namespace Envoy

@@ -497,6 +497,9 @@ bool HttpFrameTracker::parseRequestHeaders() {
     return false;
   }
 
+  // Stable copy of the declared body length for the pool router; request_.body_remaining
+  // decrements.
+  request_content_length_ = request_.body_remaining;
   request_.phase = request_.body_remaining == 0 ? Phase::Done : Phase::Body;
   return true;
 }

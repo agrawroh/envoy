@@ -1129,6 +1129,18 @@ Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
   if (splice_pump_ != nullptr) {
     return Network::FilterStatus::StopIteration;
   }
+  // Phase-2 pool routing. On a fresh, pool-eligible connection, observe the request framing up
+  // front so this exchange can be routed by method and size before we decide whether to splice. The
+  // frame tracker is a pure observer (it does not drain `data`), so a splice chosen below still
+  // takes the same bytes -- preserving the large-upload first-chunk splice. This is the only
+  // request-direction feed on the still-undecided pool path; the buffered write below re-feeds only
+  // once the route is decided, so every request byte is framed exactly once.
+  bool request_framed_here = false;
+  if (upstream_ != nullptr && pool_eligible_ && !adopted_from_pool_ && !pool_route_decided_) {
+    feedFrameTracker(data, /*from_upstream=*/false);
+    maybePickPoolRoute();
+    request_framed_here = true;
+  }
   // L4 kernel-splice fast-path for the upload direction. Engage on the first downstream data once
   // the upstream rustls socket has installed kTLS and before any byte has been written upstream, so
   // the request and a PUT body move in-kernel like a GET response. The upstream_write_started_
@@ -1136,9 +1148,10 @@ Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
   // buffered ones; on a connection where kTLS is not yet installed at the first data the buffered
   // path below carries the upload instead. maybeEngageSplice drains `data` into the pump on
   // success.
-  // A connection adopted from the warm pool stays on the buffered path so it remains returnable
-  // (splice would hijack and force-close its fd). A fresh connection may still splice (large GET).
-  if (upstream_ != nullptr && !adopted_from_pool_ && !end_stream && data.length() > 0 &&
+  // splicePermitted() gates the pool coexistence: an adopted warm connection and a connection
+  // routed to the buffered pool path (a small upload) never splice so they stay returnable; a
+  // GET/HEAD or large upload, or any connection the pool feature never armed, splices as before.
+  if (upstream_ != nullptr && splicePermitted() && !end_stream && data.length() > 0 &&
       read_callbacks_->connection().state() == Network::Connection::State::Open) {
     OptRef<Network::Connection> up = upstream_->upstreamConnection();
     if (up.has_value()) {
@@ -1180,8 +1193,12 @@ Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
 
   if (upstream_) {
     // Observe the request-direction bytes for HTTP/1.1 framing before they are encoded (encodeData
-    // drains `data`). Only active on the poolable buffered path; a no-op once a splice engages.
-    feedFrameTracker(data, /*from_upstream=*/false);
+    // drains `data`). Skip when the route-decision block above already framed this same chunk, so
+    // each request byte is framed exactly once. Only active on the poolable buffered path; a no-op
+    // once a splice engages.
+    if (!request_framed_here) {
+      feedFrameTracker(data, /*from_upstream=*/false);
+    }
     getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(data.length());
     upstream_->encodeData(data, end_stream);
     upstream_write_started_ = true;
@@ -1376,8 +1393,11 @@ void Filter::onUpstreamData(Buffer::Instance& data, bool end_stream) {
   // SplicePump that moves bytes in-kernel and bypasses the userspace buffers and filter chain.
   // Engaging here rather than at pool-ready guarantees kTLS is installed. Falls back transparently
   // when ineligible.
-  // A connection adopted from the warm pool stays on the buffered path so it remains returnable.
-  if (splice_pump_ == nullptr && !adopted_from_pool_ && !end_stream && upstream_ != nullptr) {
+  // splicePermitted() keeps the pool path on the buffered relay: an adopted warm connection and a
+  // connection routed to the buffered pool path (a small upload) never splice the response, so they
+  // stay returnable. A GET/HEAD download, a large upload's response, or any connection the pool
+  // feature never armed splices as before.
+  if (splice_pump_ == nullptr && splicePermitted() && !end_stream && upstream_ != nullptr) {
     OptRef<Network::Connection> up = upstream_->upstreamConnection();
     if (up.has_value()) {
       // We only ever query the upstream leg, so info->trusted_peer is always true here. It is kept
@@ -1563,6 +1583,66 @@ bool Filter::tryCheckoutPooledUpstream(absl::string_view host_key,
   onUpstreamConnection();
   read_callbacks_->continueReading();
   return true;
+}
+
+namespace {
+// Phase-2 pool routing threshold. An upload (PUT/POST body) at or below this many bytes takes the
+// buffered, poolable path so its connection can be reused across the high request churn that makes
+// the per-request TLS+kTLS handshake dominate; a larger upload takes the L4 splice fast-path, where
+// the in-kernel zero-copy of the body dominates and 1:1 connection churn is negligible. 1 MiB sits
+// between the small-object PUT churn workload (<=256 KiB) and the large-object PUT workload
+// (>=4 MiB).
+constexpr uint64_t kPoolMaxUploadBytes = 1024 * 1024;
+} // namespace
+
+bool Filter::splicePermitted() const {
+  // An adopted warm connection must stay on the buffered path so it remains returnable to the pool.
+  if (adopted_from_pool_) {
+    return false;
+  }
+  // A connection the pool feature never armed splices exactly as it did before Phase 2 (this is the
+  // feature-off production path, which must stay byte-for-byte identical).
+  if (!pool_eligible_) {
+    return true;
+  }
+  // A fresh pool-eligible connection holds the splice off until its first request is framed and
+  // routed, then splices only if it routed away from the buffered pool path (a GET/HEAD or a large
+  // upload). A small upload keeps route_buffered_for_pool_ set and never splices.
+  return pool_route_decided_ && !route_buffered_for_pool_;
+}
+
+void Filter::maybePickPoolRoute() {
+  if (pool_route_decided_ || !pool_eligible_ || frame_tracker_ == nullptr) {
+    return;
+  }
+  // Decide only once the request line + headers are in (method and Content-Length known). While the
+  // headers are still arriving, stay undecided -- splicePermitted() holds the splice off meanwhile,
+  // so a small upload is never spliced before its size can be read.
+  if (!frame_tracker_->requestHeadersParsed()) {
+    return;
+  }
+  pool_route_decided_ = true;
+  const absl::string_view method = frame_tracker_->requestMethod();
+  const uint64_t upload_bytes = frame_tracker_->requestContentLength();
+  const bool small_upload = (method == "PUT" || method == "POST") && upload_bytes > 0 &&
+                            upload_bytes <= kPoolMaxUploadBytes;
+  if (small_upload) {
+    // Keep this exchange on the buffered, returnable path. The frame tracker keeps observing it;
+    // when it reaches ExchangeComplete the connection checks back into the warm pool.
+    route_buffered_for_pool_ = true;
+    ENVOY_CONN_LOG(debug, "tcp_proxy: routing {}-byte {} upload to buffered pool path",
+                   read_callbacks_->connection(), upload_bytes, method);
+    return;
+  }
+  // A GET/HEAD, a zero-body request, or a large upload: prefer the L4 splice fast-path. Abandon the
+  // pool path so splicePermitted() lets the splice engage and we never try to check this connection
+  // in. (HEAD/DELETE and smuggling requests were already dropped to NotPoolable by
+  // feedFrameTracker, which cleared pool_eligible_ before we got here.)
+  route_buffered_for_pool_ = false;
+  frame_tracker_.reset();
+  pool_eligible_ = false;
+  ENVOY_CONN_LOG(debug, "tcp_proxy: routing {} request to L4 splice fast-path",
+                 read_callbacks_->connection(), method);
 }
 
 void Filter::feedFrameTracker(const Buffer::Instance& data, bool from_upstream) {
@@ -1815,6 +1895,17 @@ void Filter::onUpstreamConnection() {
     // Early data went upstream on the buffered path, so the upload-splice can no longer engage
     // without risking reordering ahead of these bytes.
     upstream_write_started_ = true;
+    // Those request bytes bypassed the frame tracker (they flushed straight to the upstream), so
+    // this exchange can no longer be framed for pooling. Abandon the pool path: with pool_eligible_
+    // cleared the connection relays buffered and is never checked in. On a FRESH (non-adopted)
+    // connection a later large-upload chunk may still splice via splicePermitted(); an adopted
+    // connection stays buffered (splicePermitted() short-circuits on adopted_from_pool_). Pre-empt
+    // maybePickPoolRoute too.
+    if (pool_eligible_) {
+      pool_eligible_ = false;
+      pool_route_decided_ = true;
+      frame_tracker_.reset();
+    }
     ASSERT(0 == early_data_buffer_.length());
   }
 
