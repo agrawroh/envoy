@@ -1936,7 +1936,14 @@ void Filter::onUpstreamConnection() {
       resetIdleTimer();
       return true;
     });
-    if (upstream_) {
+    // Do NOT register a per-Filter bytes-sent callback on a connection that may be returned to the
+    // warm pool. addBytesSentCallback is append-only (a callback is removed only when it returns
+    // false), and a pooled upstream connection outlives the Filter that minted it, so a connection
+    // reused N times would accumulate N stale callbacks each bound to a destroyed Filter's
+    // upstream_callbacks_ -- an unbounded leak and a use-after-free hazard. The idle timer is still
+    // reset on every onData/onUpstreamData, so the pool path only loses the bytes-flushed timer
+    // refinement.
+    if (upstream_ && !pool_eligible_) {
       upstream_->addBytesSentCallback([upstream_callbacks = upstream_callbacks_](uint64_t) -> bool {
         upstream_callbacks->onBytesSent();
         return true;
