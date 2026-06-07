@@ -1202,6 +1202,14 @@ Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
     getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(data.length());
     upstream_->encodeData(data, end_stream);
     upstream_write_started_ = true;
+    // TEMP-DIAG: on the buffered pool path, did the upload back up past the upstream write
+    // high-watermark (H2 signal -- a stuck kTLS sendmsg whose writable re-arm was clobbered)?
+    if (route_buffered_for_pool_ || adopted_from_pool_) {
+      OptRef<Network::Connection> up = upstream_->upstreamConnection();
+      if (up.has_value() && up->aboveHighWatermark()) {
+        config_->stats().pool_upload_above_hwm_total_.inc();
+      }
+    }
     resetIdleTimer(); // TODO(ggreenway) PERF: do we need to reset timer on both send and receive?
   } else if (receive_before_connect_) {
     // Buffer data received before upstream connection exists.
@@ -1413,6 +1421,11 @@ void Filter::onUpstreamData(Buffer::Instance& data, bool end_stream) {
       // path below handles it.
     }
   }
+  // TEMP-DIAG funnel: first response chunk read on a buffered pool exchange.
+  if (pool_eligible_ && !pool_response_started_ && data.length() > 0) {
+    pool_response_started_ = true;
+    config_->stats().pool_response_started_total_.inc();
+  }
   // An upstream half-close (end_stream) means the peer is tearing the connection down -- it is not
   // reusable, so it must not be pooled. The pool's check-in MSG_PEEK clean-check would also catch a
   // FIN'd socket, but drop the tracker up front to skip the wasted check-in attempt.
@@ -1576,6 +1589,7 @@ bool Filter::tryCheckoutPooledUpstream(absl::string_view host_key,
   }
   upstream_info.setUpstreamSslConnection(upstream_->getUpstreamConnectionSslInfo());
 
+  config_->stats().pool_checkout_hit_total_.inc(); // TEMP-DIAG funnel.
   ENVOY_CONN_LOG(debug, "tcp_proxy: adopted warm pooled upstream for {}",
                  read_callbacks_->connection(), host_key);
   // Drive the same post-connect path the fresh-connection callback uses: flush any early data,
@@ -1630,6 +1644,7 @@ void Filter::maybePickPoolRoute() {
     // Keep this exchange on the buffered, returnable path. The frame tracker keeps observing it;
     // when it reaches ExchangeComplete the connection checks back into the warm pool.
     route_buffered_for_pool_ = true;
+    config_->stats().pool_buffered_routed_total_.inc(); // TEMP-DIAG funnel.
     ENVOY_CONN_LOG(debug, "tcp_proxy: routing {}-byte {} upload to buffered pool path",
                    read_callbacks_->connection(), upload_bytes, method);
     return;
@@ -1692,6 +1707,15 @@ void Filter::feedFrameTracker(const Buffer::Instance& data, bool from_upstream) 
     return;
   }
   if (verdict == HttpFrameTracker::Verdict::ExchangeComplete) {
+    config_->stats().pool_exchange_completed_total_.inc();      // TEMP-DIAG funnel.
+    const uint32_t code = frame_tracker_->responseStatusCode(); // TEMP-DIAG: 2xx vs error.
+    if (code >= 200 && code < 300) {
+      config_->stats().pool_resp_2xx_total_.inc();
+    } else {
+      config_->stats().pool_resp_non2xx_total_.inc();
+      ENVOY_CONN_LOG(debug, "tcp_proxy: pool exchange got non-2xx response {}",
+                     read_callbacks_->connection(), code);
+    }
     maybeCheckinPooledUpstream();
   }
 }

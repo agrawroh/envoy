@@ -538,6 +538,7 @@ bool HttpFrameTracker::parseResponseHeaders() {
     reject("malformed status code");
     return false;
   }
+  response_status_code_ = code; // TEMP-DIAG.
 
   // OSD rejects Transfer-Encoding on the poolable path (server.rs:459-476 falls back to copy and
   // does NOT pool). Treat TE response as non-poolable.

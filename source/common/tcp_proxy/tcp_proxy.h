@@ -75,6 +75,13 @@ constexpr absl::string_view ReceiveBeforeConnectKey = "envoy.tcp_proxy.receive_b
   COUNTER(upstream_flush_total)                                                                    \
   COUNTER(splice_pump_engaged_total)                                                               \
   COUNTER(splice_pump_torndown_total)                                                              \
+  COUNTER(pool_buffered_routed_total)                                                              \
+  COUNTER(pool_checkout_hit_total)                                                                 \
+  COUNTER(pool_response_started_total)                                                             \
+  COUNTER(pool_exchange_completed_total)                                                           \
+  COUNTER(pool_upload_above_hwm_total)                                                             \
+  COUNTER(pool_resp_2xx_total)                                                                     \
+  COUNTER(pool_resp_non2xx_total)                                                                  \
   GAUGE(downstream_cx_rx_bytes_buffered, Accumulate)                                               \
   GAUGE(downstream_cx_tx_bytes_buffered, Accumulate)                                               \
   GAUGE(upstream_flush_active, Accumulate)                                                         \
@@ -882,6 +889,8 @@ protected:
   // false on an adopted or never-eligible connection, which splicePermitted() handles directly.
   bool pool_route_decided_{false};
   bool route_buffered_for_pool_{false};
+  // TEMP-DIAG: counted-once-per-exchange guard for the pool_response_started_total funnel counter.
+  bool pool_response_started_{false};
 
   // Connection establishment mode configuration.
   envoy::extensions::filters::network::tcp_proxy::v3::UpstreamConnectMode connect_mode_{

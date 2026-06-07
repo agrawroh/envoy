@@ -96,6 +96,9 @@ public:
   // The request body length from Content-Length (0 if absent). Unlike the internal body counter
   // this does not decrement as body bytes arrive. Valid once requestHeadersParsed() is true.
   uint64_t requestContentLength() const { return request_content_length_; }
+  // The response status code parsed from the status line (0 until response headers parse).
+  // TEMP-DIAG.
+  uint32_t responseStatusCode() const { return response_status_code_; }
 
 private:
   // One direction's parse state. The request and the response are framed identically (header block
@@ -154,6 +157,8 @@ private:
   // stable copy of the declared body length; request_.body_remaining decrements as body bytes
   // arrive.
   uint64_t request_content_length_{0};
+  // TEMP-DIAG: response status code captured at parse time, for the 2xx-vs-error funnel.
+  uint32_t response_status_code_{0};
 };
 
 } // namespace TcpProxy
