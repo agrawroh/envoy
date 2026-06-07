@@ -34,8 +34,10 @@
 #include "source/common/network/hash_policy.h"
 #include "source/common/network/utility.h"
 #include "source/common/stream_info/stream_info_impl.h"
+#include "source/common/tcp_proxy/http_frame_tracker.h"
 #include "source/common/tcp_proxy/splice_pump.h"
 #include "source/common/tcp_proxy/upstream.h"
+#include "source/common/tcp_proxy/upstream_pool.h"
 #include "source/common/upstream/load_balancer_context_base.h"
 #include "source/common/upstream/od_cds_api_impl.h"
 
@@ -351,6 +353,11 @@ public:
     return shared_config_->tunnelingConfigHelper();
   }
   UpstreamDrainManager& drainManager();
+  // Per-worker warm upstream connection pool (Phase 2; see UPSTREAM_POOL_DESIGN.md). Lives in a
+  // thread-local slot like the drain manager, so it is single-worker-confined and needs no mutex.
+  // Returns nullopt when the l4_connection_pool runtime feature is off (the slot is then never
+  // populated), so callers stay on the strictly-1:1 path.
+  OptRef<UpstreamPool> upstreamPool();
   SharedConfigSharedPtr sharedConfig() { return shared_config_; }
   const Router::MetadataMatchCriteria* metadataMatchCriteria() const {
     return cluster_metadata_match_criteria_.get();
@@ -433,6 +440,13 @@ private:
   AccessLog::InstanceSharedPtrVector access_logs_;
   const uint32_t max_connect_attempts_;
   ThreadLocal::SlotPtr upstream_drain_manager_slot_;
+  // Thread-local slot for the Phase-2 warm upstream connection pool. Allocated unconditionally
+  // (like upstream_drain_manager_slot_) but only set() -- i.e. populated with an UpstreamPool --
+  // when the l4_connection_pool runtime feature is enabled, so the pool is fail-closed by default.
+  ThreadLocal::SlotPtr upstream_pool_slot_;
+  // True iff the l4_connection_pool runtime feature was enabled at config load (the slot was
+  // set()). upstreamPool() gates on this so it never calls get() on an unset slot.
+  bool l4_pool_enabled_{false};
   SharedConfigSharedPtr shared_config_;
   std::unique_ptr<const Router::MetadataMatchCriteria> cluster_metadata_match_criteria_;
   Random::RandomGenerator& random_generator_;
@@ -714,6 +728,24 @@ protected:
   // manager discard it rather than reuse a socket whose FileEvents the pump removed. A no-op when
   // no splice is engaged.
   void tearDownSplice();
+  // Phase-2 connection pool integration (buffered relay path only; see UPSTREAM_POOL_DESIGN.md).
+  //
+  // tryCheckoutPooledUpstream: at upstream-establishment time, if the l4_connection_pool feature is
+  // on, try to adopt a warm, already-handshaked (kTLS-installed) connection to `host` (keyed by
+  // host_key) instead of opening a fresh one. Returns true if a warm connection was adopted
+  // (upstream_ is set, onUpstreamConnection() has run, and the normal newStream path must be
+  // skipped).
+  bool tryCheckoutPooledUpstream(absl::string_view host_key,
+                                 const Upstream::HostDescriptionConstSharedPtr& host);
+  // feedFrameTracker: on the buffered path, observe request-/response-direction bytes so the
+  // tracker can find the HTTP/1.1 message boundary that makes the connection returnable. No-op once
+  // a splice is engaged (a spliced connection is never poolable) or the pool path is not active.
+  void feedFrameTracker(const Buffer::Instance& data, bool from_upstream);
+  // maybeCheckinPooledUpstream: once the frame tracker reports ExchangeComplete, release ownership
+  // of upstream_ (so ~Filter does not close it) and hand it to the pool, which owns the close from
+  // then on. On NotPoolable, abandon pooling for this connection (it is dropped by the normal
+  // teardown). Safe to call repeatedly; only acts on a state transition.
+  void maybeCheckinPooledUpstream();
   // SplicePump completion callback. Schedules deferred teardown via a member callback so a Filter
   // destroyed before it fires cancels it.
   void onSpliceComplete(Network::ConnectionEvent event);
@@ -805,6 +837,27 @@ protected:
   Event::SchedulableCallbackPtr ktls_engage_schedulable_;
   uint32_t ktls_engage_attempts_{0};
   bool upload_engage_deferred_{false};
+
+  // Phase-2 warm-connection-pool state (see UPSTREAM_POOL_DESIGN.md). Only ever populated when the
+  // l4_connection_pool runtime feature is on. The frame tracker observes the buffered relay to find
+  // the HTTP/1.1 message boundary; when it reaches ExchangeComplete, upstream_ is released into the
+  // pool. pool_eligible_ is the "buffered+framed+pooled" path selector: it is mutually exclusive
+  // with the splice path (splice_pump_ != nullptr), so engaging a splice clears it and a pooled
+  // connection never splices.
+  std::unique_ptr<HttpFrameTracker> frame_tracker_;
+  // "ip:port" key for checkout/checkin, captured from the selected upstream host.
+  std::string pool_host_key_;
+  // True while this Filter is on the poolable buffered path (frame_tracker_ active, no splice).
+  bool pool_eligible_{false};
+  // True when upstream_ was adopted from the warm pool (vs. freshly opened). An adopted connection
+  // must stay on the buffered path so it remains returnable, so splice is suppressed for it. A
+  // fresh connection may still splice opportunistically (preserving the large-GET win); if it does,
+  // feedFrameTracker drops the tracker and it is simply not pooled. Either way a given connection
+  // is EITHER spliced OR pooled, never both -- the clean XOR.
+  bool adopted_from_pool_{false};
+  // True once upstream_ has been handed to the pool, so ~Filter must not close it (the pool owns
+  // the close). Guards against a double check-in / double-close.
+  bool checked_in_to_pool_{false};
 
   // Connection establishment mode configuration.
   envoy::extensions::filters::network::tcp_proxy::v3::UpstreamConnectMode connect_mode_{

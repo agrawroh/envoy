@@ -184,6 +184,12 @@ FALSE_RUNTIME_GUARD(envoy_reloadable_features_xdstp_based_config_singleton_subsc
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_disable_quic_rx_queue_overflow_socket_options);
 // TODO(abeyad): Flip to true after prod testing.
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_disable_quic_ip_packet_info_socket_options);
+// Phase-2 warm upstream connection pool for the L4 tcp_proxy kTLS-splice fast-path (ships dark).
+// When enabled, the buffered relay path reuses already-handshaked, kTLS-installed upstream
+// connections across high-churn request boundaries instead of being strictly 1:1. Defaults off; the
+// eventual home for this switch is a typed proto field on the TcpProxy config. See
+// source/common/tcp_proxy/UPSTREAM_POOL_DESIGN.md.
+FALSE_RUNTIME_GUARD(envoy_reloadable_features_tcp_proxy_l4_connection_pool);
 
 // A flag to set the maximum TLS version for google_grpc client to TLS1.2, when needed for
 // compliance restrictions.

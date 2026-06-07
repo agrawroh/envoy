@@ -185,6 +185,14 @@ public:
     }
     return upstream_conn_data_->connection();
   }
+  void rebindUpstreamCallbacks(Tcp::ConnectionPool::UpstreamCallbacks& callbacks) override {
+    // Re-point the underlying ConnectionData at the new Filter's callbacks (Phase-2 pool checkout).
+    // addUpstreamCallbacks replaces rather than appends, so the dead original Filter's callbacks
+    // are dropped here.
+    if (upstream_conn_data_ != nullptr) {
+      upstream_conn_data_->addUpstreamCallbacks(callbacks);
+    }
+  }
   StreamInfo::DetectedCloseType detectedCloseType() const override;
   absl::string_view localCloseReason() const override;
 

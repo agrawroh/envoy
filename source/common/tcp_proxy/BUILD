@@ -39,23 +39,44 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "http_frame_tracker_lib",
+    srcs = [
+        "http_frame_tracker.cc",
+    ],
+    hdrs = [
+        "http_frame_tracker.h",
+    ],
+    deps = [
+        "//source/common/common:minimal_logger_lib",
+        "@abseil-cpp//absl/strings",
+    ],
+)
+
+envoy_cc_library(
     name = "tcp_proxy",
     srcs = [
         "splice_pump.cc",
         "tcp_proxy.cc",
+        "upstream_pool.cc",
     ],
     hdrs = [
         "splice_pump.h",
         "tcp_proxy.h",
+        "upstream_pool.h",
     ],
     deps = [
+        ":http_frame_tracker_lib",
         ":upstream_lib",
         "//envoy/access_log:access_log_interface",
+        "//envoy/api:io_error_interface",
         "//envoy/buffer:buffer_interface",
         "//envoy/common:time_interface",
         "//envoy/event:dispatcher_interface",
+        "//envoy/event:timer_interface",
         "//envoy/network:connection_interface",
         "//envoy/network:filter_interface",
+        "//envoy/network:io_handle_interface",
+        "//envoy/network:socket_interface",
         "//envoy/registry",
         "//envoy/router:router_interface",
         "//envoy/server:filter_config_interface",
@@ -66,6 +87,7 @@ envoy_cc_library(
         "//envoy/stream_info:filter_state_interface",
         "//envoy/tcp:conn_pool_interface",
         "//envoy/tcp:upstream_interface",
+        "//envoy/thread_local:thread_local_object",
         "//envoy/upstream:cluster_manager_interface",
         "//envoy/upstream:upstream_interface",
         "//source/common/access_log:access_log_lib",

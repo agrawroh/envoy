@@ -90,6 +90,15 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "http_frame_tracker_test",
+    srcs = ["http_frame_tracker_test.cc"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/common/tcp_proxy:http_frame_tracker_lib",
+    ],
+)
+
+envoy_cc_test(
     name = "upstream_test",
     srcs = ["upstream_test.cc"],
     rbe_pool = "6gig",
