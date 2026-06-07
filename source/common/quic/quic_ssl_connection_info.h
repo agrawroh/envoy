@@ -472,9 +472,9 @@ private:
   }
 
   // Computes a hex-encoded digest for each certificate in the peer chain.
-  std::vector<std::string>
-  computeChainDigests(size_t digest_length,
-                      uint8_t* (*digest_fn)(const uint8_t*, size_t, uint8_t*)) const {
+  std::vector<std::string> computeChainDigests(size_t digest_length,
+                                               uint8_t* (*digest_fn)(const uint8_t*, size_t,
+                                                                     uint8_t*)) const {
     const STACK_OF(CRYPTO_BUFFER)* cert_stack = peerCertificateStack();
     if (cert_stack == nullptr) {
       return {};

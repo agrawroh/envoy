@@ -22,6 +22,7 @@ ARM64_SKIP_CONTRIB_TARGETS = [
 ]
 X86_SKIP_CONTRIB_TARGETS = [
     "envoy.tls.key_providers.kae",
+    "envoy.network.connection_balance.dlb",
 ]
 PPC_SKIP_CONTRIB_TARGETS = [
     "envoy.tls.key_providers.cryptomb",
@@ -34,10 +35,13 @@ PPC_SKIP_CONTRIB_TARGETS = [
     "envoy.compression.qatzstd.compressor",
 ]
 
-# BoringSSL-FIPS historically only skipped qatzip and kae on x86_64
+# BoringSSL-FIPS historically only skipped qatzip and kae on x86_64.
+# dlb is skipped because its source archive (downloadmirror.intel.com) is
+# unreachable in the restricted build network.
 BORINGSSL_FIPS_SKIP_CONTRIB_TARGETS = [
     "envoy.compression.qatzip.compressor",
     "envoy.tls.key_providers.kae",
+    "envoy.network.connection_balance.dlb",
 ]
 
 # AWS-LC needs to skip additional Intel-specific crypto providers
@@ -47,6 +51,7 @@ AWS_LC_SKIP_CONTRIB_TARGETS = [
     "envoy.tls.key_providers.kae",
     "envoy.compression.qatzip.compressor",
     "envoy.compression.qatzstd.compressor",
+    "envoy.network.connection_balance.dlb",
 ]
 
 # OpenSSL is incompatible with Intel-specific private key providers
@@ -54,6 +59,7 @@ AWS_LC_SKIP_CONTRIB_TARGETS = [
 OPENSSL_SKIP_CONTRIB_TARGETS = [
     "envoy.tls.key_providers.cryptomb",
     "envoy.tls.key_providers.qat",
+    "envoy.network.connection_balance.dlb",
 ]
 
 def envoy_all_contrib_extensions(denylist = []):

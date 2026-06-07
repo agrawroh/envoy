@@ -83,8 +83,7 @@ absl::Status initializeQuicClientCertAndKey(SSL_CTX* quic_ssl_ctx,
     cert_array[i] = sk_CRYPTO_BUFFER_value(cert_chain_stack.get(), i);
   }
   if (SSL_CTX_set_chain_and_key(quic_ssl_ctx, cert_array.data(), cert_count,
-                                SSL_CTX_get0_privatekey(first_ctx.ssl_ctx_.get()),
-                                nullptr) != 1) {
+                                SSL_CTX_get0_privatekey(first_ctx.ssl_ctx_.get()), nullptr) != 1) {
     return absl::InvalidArgumentError("failed to set QUIC client certificate chain.");
   }
   return absl::OkStatus();
