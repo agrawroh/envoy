@@ -1088,13 +1088,40 @@ Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
   // buffered ones; on a connection where kTLS is not yet installed at the first data the buffered
   // path below carries the upload instead. maybeEngageSplice drains `data` into the pump on
   // success.
-  if (upstream_ != nullptr && !upstream_write_started_ && !end_stream && data.length() > 0) {
+  if (upstream_ != nullptr && !end_stream && data.length() > 0 &&
+      read_callbacks_->connection().state() == Network::Connection::State::Open) {
     OptRef<Network::Connection> up = upstream_->upstreamConnection();
     if (up.has_value()) {
       OptRef<const Network::KtlsBytestreamInfo> info = up->ktlsBytestreamInfo();
-      if (info.has_value() && info->installed && info->trusted_peer &&
-          read_callbacks_->connection().state() == Network::Connection::State::Open &&
+      const bool ktls_ready = info.has_value() && info->installed && info->trusted_peer;
+      // Engage the upload splice once kTLS is installed and ordering is safe: the first chunk is
+      // trivially safe (nothing written yet); a later chunk -- a PUT body after buffered request
+      // headers -- is safe once those small headers have flushed, which maybeEngageSplice gates via
+      // the upstream high-watermark.
+      if (ktls_ready && (!upstream_write_started_ || !up->aboveHighWatermark()) &&
           maybeEngageSplice(data, /*from_upstream=*/false)) {
+        return Network::FilterStatus::StopIteration;
+      }
+      // A PUT body that beat the kTLS install: hold it and poll until kTLS installs, then splice
+      // it. Only LATER chunks are held (upstream_write_started_ -- the request headers already went
+      // out on the buffered path), so a GET, which sends only the request and no body, is never
+      // held and its latency is unchanged. Only a kTLS-capable upstream still installing (info
+      // present, not installed) is held, so non-kTLS/mock upstreams stay on the buffered path. This
+      // recovers the large-PUT in-kernel splice without the GET cost of deferring the first chunk.
+      // The headers flush during the poll, and the engage's watermark check keeps the spliced body
+      // ordered after them; AWS SigV4 signs the payload, so any reorder fails at S3 and shows as a
+      // succ drop.
+      if (upstream_write_started_ && info.has_value() && !info->installed &&
+          !upload_engage_deferred_) {
+        upload_engage_deferred_ = true;
+        deferred_upload_buffer_.move(data);
+        read_callbacks_->connection().readDisable(true);
+        if (ktls_engage_schedulable_ == nullptr) {
+          ktls_engage_schedulable_ =
+              read_callbacks_->connection().dispatcher().createSchedulableCallback(
+                  [this]() { onKtlsEngageRetry(); });
+        }
+        ktls_engage_schedulable_->scheduleCallbackNextIteration();
         return Network::FilterStatus::StopIteration;
       }
     }
@@ -1442,6 +1469,44 @@ void Filter::onSpliceComplete(Network::ConnectionEvent event) {
         });
   }
   splice_complete_schedulable_->scheduleCallbackNextIteration();
+}
+
+namespace {
+// Upper bound on per-iteration retries waiting for the upstream kTLS to install before splicing a
+// held PUT body. The install completes within a handful of dispatcher iterations after the
+// handshake; the cap only guards a connection that never installs, in which case the held body is
+// flushed on the normal path.
+constexpr uint32_t kMaxKtlsEngageAttempts = 64;
+} // namespace
+
+void Filter::onKtlsEngageRetry() {
+  if (splice_pump_ != nullptr || upstream_ == nullptr) {
+    return;
+  }
+  ++ktls_engage_attempts_;
+  OptRef<Network::Connection> up = upstream_->upstreamConnection();
+  if (up.has_value() && read_callbacks_->connection().state() == Network::Connection::State::Open) {
+    OptRef<const Network::KtlsBytestreamInfo> info = up->ktlsBytestreamInfo();
+    // Engage only when kTLS is installed AND the upstream is not backed up, so the buffered request
+    // headers have flushed and the spliced body cannot reorder ahead of them.
+    if (info.has_value() && info->installed && info->trusted_peer && !up->aboveHighWatermark() &&
+        maybeEngageSplice(deferred_upload_buffer_, /*from_upstream=*/false)) {
+      return; // engaged; the pump owns the held body and the raw fds.
+    }
+    if (ktls_engage_attempts_ < kMaxKtlsEngageAttempts) {
+      ktls_engage_schedulable_->scheduleCallbackNextIteration();
+      return;
+    }
+  }
+  // Exhausted (kTLS never installed) or the connection closed: flush the held body on the normal
+  // path so the upload still completes -- no worse than before -- and re-enable downstream reads.
+  if (upstream_ != nullptr && deferred_upload_buffer_.length() > 0) {
+    getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(deferred_upload_buffer_.length());
+    upstream_->encodeData(deferred_upload_buffer_, /*end_stream=*/false);
+  }
+  if (read_callbacks_->connection().state() == Network::Connection::State::Open) {
+    read_callbacks_->connection().readDisable(false);
+  }
 }
 
 void Filter::onUpstreamEvent(Network::ConnectionEvent event) {

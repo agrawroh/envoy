@@ -717,6 +717,10 @@ protected:
   // SplicePump completion callback. Schedules deferred teardown via a member callback so a Filter
   // destroyed before it fires cancels it.
   void onSpliceComplete(Network::ConnectionEvent event);
+  // Polls until the upstream kTLS installs, then splices the held PUT body chunk; on exhaustion
+  // flushes it on the normal path and re-enables downstream reads. Only ever holds a later (body)
+  // chunk on a kTLS-capable upstream, so a GET request is never delayed by it.
+  void onKtlsEngageRetry();
   void onIdleTimeout();
   void resetIdleTimer();
   void disableIdleTimer();
@@ -788,6 +792,19 @@ protected:
   bool early_data_end_stream_{false};
   Buffer::OwnedImpl early_data_buffer_;
   HttpStreamDecoderFilterCallbacks upstream_decoder_filter_callbacks_;
+
+  // Deferred upload-splice engage for a PUT body that arrives before the upstream finishes
+  // installing kTLS (it raises Connected at handshake completion, then installs kTLS a moment
+  // later). Only a LATER chunk -- a body that follows request headers already sent on the buffered
+  // path -- is held: a GET sends just the request (one chunk, no body) so it is never delayed, and
+  // only a kTLS-capable upstream still installing is held, so non-kTLS/mock upstreams stay on the
+  // buffered path. The held body is spliced once kTLS installs and the (small) headers have flushed
+  // (maybeEngageSplice's watermark check enforces ordering). Bounded retries; on exhaustion the
+  // body is flushed normally.
+  Buffer::OwnedImpl deferred_upload_buffer_;
+  Event::SchedulableCallbackPtr ktls_engage_schedulable_;
+  uint32_t ktls_engage_attempts_{0};
+  bool upload_engage_deferred_{false};
 
   // Connection establishment mode configuration.
   envoy::extensions::filters::network::tcp_proxy::v3::UpstreamConnectMode connect_mode_{
