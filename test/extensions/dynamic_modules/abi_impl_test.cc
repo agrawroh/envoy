@@ -1145,10 +1145,16 @@ WEAK_STUB(UpstreamBridgeGetRequestBuffer,
           envoy_dynamic_module_callback_upstream_http_tcp_bridge_get_request_buffer(nullptr,
                                                                                     nullptr,
                                                                                     nullptr))
+WEAK_STUB(
+    UpstreamBridgeGetRequestBufferChunksSize,
+    envoy_dynamic_module_callback_upstream_http_tcp_bridge_get_request_buffer_chunks_size(nullptr))
 WEAK_STUB(UpstreamBridgeGetResponseBuffer,
           envoy_dynamic_module_callback_upstream_http_tcp_bridge_get_response_buffer(nullptr,
                                                                                      nullptr,
                                                                                      nullptr))
+WEAK_STUB(
+    UpstreamBridgeGetResponseBufferChunksSize,
+    envoy_dynamic_module_callback_upstream_http_tcp_bridge_get_response_buffer_chunks_size(nullptr))
 WEAK_STUB(UpstreamBridgeSendUpstreamData,
           envoy_dynamic_module_callback_upstream_http_tcp_bridge_send_upstream_data(nullptr,
                                                                                     {nullptr, 0},

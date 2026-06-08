@@ -3069,12 +3069,30 @@ envoy_dynamic_module_callback_upstream_http_tcp_bridge_get_request_buffer(
                "not implemented in this context");
 }
 
+__attribute__((weak)) size_t
+envoy_dynamic_module_callback_upstream_http_tcp_bridge_get_request_buffer_chunks_size(
+    envoy_dynamic_module_type_upstream_http_tcp_bridge_envoy_ptr) {
+  IS_ENVOY_BUG(
+      "envoy_dynamic_module_callback_upstream_http_tcp_bridge_get_request_buffer_chunks_size: "
+      "not implemented in this context");
+  return 0;
+}
+
 __attribute__((weak)) void
 envoy_dynamic_module_callback_upstream_http_tcp_bridge_get_response_buffer(
     envoy_dynamic_module_type_upstream_http_tcp_bridge_envoy_ptr,
     envoy_dynamic_module_type_envoy_buffer*, size_t*) {
   IS_ENVOY_BUG("envoy_dynamic_module_callback_upstream_http_tcp_bridge_get_response_buffer: "
                "not implemented in this context");
+}
+
+__attribute__((weak)) size_t
+envoy_dynamic_module_callback_upstream_http_tcp_bridge_get_response_buffer_chunks_size(
+    envoy_dynamic_module_type_upstream_http_tcp_bridge_envoy_ptr) {
+  IS_ENVOY_BUG(
+      "envoy_dynamic_module_callback_upstream_http_tcp_bridge_get_response_buffer_chunks_size: "
+      "not implemented in this context");
+  return 0;
 }
 
 __attribute__((weak)) void
