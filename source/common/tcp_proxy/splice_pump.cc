@@ -1,5 +1,6 @@
 #include "source/common/tcp_proxy/splice_pump.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -165,6 +166,12 @@ bool SplicePump::prepare(std::string initial_u2d, std::string initial_d2u) {
   return true;
 }
 
+void SplicePump::setBounds(absl::optional<uint64_t> u2d_limit, absl::optional<uint64_t> d2u_limit) {
+  bounded_ = true;
+  u2d_limit_ = u2d_limit;
+  d2u_limit_ = d2u_limit;
+}
+
 void SplicePump::arm() {
   // Best-effort enlarge both pipes. On failure the kernel keeps the default size.
   ::fcntl(u2d_.write_fd, F_SETPIPE_SZ, static_cast<int>(kPipeCapacity));
@@ -255,7 +262,7 @@ void SplicePump::pump() {
         on_u2d_bytes_(static_cast<uint64_t>(w));
         progress = true;
       } else if (w == 0) {
-        complete(Network::ConnectionEvent::RemoteClose);
+        complete(SpliceCompletion::Closed);
         return;
       } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
         down_writable_ = false;
@@ -263,7 +270,7 @@ void SplicePump::pump() {
       } else if (errno == EINTR) {
         continue;
       } else {
-        complete(Network::ConnectionEvent::RemoteClose);
+        complete(SpliceCompletion::Closed);
         return;
       }
     }
@@ -276,7 +283,7 @@ void SplicePump::pump() {
         on_u2d_bytes_(static_cast<uint64_t>(n));
         progress = true;
       } else if (n == 0) {
-        complete(Network::ConnectionEvent::RemoteClose);
+        complete(SpliceCompletion::Closed);
         return;
       } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
         down_writable_ = false;
@@ -285,17 +292,24 @@ void SplicePump::pump() {
         continue;
       } else {
         ENVOY_LOG(debug, "splice pump u2d downstream write error, {}", std::strerror(errno));
-        complete(Network::ConnectionEvent::RemoteClose);
+        complete(SpliceCompletion::Closed);
         return;
       }
     }
 
-    // (2) Fill u2d pipe <- upstream kTLS socket (read the decrypted download body).
-    while (up_readable_ && !up_read_eof_ && u2d_.in_pipe < u2d_.capacity) {
-      const ssize_t n =
-          ::splice(up_fd_, nullptr, u2d_.write_fd, nullptr, u2d_.capacity - u2d_.in_pipe, flags);
+    // (2) Fill u2d pipe <- upstream kTLS socket (read the decrypted download body). In bounded mode
+    // this direction is read only while it has a byte budget left, and never beyond it, so the next
+    // keep-alive message stays in the socket. An inactive direction (no limit) is skipped entirely.
+    while (up_readable_ && !up_read_eof_ && u2d_.in_pipe < u2d_.capacity &&
+           (!bounded_ || (u2d_limit_.has_value() && u2d_read_ < u2d_limit_.value()))) {
+      size_t want = u2d_.capacity - u2d_.in_pipe;
+      if (bounded_) {
+        want = std::min(want, static_cast<size_t>(u2d_limit_.value() - u2d_read_));
+      }
+      const ssize_t n = ::splice(up_fd_, nullptr, u2d_.write_fd, nullptr, want, flags);
       if (n > 0) {
         u2d_.in_pipe += static_cast<size_t>(n);
+        u2d_read_ += static_cast<uint64_t>(n);
         progress = true;
       } else if (n == 0) {
         up_read_eof_ = true;
@@ -315,7 +329,7 @@ void SplicePump::pump() {
         if (drainUpstreamControlMessage()) {
           if (++control_records > kMaxControlRecordsPerPass) {
             ENVOY_LOG(debug, "splice pump too many kTLS control records, closing");
-            complete(Network::ConnectionEvent::RemoteClose);
+            complete(SpliceCompletion::Closed);
             return;
           }
           progress = true;
@@ -327,7 +341,7 @@ void SplicePump::pump() {
         break; // EAGAIN or close_notify, stop reading upstream but keep draining the d2u direction
       } else {
         ENVOY_LOG(debug, "splice pump u2d upstream read error, {}", std::strerror(errno));
-        complete(Network::ConnectionEvent::RemoteClose);
+        complete(SpliceCompletion::Closed);
         return;
       }
     }
@@ -342,7 +356,7 @@ void SplicePump::pump() {
         on_d2u_bytes_(static_cast<uint64_t>(w));
         progress = true;
       } else if (w == 0) {
-        complete(Network::ConnectionEvent::RemoteClose);
+        complete(SpliceCompletion::Closed);
         return;
       } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
         up_writable_ = false;
@@ -350,7 +364,7 @@ void SplicePump::pump() {
       } else if (errno == EINTR) {
         continue;
       } else {
-        complete(Network::ConnectionEvent::RemoteClose);
+        complete(SpliceCompletion::Closed);
         return;
       }
     }
@@ -365,7 +379,7 @@ void SplicePump::pump() {
         on_d2u_bytes_(static_cast<uint64_t>(n));
         progress = true;
       } else if (n == 0) {
-        complete(Network::ConnectionEvent::RemoteClose);
+        complete(SpliceCompletion::Closed);
         return;
       } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
         up_writable_ = false;
@@ -374,18 +388,25 @@ void SplicePump::pump() {
         continue;
       } else {
         ENVOY_LOG(debug, "splice pump d2u upstream write error, {}", std::strerror(errno));
-        complete(Network::ConnectionEvent::RemoteClose);
+        complete(SpliceCompletion::Closed);
         return;
       }
     }
 
     // (4) Fill d2u pipe <- downstream socket (read the plaintext request and upload body), only
-    // after draining toward the upstream so the bounded pipe releases backpressure first.
-    while (down_readable_ && !down_read_eof_ && d2u_.in_pipe < d2u_.capacity) {
-      const ssize_t n =
-          ::splice(down_fd_, nullptr, d2u_.write_fd, nullptr, d2u_.capacity - d2u_.in_pipe, flags);
+    // after draining toward the upstream so the bounded pipe releases backpressure first. In bounded
+    // mode this direction is read only while it has a byte budget left, and never beyond it; an
+    // inactive direction (no limit) is skipped so the next request stays in the downstream socket.
+    while (down_readable_ && !down_read_eof_ && d2u_.in_pipe < d2u_.capacity &&
+           (!bounded_ || (d2u_limit_.has_value() && d2u_read_ < d2u_limit_.value()))) {
+      size_t want = d2u_.capacity - d2u_.in_pipe;
+      if (bounded_) {
+        want = std::min(want, static_cast<size_t>(d2u_limit_.value() - d2u_read_));
+      }
+      const ssize_t n = ::splice(down_fd_, nullptr, d2u_.write_fd, nullptr, want, flags);
       if (n > 0) {
         d2u_.in_pipe += static_cast<size_t>(n);
+        d2u_read_ += static_cast<uint64_t>(n);
         progress = true;
       } else if (n == 0) {
         down_read_eof_ = true;
@@ -419,7 +440,7 @@ void SplicePump::pump() {
         continue;
       } else {
         ENVOY_LOG(debug, "splice pump d2u downstream read error, {}", std::strerror(errno));
-        complete(Network::ConnectionEvent::RemoteClose);
+        complete(SpliceCompletion::Closed);
         return;
       }
     }
@@ -454,7 +475,7 @@ bool SplicePump::drainUpstreamControlMessage() {
       return false;
     }
     ENVOY_LOG(debug, "splice pump kTLS control recvmsg error, {}", std::strerror(errno));
-    complete(Network::ConnectionEvent::RemoteClose);
+    complete(SpliceCompletion::Closed);
     return false;
   }
   if (n == 0) {
@@ -467,7 +488,7 @@ bool SplicePump::drainUpstreamControlMessage() {
   // safely, so close.
   if (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) {
     ENVOY_LOG(debug, "splice pump kTLS control record truncated");
-    complete(Network::ConnectionEvent::RemoteClose);
+    complete(SpliceCompletion::Closed);
     return false;
   }
 
@@ -495,7 +516,7 @@ bool SplicePump::drainUpstreamControlMessage() {
     } else {
       ENVOY_LOG(debug, "splice pump closing on TLS record type {}", record_type);
     }
-    complete(Network::ConnectionEvent::RemoteClose);
+    complete(SpliceCompletion::Closed);
     return false;
   }
   return false; // all ControlActions are handled above
@@ -537,6 +558,28 @@ void SplicePump::maybeHalfCloseOrComplete() {
   if (completed_) {
     return;
   }
+  if (bounded_) {
+    // Bounded mode never half-closes. A source EOF before the byte budget is met is a truncated
+    // message, so the connection cannot be reused.
+    if ((u2d_limit_.has_value() && up_read_eof_ && u2d_read_ < u2d_limit_.value()) ||
+        (d2u_limit_.has_value() && down_read_eof_ && d2u_read_ < d2u_limit_.value())) {
+      complete(SpliceCompletion::Closed);
+      return;
+    }
+    // A direction is done when it is inactive, or it has read its full budget and flushed both the
+    // pre-engage chunk and the pipe to its destination. The sockets are left intact for the caller
+    // to resume the codecs once every active direction is done.
+    const bool u2d_done = !u2d_limit_.has_value() ||
+                          (u2d_read_ >= u2d_limit_.value() && u2d_.in_pipe == 0 &&
+                           pending_down_off_ >= pending_down_.size());
+    const bool d2u_done = !d2u_limit_.has_value() ||
+                          (d2u_read_ >= d2u_limit_.value() && d2u_.in_pipe == 0 &&
+                           pending_up_off_ >= pending_up_.size());
+    if (u2d_done && d2u_done) {
+      complete(SpliceCompletion::BoundsReached);
+    }
+    return;
+  }
   const bool u2d_drained =
       up_read_eof_ && u2d_.in_pipe == 0 && pending_down_off_ >= pending_down_.size();
   const bool d2u_drained =
@@ -555,7 +598,7 @@ void SplicePump::maybeHalfCloseOrComplete() {
     up_write_shutdown_ = true;
   }
   if (u2d_drained && d2u_drained) {
-    complete(Network::ConnectionEvent::RemoteClose);
+    complete(SpliceCompletion::Closed);
     return;
   }
   // Upstream finished: it sent a real EOF or close_notify (u2d_drained requires up_read_eof_) and
@@ -566,7 +609,7 @@ void SplicePump::maybeHalfCloseOrComplete() {
   // the both-drained path above nor the client-close path below fires, and the pump holds both
   // sockets and the two pipes until the worker recycles. This is the dominant leak under PUT churn.
   if (u2d_drained && down_write_shutdown_) {
-    complete(Network::ConnectionEvent::RemoteClose);
+    complete(SpliceCompletion::Closed);
     return;
   }
   // The client closed its send side (d2u_drained), the request was fully relayed, and the upstream
@@ -580,11 +623,11 @@ void SplicePump::maybeHalfCloseOrComplete() {
   // buffered response downstream) before reaching here.
   if (d2u_drained && up_write_shutdown_ && up_eagain_this_pass_ && u2d_.in_pipe == 0 &&
       pending_down_off_ >= pending_down_.size()) {
-    complete(Network::ConnectionEvent::RemoteClose);
+    complete(SpliceCompletion::Closed);
   }
 }
 
-void SplicePump::complete(Network::ConnectionEvent event) {
+void SplicePump::complete(SpliceCompletion status) {
   if (completed_) {
     return;
   }
@@ -600,7 +643,7 @@ void SplicePump::complete(Network::ConnectionEvent event) {
   }
   // The owning Filter is alive here because it owns this pump. Its callback must not destroy the
   // pump synchronously and defers teardown through its own SchedulableCallback.
-  on_complete_(event);
+  on_complete_(status);
 }
 
 #else // !defined(__linux__)
@@ -616,6 +659,7 @@ SplicePump::SplicePump(os_fd_t down_fd, os_fd_t up_fd, bool up_is_ktls,
 
 SplicePump::~SplicePump() = default;
 bool SplicePump::prepare(std::string, std::string) { return false; }
+void SplicePump::setBounds(absl::optional<uint64_t>, absl::optional<uint64_t>) {}
 void SplicePump::arm() {}
 absl::Status SplicePump::onUpReady(uint32_t) { return absl::OkStatus(); }
 absl::Status SplicePump::onDownReady(uint32_t) { return absl::OkStatus(); }
@@ -623,7 +667,7 @@ void SplicePump::pump() {}
 bool SplicePump::drainUpstreamControlMessage() { return false; }
 void SplicePump::sendUpstreamCloseNotify() {}
 void SplicePump::maybeHalfCloseOrComplete() {}
-void SplicePump::complete(Network::ConnectionEvent) {}
+void SplicePump::complete(SpliceCompletion) {}
 
 #endif
 

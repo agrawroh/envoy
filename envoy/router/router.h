@@ -1677,6 +1677,14 @@ public:
    * Get the bytes meter for this stream.
    */
   virtual const StreamInfo::BytesMeterSharedPtr& bytesMeter() PURE;
+
+  /**
+   * @return the upstream Network::Connection when this upstream is backed by a single,
+   * non-multiplexed HTTP/1.1 socket that can be borrowed for the kTLS body-splice fast path, or an
+   * empty OptRef otherwise (HTTP/2, HTTP/3, TCP tunnel, UDP). Defaults to empty so only the
+   * HTTP/1.1 upstream opts in.
+   */
+  virtual OptRef<Network::Connection> upstreamConnectionForSplice() { return {}; }
 };
 
 using GenericConnPoolPtr = std::unique_ptr<GenericConnPool>;

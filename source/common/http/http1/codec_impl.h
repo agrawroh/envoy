@@ -68,6 +68,11 @@ public:
   uint32_t bufferLimit() const override;
   absl::string_view responseDetails() override { return details_; }
   const Network::ConnectionInfoProvider& connectionInfoProvider() override;
+  // HTTP/1.1 owns its connection one stream at a time, so the backing socket can be borrowed for
+  // the kTLS body-splice fast path.
+  OptRef<Network::Connection> connectionForSplice() override {
+    return makeOptRef(connection_.connection());
+  }
   void setFlushTimeout(std::chrono::milliseconds) override {
     // HTTP/1 has one stream per connection, thus any data encoded is immediately written to the
     // connection, invoking any watermarks as necessary. There is no internal buffering that would

@@ -22,6 +22,10 @@
 #include "source/common/http/status.h"
 
 namespace Envoy {
+namespace Network {
+class Connection;
+} // namespace Network
+
 namespace Http {
 
 enum class CodecType { HTTP1, HTTP2, HTTP3 };
@@ -440,6 +444,15 @@ public:
    * associated with the stream.
    */
   virtual const Network::ConnectionInfoProvider& connectionInfoProvider() PURE;
+
+  /**
+   * @return OptRef<Network::Connection> the underlying network connection when this stream is the
+   * sole user of a non-multiplexed connection whose socket can be borrowed for the kTLS body-splice
+   * fast path. Implemented only by the HTTP/1.1 codec. Multiplexed codecs (HTTP/2 and HTTP/3) and
+   * the default return absl::nullopt so a raw-socket splice is never attempted where it would
+   * corrupt framing.
+   */
+  virtual OptRef<Network::Connection> connectionForSplice() { return {}; }
 
   /**
    * Set the flush timeout for the stream. At the codec level this is used to bound the amount of

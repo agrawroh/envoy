@@ -12,6 +12,8 @@
 
 #include "source/common/common/logger.h"
 
+#include "absl/types/optional.h"
+
 namespace Envoy {
 namespace TcpProxy {
 
@@ -20,6 +22,17 @@ enum class ControlAction {
   Retry, // benign record consumed (NewSessionTicket or ChangeCipherSpec), retry the splice
   Eof,   // peer sent close_notify, treat the upstream read as EOF
   Close, // fatal alert or unsupported record, tear the splice down
+};
+
+// Terminal outcome reported once through the SplicePump completion callback.
+enum class SpliceCompletion {
+  // A bounded transfer moved exactly the configured byte budget in every active direction. The
+  // borrowed sockets are intact and can carry the next keep-alive message, so the caller resumes
+  // the codecs rather than closing.
+  BoundsReached,
+  // The transfer ended because a peer closed or half-closed, an unbounded pump ran a socket to EOF,
+  // or an error occurred. The sockets must not be reused.
+  Closed,
 };
 
 // Classifies a non-DATA TLS record by its record type and bytes. Pure so it can be unit-tested
@@ -45,7 +58,7 @@ ControlAction classifyKtlsControlRecord(uint8_t record_type, const uint8_t* data
 // own teardown.
 class SplicePump : public Logger::Loggable<Logger::Id::filter> {
 public:
-  using CompletionCb = std::function<void(Network::ConnectionEvent)>;
+  using CompletionCb = std::function<void(SpliceCompletion)>;
   using BytesCb = std::function<void(uint64_t)>;
 
   SplicePump(os_fd_t down_fd, os_fd_t up_fd, bool up_is_ktls, Event::Dispatcher& dispatcher,
@@ -61,6 +74,15 @@ public:
   // one is non-empty per engage. Returns false only on unrecoverable setup failure such as pipe
   // creation, in which case the caller must not detach and should re-deliver on the buffered path.
   bool prepare(std::string initial_u2d, std::string initial_d2u);
+  // Switches the pump into bounded mode. Called between prepare() and arm(). Each direction with a
+  // byte limit moves exactly that many bytes read from its source socket, then the pump completes
+  // with SpliceCompletion::BoundsReached and leaves both sockets intact for keep-alive reuse. A
+  // direction with absl::nullopt is inactive and its source socket is never read, so the bytes of
+  // the next message stay queued for the codec. The limits count bytes read from the source socket
+  // and exclude any pre-engage chunk handed to prepare(), which is delivered and accounted
+  // separately. The HTTP body-splice runs one direction at a time (a response body up to down, or a
+  // request body down to up), so exactly one limit is set per engage.
+  void setBounds(absl::optional<uint64_t> u2d_limit, absl::optional<uint64_t> d2u_limit);
   // Phase 2, called after detaching the ConnectionImpl FileEvents. Installs the pump's FileEvents
   // and primes the first pass.
   void arm();
@@ -79,7 +101,7 @@ private:
   bool drainUpstreamControlMessage();
   void sendUpstreamCloseNotify();
   void maybeHalfCloseOrComplete();
-  void complete(Network::ConnectionEvent event);
+  void complete(SpliceCompletion status);
 
   const os_fd_t down_fd_;
   const os_fd_t up_fd_;
@@ -88,6 +110,16 @@ private:
   CompletionCb on_complete_;
   BytesCb on_u2d_bytes_;
   BytesCb on_d2u_bytes_;
+
+  // Bounded-mode state (HTTP body-splice). bounded_ is set by setBounds(). Each limit, when present,
+  // caps the bytes read from that direction's source socket so the splice stops exactly on the
+  // Content-Length boundary and the next keep-alive message stays in the socket. The *_read_
+  // counters track bytes already read from each source.
+  bool bounded_{false};
+  absl::optional<uint64_t> u2d_limit_;
+  absl::optional<uint64_t> d2u_limit_;
+  uint64_t u2d_read_{0};
+  uint64_t d2u_read_{0};
 
   Pipe u2d_; // upstream to downstream, the download body, moved in-kernel by splice
   // The downstream-to-upstream direction (request and upload body) is also moved in-kernel by

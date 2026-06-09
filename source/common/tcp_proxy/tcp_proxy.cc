@@ -1488,7 +1488,9 @@ bool Filter::maybeEngageSplice(Buffer::Instance& data, bool from_upstream) {
   }
   auto pump = std::make_unique<SplicePump>(
       down_fd, up_fd, /*up_is_ktls=*/true, down.dispatcher(),
-      [this](Network::ConnectionEvent event) { onSpliceComplete(event); },
+      // The L4 pump is unbounded, so it only ever completes as Closed. Map that to the RemoteClose
+      // teardown the filter already drives.
+      [this](SpliceCompletion) { onSpliceComplete(Network::ConnectionEvent::RemoteClose); },
       [this](uint64_t n) {
         getStreamInfo().getUpstreamBytesMeter()->addWireBytesReceived(n);
         getStreamInfo().getDownstreamBytesMeter()->addWireBytesSent(n);
