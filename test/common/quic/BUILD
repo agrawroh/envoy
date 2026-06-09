@@ -27,6 +27,15 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "web_transport_test_tools_test",
+    srcs = envoy_select_enable_http3(["web_transport_test_tools_test.cc"]),
+    rbe_pool = "6gig",
+    deps = envoy_select_enable_http3([
+        "@quiche//:quiche_web_transport_test_tools_lib",
+    ]),
+)
+
+envoy_cc_test(
     name = "envoy_quic_clock_test",
     srcs = envoy_select_enable_http3(["envoy_quic_clock_test.cc"]),
     rbe_pool = "6gig",
