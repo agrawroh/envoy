@@ -182,6 +182,9 @@ public:
   // TODO(paulsohn): Enable H/1 codec to get a pointer to the new
   // request decoder on recreateStream, here or elsewhere.
   void setRequestDecoder(Http::RequestDecoder& /*decoder*/) override {}
+  // Defined out-of-line because it dispatches to the owning ServerConnectionImpl, which is declared
+  // later in this header.
+  void completeSplicedRequest(uint64_t request_body_bytes) override;
 
   // Http1::StreamEncoderImpl
   void resetStream(StreamResetReason reason) override;
@@ -469,6 +472,12 @@ public:
                            headers_with_underscores_action,
                        Server::OverloadManager& overload_manager);
   bool supportsHttp10() override { return codec_settings_.accept_http_10_; }
+
+  // Finalizes a request whose Content-Length body was relayed out-of-band by the kTLS body-splice
+  // fast path. Mirrors onMessageCompleteBase() for a Content-Length body, then rebuilds the parser
+  // (which is otherwise stuck mid-body because the spliced bytes bypassed it) so the connection can
+  // carry the next keep-alive request.
+  void completeSplicedRequest(uint64_t request_body_bytes);
 
 protected:
   /**

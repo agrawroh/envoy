@@ -407,6 +407,15 @@ public:
    * Defaults to empty so only the HTTP/1.1 downstream opts in.
    */
   virtual OptRef<Network::Connection> downstreamConnectionForSplice() { return {}; }
+
+  /**
+   * Finalize a request whose Content-Length body was relayed out-of-band by the kTLS body-splice
+   * fast path: account the spliced bytes, deliver the terminal end-of-stream to the request
+   * decoder, and ready the downstream connection for the next keep-alive request. Only the HTTP/1.1
+   * downstream implements this; the default is a no-op.
+   * @param request_body_bytes the number of body bytes that were spliced.
+   */
+  virtual void completeSplicedRequest(uint64_t /* request_body_bytes */) {}
 };
 
 /**

@@ -210,6 +210,16 @@ public:
                                        Http::ResponseHeaderMapConstSharedPtr response_header_map,
                                        Http::ResponseTrailerMapConstSharedPtr response_trailer_map,
                                        StreamInfo::StreamInfo& stream_info) PURE;
+
+  /**
+   * Finalize a request whose Content-Length body was relayed out-of-band by the kTLS body-splice
+   * fast path instead of through the decode callbacks. The codec accounts the spliced bytes,
+   * delivers the terminal end-of-stream to the request decoder, and readies the connection for the
+   * next keep-alive request. Only the HTTP/1.1 codec implements this; multiplexed codecs (HTTP/2,
+   * HTTP/3) never opt into the splice, so the default is a no-op.
+   * @param request_body_bytes the number of body bytes that were spliced.
+   */
+  virtual void completeSplicedRequest(uint64_t /* request_body_bytes */) {}
 };
 
 class ResponseDecoder;
