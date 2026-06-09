@@ -30,6 +30,7 @@
 #include "gtest/gtest.h"
 #include "quiche/quic/core/crypto/null_encrypter.h"
 #include "quiche/quic/core/deterministic_connection_id_generator.h"
+#include "quiche/quic/core/http/http_constants.h"
 #include "quiche/quic/core/quic_crypto_server_stream.h"
 #include "quiche/quic/core/quic_error_codes.h"
 #include "quiche/quic/core/quic_utils.h"
@@ -1252,6 +1253,34 @@ TEST_F(EnvoyQuicServerSessionTest, WebTransportDisabledWithoutExtendedConnect) {
   EXPECT_FALSE(envoy_quic_session_.LocallySupportedWebTransportVersions().Any());
 
   installReadFilter();
+}
+
+// An incoming WebTransport unidirectional stream is a QUICHE-internal stream, not an
+// EnvoyQuicStream. The connection watermark callbacks must skip it instead of dereferencing a null
+// cast result.
+TEST_F(EnvoyQuicServerSessionTest, WatermarkCallbacksSkipWebTransportStreams) {
+#ifndef ENVOY_ENABLE_HTTP_DATAGRAMS
+  GTEST_SKIP() << "WebTransport requires HTTP/3 datagram support.";
+#endif
+  installReadFilter();
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "true"}});
+  envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.set_allow_extended_connect(true);
+  envoy_quic_session_.setHttp3Options(http3_options);
+
+  // Feed an incoming WebTransport unidirectional stream so QUICHE creates and activates a
+  // WebTransportHttp3UnidirectionalStream.
+  quic::QuicStreamId stream_id = 2u;
+  char type[2];
+  quic::QuicDataWriter writer(sizeof(type), type);
+  ASSERT_TRUE(writer.WriteVarInt62(quic::kWebTransportUnidirectionalStream));
+  quic::QuicStreamFrame stream_frame(stream_id, false, 0, absl::string_view(type, writer.length()));
+  envoy_quic_session_.OnStreamFrame(stream_frame);
+
+  // The watermark fan-out iterates every active stream. It must not crash on the non-Envoy stream.
+  http_connection_->onUnderlyingConnectionAboveWriteBufferHighWatermark();
+  http_connection_->onUnderlyingConnectionBelowWriteBufferLowWatermark();
 }
 
 TEST_F(EnvoyQuicServerSessionTest, ConnectionFlowControlForStreamsEnabledByDefault) {
