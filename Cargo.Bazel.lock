@@ -1,5 +1,5 @@
 {
-  "checksum": "5b2732d6faf4872654fe43d84a7d3424c73c0bbd48835c02915ef6c4443adadc",
+  "checksum": "d2b0fe2ac1cfb5abf45fe653b770e12d49e6222cc04973182f7b2c5efffa70be",
   "crates": {
     "aho-corasick 1.1.4": {
       "name": "aho-corasick",
@@ -1693,6 +1693,55 @@
           ],
           "selects": {}
         }
+      },
+      "license": "Apache-2.0",
+      "license_ids": [
+        "Apache-2.0"
+      ],
+      "license_file": null
+    },
+    "envoy-rustls-ktls 0.1.0": {
+      "name": "envoy-rustls-ktls",
+      "version": "0.1.0",
+      "package_url": "https://github.com/envoyproxy/envoy",
+      "repository": null,
+      "targets": [],
+      "library_target_name": null,
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "libc 0.2.183",
+              "target": "libc"
+            },
+            {
+              "id": "rustls 0.23.37",
+              "target": "rustls"
+            },
+            {
+              "id": "rustls-pemfile 2.2.0",
+              "target": "rustls_pemfile"
+            },
+            {
+              "id": "serde 1.0.228",
+              "target": "serde"
+            },
+            {
+              "id": "serde_json 1.0.149",
+              "target": "serde_json"
+            },
+            {
+              "id": "webpki-roots 0.26.11",
+              "target": "webpki_roots"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.1.0"
       },
       "license": "Apache-2.0",
       "license_ids": [
@@ -4774,29 +4823,11 @@
           "**"
         ],
         "crate_features": {
-          "common": [],
-          "selects": {
-            "aarch64-apple-darwin": [
-              "default",
-              "std"
-            ],
-            "aarch64-unknown-linux-gnu": [
-              "default",
-              "std"
-            ],
-            "wasm32-wasip1": [
-              "default",
-              "std"
-            ],
-            "x86_64-unknown-linux-gnu": [
-              "default",
-              "std"
-            ],
-            "x86_64-unknown-nixos-gnu": [
-              "default",
-              "std"
-            ]
-          }
+          "common": [
+            "default",
+            "std"
+          ],
+          "selects": {}
         },
         "deps": {
           "common": [
@@ -7409,6 +7440,63 @@
         "MIT"
       ],
       "license_file": "LICENSE-APACHE"
+    },
+    "rustls-pemfile 2.2.0": {
+      "name": "rustls-pemfile",
+      "version": "2.2.0",
+      "package_url": "https://github.com/rustls/pemfile",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/rustls-pemfile/2.2.0/download",
+          "sha256": "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "rustls_pemfile",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "rustls_pemfile",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
+        "deps": {
+          "common": [
+            {
+              "id": "rustls-pki-types 1.14.0",
+              "target": "rustls_pki_types",
+              "alias": "pki_types"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "version": "2.2.0"
+      },
+      "license": "Apache-2.0 OR ISC OR MIT",
+      "license_ids": [
+        "Apache-2.0",
+        "ISC",
+        "MIT"
+      ],
+      "license_file": "LICENSE"
     },
     "rustls-pki-types 1.14.0": {
       "name": "rustls-pki-types",
@@ -10700,6 +10788,54 @@
       ],
       "license_file": null
     },
+    "webpki-roots 0.26.11": {
+      "name": "webpki-roots",
+      "version": "0.26.11",
+      "package_url": "https://github.com/rustls/webpki-roots",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/webpki-roots/0.26.11/download",
+          "sha256": "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "webpki_roots",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "webpki_roots",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "webpki-roots 1.0.6",
+              "target": "webpki_roots",
+              "alias": "parent"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.26.11"
+      },
+      "license": "CDLA-Permissive-2.0",
+      "license_ids": [
+        "CDLA-Permissive-2.0"
+      ],
+      "license_file": "LICENSE"
+    },
     "webpki-roots 1.0.6": {
       "name": "webpki-roots",
       "version": "1.0.6",
@@ -12962,6 +13098,7 @@
   "workspace_members": {
     "envoy-dynamic-modules-builtin-extensions 0.1.0": "source/extensions/dynamic_modules/builtin_extensions",
     "envoy-proxy-dynamic-modules-rust-sdk 0.1.0": "source/extensions/dynamic_modules/sdk/rust",
+    "envoy-rustls-ktls 0.1.0": "source/extensions/transport_sockets/rustls/rust",
     "test-programs 0.1.0": "test/extensions/dynamic_modules/test_data/rust"
   },
   "conditions": {
@@ -13064,12 +13201,16 @@
   "direct_deps": [
     "bindgen 0.70.1",
     "hickory-resolver 0.26.1",
+    "libc 0.2.183",
     "mockall 0.13.1",
+    "rustls 0.23.37",
+    "rustls-pemfile 2.2.0",
     "serde 1.0.228",
     "serde_json 1.0.149",
     "time 0.3.47",
     "tokio 1.50.0",
-    "url 2.5.8"
+    "url 2.5.8",
+    "webpki-roots 0.26.11"
   ],
   "direct_dev_deps": [],
   "unused_patches": []

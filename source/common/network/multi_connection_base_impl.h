@@ -116,6 +116,8 @@ public:
   // Note, this might change before connect finishes.
   Ssl::ConnectionInfoConstSharedPtr ssl() const override;
   OptRef<const KtlsBytestreamInfo> ktlsBytestreamInfo() const override;
+  void reinstallFileEvents() override;
+  std::string extractPendingWriteForSplice() override;
   State state() const override;
   bool connecting() const override;
   uint32_t bufferLimit() const override;

@@ -132,6 +132,18 @@ new_features:
     ``%DOWNSTREAM_PEER_CERT*%`` will behave as if the connection were plaintext — do not route
     through this socket from a listener whose filter chain depends on TLS-derived principals or
     audit fields. Use ``envoy.transport_sockets.tls`` for any of the above.
+- area: router
+  change: |
+    Added an experimental, dark-by-default HTTP/1.1 kernel-TLS response-body splice fast path,
+    guarded by runtime feature ``envoy.reloadable_features.http1_ktls_body_splice``. When enabled and
+    both the upstream and downstream legs are single, non-multiplexed HTTP/1.1 sockets, a
+    Content-Length response body read from a kernel-TLS upstream is relayed to the downstream socket
+    with an in-kernel ``splice()`` that bypasses Envoy's userspace buffers and the encoder filter
+    chain. The fast path only engages when the upstream has kernel TLS installed and is a trusted
+    peer, the downstream is plaintext or kernel TLS, and the response is Content-Length framed and
+    at least 64 KiB; otherwise the connection stays on the normal buffered path. Because the spliced
+    body bypasses the encoder filter chain, the fast path must not be enabled alongside response
+    filters that transform the body. Defaults off.
 - area: stat_sinks
   change: |
     Added :ref:`max_data_points_per_request

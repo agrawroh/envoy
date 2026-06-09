@@ -112,6 +112,12 @@ public:
                                        : OptRef<Network::Connection>{};
   }
 
+  void completeSplicedResponse(uint64_t response_body_bytes) override {
+    if (request_encoder_ != nullptr) {
+      request_encoder_->completeSplicedResponse(response_body_bytes);
+    }
+  }
+
 private:
   Router::UpstreamToDownstream& upstream_request_;
   Envoy::Http::RequestEncoder* request_encoder_{};

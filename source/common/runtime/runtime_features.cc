@@ -191,6 +191,13 @@ FALSE_RUNTIME_GUARD(envoy_reloadable_features_disable_quic_ip_packet_info_socket
 // source/common/tcp_proxy/UPSTREAM_POOL_DESIGN.md.
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_tcp_proxy_l4_connection_pool);
 
+// L7 HTTP/1.1 kTLS body-splice fast-path (ships dark). When enabled, the router relays a
+// Content-Length response body from a kTLS upstream socket to the downstream socket with an
+// in-kernel splice that bypasses Envoy's userspace buffers and the encoder filter chain. Defaults
+// off; only engages when both legs are HTTP/1.1 real sockets, the upstream has kernel TLS
+// installed, the downstream is plaintext or kTLS, and the response is Content-Length framed.
+FALSE_RUNTIME_GUARD(envoy_reloadable_features_http1_ktls_body_splice);
+
 // A flag to set the maximum TLS version for google_grpc client to TLS1.2, when needed for
 // compliance restrictions.
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_google_grpc_disable_tls_13);

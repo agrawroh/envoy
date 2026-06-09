@@ -141,6 +141,16 @@ public:
    * Enable TCP Tunneling.
    */
   virtual void enableTcpTunneling() PURE;
+
+  /**
+   * Finalize a response whose Content-Length body was relayed out-of-band by the kTLS body-splice
+   * fast path instead of through the decode callbacks. The codec accounts the spliced bytes,
+   * delivers the terminal end-of-stream to the response decoder, and readies the connection for the
+   * next keep-alive response. Only the HTTP/1.1 codec implements this; multiplexed codecs (HTTP/2,
+   * HTTP/3) never opt into the splice, so the default is a no-op.
+   * @param response_body_bytes the number of body bytes that were spliced.
+   */
+  virtual void completeSplicedResponse(uint64_t /* response_body_bytes */) {}
 };
 
 /**

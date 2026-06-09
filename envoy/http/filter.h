@@ -398,6 +398,15 @@ public:
    */
   virtual void
   requestRouteConfigUpdate(RouteConfigUpdatedCallbackSharedPtr route_config_updated_cb) PURE;
+
+  /**
+   * @return the downstream Network::Connection when the response is encoded over a single,
+   * non-multiplexed HTTP/1.1 socket that can be borrowed for the kTLS body-splice fast path, or an
+   * empty OptRef otherwise (HTTP/2, HTTP/3, no active encoder). Unlike connection() this returns a
+   * non-const reference because the splice detaches and later re-arms the socket's file event.
+   * Defaults to empty so only the HTTP/1.1 downstream opts in.
+   */
+  virtual OptRef<Network::Connection> downstreamConnectionForSplice() { return {}; }
 };
 
 /**

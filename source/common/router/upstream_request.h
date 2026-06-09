@@ -34,6 +34,7 @@ namespace Router {
 class GenericUpstream;
 class GenericConnectionPoolCallbacks;
 class RouterFilterInterface;
+class SpliceCoordinator;
 class UpstreamRequest;
 class UpstreamRequestFilterManagerCallbacks;
 class UpstreamFilterManager;
@@ -175,6 +176,7 @@ private:
   friend class UpstreamFilterManager;
   friend class UpstreamCodecFilter;
   friend class UpstreamRequestFilterManagerCallbacks;
+  friend class SpliceCoordinator;
   StreamInfo::UpstreamTiming& upstreamTiming() {
     return stream_info_.upstreamInfo()->upstreamTiming();
   }
@@ -223,6 +225,10 @@ private:
 
   std::unique_ptr<UpstreamRequestFilterManagerCallbacks> filter_manager_callbacks_;
   std::unique_ptr<Http::FilterManager> filter_manager_;
+
+  // Drives the L7 kTLS body-splice fast path for this request's response. Lazily created when a
+  // response first becomes splice-eligible; null on every connection that never qualifies.
+  std::unique_ptr<SpliceCoordinator> splice_coordinator_;
 
   // The number of outstanding readDisable to be called with parameter value true.
   // When downstream send buffers get above high watermark before response headers arrive, we

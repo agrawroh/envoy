@@ -215,6 +215,16 @@ OptRef<const KtlsBytestreamInfo> MultiConnectionBaseImpl::ktlsBytestreamInfo() c
   return connections_[0]->ktlsBytestreamInfo();
 }
 
+// Delegate to the active connection so the kTLS body-splice re-arms the inner socket it borrowed
+// (getSocket() and ktlsBytestreamInfo() above resolve to the same connection). Without this a
+// Happy Eyeballs (DNS-cluster) upstream would keep the base no-op and never resume reads after a
+// bounded splice completes.
+void MultiConnectionBaseImpl::reinstallFileEvents() { connections_[0]->reinstallFileEvents(); }
+
+std::string MultiConnectionBaseImpl::extractPendingWriteForSplice() {
+  return connections_[0]->extractPendingWriteForSplice();
+}
+
 Connection::State MultiConnectionBaseImpl::state() const {
   if (!connect_finished_) {
     ASSERT(connections_[0]->state() == Connection::State::Open);

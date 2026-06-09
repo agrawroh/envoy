@@ -475,6 +475,7 @@ visibility_excludes:
 - source/extensions/formatter/file_content/BUILD
 - source/extensions/http/header_validators/envoy_default/BUILD
 - source/extensions/transport_sockets/common/BUILD
+- source/extensions/transport_sockets/rustls/rust/BUILD
 - source/extensions/transport_sockets/tap/BUILD
 - source/extensions/udp_packet_writer/default/BUILD
 - source/extensions/udp_packet_writer/gso/BUILD

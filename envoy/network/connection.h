@@ -294,6 +294,25 @@ public:
   virtual OptRef<const KtlsBytestreamInfo> ktlsBytestreamInfo() const { return {}; }
 
   /**
+   * Re-arm the connection's read/write file event after a kTLS body-splice borrowed the socket and
+   * detached the event via ``getSocket()->ioHandle().resetFileEvents()``. This restores
+   * Envoy-driven I/O so the connection can carry the next keep-alive message once the bounded
+   * splice completes. The base is a no-op; only the real socket connection that the splice path
+   * borrows re-installs its event.
+   */
+  virtual void reinstallFileEvents() {}
+
+  /**
+   * Removes and returns all bytes currently queued in the connection's write buffer (data accepted
+   * for write but not yet flushed to the transport). The kTLS body-splice calls this on the leg it
+   * borrows so the pump can emit the pending output (e.g. response headers and any body delivered
+   * before engage) ahead of the spliced body, preserving wire order without the splice writing
+   * behind it. Defaults to an empty string for connections without a userspace write buffer; the
+   * real socket connection the splice borrows overrides it.
+   */
+  virtual std::string extractPendingWriteForSplice() { return {}; }
+
+  /**
    * @return requested server name (e.g. SNI in TLS), if any.
    */
   virtual absl::string_view requestedServerName() const PURE;

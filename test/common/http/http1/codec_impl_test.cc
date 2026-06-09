@@ -2673,6 +2673,41 @@ TEST_F(Http1ClientConnectionImplTest, SimpleGet) {
   EXPECT_EQ("GET / HTTP/1.1\r\n\r\n", output);
 }
 
+// completeSplicedResponse() finalizes a Content-Length response whose body was relayed out-of-band
+// by the kTLS body-splice fast path: it delivers the terminal end-of-stream to the decoder and
+// leaves the connection ready to parse the next keep-alive response.
+TEST_F(Http1ClientConnectionImplTest, CompleteSplicedResponseFinalizesAndResetsParser) {
+  initialize();
+
+  NiceMock<MockResponseDecoder> response_decoder;
+  Http::RequestEncoder& request_encoder = codec_->newStream(response_decoder);
+  TestRequestHeaderMapImpl request_headers{
+      {":method", "GET"}, {":path", "/"}, {":authority", "host"}};
+  EXPECT_TRUE(request_encoder.encodeHeaders(request_headers, true).ok());
+
+  // Deliver only the response headers; the 100000-byte body would be spliced out-of-band, so it
+  // never passes through the parser or the decode path.
+  EXPECT_CALL(response_decoder, decodeHeaders_(_, false));
+  Buffer::OwnedImpl headers_buffer("HTTP/1.1 200 OK\r\ncontent-length: 100000\r\n\r\n");
+  auto status = codec_->dispatch(headers_buffer);
+  EXPECT_TRUE(status.ok());
+  EXPECT_EQ(0, headers_buffer.length());
+
+  // Finalize the spliced response. The decoder observes the terminal end-of-stream with no body.
+  EXPECT_CALL(response_decoder, decodeData(_, true));
+  request_encoder.completeSplicedResponse(100000);
+
+  // The connection is keep-alive ready: a second response parses cleanly on a fresh stream, proving
+  // the parser was rebuilt rather than left stuck mid-body.
+  NiceMock<MockResponseDecoder> second_response_decoder;
+  Http::RequestEncoder& second_request_encoder = codec_->newStream(second_response_decoder);
+  EXPECT_TRUE(second_request_encoder.encodeHeaders(request_headers, true).ok());
+  EXPECT_CALL(second_response_decoder, decodeHeaders_(_, true));
+  Buffer::OwnedImpl second_response("HTTP/1.1 204 No Content\r\n\r\n");
+  status = codec_->dispatch(second_response);
+  EXPECT_TRUE(status.ok());
+}
+
 TEST_F(Http1ClientConnectionImplTest, SimpleGetWithHeaderCasing) {
   codec_settings_.header_key_format_ = Http1Settings::HeaderKeyFormat::ProperCase;
 

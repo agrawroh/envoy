@@ -318,6 +318,10 @@ private:
     void refreshRouteCluster() override;
     void requestRouteConfigUpdate(
         Http::RouteConfigUpdatedCallbackSharedPtr route_config_updated_cb) override;
+    OptRef<Network::Connection> downstreamConnectionForSplice() override {
+      return response_encoder_ != nullptr ? response_encoder_->getStream().connectionForSplice()
+                                          : OptRef<Network::Connection>{};
+    }
 
     void setVirtualHostRoute(Router::VirtualHostRoute route);
     // Set cached route. This method should never be called directly. This is only called in the

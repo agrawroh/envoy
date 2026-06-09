@@ -401,6 +401,10 @@ const Network::ConnectionInfoProvider& StreamEncoderImpl::connectionInfoProvider
   return connection_.connection().connectionInfoProvider();
 }
 
+OptRef<Network::Connection> StreamEncoderImpl::connectionForSplice() {
+  return makeOptRef(connection_.connection());
+}
+
 static constexpr absl::string_view RESPONSE_PREFIX = "HTTP/1.1 ";
 static constexpr absl::string_view HTTP_10_RESPONSE_PREFIX = "HTTP/1.0 ";
 
@@ -509,6 +513,13 @@ Status RequestEncoderImpl::encodeHeaders(const RequestHeaderMap& headers, bool e
   encodeHeadersBase(headers, absl::nullopt, end_stream,
                     HeaderUtility::requestShouldHaveNoBody(headers));
   return okStatus();
+}
+
+void RequestEncoderImpl::completeSplicedResponse(uint64_t response_body_bytes) {
+  // A RequestEncoderImpl is only ever created by ClientConnectionImpl::newStream (it lives inside
+  // PendingResponse), so its connection is always a ClientConnectionImpl. Dispatch to the
+  // connection that owns the response parser and pending response.
+  static_cast<ClientConnectionImpl&>(connection_).completeSplicedResponse(response_body_bytes);
 }
 
 CallbackResult ConnectionImpl::setAndCheckCallbackStatus(Status&& status) {
@@ -1654,6 +1665,40 @@ CallbackResult ClientConnectionImpl::onMessageCompleteBase() {
 
   // Pause the parser after a response is complete. Any remaining data indicates an error.
   return parser_->pause();
+}
+
+void ClientConnectionImpl::completeSplicedResponse(uint64_t response_body_bytes) {
+  ENVOY_CONN_LOG(trace, "splice complete: {} response body bytes relayed out-of-band", connection_,
+                 response_body_bytes);
+  // The fast path only engages on a Content-Length response after the request has finished
+  // encoding, so there is always an active, not-yet-complete pending response and no deferred
+  // headers or trailer state to flush.
+  ASSERT(pending_response_.has_value() && !pending_response_done_);
+  ASSERT(!deferred_end_stream_headers_ && !processing_trailers_);
+  ASSERT(encode_complete_);
+  // The spliced bytes bypassed the network connection's read accounting, so attribute them to the
+  // response here.
+  getBytesMeter().addWireBytesReceived(response_body_bytes);
+
+  PendingResponse& response = pending_response_.value();
+  // After delivering end stream below we can no longer reset, so latch completion first.
+  pending_response_done_ = true;
+  ResponseDecoder* decoder = response.decoder_handle_->get().ptr();
+  ENVOY_BUG(decoder != nullptr, "ResponseDecoder is null in completeSplicedResponse");
+  if (decoder != nullptr) {
+    Buffer::OwnedImpl empty;
+    decoder->decodeData(empty, true);
+  }
+  // Reset to ensure no information from one request persists to the next.
+  pending_response_.reset();
+  headers_or_trailers_.emplace<ResponseHeaderMapPtr>(nullptr);
+
+  // The spliced body never reached the parser, leaving it stuck mid-body. Rebuild it so the next
+  // response on this keep-alive connection parses from a clean state, equivalent to the
+  // ready-for-next-message state a normal onMessageComplete leaves via parser_->pause() and the
+  // resume() that the next dispatch performs.
+  parser_ = std::make_unique<BalsaParser>(MessageType::Response, this, max_headers_kb_ * 1024,
+                                          enableTrailers(), codec_settings_.allow_custom_methods_);
 }
 
 void ClientConnectionImpl::onResetStream(StreamResetReason reason) {

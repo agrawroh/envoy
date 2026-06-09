@@ -52,20 +52,43 @@ envoy_cc_library(
     ],
 )
 
+# Standalone so the L7 kTLS body-splice (source/common/router) can reuse the in-kernel pump without
+# depending on the whole tcp_proxy network filter (which would form a dependency cycle).
+envoy_cc_library(
+    name = "splice_pump_lib",
+    srcs = [
+        "splice_pump.cc",
+    ],
+    hdrs = [
+        "splice_pump.h",
+    ],
+    deps = [
+        "//envoy/common:base_includes",
+        "//envoy/event:dispatcher_interface",
+        "//envoy/event:file_event_interface",
+        "//envoy/network:connection_interface",
+        "//envoy/network:io_handle_interface",
+        "//envoy/network:socket_interface",
+        "//source/common/common:assert_lib",
+        "//source/common/common:minimal_logger_lib",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/types:optional",
+    ],
+)
+
 envoy_cc_library(
     name = "tcp_proxy",
     srcs = [
-        "splice_pump.cc",
         "tcp_proxy.cc",
         "upstream_pool.cc",
     ],
     hdrs = [
-        "splice_pump.h",
         "tcp_proxy.h",
         "upstream_pool.h",
     ],
     deps = [
         ":http_frame_tracker_lib",
+        ":splice_pump_lib",
         ":upstream_lib",
         "//envoy/access_log:access_log_interface",
         "//envoy/api:io_error_interface",

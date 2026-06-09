@@ -34,6 +34,7 @@
 #include "source/common/router/config_impl.h"
 #include "source/common/router/debug_config.h"
 #include "source/common/router/router.h"
+#include "source/common/router/splice_coordinator.h"
 #include "source/common/router/upstream_codec_filter.h"
 #include "source/common/stream_info/uint32_accessor_impl.h"
 #include "source/common/tracing/http_tracer_impl.h"
@@ -177,6 +178,11 @@ void UpstreamRequest::cleanUp() {
   }
   cleaned_up_ = true;
 
+  // Cancel any pending arm and tear down an in-flight splice before the rest of teardown.
+  if (splice_coordinator_ != nullptr) {
+    splice_coordinator_->reset();
+  }
+
   filter_manager_->destroyFilters();
 
   if (span_ != nullptr) {
@@ -312,7 +318,23 @@ void UpstreamRequest::decodeHeaders(Http::ResponseHeaderMapPtr&& headers, bool e
   maybeHandleDeferredReadDisable();
   ASSERT(headers.get());
 
+  // Offer this response to the kTLS body-splice fast path. Arm before forwarding the headers so the
+  // Content-Length can be read, then forward them, then schedule the engage so it runs after the
+  // headers' downstream write is activated. When armed, the headers still flow downstream normally
+  // and the body is spliced once the scheduled engage runs.
+  bool splice_armed = false;
+  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.http1_ktls_body_splice")) {
+    if (splice_coordinator_ == nullptr) {
+      splice_coordinator_ = std::make_unique<SpliceCoordinator>(*this);
+    }
+    splice_armed = splice_coordinator_->maybeArmForResponse(*headers, end_stream);
+  }
+
   parent_.onUpstreamHeaders(response_code, std::move(headers), *this, end_stream);
+
+  if (splice_armed) {
+    splice_coordinator_->scheduleEngage();
+  }
 }
 
 void UpstreamRequest::maybeHandleDeferredReadDisable() {
@@ -332,6 +354,16 @@ void UpstreamRequest::decodeData(Buffer::Instance& data, bool end_stream) {
 
   resetPerTryIdleTimer();
   stream_info_.addBytesReceived(data.length());
+  // While a splice is armed but not yet engaged, hold the body back from the downstream encoder so
+  // engage can emit it ahead of the spliced remainder; this keeps the downstream off its write high
+  // watermark so the splice reliably engages. bufferPreEngageResponseBody returns true once it has
+  // taken the body (do not forward it); it returns false when the response ends first, having
+  // flushed any held body, so the terminal chunk forwards normally below.
+  if (splice_coordinator_ != nullptr && splice_coordinator_->armed() &&
+      !splice_coordinator_->engaged() &&
+      splice_coordinator_->bufferPreEngageResponseBody(data, end_stream)) {
+    return;
+  }
   parent_.onUpstreamData(data, *this, end_stream);
 }
 
@@ -473,6 +505,11 @@ void UpstreamRequest::onResetStream(Http::StreamResetReason reason,
                                     absl::string_view transport_failure_reason) {
   ScopeTrackerScopeState scope(&parent_.callbacks()->scope(), parent_.callbacks()->dispatcher());
 
+  // Tear down an in-flight splice before the connection is reset out from under it.
+  if (splice_coordinator_ != nullptr) {
+    splice_coordinator_->reset();
+  }
+
   if (span_ != nullptr) {
     // Add tags about reset.
     span_->setTag(Tracing::Tags::get().Error, Tracing::Tags::get().True);
@@ -486,6 +523,12 @@ void UpstreamRequest::onResetStream(Http::StreamResetReason reason,
 }
 
 void UpstreamRequest::resetStream() {
+  // Tear down an in-flight splice before the upstream stream is reset. reset() is idempotent, so
+  // the re-entrant call from the splice coordinator's own truncation path is a no-op.
+  if (splice_coordinator_ != nullptr) {
+    splice_coordinator_->reset();
+  }
+
   if (conn_pool_->cancelAnyPendingStream()) {
     ENVOY_STREAM_LOG(debug, "canceled pool request", *parent_.callbacks());
     ASSERT(!upstream_);

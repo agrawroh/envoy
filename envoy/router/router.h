@@ -1685,6 +1685,15 @@ public:
    * HTTP/1.1 upstream opts in.
    */
   virtual OptRef<Network::Connection> upstreamConnectionForSplice() { return {}; }
+
+  /**
+   * Finalize a response whose Content-Length body was relayed out-of-band by the kTLS body-splice
+   * fast path: account the spliced bytes, deliver the terminal end-of-stream to the response
+   * decoder, and ready the upstream connection for the next keep-alive response. Only the HTTP/1.1
+   * upstream implements this; the default is a no-op.
+   * @param response_body_bytes the number of body bytes that were spliced.
+   */
+  virtual void completeSplicedResponse(uint64_t /* response_body_bytes */) {}
 };
 
 using GenericConnPoolPtr = std::unique_ptr<GenericConnPool>;
