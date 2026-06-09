@@ -24,6 +24,7 @@
 #include "test/test_common/global.h"
 #include "test/test_common/logging.h"
 #include "test/test_common/simulated_time_system.h"
+#include "test/test_common/test_runtime.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -61,6 +62,7 @@ public:
   }
 
   using EnvoyQuicServerSession::GetCryptoStream;
+  using EnvoyQuicServerSession::LocallySupportedWebTransportVersions;
 };
 
 class ProofSourceDetailsSetter {
@@ -1201,6 +1203,53 @@ TEST_F(EnvoyQuicServerSessionTest, DisableQpack) {
   envoy_quic_session_.setHttp3Options(http3_options);
 
   EXPECT_EQ(envoy_quic_session_.qpack_maximum_dynamic_table_capacity(), 0);
+
+  installReadFilter();
+}
+
+// WebTransport is advertised only when the runtime flag is enabled, extended CONNECT is allowed,
+// and HTTP/3 datagrams are compiled in.
+TEST_F(EnvoyQuicServerSessionTest, WebTransportEnabledWhenConfigured) {
+#ifndef ENVOY_ENABLE_HTTP_DATAGRAMS
+  GTEST_SKIP() << "WebTransport requires HTTP/3 datagram support.";
+#endif
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "true"}});
+
+  envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.set_allow_extended_connect(true);
+  envoy_quic_session_.setHttp3Options(http3_options);
+
+  EXPECT_TRUE(envoy_quic_session_.LocallySupportedWebTransportVersions().Any());
+
+  installReadFilter();
+}
+
+// WebTransport stays off when the runtime flag is disabled, even with extended CONNECT allowed.
+TEST_F(EnvoyQuicServerSessionTest, WebTransportDisabledWithoutRuntimeFlag) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "false"}});
+
+  envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.set_allow_extended_connect(true);
+  envoy_quic_session_.setHttp3Options(http3_options);
+
+  EXPECT_FALSE(envoy_quic_session_.LocallySupportedWebTransportVersions().Any());
+
+  installReadFilter();
+}
+
+// WebTransport requires extended CONNECT. Without it negotiation stays off and the QUICHE
+// set_allow_extended_connect() invariant is never tripped.
+TEST_F(EnvoyQuicServerSessionTest, WebTransportDisabledWithoutExtendedConnect) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "true"}});
+
+  envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.set_allow_extended_connect(false);
+  envoy_quic_session_.setHttp3Options(http3_options);
+
+  EXPECT_FALSE(envoy_quic_session_.LocallySupportedWebTransportVersions().Any());
 
   installReadFilter();
 }

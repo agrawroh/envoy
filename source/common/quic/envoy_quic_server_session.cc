@@ -16,6 +16,7 @@
 #include "source/common/quic/envoy_quic_server_connection.h"
 #include "source/common/quic/envoy_quic_server_stream.h"
 #include "source/common/quic/quic_filter_manager_connection_impl.h"
+#include "source/common/runtime/runtime_features.h"
 
 #include "absl/types/optional.h"
 #include "quiche/quic/core/quic_config.h"
@@ -216,6 +217,13 @@ void EnvoyQuicServerSession::setHttp3Options(
           quic::QuicTime::Delta::FromMilliseconds(memory_reduction_timeout_ms));
     }
   }
+  // Latch before set_allow_extended_connect(). Only enable when extended CONNECT and HTTP/3
+  // datagrams are both on, because QUICHE forbids disabling extended CONNECT once WebTransport is
+  // negotiated.
+  web_transport_enabled_ =
+      Runtime::runtimeFeatureEnabled("envoy.reloadable_features.web_transport") &&
+      http3_options_->allow_extended_connect() &&
+      LocalHttpDatagramSupport() != quic::HttpDatagramSupport::kNone;
   set_allow_extended_connect(http3_options_->allow_extended_connect());
   if (http3_options_->disable_qpack()) {
     DisableHuffmanEncoding();

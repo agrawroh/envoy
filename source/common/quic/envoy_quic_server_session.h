@@ -145,6 +145,14 @@ protected:
 
   quic::HttpDatagramSupport LocalHttpDatagramSupport() override { return http_datagram_support_; }
 
+  // quic::QuicSpdySession
+  // Advertises WebTransport only when it is latched on in setHttp3Options(). Flag flips apply to
+  // new connections only.
+  quic::WebTransportHttp3VersionSet LocallySupportedWebTransportVersions() const override {
+    return web_transport_enabled_ ? quic::kDefaultSupportedWebTransportVersions
+                                  : quic::WebTransportHttp3VersionSet();
+  }
+
   // QuicFilterManagerConnectionImpl
   bool hasDataToWrite() override;
   // Used by base class to access quic connection after initialization.
@@ -173,6 +181,8 @@ private:
   absl::optional<ConnectionMapPosition> position_;
   QuicConnectionStats& connection_stats_;
   quic::HttpDatagramSupport http_datagram_support_ = quic::HttpDatagramSupport::kNone;
+  // Whether to advertise WebTransport support, latched once in setHttp3Options().
+  bool web_transport_enabled_ = false;
   std::unique_ptr<quic::QuicConnectionDebugVisitor> debug_visitor_;
   // Load shed points for H3 GoAway
   Server::LoadShedPoint* should_send_go_away_and_close_on_dispatch_ = nullptr;
