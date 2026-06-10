@@ -73,6 +73,7 @@ constexpr absl::string_view ReceiveBeforeConnectKey = "envoy.tcp_proxy.receive_b
   COUNTER(idle_timeout)                                                                            \
   COUNTER(max_downstream_connection_duration)                                                      \
   COUNTER(upstream_flush_total)                                                                    \
+  COUNTER(route_delayed_total)                                                                     \
   COUNTER(splice_pump_engaged_total)                                                               \
   COUNTER(splice_pump_torndown_total)                                                              \
   COUNTER(pool_buffered_routed_total)                                                              \
@@ -900,6 +901,7 @@ protected:
   bool initial_data_received_{false};
   bool read_disabled_due_to_buffer_{false}; // Track if we disabled reading due to buffer overflow.
   uint32_t max_buffered_bytes_{65536};      // Default 64KB.
+  bool delay_route_selection_{false};
 };
 
 // This class deals with an upstream connection that needs to finish flushing, when the downstream

@@ -1551,6 +1551,8 @@ public:
   virtual bool valid() const PURE;
 };
 
+using GenericConnPoolPtr = std::unique_ptr<GenericConnPool>;
+
 /**
  * An API for the interactions the upstream stream needs to have with the downstream stream
  * and/or router components
@@ -1695,8 +1697,6 @@ public:
    */
   virtual void completeSplicedResponse(uint64_t /* response_body_bytes */) {}
 };
-
-using GenericConnPoolPtr = std::unique_ptr<GenericConnPool>;
 
 /*
  * A factory for creating generic connection pools.
