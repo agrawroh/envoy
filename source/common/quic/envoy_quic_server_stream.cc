@@ -96,13 +96,26 @@ void EnvoyQuicServerStream::encodeHeaders(const Http::ResponseHeaderMap& headers
     ENVOY_BUG(bytes_sent != 0, "Failed to encode headers.");
   }
 
-  // Accept a WebTransport session once a filter has claimed it and a 2xx with no FIN is written. A
-  // non-2xx or FIN response rejects the session, which QUICHE tears down on stream close. The
-  // runtime flag is enforced upstream, the bridge exists only for a negotiated WebTransport
-  // CONNECT.
-  if (bytes_sent != 0 && web_transport_session_ != nullptr && web_transport_session_->claimed() &&
-      !end_stream && absl::StartsWith(headers.getStatusValue(), "2")) {
-    web_transport_session_->accept();
+  // Handle the final response to a negotiated WebTransport CONNECT. web_transport() is non-null
+  // only for such a stream, and an interim 1xx is not the final response so it falls through.
+  if (bytes_sent != 0 && web_transport() != nullptr && !end_stream &&
+      !absl::StartsWith(headers.getStatusValue(), "1")) {
+    const bool is_2xx = absl::StartsWith(headers.getStatusValue(), "2");
+    if (is_2xx && web_transport_session_ != nullptr && web_transport_session_->claimed()) {
+      // A filter claimed the session and accepted it with a 2xx.
+      web_transport_session_->accept();
+    } else if (is_2xx) {
+      // A 2xx reached a negotiated CONNECT that no filter claimed (opted-in route with no
+      // WebTransport filter). Reset rather than leave a half-open session.
+      static_cast<EnvoyQuicServerSession*>(session())
+          ->webTransportStats()
+          .sessions_unclaimed_.inc();
+      Reset(quic::QUIC_STREAM_CANCELLED);
+    } else {
+      // A non-2xx rejects the session. The response must be body-less because the client capsule
+      // parser would reject a payload.
+      web_transport_reject_ = true;
+    }
   }
 
   if (local_end_stream_) {
@@ -133,6 +146,14 @@ OptRef<Http::WebTransportSession> EnvoyQuicServerStream::webTransport() {
         web_transport(), connection.webTransportStats(), session_limit_exceeded);
   }
   return *web_transport_session_;
+}
+
+void EnvoyQuicServerStream::encodeData(Buffer::Instance& data, bool end_stream) {
+  if (web_transport_reject_) {
+    // A WebTransport CONNECT reject is body-less. Drop the body but keep the stream end.
+    data.drain(data.length());
+  }
+  EnvoyQuicStream::encodeData(data, end_stream);
 }
 
 void EnvoyQuicServerStream::encodeTrailers(const Http::ResponseTrailerMap& trailers) {

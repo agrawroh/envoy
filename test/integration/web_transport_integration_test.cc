@@ -179,6 +179,49 @@ TEST_P(WebTransportIntegrationTest, DatagramEcho) {
   test_server_->waitForCounter(webTransportStat("sessions_total"), testing::Eq(1));
 }
 
+// An interim 1xx before the accept does not poison the WebTransport response handling.
+TEST_P(WebTransportIntegrationTest, InterimResponseBeforeAccept) {
+#ifndef ENVOY_ENABLE_HTTP_DATAGRAMS
+  GTEST_SKIP() << "WebTransport requires HTTP/3 datagram support.";
+#endif
+  setup();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  // Expect 100-continue makes the server send an interim 100 before the filter accepts.
+  Http::TestRequestHeaderMapImpl headers{{":method", "CONNECT"}, {":protocol", "webtransport"},
+                                         {":scheme", "https"},   {":path", "/"},
+                                         {":authority", "host"}, {"expect", "100-continue"}};
+  auto encoder_decoder = codec_client_->startRequest(headers);
+  request_encoder_ = &encoder_decoder.first;
+  auto response = std::move(encoder_decoder.second);
+
+  response->waitForHeaders();
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  test_server_->waitForGauge(webTransportStat("sessions_active"), testing::Eq(1));
+
+  codec_client_->close();
+}
+
+// Resetting the CONNECT stream mid-session tears the session down cleanly on the server.
+TEST_P(WebTransportIntegrationTest, ResetMidSession) {
+#ifndef ENVOY_ENABLE_HTTP_DATAGRAMS
+  GTEST_SKIP() << "WebTransport requires HTTP/3 datagram support.";
+#endif
+  setup();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  IntegrationStreamDecoderPtr response;
+  quic::WebTransportHttp3* session = establishWebTransportSession(response);
+  ASSERT_NE(nullptr, session);
+  test_server_->waitForGauge(webTransportStat("sessions_active"), testing::Eq(1));
+
+  request_encoder_->getStream().resetStream(Http::StreamResetReason::LocalReset);
+
+  test_server_->waitForGauge(webTransportStat("sessions_active"), testing::Eq(0));
+
+  codec_client_->close();
+}
+
 // A non-WebTransport request is not touched by the filter and is proxied upstream as usual.
 TEST_P(WebTransportIntegrationTest, NonWebTransportRequestPassesThrough) {
 #ifndef ENVOY_ENABLE_HTTP_DATAGRAMS

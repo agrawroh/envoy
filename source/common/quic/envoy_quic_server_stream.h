@@ -38,6 +38,7 @@ public:
   // Http::StreamEncoder
   void encode1xxHeaders(const Http::ResponseHeaderMap& headers) override;
   void encodeHeaders(const Http::ResponseHeaderMap& headers, bool end_stream) override;
+  void encodeData(Buffer::Instance& data, bool end_stream) override;
   void encodeTrailers(const Http::ResponseTrailerMap& trailers) override;
   Http::Http1StreamEncoderOptionsOptRef http1StreamEncoderOptions() override {
     return absl::nullopt;
@@ -135,6 +136,8 @@ private:
   std::unique_ptr<EnvoyQuicWebTransportSession> web_transport_session_;
   // Whether this stream reserved a slot against the connection WebTransport session cap.
   bool web_transport_session_reserved_{false};
+  // Set when a non-2xx response rejects a WebTransport CONNECT, so the response body is dropped.
+  bool web_transport_reject_{false};
   envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
       headers_with_underscores_action_;
 
