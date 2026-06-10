@@ -99,6 +99,20 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "upstream_pool_test",
+    srcs = ["upstream_pool_test.cc"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/common/network:io_socket_error_lib",
+        "//source/common/tcp_proxy",
+        "//test/mocks/event:event_mocks",
+        "//test/mocks/network:network_mocks",
+        "//test/mocks/upstream:cluster_manager_mocks",
+        "//test/test_common:simulated_time_system_lib",
+    ],
+)
+
+envoy_cc_test(
     name = "upstream_test",
     srcs = ["upstream_test.cc"],
     rbe_pool = "6gig",
