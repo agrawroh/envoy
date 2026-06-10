@@ -52,6 +52,8 @@ void WebTransportStreamRelay::pump(bool from_incoming) {
     }
   }
 
+  // Read only while the destination can write. QUICHE accepts a write in full once it reports it
+  // can write, so the held bytes above are a defensive fallback the normal path does not reach.
   std::array<char, MaxStreamReadSize> buffer;
   while (destination.canWriteWebTransportStream()) {
     Envoy::Http::WebTransportStreamReadResult result =
