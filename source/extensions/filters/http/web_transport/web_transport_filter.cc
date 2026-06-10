@@ -2,12 +2,43 @@
 
 #include "source/common/http/header_map_impl.h"
 
+#include "quiche/web_transport/web_transport_headers.h"
+
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
 namespace WebTransport {
 
-Http::FilterHeadersStatus WebTransportFilter::decodeHeaders(Http::RequestHeaderMap&, bool) {
+namespace {
+// Selects a subprotocol for the 200 response by echoing the client's most preferred offer. The
+// client lists its offers in the wt-available-protocols request header as a structured field list,
+// most preferred first, and the server returns its single choice in the wt-protocol response
+// header. A missing or malformed offer leaves the response without a selection, which the spec
+// allows, so negotiation never fails the handshake.
+void maybeSelectSubprotocol(const Http::RequestHeaderMap& request_headers,
+                            Http::ResponseHeaderMap& response_headers) {
+  const auto offer = request_headers.get(
+      Http::LowerCaseString(std::string(webtransport::kSubprotocolRequestHeader)));
+  if (offer.empty()) {
+    return;
+  }
+  const absl::StatusOr<std::vector<std::string>> offered =
+      webtransport::ParseSubprotocolRequestHeader(offer[0]->value().getStringView());
+  if (!offered.ok() || offered->empty()) {
+    return;
+  }
+  const absl::StatusOr<std::string> selected =
+      webtransport::SerializeSubprotocolResponseHeader(offered->front());
+  if (!selected.ok()) {
+    return;
+  }
+  response_headers.addCopy(
+      Http::LowerCaseString(std::string(webtransport::kSubprotocolResponseHeader)), *selected);
+}
+} // namespace
+
+Http::FilterHeadersStatus WebTransportFilter::decodeHeaders(Http::RequestHeaderMap& request_headers,
+                                                            bool) {
   OptRef<Http::WebTransportSession> session = decoder_callbacks_->webTransport();
   if (!session.has_value()) {
     // Not a WebTransport session. Let normal routing handle the request.
@@ -28,9 +59,10 @@ Http::FilterHeadersStatus WebTransportFilter::decodeHeaders(Http::RequestHeaderM
 
   // Accept the session with a 200. The response must not end the stream so the session stays open.
   ENVOY_STREAM_LOG(debug, "accepting WebTransport session", *decoder_callbacks_);
-  Http::ResponseHeaderMapPtr headers = Http::ResponseHeaderMapImpl::create();
-  headers->setStatus(200);
-  decoder_callbacks_->encodeHeaders(std::move(headers), false, "web_transport");
+  Http::ResponseHeaderMapPtr response_headers = Http::ResponseHeaderMapImpl::create();
+  response_headers->setStatus(200);
+  maybeSelectSubprotocol(request_headers, *response_headers);
+  decoder_callbacks_->encodeHeaders(std::move(response_headers), false, "web_transport");
   return Http::FilterHeadersStatus::StopIteration;
 }
 

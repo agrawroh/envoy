@@ -14,6 +14,7 @@ namespace WebTransport {
 namespace {
 
 using testing::_;
+using testing::Invoke;
 using testing::Return;
 using testing::SaveArg;
 
@@ -48,6 +49,63 @@ TEST_F(WebTransportFilterTest, AcceptsWebTransportConnect) {
       {":method", "CONNECT"}, {":protocol", "webtransport"}, {":authority", "example.com"}};
   EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, filter_.decodeHeaders(headers, false));
   EXPECT_EQ(registered, &filter_);
+}
+
+// The filter selects the client's most preferred offered subprotocol and returns it in the
+// wt-protocol response header as a structured field string.
+TEST_F(WebTransportFilterTest, SelectsFirstOfferedSubprotocol) {
+  EXPECT_CALL(decoder_callbacks_, webTransport())
+      .WillOnce(Return(OptRef<Http::WebTransportSession>(session_)));
+  std::string selected;
+  EXPECT_CALL(decoder_callbacks_, encodeHeaders_(Http::HttpStatusIs(200), false))
+      .WillOnce(Invoke([&selected](Http::ResponseHeaderMap& headers, bool) {
+        const auto value = headers.get(Http::LowerCaseString("wt-protocol"));
+        if (!value.empty()) {
+          selected = std::string(value[0]->value().getStringView());
+        }
+      }));
+
+  Http::TestRequestHeaderMapImpl headers{{":method", "CONNECT"},
+                                         {":protocol", "webtransport"},
+                                         {":authority", "example.com"},
+                                         {"wt-available-protocols", "\"chat\", \"echo\""}};
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, filter_.decodeHeaders(headers, false));
+  EXPECT_EQ("\"chat\"", selected);
+}
+
+// A CONNECT that offers no subprotocols gets a 200 with no wt-protocol header.
+TEST_F(WebTransportFilterTest, NoSubprotocolWhenNoneOffered) {
+  EXPECT_CALL(decoder_callbacks_, webTransport())
+      .WillOnce(Return(OptRef<Http::WebTransportSession>(session_)));
+  bool has_selection = true;
+  EXPECT_CALL(decoder_callbacks_, encodeHeaders_(Http::HttpStatusIs(200), false))
+      .WillOnce(Invoke([&has_selection](Http::ResponseHeaderMap& headers, bool) {
+        has_selection = !headers.get(Http::LowerCaseString("wt-protocol")).empty();
+      }));
+
+  Http::TestRequestHeaderMapImpl headers{
+      {":method", "CONNECT"}, {":protocol", "webtransport"}, {":authority", "example.com"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, filter_.decodeHeaders(headers, false));
+  EXPECT_FALSE(has_selection);
+}
+
+// A malformed offer is ignored, the handshake still completes with a 200 and no selection.
+TEST_F(WebTransportFilterTest, MalformedSubprotocolOfferIgnored) {
+  EXPECT_CALL(decoder_callbacks_, webTransport())
+      .WillOnce(Return(OptRef<Http::WebTransportSession>(session_)));
+  bool has_selection = true;
+  EXPECT_CALL(decoder_callbacks_, encodeHeaders_(Http::HttpStatusIs(200), false))
+      .WillOnce(Invoke([&has_selection](Http::ResponseHeaderMap& headers, bool) {
+        has_selection = !headers.get(Http::LowerCaseString("wt-protocol")).empty();
+      }));
+
+  // An sf-list of an integer is not a list of strings, so parsing rejects it.
+  Http::TestRequestHeaderMapImpl headers{{":method", "CONNECT"},
+                                         {":protocol", "webtransport"},
+                                         {":authority", "example.com"},
+                                         {"wt-available-protocols", "42"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, filter_.decodeHeaders(headers, false));
+  EXPECT_FALSE(has_selection);
 }
 
 // A WebTransport CONNECT over the connection session limit is rejected with a 429 and the filter

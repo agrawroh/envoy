@@ -263,6 +263,32 @@ TEST_P(WebTransportIntegrationTest, DatagramEcho) {
   test_server_->waitForCounter(webTransportStat("sessions_total"), testing::Eq(1));
 }
 
+// The terminating filter selects the client's most preferred offered subprotocol and returns it in
+// the wt-protocol response header.
+TEST_P(WebTransportIntegrationTest, SubprotocolSelected) {
+#ifndef ENVOY_ENABLE_HTTP_DATAGRAMS
+  GTEST_SKIP() << "WebTransport requires HTTP/3 datagram support.";
+#endif
+  setup();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  Http::TestRequestHeaderMapImpl headers{
+      {":method", "CONNECT"}, {":protocol", "webtransport"},
+      {":scheme", "https"},   {":path", "/"},
+      {":authority", "host"}, {"wt-available-protocols", "\"chat\", \"echo\""}};
+  auto encoder_decoder = codec_client_->startRequest(headers);
+  request_encoder_ = &encoder_decoder.first;
+  auto response = std::move(encoder_decoder.second);
+
+  response->waitForHeaders();
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  const auto selected = response->headers().get(Http::LowerCaseString("wt-protocol"));
+  ASSERT_FALSE(selected.empty());
+  EXPECT_EQ("\"chat\"", selected[0]->value().getStringView());
+
+  codec_client_->close();
+}
+
 // An interim 1xx before the accept does not poison the WebTransport response handling.
 TEST_P(WebTransportIntegrationTest, InterimResponseBeforeAccept) {
 #ifndef ENVOY_ENABLE_HTTP_DATAGRAMS
@@ -454,6 +480,46 @@ TEST_P(WebTransportIntegrationTest, ProxyDatagramEcho) {
   // Detach the echo before teardown closes the upstream session, so the closing session does not
   // call back into the echo once it is freed.
   upstream_session->setWebTransportSessionCallbacks(nullptr);
+  codec_client_->close();
+}
+
+// A subprotocol offer is forwarded to the upstream on the CONNECT and the upstream selection flows
+// back to the downstream, so the proxy negotiates subprotocols transparently.
+TEST_P(WebTransportIntegrationTest, ProxySubprotocolPassthrough) {
+#ifndef ENVOY_ENABLE_HTTP_DATAGRAMS
+  GTEST_SKIP() << "WebTransport requires HTTP/3 datagram support.";
+#endif
+  setupProxy();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  Http::TestRequestHeaderMapImpl headers{
+      {":method", "CONNECT"},         {":protocol", "webtransport"},
+      {":scheme", "https"},           {":path", "/"},
+      {":authority", "sni.lyft.com"}, {"wt-available-protocols", "\"chat\", \"echo\""}};
+  auto encoder_decoder = codec_client_->startRequest(headers);
+  request_encoder_ = &encoder_decoder.first;
+  auto response = std::move(encoder_decoder.second);
+
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForHeadersComplete());
+
+  // The downstream offer is forwarded verbatim on the upstream CONNECT.
+  const auto forwarded =
+      upstream_request_->headers().get(Http::LowerCaseString("wt-available-protocols"));
+  ASSERT_FALSE(forwarded.empty());
+  EXPECT_EQ("\"chat\", \"echo\"", forwarded[0]->value().getStringView());
+
+  // The upstream selects a subprotocol in its 200, which flows back to the downstream.
+  upstream_request_->encodeHeaders(
+      Http::TestResponseHeaderMapImpl{{":status", "200"}, {"wt-protocol", "\"chat\""}}, false);
+
+  response->waitForHeaders();
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  const auto selected = response->headers().get(Http::LowerCaseString("wt-protocol"));
+  ASSERT_FALSE(selected.empty());
+  EXPECT_EQ("\"chat\"", selected[0]->value().getStringView());
+
   codec_client_->close();
 }
 
