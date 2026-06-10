@@ -858,10 +858,18 @@ message Http3ProtocolOptions {
 }
 
 // Configuration for WebTransport over HTTP/3.
+// [#next-free-field: 3]
 message WebTransportOptions {
   // Whether to enable WebTransport over HTTP/3 on this listener. Has effect only when extended
   // CONNECT is allowed and the build includes HTTP/3 datagram support.
   bool enabled = 1;
+
+  // The maximum number of concurrent WebTransport sessions allowed on a connection. Defaults to 16.
+  // This bounds Envoy session accounting only, as QUICHE advertises a fixed value on the wire.
+  google.protobuf.UInt32Value max_sessions = 2 [
+    (validate.rules).uint32 = {gte: 1},
+    (xds.annotations.v3.field_status).work_in_progress = true
+  ];
 }
 
 // A message to control transformations to the :scheme header

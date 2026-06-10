@@ -140,7 +140,7 @@ public:
   // Per-connection WebTransport session accounting. A new session is refused once the active count
   // reaches the cap.
   bool webTransportSessionLimitReached() const {
-    return active_web_transport_sessions_ >= MaxConcurrentWebTransportSessions;
+    return active_web_transport_sessions_ >= max_web_transport_sessions_;
   }
   void onWebTransportSessionOpened() { ++active_web_transport_sessions_; }
   void onWebTransportSessionClosed() { --active_web_transport_sessions_; }
@@ -197,8 +197,8 @@ private:
   quic::HttpDatagramSupport http_datagram_support_ = quic::HttpDatagramSupport::kNone;
   // Whether to advertise WebTransport support, latched once in setHttp3Options().
   bool web_transport_enabled_ = false;
-  // Maximum concurrent WebTransport sessions per connection.
-  static constexpr uint32_t MaxConcurrentWebTransportSessions = 16;
+  // Maximum concurrent WebTransport sessions per connection, latched in setHttp3Options().
+  uint32_t max_web_transport_sessions_ = 16;
   uint32_t active_web_transport_sessions_ = 0;
   WebTransportStats::AtomicPtr web_transport_stats_;
   std::unique_ptr<quic::QuicConnectionDebugVisitor> debug_visitor_;

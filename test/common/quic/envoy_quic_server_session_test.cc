@@ -1287,6 +1287,19 @@ TEST_F(EnvoyQuicServerSessionTest, WebTransportSessionLimit) {
   EXPECT_FALSE(envoy_quic_session_.webTransportSessionLimitReached());
 }
 
+// The per-connection WebTransport session limit honors the configured max_sessions value.
+TEST_F(EnvoyQuicServerSessionTest, WebTransportConfiguredSessionLimit) {
+  installReadFilter();
+  envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.mutable_web_transport_options()->mutable_max_sessions()->set_value(2);
+  envoy_quic_session_.setHttp3Options(http3_options);
+
+  EXPECT_FALSE(envoy_quic_session_.webTransportSessionLimitReached());
+  envoy_quic_session_.onWebTransportSessionOpened();
+  envoy_quic_session_.onWebTransportSessionOpened();
+  EXPECT_TRUE(envoy_quic_session_.webTransportSessionLimitReached());
+}
+
 // An incoming WebTransport unidirectional stream is a QUICHE-internal stream, not an
 // EnvoyQuicStream. The connection watermark callbacks must skip it instead of dereferencing a null
 // cast result.
