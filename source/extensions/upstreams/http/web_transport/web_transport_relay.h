@@ -86,6 +86,8 @@ public:
     virtual void onRelayClosed() PURE;
     // Called for each datagram forwarded to a peer, so the owner can count it.
     virtual void onDatagramRelayed() PURE;
+    // Called when a data stream is relayed, so the owner can keep a busy session alive.
+    virtual void onWebTransportActivity() PURE;
   };
 
   WebTransportRelay(Envoy::Http::WebTransportSession& downstream,

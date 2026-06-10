@@ -62,11 +62,14 @@ public:
   bool auto_fire_ready_{true};
 };
 
-// An upstream to downstream interface whose downstream WebTransport session is controllable.
+// An upstream to downstream interface whose downstream WebTransport session is controllable. It
+// also counts the relayed activity notifications that reset the downstream stream idle timer.
 class FakeUpstreamToDownstream : public Router::MockUpstreamToDownstream {
 public:
   OptRef<Envoy::Http::WebTransportSession> webTransport() override { return session_; }
+  void onWebTransportActivity() override { ++activity_count_; }
   OptRef<Envoy::Http::WebTransportSession> session_;
+  int activity_count_{0};
 };
 
 class WebTransportUpstreamTest : public testing::Test {
@@ -127,6 +130,27 @@ TEST_F(WebTransportUpstreamTest, EncodeHeadersDeferredUntilReady) {
   EXPECT_NE(nullptr, downstream_session_.callbacks_);
   EXPECT_EQ(1, counter("sessions_total"));
   EXPECT_EQ(1, gauge("sessions_active"));
+}
+
+// Relayed traffic resets the downstream stream idle timer through the upstream to downstream route,
+// so a busy proxied session is not reaped.
+TEST_F(WebTransportUpstreamTest, RelayedTrafficSignalsDownstreamActivity) {
+  encoder_.session_ = upstream_session_;
+  upstream_to_downstream_.session_ = downstream_session_;
+  WebTransportUpstream upstream(upstream_to_downstream_, &encoder_, *store_.rootScope());
+  EXPECT_TRUE(upstream.encodeHeaders(connectHeaders(), false).ok());
+
+  // A datagram relayed from the downstream client signals activity and is counted.
+  ASSERT_NE(nullptr, downstream_session_.callbacks_);
+  downstream_session_.callbacks_->onWebTransportDatagram("ping");
+  EXPECT_EQ(1, upstream_to_downstream_.activity_count_);
+  EXPECT_EQ(1, counter("datagrams_rx"));
+  EXPECT_EQ(1, counter("datagrams_tx"));
+
+  // A relayed data stream signals activity without bumping the datagram counters.
+  upstream.onWebTransportActivity();
+  EXPECT_EQ(2, upstream_to_downstream_.activity_count_);
+  EXPECT_EQ(1, counter("datagrams_rx"));
 }
 
 // Without an upstream session the upstream did not negotiate WebTransport, so an inline CONNECT is

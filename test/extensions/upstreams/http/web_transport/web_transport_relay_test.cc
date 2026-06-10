@@ -97,8 +97,10 @@ class CountingRelayCallbacks : public WebTransportRelay::Callbacks {
 public:
   void onRelayClosed() override { ++closed_count_; }
   void onDatagramRelayed() override { ++datagrams_relayed_; }
+  void onWebTransportActivity() override { ++activity_count_; }
   int closed_count_{0};
   int datagrams_relayed_{0};
+  int activity_count_{0};
 };
 
 class WebTransportRelayTest : public testing::Test {
@@ -187,6 +189,8 @@ TEST_F(WebTransportRelayTest, MirrorsStreamAndForwardsData) {
 
   EXPECT_NE(nullptr, incoming.callbacks_);
   EXPECT_EQ("hello", mirror.written_);
+  // Relaying a stream signals activity so the owner can keep the downstream stream alive.
+  EXPECT_EQ(1, callbacks_.activity_count_);
 }
 
 // A blocked peer applies backpressure, and the held bytes flush once it can write again.
@@ -227,6 +231,8 @@ TEST_F(WebTransportRelayTest, StreamRejectedWhenPeerCannotOpen) {
   FakeWebTransportStream incoming(true);
   downstream_.callbacks_->onWebTransportStreamIncoming(incoming, true);
   EXPECT_TRUE(incoming.reset_);
+  // A rejected stream is not relayed, so it does not signal activity.
+  EXPECT_EQ(0, callbacks_.activity_count_);
 }
 
 // A unidirectional stream is mirrored and its data forwarded.

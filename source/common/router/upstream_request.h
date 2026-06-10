@@ -110,6 +110,7 @@ public:
     return stream_options_;
   }
   OptRef<Http::WebTransportSession> webTransport() override;
+  void onWebTransportActivity() override;
 
   void disableDataFromDownstreamForFlowControl();
   void enableDataFromDownstreamForFlowControl();
@@ -322,6 +323,8 @@ public:
   OptRef<Http::WebTransportSession> webTransport() override {
     return upstream_request_.webTransport();
   }
+  // Routes the relay's WebTransport activity signal back to the downstream stream idle timer.
+  void onWebTransportActivity() override { upstream_request_.onWebTransportActivity(); }
   // If the filter manager determines a decoder filter has available, tell
   // the router to resume the flow of data from downstream.
   void onDecoderFilterBelowWriteBufferLowWatermark() override {

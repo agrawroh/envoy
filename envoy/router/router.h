@@ -1577,6 +1577,13 @@ public:
    * CONNECT, used to relay a session to a WebTransport upstream.
    */
   virtual OptRef<Http::WebTransportSession> webTransport() { return {}; }
+
+  /**
+   * Notify the downstream stream that the relayed WebTransport session saw activity, so the
+   * downstream stream idle timer is reset and a busy session is not reaped. The default is a no-op
+   * for non-WebTransport streams.
+   */
+  virtual void onWebTransportActivity() {}
 };
 
 /**

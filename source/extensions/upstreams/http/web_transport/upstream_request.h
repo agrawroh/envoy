@@ -108,11 +108,15 @@ public:
 
   // WebTransportRelay::Callbacks
   void onRelayClosed() override;
-  // A relayed datagram is both received from one peer and sent to the other by this proxy.
+  // A relayed datagram is both received from one peer and sent to the other by this proxy. Relayed
+  // traffic keeps the downstream stream alive, so reset its idle timer too.
   void onDatagramRelayed() override {
     stats_.datagrams_rx_.inc();
     stats_.datagrams_tx_.inc();
+    upstream_request_.onWebTransportActivity();
   }
+  // A relayed data stream keeps the downstream stream alive, so reset its idle timer.
+  void onWebTransportActivity() override { upstream_request_.onWebTransportActivity(); }
 
 private:
   // Wires the relay once the upstream CONNECT has been issued, or refuses it if either side did not

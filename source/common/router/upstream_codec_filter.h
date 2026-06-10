@@ -82,6 +82,9 @@ public:
     OptRef<Http::WebTransportSession> webTransport() override {
       return filter_.callbacks_->webTransport();
     }
+    void onWebTransportActivity() override {
+      filter_.callbacks_->upstreamCallbacks()->onWebTransportActivity();
+    }
 
   private:
     void maybeEndDecode(bool end_stream);

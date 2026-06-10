@@ -124,6 +124,7 @@ void WebTransportRelay::relayStream(Direction from, Envoy::Http::WebTransportStr
     return;
   }
   stream_relays_.push_back(std::make_unique<WebTransportStreamRelay>(incoming, *mirror));
+  callbacks_.onWebTransportActivity();
 }
 
 void WebTransportRelay::onSessionClosed(Direction which) {
