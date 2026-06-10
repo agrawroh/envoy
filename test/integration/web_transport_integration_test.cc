@@ -382,6 +382,9 @@ TEST_P(WebTransportIntegrationTest, ProxyDatagramEcho) {
 
   test_server_->waitForCounter(clusterWebTransportStat("sessions_total"), testing::Eq(1));
   test_server_->waitForGauge(clusterWebTransportStat("sessions_active"), testing::Eq(1));
+  // The relay counts the datagram it forwarded each way on the cluster scope.
+  test_server_->waitForCounter(clusterWebTransportStat("datagrams_rx"), testing::Ge(1));
+  test_server_->waitForCounter(clusterWebTransportStat("datagrams_tx"), testing::Ge(1));
 
   // Detach the echo before teardown closes the upstream session, so the closing session does not
   // call back into the echo once it is freed.

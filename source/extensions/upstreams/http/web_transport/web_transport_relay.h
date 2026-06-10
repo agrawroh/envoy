@@ -78,11 +78,14 @@ private:
 // callback into a freed relay.
 class WebTransportRelay : protected Logger::Loggable<Logger::Id::upstream> {
 public:
-  // Notified once when either session closes.
+  // Notified of relay events on the owning upstream.
   class Callbacks {
   public:
     virtual ~Callbacks() = default;
+    // Called once when either session closes.
     virtual void onRelayClosed() PURE;
+    // Called for each datagram forwarded to a peer, so the owner can count it.
+    virtual void onDatagramRelayed() PURE;
   };
 
   WebTransportRelay(Envoy::Http::WebTransportSession& downstream,

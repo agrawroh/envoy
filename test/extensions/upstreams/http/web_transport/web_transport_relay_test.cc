@@ -92,11 +92,13 @@ public:
   Envoy::Http::WebTransportStream* next_outgoing_{nullptr};
 };
 
-// Counts relay close notifications.
+// Counts relay close and datagram notifications.
 class CountingRelayCallbacks : public WebTransportRelay::Callbacks {
 public:
   void onRelayClosed() override { ++closed_count_; }
+  void onDatagramRelayed() override { ++datagrams_relayed_; }
   int closed_count_{0};
+  int datagrams_relayed_{0};
 };
 
 class WebTransportRelayTest : public testing::Test {
@@ -120,6 +122,7 @@ TEST_F(WebTransportRelayTest, ForwardsDownstreamToUpstream) {
   ASSERT_EQ(1, upstream_.sent_.size());
   EXPECT_EQ("ping", upstream_.sent_[0]);
   EXPECT_TRUE(downstream_.sent_.empty());
+  EXPECT_EQ(1, callbacks_.datagrams_relayed_);
 }
 
 // A datagram received on the upstream session is forwarded to the downstream session.

@@ -106,6 +106,7 @@ void WebTransportRelay::forwardDatagram(Direction from, absl::string_view datagr
   Envoy::Http::WebTransportSession* peer = from == Direction::Downstream ? upstream_ : downstream_;
   if (peer != nullptr) {
     peer->sendWebTransportDatagram(datagram);
+    callbacks_.onDatagramRelayed();
   }
 }
 

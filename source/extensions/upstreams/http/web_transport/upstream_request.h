@@ -108,6 +108,11 @@ public:
 
   // WebTransportRelay::Callbacks
   void onRelayClosed() override;
+  // A relayed datagram is both received from one peer and sent to the other by this proxy.
+  void onDatagramRelayed() override {
+    stats_.datagrams_rx_.inc();
+    stats_.datagrams_tx_.inc();
+  }
 
 private:
   // Wires the relay once the upstream CONNECT has been issued, or refuses it if either side did not
