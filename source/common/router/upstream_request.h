@@ -109,6 +109,7 @@ public:
   const Http::ConnectionPool::Instance::StreamOptions& upstreamStreamOptions() const override {
     return stream_options_;
   }
+  OptRef<Http::WebTransportSession> webTransport() override;
 
   void disableDataFromDownstreamForFlowControl();
   void enableDataFromDownstreamForFlowControl();

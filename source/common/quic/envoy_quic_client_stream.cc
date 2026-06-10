@@ -8,6 +8,7 @@
 #include "source/common/http/header_utility.h"
 #include "source/common/http/utility.h"
 #include "source/common/quic/envoy_quic_client_session.h"
+#include "source/common/quic/envoy_quic_client_web_transport_session.h"
 #include "source/common/quic/envoy_quic_utils.h"
 #include "source/common/runtime/runtime_features.h"
 
@@ -34,6 +35,20 @@ EnvoyQuicClientStream::EnvoyQuicClientStream(
   ASSERT(static_cast<uint32_t>(GetReceiveWindow().value()) > 8 * 1024,
          "Send buffer limit should be larger than 8KB.");
   RegisterMetadataVisitor(this);
+}
+
+EnvoyQuicClientStream::~EnvoyQuicClientStream() = default;
+
+OptRef<Http::WebTransportSession> EnvoyQuicClientStream::webTransport() {
+  // QUICHE only mints the session for a negotiated WebTransport CONNECT, after the request headers
+  // are sent.
+  if (web_transport() == nullptr) {
+    return {};
+  }
+  if (web_transport_session_ == nullptr) {
+    web_transport_session_ = std::make_unique<EnvoyQuicClientWebTransportSession>(web_transport());
+  }
+  return *web_transport_session_;
 }
 
 void EnvoyQuicClientStream::setResponseDecoder(Http::ResponseDecoder& decoder) {

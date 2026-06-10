@@ -1571,6 +1571,12 @@ public:
    * @return returns the options to be consulted with for upstream stream creation.
    */
   virtual const Http::ConnectionPool::Instance::StreamOptions& upstreamStreamOptions() const PURE;
+
+  /**
+   * @return the downstream WebTransport session when the downstream stream is a WebTransport
+   * CONNECT, used to relay a session to a WebTransport upstream.
+   */
+  virtual OptRef<Http::WebTransportSession> webTransport() { return {}; }
 };
 
 /**
@@ -1689,7 +1695,7 @@ public:
   /*
    * Protocol used by the upstream sockets.
    */
-  enum class UpstreamProtocol { HTTP, TCP, UDP };
+  enum class UpstreamProtocol { HTTP, TCP, UDP, WEBTRANSPORT };
 
   ~GenericConnPoolFactory() override = default;
 

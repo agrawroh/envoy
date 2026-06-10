@@ -317,6 +317,18 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "envoy_quic_client_web_transport_session_lib",
+    srcs = envoy_select_enable_http3(["envoy_quic_client_web_transport_session.cc"]),
+    hdrs = envoy_select_enable_http3(["envoy_quic_client_web_transport_session.h"]),
+    deps = envoy_select_enable_http3([
+        "//envoy/http:web_transport_interface",
+        "//source/common/common:logger_lib",
+        "@quiche//:quic_core_http_spdy_session_lib",
+        "@abseil-cpp//absl/strings",
+    ]),
+)
+
+envoy_cc_library(
     name = "envoy_quic_server_session_lib",
     srcs = envoy_select_enable_http3([
         "envoy_quic_server_session.cc",
@@ -368,6 +380,7 @@ envoy_cc_library(
         ":envoy_quic_client_connection_lib",
         ":scone_state",
         ":envoy_quic_client_crypto_stream_factory_lib",
+        ":envoy_quic_client_web_transport_session_lib",
         ":envoy_quic_proof_verifier_lib",
         ":envoy_quic_stream_lib",
         ":envoy_quic_utils_lib",
