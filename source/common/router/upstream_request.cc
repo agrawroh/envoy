@@ -320,7 +320,7 @@ void UpstreamRequest::decodeHeaders(Http::ResponseHeaderMapPtr&& headers, bool e
 
   // Offer this response to the kTLS body-splice fast path. Arm (reads the Content-Length) and
   // schedule the engage BEFORE forwarding the headers, so no coordinator member is touched after
-  // onUpstreamHeaders() — which may tear this UpstreamRequest down (e.g. an internal redirect that
+  // onUpstreamHeaders(), which may tear this UpstreamRequest down (e.g. an internal redirect that
   // recreates the downstream stream). The engage callback runs at the end of this dispatch, after
   // the headers' downstream write has been activated, and is cancelled if this request is destroyed
   // first; engage() also re-resolves both legs and abandons to the buffered path if either is gone.
@@ -533,6 +533,12 @@ void UpstreamRequest::acceptMetadataFromRouter(Http::MetadataMapPtr&& metadata_m
 
 void UpstreamRequest::onResetStream(Http::StreamResetReason reason,
                                     absl::string_view transport_failure_reason) {
+  // SpliceCoordinator::reset() force-closes the borrowed upstream inline, whose codec reset cascade
+  // re-enters here. reset() latches on_reset_stream_in_progress_ before that close, so the nested
+  // call returns here and the request leaves the parent list exactly once.
+  if (on_reset_stream_in_progress_) {
+    return;
+  }
   ScopeTrackerScopeState scope(&parent_.callbacks()->scope(), parent_.callbacks()->dispatcher());
 
   // Tear down an in-flight splice before the connection is reset out from under it.

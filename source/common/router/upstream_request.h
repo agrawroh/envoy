@@ -260,6 +260,10 @@ private:
   bool paused_for_connect_ : 1 = false;
   bool paused_for_websocket_ : 1 = false;
   bool reset_stream_ : 1 = false;
+  // Guards onResetStream against re-entry. The splice no-progress watchdog calls onResetStream
+  // directly, and reset() force-closes the upstream inline, whose codec reset cascade re-enters
+  // onResetStream. The nested call must be a no-op so the request leaves the parent list once.
+  bool on_reset_stream_in_progress_ : 1 = false;
 
   // Sentinel to indicate if timeout budget tracking is configured for the cluster,
   // and if so, if the per-try histogram should record a value.

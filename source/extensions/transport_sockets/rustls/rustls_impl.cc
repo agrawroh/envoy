@@ -202,24 +202,26 @@ bool RustlsTransportSocket::canFlushClose() {
 }
 
 OptRef<const Network::KtlsBytestreamInfo> RustlsTransportSocket::ktlsBytestreamInfo() const {
-  // Hand out nothing on a failed or closing socket so a higher layer never splices on it.
+  // trusted_peer follows the socket direction. Only the upstream leg connects to a peer Envoy
+  // chose, while downstream listeners may face untrusted clients. It gates TLS_RX_EXPECT_NO_PAD.
+  const bool trusted_peer = config_->isUpstream();
+  // On a failed or closing socket report installed=false rather than an empty OptRef, so the
+  // body-splice gate rejects it. An empty OptRef means a plaintext raw_buffer socket (the base
+  // default), and a failing rustls socket must never be mistaken for that and spliced as plaintext.
   if (socket_module_ == nullptr || !failureReason().empty()) {
-    return {};
+    ktls_info_storage_ = {/*installed=*/false, /*fd=*/-1, trusted_peer};
+    return ktls_info_storage_;
   }
   int fd = -1;
   const bool installed = config_->on_ktls_state_(
       const_cast<RustlsTransportSocket*>(this)->thisAsEnvoyPtr(), socket_module_, &fd);
-  // trusted_peer follows the socket direction. Only the upstream leg connects to a peer Envoy
-  // chose, while downstream listeners may face untrusted clients. It gates TLS_RX_EXPECT_NO_PAD.
-  const bool trusted_peer = config_->isUpstream();
   if (!installed || fd < 0) {
     // Report a populated info with installed=false rather than an empty OptRef. This distinguishes
-    // a rustls TLS socket whose kTLS is not (yet) installed — including userspace-TLS fallback —
+    // a rustls TLS socket whose kTLS is not (yet) installed, including userspace-TLS fallback,
     // from a plaintext raw_buffer socket, which has no KtlsBytestreamInfo at all (the base default
-    // empty OptRef). The body-splice gate depends on that distinction: writing raw plaintext into a
+    // empty OptRef). The body-splice gate depends on that distinction. Writing raw plaintext into a
     // userspace-TLS socket would bypass encryption, so a non-installed rustls socket must NOT be
-    // treated as "plaintext or kTLS" the way ssl()==nullptr alone would suggest. It also lets the
-    // upload engage poll tell "kTLS still installing" (retry) from "not a kTLS socket" (give up).
+    // treated as "plaintext or kTLS" the way ssl()==nullptr alone would suggest.
     ktls_info_storage_ = {/*installed=*/false, /*fd=*/-1, trusted_peer};
     return ktls_info_storage_;
   }

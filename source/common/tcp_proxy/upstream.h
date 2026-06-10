@@ -359,6 +359,7 @@ public:
   // The tunneling upstream does not run router retries (the per-try/timeout hooks above are all
   // no-ops), and the L7 body-splice never engages on a tunnel, so there is nothing to disable.
   void disableRetries() override {}
+  bool shadowStreamsActive() const override { return false; }
   Router::TimeoutData timeout() override { return {}; }
   absl::optional<std::chrono::milliseconds> dynamicMaxStreamDuration() const override {
     return absl::nullopt;

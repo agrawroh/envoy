@@ -130,8 +130,8 @@ bool SplicePump::createPipes(bool need_u2d, bool need_d2u) {
 
 bool SplicePump::prepare(std::string initial_u2d, std::string initial_d2u) {
   // Lazily create both pipes when the caller did not pre-create them (the L4 path and unit tests
-  // call prepare() directly). The L7 coordinator instead calls createPipes() first — before it
-  // irreversibly extracts the sink's pending write — so a pipe-creation failure there falls back to
+  // call prepare() directly). The L7 coordinator instead calls createPipes() first, before it
+  // irreversibly extracts the sink's pending write, so a pipe-creation failure there falls back to
   // the buffered path rather than corrupting an already-drained connection.
   if (u2d_.read_fd < 0 && d2u_.read_fd < 0) {
     if (!createPipes(/*need_u2d=*/true, /*need_d2u=*/true)) {
@@ -206,11 +206,11 @@ void SplicePump::setBounds(absl::optional<uint64_t> u2d_limit, absl::optional<ui
 
 void SplicePump::arm() {
   // Enlarge each created pipe and record the capacity the kernel ACTUALLY gave us, not the size we
-  // asked for. F_SETPIPE_SZ returns the (page-rounded) size on success; if it fails — EPERM past
-  // fs.pipe-user-pages-soft for an unprivileged process, or a clamp to fs.pipe-max-size — the pipe
+  // asked for. F_SETPIPE_SZ returns the (page-rounded) size on success; if it fails, EPERM past
+  // fs.pipe-user-pages-soft for an unprivileged process, or a clamp to fs.pipe-max-size, the pipe
   // keeps a smaller size and F_GETPIPE_SZ reports it. Trusting the requested 1 MiB while the real
   // pipe is a few pages makes the section-(2)/(4) `in_pipe < capacity` guard splice into a full
-  // pipe, get EAGAIN, and misattribute it to the source socket — a stall or false-EOF truncation.
+  // pipe, get EAGAIN, and misattribute it to the source socket, a stall or false-EOF truncation.
   // Mirrors OSD's zerocopy proxy, which accounts the real F_GETPIPE_SZ size.
   auto size_pipe = [](Pipe& pipe) {
     if (pipe.write_fd < 0) {
@@ -312,7 +312,7 @@ void SplicePump::pump() {
     // budget makes "more is coming" exact and the final drain provably clears it. The unbounded L4
     // pass-through has no end-of-message signal (a keep-alive upstream never EOFs), so leaving MORE
     // set would cork every response's final segment for ~200 ms (a latency regression for tunneled
-    // request/response protocols) — there it stays unset, exactly as before this fast path.
+    // request/response protocols), there it stays unset, exactly as before this fast path.
     const bool u2d_more_expected =
         bounded_ && u2d_limit_.has_value() && u2d_read_ < u2d_limit_.value();
     const bool d2u_more_expected =
@@ -384,7 +384,7 @@ void SplicePump::pump() {
         break;
       } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
         // EAGAIN reading the source is only authoritative ("the upstream RX is empty right now")
-        // when the pipe still had room — i.e. the read failed because the socket is drained, not
+        // when the pipe still had room, i.e. the read failed because the socket is drained, not
         // because the destination pipe is full. Pipe capacity is slot-accounted (one page slot per
         // spliced skb), so a pipe can be slot-full while in_pipe (bytes) is below capacity, or our
         // capacity estimate can be stale; in that case the EAGAIN means pipe-full, not
@@ -615,7 +615,7 @@ bool SplicePump::drainUpstreamControlMessage() {
 
 bool SplicePump::upstreamHasExtraneousData() {
   // Peek (consume nothing) for one application-data byte. A queued control record yields EINVAL/EIO
-  // (no cmsg buffer supplied) and an empty RX yields EAGAIN — both mean "no extraneous DATA". Only
+  // (no cmsg buffer supplied) and an empty RX yields EAGAIN, both mean "no extraneous DATA". Only
   // a successful peek of >0 bytes is a real post-Content-Length data record.
   uint8_t b;
   ssize_t n;
@@ -684,7 +684,7 @@ void SplicePump::maybeHalfCloseOrComplete() {
       // after response complete" and closes the connection; the splice skipped the codec, so prove
       // the same invariant here. A trusted-but-misbehaving (or compromised) upstream that sent more
       // than Content-Length would otherwise leave a crafted response queued on a pooled connection
-      // that a different downstream client then reuses — cross-client response smuggling. Only a
+      // that a different downstream client then reuses, cross-client response smuggling. Only a
       // peeked DATA record counts as extraneous; a queued control record (e.g. a NewSessionTicket,
       // which S3/s2n sends) is benign and the rustls socket drains it on the next read.
       if (u2d_limit_.has_value() && upstreamHasExtraneousData()) {

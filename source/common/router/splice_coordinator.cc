@@ -2,6 +2,7 @@
 
 #include "envoy/http/header_map.h"
 #include "envoy/network/address.h"
+#include "envoy/stats/scope.h"
 
 #include "source/common/common/assert.h"
 #include "source/common/router/router.h"
@@ -78,7 +79,7 @@ bool SpliceCoordinator::maybeArmForResponse(const Http::ResponseHeaderMap& heade
   if (!ktls.has_value() || !ktls->installed || !ktls->trusted_peer) {
     return false;
   }
-  // The downstream sink must be a plaintext (raw_buffer) or installed-kTLS socket — never a
+  // The downstream sink must be a plaintext (raw_buffer) or installed-kTLS socket, never a
   // userspace-TLS socket, into which writing raw plaintext would bypass encryption. ssl()==nullptr
   // alone does not prove that (a rustls userspace socket also reports null), so use the positive
   // signal.
@@ -114,7 +115,7 @@ bool SpliceCoordinator::maybeArmForRequest(const Http::RequestHeaderMap& headers
     return false;
   }
   // The downstream source must be a single, non-multiplexed HTTP/1.1 socket that is plaintext
-  // (raw_buffer) or installed-kTLS — never userspace TLS, off which the pump would read ciphertext
+  // (raw_buffer) or installed-kTLS, never userspace TLS, off which the pump would read ciphertext
   // and relay it as the request body. ssl()==nullptr alone does not prove that, so use the positive
   // signal. The upstream (sink) leg is not connected yet, so engage() polls for it and its kTLS-TX.
   OptRef<Network::Connection> downstream = downstreamConnection();
@@ -187,10 +188,10 @@ void SpliceCoordinator::abandon() {
 
 bool SpliceCoordinator::sinkLegIsRawOrKtls(Network::Connection& connection) {
   // Splicing raw bytes into (download sink) or out of (upload source) a userspace-TLS socket would
-  // bypass its in-place encryption — plaintext on the wire, or relayed ciphertext. Two signals are
+  // bypass its in-place encryption, plaintext on the wire, or relayed ciphertext. Two signals are
   // both required:
-  //   1. ssl() == nullptr. A userspace-TLS socket that exposes Ssl::ConnectionInfo — e.g. the
-  //      BoringSSL `tls` transport socket — reports a non-null ssl(); reject it. This is the ONLY
+  //   1. ssl() == nullptr. A userspace-TLS socket that exposes Ssl::ConnectionInfo, e.g. the
+  //      BoringSSL `tls` transport socket, reports a non-null ssl(); reject it. This is the ONLY
   //      thing that distinguishes a BoringSSL/standard-TLS leg, which does not expose
   //      KtlsBytestreamInfo at all (it inherits the empty base default, indistinguishable from
   //      plaintext on that signal alone).
@@ -227,10 +228,10 @@ void SpliceCoordinator::armProgressWatchdog() {
     progress_watchdog_ = upstream_request_.parent_.callbacks()->dispatcher().createTimer([this]() {
       // A wedged splice (peer stalled with the codec detached, so no route/HCM timer is driven
       // by I/O) is reaped here independent of route-timeout configuration. Part of the body has
-      // already left for the sink, so the message cannot recover: reset the stream. reset() runs
-      // via the standard teardown path, re-arming the borrowed legs first.
+      // already left for the sink, so the message cannot recover and the stream is reset. The
+      // teardown reaches reset(), which force-closes the borrowed upstream and counts the
+      // truncation, so it is not counted here.
       ENVOY_LOG(debug, "kTLS body-splice no-progress watchdog fired, resetting");
-      incSpliceCounter("truncated");
       upstream_request_.onResetStream(Http::StreamResetReason::ConnectionTermination,
                                       "kTLS body-splice stalled");
     });
@@ -239,8 +240,11 @@ void SpliceCoordinator::armProgressWatchdog() {
 }
 
 void SpliceCoordinator::incSpliceCounter(absl::string_view event) {
-  // Per-cluster terminal-event counters: cluster.<name>.http1_ktls_splice.<engaged|abandoned|
-  // truncated>. Created on the cluster stats scope; only ticked on terminal events, never per byte.
+  // Per-cluster splice lifecycle counters cluster.<name>.http1_ktls_splice.<engaged|abandoned|
+  // completed|truncated>. `abandoned` ticks when the splice falls back to the buffered path before
+  // engaging. `engaged` ticks once when a splice commits, then exactly one of `completed` (reached
+  // the Content-Length boundary) or `truncated` (torn down first) ticks. Counted once per splice
+  // decision, never per byte.
   const Upstream::ClusterInfoConstSharedPtr cluster = upstream_request_.parent_.cluster();
   if (cluster == nullptr) {
     return;
@@ -257,6 +261,12 @@ void SpliceCoordinator::maybeReadEnableSource() {
   // readDisable() asserts the connection is open, so guard like the re-arm paths do; a closed
   // source is being torn down and needs no re-enable.
   if (downstream.has_value() && downstream->state() == Network::Connection::State::Open) {
+    // The source is read-disabled only on an upload, which means engage() already detached this
+    // leg's file event. readDisable(false) re-enables that event, so reinstall it first. The
+    // success path reaches here too, so this is the single reinstall point for the source leg.
+    if (legs_detached_) {
+      downstream->reinstallFileEvents();
+    }
     downstream->readDisable(false);
   }
 }
@@ -288,13 +298,20 @@ void SpliceCoordinator::engage() {
   // The upload's sink (upstream) connects and installs kTLS-TX only after the request headers are
   // written, so poll until both are ready; the download's legs are already settled at arm.
   if (direction_ == Direction::Upload) {
+    // Streaming shadows replay the request body through decodeData, which an engaged upload
+    // bypasses by reading the body raw off the socket. They are started after arm, so re-check
+    // here and stay on the buffered path when one is active so the shadow still gets the body.
+    if (upstream_request_.parent_.shadowStreamsActive()) {
+      abandon();
+      return;
+    }
     if (!downstream.has_value()) {
       abandon();
       return;
     }
     if (!upstream.has_value()) {
       // Distinguish "pool not ready yet" (keep polling) from "the upstream connected but is not a
-      // borrowable HTTP/1.1 socket" (an HTTP/2 or HTTP/3 upstream — upstreamConnectionForSplice()
+      // borrowable HTTP/1.1 socket" (an HTTP/2 or HTTP/3 upstream, upstreamConnectionForSplice()
       // is empty forever). Polling the latter to the bound would read-disable the client for ~130
       // ms for nothing, so abandon immediately to the buffered path once the pool stream exists.
       if (upstream_request_.upstream_ != nullptr) {
@@ -327,7 +344,7 @@ void SpliceCoordinator::engage() {
 
   // Re-validate after the schedulable-callback gap: the upstream leg must have kTLS installed and
   // be a trusted peer, and the downstream leg (the splice's sink for a download, its source for an
-  // upload) must be plaintext or installed-kTLS — never userspace TLS the splice would bypass. Any
+  // upload) must be plaintext or installed-kTLS, never userspace TLS the splice would bypass. Any
   // bail-out here flushes the held body back through the normal path so the message still
   // completes.
   const bool download = direction_ == Direction::Download;
@@ -361,12 +378,12 @@ void SpliceCoordinator::engage() {
       // Each byte callback keeps the transfer's liveness timers fresh: the per-try idle timer (so a
       // long transfer does not trip it) and the coordinator's own no-progress watchdog. It also
       // resets the HCM stream idle timer, which no decode/encode event refreshes while the codec is
-      // bypassed — otherwise an actively-progressing splice slower than stream_idle_timeout would
+      // bypassed, otherwise an actively-progressing splice slower than stream_idle_timeout would
       // be killed mid-body. The active direction's callback does the work; the other is inactive.
       [this](uint64_t) { onSpliceProgress(); }, [this](uint64_t) { onSpliceProgress(); });
 
   // Create only the active direction's pipe, and do it BEFORE extracting the sink's pending write
-  // (which is irreversible). A pipe2() failure here — e.g. EMFILE/ENFILE under fd pressure — then
+  // (which is irreversible). A pipe2() failure here, e.g. EMFILE/ENFILE under fd pressure, then
   // falls back to the buffered path losslessly instead of resetting a connection whose write buffer
   // we already drained.
   if (!pump->createPipes(/*need_u2d=*/download, /*need_d2u=*/!download)) {
@@ -378,13 +395,12 @@ void SpliceCoordinator::engage() {
   // Hand the pump the sink's pending output (the encoded headers) followed by the body held before
   // engage, as the pre-engage chunk, so they precede the spliced body and wire order is preserved.
   std::string pre_engage = sink.extractPendingWriteForSplice();
-  // extractPendingWriteForSplice drained these bytes behind the connection's back, so the
-  // connection layer never accounted them on the wire meter. Account them now (finalize adds only
-  // the body).
-  const uint64_t pre_engage_wire_bytes = pre_engage.size();
   pre_engage.reserve(pre_engage.size() + pre_engage_body_.length());
   pre_engage += pre_engage_body_.toString();
   pre_engage_body_.drain(buffered);
+  // The sink write buffer is now drained, so the splice is committed. Count it engaged here so a
+  // prepare() failure below still counts as engaged then truncated.
+  incSpliceCounter("engaged");
   // The pre-engage chunk and the splice bound apply to the active direction: u2d for a download
   // (upstream -> downstream), d2u for an upload (downstream -> upstream). The pipes already exist,
   // so prepare() only emits the chunk; it returns false only if the sink socket is already broken,
@@ -392,12 +408,14 @@ void SpliceCoordinator::engage() {
   const bool ok = download ? pump->prepare(std::move(pre_engage), /*initial_d2u=*/"")
                            : pump->prepare(/*initial_u2d=*/"", std::move(pre_engage));
   if (!ok) {
+    // The pending output was already drained from the sink, so this is a reset, not a fallback.
+    // Count it with the other splice-driven resets.
+    incSpliceCounter("truncated");
     ENVOY_LOG(warn, "kTLS body-splice setup failed after taking pending output, resetting");
     upstream_request_.onResetStream(Http::StreamResetReason::ConnectionTermination,
                                     "kTLS body-splice setup failed");
     return;
   }
-  pre_engage_wire_bytes_ = pre_engage_wire_bytes;
   if (download) {
     pump->setBounds(/*u2d_limit=*/spliced_body_bytes_, /*d2u_limit=*/absl::nullopt);
   } else {
@@ -415,9 +433,11 @@ void SpliceCoordinator::engage() {
   }
 
   // Commit: remove both ConnectionImpl file events so the pump owns the only registration on each
-  // fd, then arm it.
+  // fd, then arm it. The legs now have no file event, so any later readDisable or re-arm must
+  // reinstall first.
   upstream->getSocket()->ioHandle().resetFileEvents();
   downstream->getSocket()->ioHandle().resetFileEvents();
+  legs_detached_ = true;
   upstream_connection_ = upstream;
   downstream_connection_ = downstream;
   splice_pump_ = std::move(pump);
@@ -426,7 +446,6 @@ void SpliceCoordinator::engage() {
   // no HCM/router timer is driven by I/O) is reaped independent of route timeout configuration.
   // Each byte callback re-arms it; only a genuine stall lets it fire.
   armProgressWatchdog();
-  incSpliceCounter("engaged");
   ENVOY_LOG(debug, "kTLS body-splice engaged: {} {} body bytes (down_fd={}, up_fd={})",
             spliced_body_bytes_, download ? "response" : "request", down_fd.value(), up_fd.value());
 }
@@ -462,12 +481,12 @@ void SpliceCoordinator::onSpliceComplete(TcpProxy::SpliceCompletion status) {
 void SpliceCoordinator::finalize() {
   // ORDERING INVARIANT (the crux of crash-safety): destroy the pump first so the borrowed fds are
   // free, but leave the ConnectionImpl file events DETACHED while the codec stream is finalized.
-  // The codec completion (completeSpliced*) runs out-of-band — from this scheduled callback, not
-  // from within dispatch() — so it must not race a socket event. With events detached, no read can
+  // The codec completion (completeSpliced*) runs out-of-band, from this scheduled callback, not
+  // from within dispatch(), so it must not race a socket event. With events detached, no read can
   // fire and dispatch into the half-finalized codec, and no peer-close can hit a still-active
   // ActiveRequest. Only AFTER the stream is finalized (so the codec's active_requests_ no longer
   // references it) do we re-arm the legs for reuse. The original order (re-arm, then finalize)
-  // exposed the window where a remote-close dispatched into the just-spliced stream — the
+  // exposed the window where a remote-close dispatched into the just-spliced stream, the
   // "Wrapped decoder use after free" / CodecClient::onEvent segfault under connection churn.
   if (progress_watchdog_ != nullptr) {
     progress_watchdog_->disableTimer();
@@ -487,7 +506,7 @@ void SpliceCoordinator::finalize() {
     // A truncated or failed splice cannot be recovered: part of the body has already left for the
     // sink socket. Do NOT re-arm the borrowed legs (a pending peer-close would dispatch into the
     // still-active, soon-dead stream). Re-enable the source read (upload may have read-disabled it)
-    // so teardown is not blocked, then force-close the upstream NoFlush — mirroring the proven L4
+    // so teardown is not blocked, then force-close the upstream NoFlush, mirroring the proven L4
     // tearDownSplice. The upstream close drives the codec reset, which propagates through the
     // router to reset the downstream stream too, so neither connection is reused.
     incSpliceCounter("truncated");
@@ -499,18 +518,19 @@ void SpliceCoordinator::finalize() {
     return;
   }
 
-  // Account the body the splice carried plus the pre-engage header bytes the pump emitted (those
-  // were extracted from the sink write buffer behind the connection's back, so the connection layer
-  // never counted them). The sink codec emitted only the headers, so the full Content-Length body
-  // is added to the sink's wire meter and legacy counter here. The source side already counts the
-  // held pre-engage body through its codec's read path, so only the spliced remainder is added
-  // there (in completeSpliced*).
+  // The splice reached the Content-Length boundary. Count the clean completion now, before
+  // completeSpliced* below may defer-delete this coordinator.
+  incSpliceCounter("completed");
+
+  // The spliced body bypassed the sink codec, so its full Content-Length is added to the sink wire
+  // meter and legacy counter here. The headers were already counted by the codec at encode time, so
+  // they are not added again. The source side counts the held pre-engage body through its codec
+  // read path, so only the spliced remainder is added there (in completeSpliced*).
   StreamInfo::StreamInfo& downstream_info = upstream_request_.parent_.callbacks()->streamInfo();
   ENVOY_LOG(debug, "kTLS body-splice complete: {} body bytes relayed", spliced_body_bytes_);
   if (direction_ == Direction::Download) {
     if (downstream_info.getDownstreamBytesMeter() != nullptr) {
-      downstream_info.getDownstreamBytesMeter()->addWireBytesSent(content_length_ +
-                                                                  pre_engage_wire_bytes_);
+      downstream_info.getDownstreamBytesMeter()->addWireBytesSent(content_length_);
     }
     downstream_info.addBytesSent(content_length_);
     upstream_request_.stream_info_.addBytesReceived(spliced_body_bytes_);
@@ -536,18 +556,15 @@ void SpliceCoordinator::finalize() {
   }
 
   // Upload: the upstream is the sink and still awaits the response, so both legs are re-armed and
-  // reused. Re-arm both BEFORE completing (the response is read off the re-armed upstream),
-  // re-enable the held source read, then account and finalize.
+  // reused. Re-arm the sink BEFORE completing (the response is read off the re-armed upstream),
+  // then re-enable the held source read (maybeReadEnableSource reinstalls the source leg), then
+  // account and finalize.
   if (up.has_value() && up->state() == Network::Connection::State::Open) {
     up->reinstallFileEvents();
   }
-  if (down.has_value() && down->state() == Network::Connection::State::Open) {
-    down->reinstallFileEvents();
-  }
   maybeReadEnableSource();
   if (downstream_info.getUpstreamBytesMeter() != nullptr) {
-    downstream_info.getUpstreamBytesMeter()->addWireBytesSent(content_length_ +
-                                                              pre_engage_wire_bytes_);
+    downstream_info.getUpstreamBytesMeter()->addWireBytesSent(content_length_);
   }
   downstream_info.addBytesReceived(spliced_body_bytes_);
   // Finalize the request: the terminal end-of-stream to the request decoder finalizes the upstream
@@ -578,13 +595,23 @@ void SpliceCoordinator::reset() {
   // finalize() this is a no-op (pump already gone, refs cleared). When it fires WITH a splice in
   // flight (the stream is reset mid-transfer), dispose of the borrowed legs the same way the
   // truncation path does: destroy the pump, re-enable the source read, and force-close the borrowed
-  // upstream NoFlush so a detached socket is never left behind — do NOT re-arm it (the stream is
+  // upstream NoFlush so a detached socket is never left behind. Do NOT re-arm it (the stream is
   // being torn down, and re-arming an idle connection whose ActiveRequest is still in flight is
   // what raced a peer-close into the codec). The surrounding teardown closes the downstream.
+  if (splice_pump_ != nullptr) {
+    // An engaged splice torn down mid-transfer (external reset, or the watchdog) is a truncation.
+    // finalize() clears the pump before its own teardown reaches here, so this never double-counts.
+    incSpliceCounter("truncated");
+  }
   splice_pump_.reset();
   maybeReadEnableSource();
   if (upstream_connection_.has_value() &&
       upstream_connection_->state() == Network::Connection::State::Open) {
+    // The NoFlush close runs the codec reset cascade inline, which re-enters
+    // UpstreamRequest::onResetStream. Latch the guard so that nested call is a no-op and the
+    // request leaves the parent list exactly once, whichever path entered reset() (onResetStream,
+    // the watchdog, resetStream, or cleanUp).
+    upstream_request_.on_reset_stream_in_progress_ = true;
     upstream_connection_->close(Network::ConnectionCloseType::NoFlush);
   }
   upstream_connection_ = {};

@@ -361,12 +361,12 @@ TEST_F(SplicePumpIoTest, ClientCloseCompletesWithKeepAliveUpstream) {
   EXPECT_TRUE(completed_);
 }
 
-// Bounded download: the pump reads exactly the Content-Length budget from the upstream and never
+// Bounded download. The pump reads exactly the Content-Length budget from the upstream and never
 // over-reads (the bytes past the budget stay untouched in the socket). On a download an H1 upstream
 // sends nothing past the response body until asked, so bytes still queued past the budget are
-// extraneous; the pump completes Closed (not BoundsReached) so the connection is not pool-reused —
-// the anti-smuggling defense that replaces the H1 client codec's "extraneous data after response
-// complete" check that the splice bypasses.
+// extraneous. The pump completes Closed (not BoundsReached) so the connection is not pool-reused.
+// This is the anti-smuggling defense that replaces the H1 client codec's "extraneous data after
+// response complete" check that the splice bypasses.
 TEST_F(SplicePumpIoTest, BoundedDownloadExtraneousDataIsNotReusable) {
   buildAndArmBounded(/*u2d_limit=*/absl::make_optional<uint64_t>(8192),
                      /*d2u_limit=*/absl::nullopt);

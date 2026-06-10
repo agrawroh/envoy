@@ -10,7 +10,6 @@
 #include "envoy/event/timer.h"
 #include "envoy/http/header_map.h"
 #include "envoy/network/connection.h"
-#include "envoy/stats/stats.h"
 
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/common/logger.h"
@@ -130,18 +129,18 @@ private:
   // OptRef unless its codec is a single, non-multiplexed HTTP/1.1 socket.
   OptRef<Network::Connection> upstreamConnection();
   OptRef<Network::Connection> downstreamConnection();
-  // True iff `connection` is safe to splice into without bypassing in-place encryption: a plaintext
-  // (raw_buffer) socket, or a connection whose own kTLS is installed (the kernel still encrypts the
-  // raw bytes the pump writes). A userspace-TLS rustls socket reports ssl()==nullptr yet is NOT
-  // safe — writing raw plaintext would leave the wire unencrypted — so ssl()==nullptr alone is not
-  // proof; this requires the positive signal.
+  // True iff `connection` is safe to splice raw bytes into (a download sink) or out of (an upload
+  // source) without bypassing in-place encryption. It must be a plaintext (raw_buffer) socket, or a
+  // connection whose own kTLS is installed (the kernel still encrypts the raw bytes the pump
+  // writes). A userspace-TLS rustls socket reports ssl()==nullptr yet is NOT safe, so that signal
+  // alone is not proof and this requires the positive kTLS signal.
   static bool sinkLegIsRawOrKtls(Network::Connection& connection);
   // Liveness on byte movement: re-arms the no-progress watchdog and refreshes the per-try and HCM
   // stream idle timers (which no codec event refreshes while the splice bypasses the codec).
   void onSpliceProgress();
   void armProgressWatchdog();
   // Increment the per-cluster counter cluster.<name>.http1_ktls_splice.<event>, created on the
-  // cluster stats scope. Terminal events only (engaged/abandoned/truncated), never per byte.
+  // cluster stats scope. Lifecycle events (engaged/abandoned/completed/truncated), never per byte.
   // No-op if the cluster is not resolved (defensive; it always is once a route is matched).
   void incSpliceCounter(absl::string_view event);
 
@@ -164,9 +163,6 @@ private:
   // source leg's wire meter already counts the held body via the codec's read accounting, so only
   // this remainder is added there on completion.
   uint64_t spliced_body_bytes_{0};
-  // Header bytes extracted from the sink's write buffer at engage and emitted by the pump as the
-  // pre-engage chunk; they bypassed the connection's wire accounting, so finalize() re-adds them.
-  uint64_t pre_engage_wire_bytes_{0};
   // No-progress watchdog duration. The splice is reaped if neither direction moves a byte for this
   // long, independent of route/per-try timeout configuration (which may be disabled for streaming).
   static constexpr std::chrono::seconds ProgressWatchdogTimeout{30};
@@ -175,8 +171,11 @@ private:
   uint32_t engage_polls_{0};
   bool armed_{false};
   // True when the upload read-disabled the source to hold the request body in the kernel until
-  // engage; cleared once reads are re-enabled.
+  // engage, cleared once reads are re-enabled.
   bool source_read_disabled_{false};
+  // True once engage() detached both legs' ConnectionImpl file events. Any later readDisable or
+  // re-arm of a leg must reinstall its file event first, or it asserts on a null event.
+  bool legs_detached_{false};
 };
 
 using SpliceCoordinatorPtr = std::unique_ptr<SpliceCoordinator>;

@@ -42,6 +42,7 @@ public:
   MOCK_METHOD(Upstream::ClusterInfoConstSharedPtr, cluster, ());
   MOCK_METHOD(FilterConfig&, config, ());
   MOCK_METHOD(void, disableRetries, ());
+  MOCK_METHOD(bool, shadowStreamsActive, (), (const));
   MOCK_METHOD(TimeoutData, timeout, ());
   MOCK_METHOD(absl::optional<std::chrono::milliseconds>, dynamicMaxStreamDuration, (), (const));
   MOCK_METHOD(Envoy::Http::RequestHeaderMap*, downstreamHeaders, ());

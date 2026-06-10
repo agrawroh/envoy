@@ -533,6 +533,7 @@ public:
   // retry_state_ makes maybeRetryReset / shouldRetryHeaders short-circuit, so no retry can replay a
   // request whose body was streamed raw past the retry buffer.
   void disableRetries() override { retry_state_.reset(); }
+  bool shadowStreamsActive() const override { return !shadow_streams_.empty(); }
   TimeoutData timeout() override { return timeout_; }
   absl::optional<std::chrono::milliseconds> dynamicMaxStreamDuration() const override {
     return dynamic_max_stream_duration_;

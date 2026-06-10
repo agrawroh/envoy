@@ -48,9 +48,10 @@ ControlAction classifyKtlsControlRecord(uint8_t record_type, const uint8_t* data
 //
 // Ported from OSD's zerocopy-proxy `transfer.rs`. The two socket fds are borrowed. They stay owned
 // and closed by their ConnectionImpls, and the pump owns only its pipes and FileEvents and never
-// closes the sockets. Init has two phases. prepare() creates the pipes and queues the pre-engage
-// chunk and can fail, so the caller runs it before detaching the ConnectionImpl FileEvents and a
-// failure leaves the connection on the buffered path. arm() then installs the pump's FileEvents.
+// closes the sockets. Init has two phases. prepare() creates the pipes (unless the caller already
+// made them via createPipes()) and queues the pre-engage chunk and can fail, so the caller runs it
+// before detaching the ConnectionImpl FileEvents and a failure leaves the connection on the
+// buffered path. arm() then installs the pump's FileEvents.
 //
 // The FileEvents are edge-triggered. Each wakeup drains every ready direction to EAGAIN and
 // returns without blocking, which keeps the worker watchdog happy. Completion is delivered
@@ -67,20 +68,20 @@ public:
   ~SplicePump();
 
   // Optional pre-step for callers (the L7 body-splice coordinator) that must create the pipes
-  // BEFORE doing anything irreversible — the coordinator extracts the sink connection's pending
+  // BEFORE doing anything irreversible, the coordinator extracts the sink connection's pending
   // write to hand to prepare(), so a pipe2() failure must be observable while the buffered-path
   // fallback is still available. Creates only the requested directions (the bounded body-splice
   // uses one), and is idempotent: prepare() lazily creates both directions only if neither exists.
   // Returns false on pipe2() failure. The L4 path and tests skip this and call prepare() directly.
   bool createPipes(bool need_u2d, bool need_d2u);
   // Phase 1, called before detaching the ConnectionImpl FileEvents. Creates the pipes (if not
-  // already created via createPipes) and queues the pre-engage chunks the buffered path already read
-  // just before engage, so they precede any spliced bytes and ordering is preserved. `initial_u2d`
-  // is the decrypted upstream chunk bound for the downstream socket (the download engage, e.g. a GET
-  // response). `initial_d2u` is the downstream chunk bound for the upstream socket (the upload
-  // engage, e.g. a PUT body); exactly one is non-empty per engage. Returns false only on
-  // unrecoverable setup failure such as pipe creation, in which case the caller must not detach and
-  // should re-deliver on the buffered path.
+  // already created via createPipes) and queues the pre-engage chunks the buffered path already
+  // read just before engage, so they precede any spliced bytes and ordering is preserved.
+  // `initial_u2d` is the decrypted upstream chunk bound for the downstream socket (the download
+  // engage, e.g. a GET response). `initial_d2u` is the downstream chunk bound for the upstream
+  // socket (the upload engage, e.g. a PUT body); exactly one is non-empty per engage. Returns false
+  // only on unrecoverable setup failure such as pipe creation, in which case the caller must not
+  // detach and should re-deliver on the buffered path.
   bool prepare(std::string initial_u2d, std::string initial_d2u);
   // Switches the pump into bounded mode. Called between prepare() and arm(). Each direction with a
   // byte limit moves exactly that many bytes read from its source socket, then the pump completes

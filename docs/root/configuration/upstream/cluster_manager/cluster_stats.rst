@@ -52,6 +52,10 @@ Every cluster has a statistics tree rooted at *cluster.<name>.* with the followi
   upstream_cx_http1_total, Counter, Total HTTP/1.1 connections
   upstream_cx_http2_total, Counter, Total HTTP/2 connections
   upstream_cx_http3_total, Counter, Total HTTP/3 connections
+  http1_ktls_splice.engaged, Counter, Total HTTP/1.1 kTLS body-splices that committed to the in-kernel fast path
+  http1_ktls_splice.abandoned, Counter, Total times the kTLS body-splice fell back to the buffered path before engaging
+  http1_ktls_splice.completed, Counter, Total engaged kTLS body-splices that reached the Content-Length boundary
+  http1_ktls_splice.truncated, Counter, Total engaged kTLS body-splices torn down before the Content-Length boundary
   upstream_cx_connect_fail, Counter, Total connection failures
   upstream_cx_connect_timeout, Counter, Total connection connect timeouts
   upstream_cx_connect_with_0_rtt, Counter, Total connections able to send 0-rtt requests (early data).
