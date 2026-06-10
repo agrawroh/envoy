@@ -1,7 +1,9 @@
 #include "source/common/stats/isolated_store_impl.h"
 #include "source/extensions/upstreams/http/web_transport/upstream_request.h"
 
+#include "test/mocks/event/mocks.h"
 #include "test/mocks/http/stream_encoder.h"
+#include "test/mocks/network/mocks.h"
 #include "test/mocks/router/mocks.h"
 #include "test/test_common/utility.h"
 
@@ -15,6 +17,7 @@ namespace WebTransport {
 namespace {
 
 using ::testing::NiceMock;
+using ::testing::Return;
 
 // A WebTransport session that reports whether it is over its limit and records the registered
 // callbacks.
@@ -88,6 +91,7 @@ protected:
   Stats::IsolatedStoreImpl store_;
   NiceMock<FakeRequestEncoder> encoder_;
   NiceMock<FakeUpstreamToDownstream> upstream_to_downstream_;
+  NiceMock<Network::MockConnection> connection_;
   FakeWebTransportSession upstream_session_;
   FakeWebTransportSession downstream_session_;
 };
@@ -171,6 +175,27 @@ TEST_F(WebTransportUpstreamTest, DeferredConnectWithoutUpstreamSessionFails) {
   encoder_.fireReady();
   EXPECT_EQ(nullptr, downstream_session_.callbacks_);
   EXPECT_EQ(1, counter("sessions_rejected"));
+}
+
+// A deferred CONNECT the upstream then declines resets the stream with the reason as the failure
+// detail, rather than charging outlier detection like a connection failure.
+TEST_F(WebTransportUpstreamTest, DeferredRejectResetsWithReason) {
+  upstream_to_downstream_.session_ = downstream_session_;
+  ON_CALL(upstream_to_downstream_, connection())
+      .WillByDefault(Return(OptRef<const Network::Connection>(connection_)));
+  encoder_.auto_fire_ready_ = false;
+  // Captures the teardown callback the upstream schedules. Ownership passes to the upstream.
+  auto* teardown = new NiceMock<Event::MockSchedulableCallback>(&connection_.dispatcher_);
+  WebTransportUpstream upstream(upstream_to_downstream_, &encoder_, *store_.rootScope());
+
+  EXPECT_TRUE(upstream.encodeHeaders(connectHeaders(), false).ok());
+  encoder_.fireReady();
+  EXPECT_EQ(1, counter("sessions_rejected"));
+
+  EXPECT_CALL(upstream_to_downstream_,
+              onResetStream(Envoy::Http::StreamResetReason::LocalReset,
+                            absl::string_view("upstream did not negotiate WebTransport")));
+  teardown->invokeCallback();
 }
 
 } // namespace
