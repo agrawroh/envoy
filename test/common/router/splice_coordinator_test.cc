@@ -1531,5 +1531,72 @@ TEST_F(SpliceCoordinatorTest, ScheduleCreatesCallbackOnce) {
   EXPECT_EQ(first, engage_sched_);
 }
 
+// ----------------------------------------------------------------------------------------------
+// M. Additional branch coverage (defensive guard arms)
+// ----------------------------------------------------------------------------------------------
+
+// engage-dl-down-fd-invalid: the SINK (downstream) leg has no kernel fd. Mirrors the upstream
+// INVALID_SOCKET test and covers the `!down_fd` arm of the engage fd check.
+TEST_F(SpliceCoordinatorTest, EngageDownloadDownFdInvalidSocket) {
+  initialize();
+  ASSERT_TRUE(armDownload());
+  coord_->scheduleEngage();
+  ON_CALL(down_io_, fdDoNotUse()).WillByDefault(Return(INVALID_SOCKET));
+  fireEngage();
+  EXPECT_FALSE(coord_->engaged());
+  EXPECT_EQ(0, counter("engaged"));
+  EXPECT_EQ(1, counter("abandoned"));
+}
+
+// engage-ul-untrusted-poll: kTLS is installed but the peer is not yet trusted, which keeps the
+// upload polling (the trusted_peer half of the install-poll gate), distinct from not-installed.
+TEST_F(SpliceCoordinatorTest, EngageUploadUntrustedPeerPolls) {
+  initialize();
+  ASSERT_TRUE(armUpload());
+  coord_->scheduleEngage();
+  up_ktls_.installed = true;
+  up_ktls_.trusted_peer = false;
+  fireEngage();
+  EXPECT_FALSE(coord_->engaged());
+  EXPECT_EQ(0, counter("abandoned"));
+  ASSERT_NE(nullptr, poll_timer_);
+  EXPECT_TRUE(poll_timer_->enabled_);
+}
+
+// reset-during-poll-disables-timer: a reset that arrives while the upload is polling for the
+// kTLS-TX install disables the pending poll timer (the `engage_poll_timer_` arm of reset()).
+TEST_F(SpliceCoordinatorTest, ResetDuringPollDisablesTimer) {
+  initialize();
+  ASSERT_TRUE(armUpload());
+  coord_->scheduleEngage();
+  up_ktls_.installed = false; // keep polling
+  fireEngage();
+  ASSERT_NE(nullptr, poll_timer_);
+  EXPECT_CALL(*poll_timer_, disableTimer());
+  coord_->reset();
+  EXPECT_FALSE(coord_->engaged());
+  // No splice was in flight, so nothing is counted truncated.
+  EXPECT_EQ(0, counter("truncated"));
+}
+
+// complete-ul-no-downstream-callbacks: an upload finalize on the clean path with the downstream
+// callbacks gone skips completeSplicedRequest without crashing (the has_value guard at finalize).
+TEST_F(SpliceCoordinatorTest, CompleteUploadNoDownstreamCallbacks) {
+  initialize();
+  ASSERT_TRUE(armUpload());
+  coord_->scheduleEngage();
+  fireEngage();
+  ASSERT_TRUE(coord_->engaged());
+  completion_cb_(TcpProxy::SpliceCompletion::BoundsReached);
+  // The downstream callbacks go away before finalize runs.
+  ON_CALL(parent_.callbacks_, downstreamCallbacks())
+      .WillByDefault(Return(OptRef<Http::DownstreamStreamFilterCallbacks>{}));
+  EXPECT_CALL(down_cb_, completeSplicedRequest(_)).Times(0);
+  EXPECT_CALL(downstream_conn_, readDisable(false))
+      .WillRepeatedly(Return(Network::Connection::ReadDisableStatus::NoTransition));
+  fireFinalize();
+  EXPECT_EQ(1, counter("completed"));
+}
+
 } // namespace Router
 } // namespace Envoy
