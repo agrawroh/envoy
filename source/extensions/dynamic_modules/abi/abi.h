@@ -12327,6 +12327,24 @@ bool envoy_dynamic_module_on_transport_socket_ktls_state(
     envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr,
     envoy_dynamic_module_type_transport_socket_module_ptr transport_socket_module_ptr, int* fd_out);
 
+/**
+ * envoy_dynamic_module_on_transport_socket_set_server_name_override supplies a per-connection
+ * server name (SNI) override for the transport socket. The host calls it once after
+ * envoy_dynamic_module_on_transport_socket_new and before
+ * envoy_dynamic_module_on_transport_socket_on_connected when the connection carries an override
+ * (e.g. a cluster with auto_sni). This hook is optional: a module that does not export it simply
+ * does not receive the override and continues to use its configured default server name.
+ *
+ * @param transport_socket_envoy_ptr is the pointer to the Envoy transport socket object.
+ * @param transport_socket_module_ptr is the pointer to the in-module transport socket.
+ * @param name is the override server name, owned by Envoy and valid only for the duration of the
+ * call. An empty buffer is never passed; the host skips the call when there is no override.
+ */
+void envoy_dynamic_module_on_transport_socket_set_server_name_override(
+    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr,
+    envoy_dynamic_module_type_transport_socket_module_ptr transport_socket_module_ptr,
+    envoy_dynamic_module_type_envoy_buffer name);
+
 // =============================================================================
 // Transport Socket Callbacks
 // =============================================================================

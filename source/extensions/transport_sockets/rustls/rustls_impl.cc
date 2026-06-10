@@ -37,8 +37,8 @@ createRustlsConfig(bool is_upstream, const Protobuf::Message& validated_proto,
   // The rustls module is statically linked and registered at process init. A failure here is a
   // build/linkage error, but propagate via Status (not RELEASE_ASSERT) so a future packaging bug
   // doesn't crash the proxy on first config push.
-  auto module_or = Envoy::Extensions::DynamicModules::newDynamicModuleByName(
-      RustlsModuleName, /*do_not_close=*/true);
+  auto module_or = Envoy::Extensions::DynamicModules::newDynamicModuleByName(RustlsModuleName,
+                                                                             /*do_not_close=*/true);
   if (!module_or.ok()) {
     return absl::InternalError(
         absl::StrCat("rustls: failed to load static module: ", module_or.status().message()));
@@ -62,15 +62,18 @@ RustlsUpstreamTransportSocketFactory::RustlsUpstreamTransportSocketFactory(
 Network::TransportSocketPtr RustlsUpstreamTransportSocketFactory::createTransportSocket(
     Network::TransportSocketOptionsConstSharedPtr options,
     Upstream::HostDescriptionConstSharedPtr) const {
-  // The rustls socket builds one rustls `ClientConfig` per factory and clones it into every
-  // connection. Per-connection TransportSocketOptions overrides for SNI, ALPN, and SAN match list
-  // cannot be honored yet. Return a `NotReadyRustlsSocket` stub when any override is set; the
-  // connection layer surfaces this as `upstream_cx_connect_fail` with the failure reason in
-  // `failureReason()`. (Returning a real nullptr is NOT safe here. `ConnectionImpl` dereferences
-  // `transport_socket_` without a null-check at construction time.)
+  // A per-connection SNI override (e.g. cluster `auto_sni`) IS honored: it is forwarded to the
+  // rustls module, which builds the `ClientConnection` with that `ServerName` while sharing the one
+  // factory `ClientConfig`. Per-connection ALPN and SAN match-list overrides cannot be honored yet.
+  // Return a `NotReadyRustlsSocket` stub when one of those is set; the connection layer surfaces it
+  // as `upstream_cx_connect_fail` with the failure reason in `failureReason()`. (Returning a real
+  // nullptr is NOT safe here. `ConnectionImpl` dereferences `transport_socket_` without a
+  // null-check at construction time.)
+  std::string server_name_override;
   if (options != nullptr) {
-    const bool has_sni_override =
-        options->serverNameOverride().has_value() && !options->serverNameOverride()->empty();
+    if (options->serverNameOverride().has_value()) {
+      server_name_override = options->serverNameOverride().value();
+    }
     const bool has_alpn_override = !options->applicationProtocolListOverride().empty();
     const bool has_san_override = !options->verifySubjectAltNameListOverride().empty();
     // `applicationProtocolFallback` is set by the HTTP/2 connection pool (e.g. `{"h2",
@@ -80,20 +83,21 @@ Network::TransportSocketPtr RustlsUpstreamTransportSocketFactory::createTranspor
     // gets a clear `upstream_cx_connect_fail` instead.
     const bool has_alpn_fallback_unbacked =
         !options->applicationProtocolFallback().empty() && alpn_protocols_.empty();
-    if (has_sni_override || has_alpn_override || has_san_override || has_alpn_fallback_unbacked) {
+    if (has_alpn_override || has_san_override || has_alpn_fallback_unbacked) {
       ENVOY_LOG_PERIODIC_MISC(
           warn, std::chrono::seconds(30),
-          "rustls upstream transport socket received per-connection options (sni_override={}, "
-          "alpn_override={}, san_override={}, alpn_fallback_unbacked={}); these are not yet "
-          "supported and the connection will fail. Use envoy.transport_sockets.tls if you need "
-          "auto_sni / match_typed_subject_alt_names / ALPN override / ALPN fallback.",
-          has_sni_override, has_alpn_override, has_san_override, has_alpn_fallback_unbacked);
+          "rustls upstream transport socket received per-connection options (alpn_override={}, "
+          "san_override={}, alpn_fallback_unbacked={}); these are not yet supported and the "
+          "connection will fail. Use envoy.transport_sockets.tls if you need "
+          "match_typed_subject_alt_names / ALPN override / ALPN fallback.",
+          has_alpn_override, has_san_override, has_alpn_fallback_unbacked);
       return std::make_unique<NotReadyRustlsSocket>(
-          "rustls: per-connection SNI/ALPN/SAN overrides (and ALPN fallback without a static "
+          "rustls: per-connection ALPN/SAN overrides (and ALPN fallback without a static "
           "alpn_protocols list) are not supported by this extension");
     }
   }
-  return std::make_unique<DynamicModules::DynamicModuleTransportSocket>(config_);
+  return std::make_unique<DynamicModules::DynamicModuleTransportSocket>(
+      config_, std::move(server_name_override));
 }
 
 void RustlsUpstreamTransportSocketFactory::hashKey(

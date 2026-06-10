@@ -42,6 +42,8 @@ using OnTransportSocketStartSecureTransportType =
     decltype(&envoy_dynamic_module_on_transport_socket_start_secure_transport);
 using OnTransportSocketKtlsStateType =
     decltype(&envoy_dynamic_module_on_transport_socket_ktls_state);
+using OnTransportSocketSetServerNameOverrideType =
+    decltype(&envoy_dynamic_module_on_transport_socket_set_server_name_override);
 
 /**
  * Configuration holding the resolved dynamic module, ABI function pointers, and the in-module
@@ -75,6 +77,10 @@ public:
   // Optional. Only modules that offer kernel TLS (e.g. rustls with kTLS offload) export this. It
   // stays null for modules that do not, in which case the socket reports no kTLS bytestream.
   OnTransportSocketKtlsStateType on_ktls_state_ = nullptr;
+  // Optional. Only modules that honor a per-connection server-name (SNI) override export this. It
+  // stays null for modules that do not, in which case the override is dropped and the module keeps
+  // its configured default server name.
+  OnTransportSocketSetServerNameOverrideType on_set_server_name_override_ = nullptr;
 
   bool implementsSecureTransport() const { return implements_secure_transport_; }
   bool isUpstream() const { return is_upstream_; }
@@ -105,7 +111,11 @@ absl::StatusOr<DynamicModuleTransportSocketConfigSharedPtr> newDynamicModuleTran
 class DynamicModuleTransportSocket : public Network::TransportSocket,
                                      public Logger::Loggable<Logger::Id::dynamic_modules> {
 public:
-  DynamicModuleTransportSocket(DynamicModuleTransportSocketConfigSharedPtr config);
+  // `server_name_override` is the per-connection SNI override (e.g. from a cluster with auto_sni),
+  // empty when there is none. It is forwarded to the module via the optional set-server-name hook
+  // after the in-module socket is created.
+  DynamicModuleTransportSocket(DynamicModuleTransportSocketConfigSharedPtr config,
+                               std::string server_name_override = "");
   ~DynamicModuleTransportSocket() override;
 
   // Network::TransportSocket
@@ -142,6 +152,9 @@ private:
   mutable std::string failure_reason_;
   // Backing store for the OptRef returned by ktlsBytestreamInfo (refreshed per call).
   mutable Network::KtlsBytestreamInfo ktls_info_storage_;
+  // Per-connection SNI override, empty when there is none. Forwarded to the module via the optional
+  // set-server-name hook in setTransportSocketCallbacks.
+  const std::string server_name_override_;
 };
 
 /**

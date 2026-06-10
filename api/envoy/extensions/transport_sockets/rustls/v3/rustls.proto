@@ -41,7 +41,6 @@ enum TlsVersion {
 //   are not supported and connections that require them will be refused at
 //   ``createTransportSocket`` time (visible as ``upstream_cx_connect_fail`` with a warn log):
 //
-//   * Per-connection SNI override (e.g. ``auto_sni: true``).
 //   * Per-connection ALPN override.
 //   * Per-connection SAN match list override (``match_typed_subject_alt_names`` /
 //     ``verify_subject_alt_name``).
@@ -91,9 +90,9 @@ message RustlsUpstreamTlsContext {
   //
   // **Required.** rustls verifies the server certificate's SAN list against this value, so it
   // must match the expected upstream hostname (e.g. ``mybucket.s3.amazonaws.com``). A factory
-  // built without a non-empty ``sni`` will be rejected at config-load time. Per-connection SNI
-  // overrides (e.g. cluster ``auto_sni: true``) are not yet plumbed through — see the
-  // limitation note at the top of this message.
+  // built without a non-empty ``sni`` will be rejected at config-load time. This is the default
+  // server name. A per-connection SNI override (e.g. cluster ``auto_sni: true``) is honored and
+  // takes precedence for that connection.
   string sni = 5;
 
   // Enables kernel TLS (``kTLS``) offload after the TLS handshake completes on Linux. When

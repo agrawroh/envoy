@@ -451,6 +451,11 @@ struct RustlsTransportSocket {
   server_cfg: Option<Arc<ServerConfig>>,
   client_cfg: Option<Arc<ClientConfig>>,
   server_name: Option<ServerName<'static>>,
+  /// Per-connection SNI override (e.g. from a cluster with `auto_sni`), set via
+  /// `on_set_server_name_override`. When present it replaces the factory-default `server_name` in
+  /// `ensure_connection`. One shared `ClientConfig` serves every SNI, so only this `ServerName`
+  /// varies per connection.
+  server_name_override: Option<ServerName<'static>>,
   conn: Option<Connection>,
   phase: Phase,
   failure: String,
@@ -498,6 +503,7 @@ impl RustlsTransportSocket {
       server_cfg: Some(cfg),
       client_cfg: None,
       server_name: None,
+      server_name_override: None,
       conn: None,
       phase: Phase::Handshaking,
       failure: String::new(),
@@ -538,6 +544,7 @@ impl RustlsTransportSocket {
       server_cfg: None,
       client_cfg: Some(cfg),
       server_name: Some(server_name),
+      server_name_override: None,
       conn: None,
       phase: Phase::Handshaking,
       failure: String::new(),
@@ -572,11 +579,17 @@ impl RustlsTransportSocket {
     if self.conn.is_some() {
       return Ok(());
     }
+    // Prefer the per-connection SNI override (e.g. auto_sni) over the factory default. The same
+    // shared `ClientConfig` is used either way, so only the `ServerName` varies per connection.
+    let effective_sn = self
+      .server_name_override
+      .as_ref()
+      .or(self.server_name.as_ref());
     let conn = if let Some(cfg) = &self.server_cfg {
       Connection::Server(
         ServerConnection::new(Arc::clone(cfg)).map_err(|e| format!("ServerConnection: {e}"))?,
       )
-    } else if let (Some(cfg), Some(sn)) = (&self.client_cfg, &self.server_name) {
+    } else if let (Some(cfg), Some(sn)) = (&self.client_cfg, effective_sn) {
       Connection::Client(
         ClientConnection::new(Arc::clone(cfg), sn.clone())
           .map_err(|e| format!("ClientConnection: {e}"))?,
@@ -1179,6 +1192,19 @@ impl RustlsTransportSocket {
 
 impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
   fn on_set_callbacks(&mut self, _envoy: &mut EnvoyTransportSocketImpl) {}
+
+  fn on_set_server_name_override(&mut self, _envoy: &mut EnvoyTransportSocketImpl, name: &str) {
+    // Validate the override into an owned `ServerName` before the connection is built. A malformed
+    // name (e.g. not a DNS name or IP address) fails the connection cleanly rather than silently
+    // falling back to the factory default and mis-handshaking against the wrong authority.
+    match ServerName::try_from(name.to_owned()) {
+      Ok(sn) => self.server_name_override = Some(sn),
+      Err(_) => {
+        self.failure = format!("invalid per-connection server_name / SNI override: {name}");
+        envoy_log_warn!("rustls: {}", self.failure);
+      },
+    }
+  }
 
   fn on_connected(&mut self, envoy: &mut EnvoyTransportSocketImpl) {
     if let Err(e) = self.ensure_connection() {
@@ -2429,6 +2455,7 @@ mod tests {
       server_cfg: None,
       client_cfg: None,
       server_name: None,
+      server_name_override: None,
       conn: None,
       phase: Phase::Handshaking,
       failure: String::new(),
@@ -2457,6 +2484,71 @@ mod tests {
       end_stream_pending: false,
       in_do_write: false,
     }
+  }
+
+  // Builds a real upstream client socket with `default.example.com` as the factory-default SNI.
+  // `ClientConnection::new` does no I/O, so `ensure_connection` can run without a network.
+  fn make_client_socket_default_sni() -> RustlsTransportSocket {
+    let cfg = JsonConfig {
+      cert_chain: String::new(),
+      private_key: String::new(),
+      trusted_ca: Some(TEST_CA_PEM.to_string()),
+      alpn_protocols: None,
+      enable_ktls: false,
+      disable_ktls_rx: false,
+      sni: Some("default.example.com".to_string()),
+      tls_minimum_protocol_version: TlsVersion::Auto,
+      tls_maximum_protocol_version: TlsVersion::Auto,
+      crl: None,
+    };
+    let factory = RustlsFactoryConfig::new_upstream(cfg).expect("upstream config builds");
+    match factory.endpoint {
+      EndpointKind::Upstream { cfg, server_name } => {
+        RustlsTransportSocket::new_client(cfg, server_name, false, false)
+      },
+      EndpointKind::Downstream(_) => panic!("expected an upstream endpoint"),
+    }
+  }
+
+  #[test]
+  fn server_name_override_replaces_factory_default() {
+    // A valid per-connection override is stored as the override `ServerName` and replaces the
+    // factory default in `ensure_connection`. The default `server_name` stays untouched so the
+    // selection (override-over-default) is observable, and the connection builds with the override.
+    let mut s = make_client_socket_default_sni();
+    assert_eq!(
+      s.server_name,
+      Some(ServerName::try_from("default.example.com".to_owned()).unwrap())
+    );
+    let mut envoy = EnvoyTransportSocketImpl::new(std::ptr::null_mut());
+    s.on_set_server_name_override(&mut envoy, "override.example.com");
+    assert!(
+      s.failure.is_empty(),
+      "valid override must not fail: {}",
+      s.failure
+    );
+    assert_eq!(
+      s.server_name_override,
+      Some(ServerName::try_from("override.example.com".to_owned()).unwrap())
+    );
+    // The override (not the default) is the SNI source for the built connection.
+    assert!(s.ensure_connection().is_ok());
+    assert!(s.conn.is_some());
+  }
+
+  #[test]
+  fn invalid_server_name_override_fails_clean() {
+    // A malformed override sets the failure state rather than silently falling back to the default,
+    // so the connection fails cleanly instead of mis-handshaking against the wrong authority.
+    let mut s = make_client_socket_default_sni();
+    let mut envoy = EnvoyTransportSocketImpl::new(std::ptr::null_mut());
+    s.on_set_server_name_override(&mut envoy, "not a valid sni!!");
+    assert!(s.server_name_override.is_none());
+    assert!(
+      s.failure.contains("invalid per-connection server_name"),
+      "failure must name the invalid override: {}",
+      s.failure
+    );
   }
 
   #[test]

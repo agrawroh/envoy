@@ -23,9 +23,9 @@ using DynamicModules::DynamicModuleTransportSocketConfigSharedPtr;
 
 /**
  * Stub transport socket returned by the rustls factories when a per-connection feature is
- * requested but not yet supported (e.g. SNI override). Every I/O is `Close`; `failureReason()` is a
- * fixed human-readable string so the connection layer surfaces a clean `upstream_cx_connect_fail`
- * with operator-visible context.
+ * requested but not yet supported (e.g. ALPN or SAN match-list override). Every I/O is `Close`;
+ * `failureReason()` is a fixed human-readable string so the connection layer surfaces a clean
+ * `upstream_cx_connect_fail` with operator-visible context.
  *
  * Mirrors `Tls::NotReadySslSocket` / `Tls::ErrorSslSocket` from the standard TLS transport socket.
  */

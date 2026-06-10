@@ -457,15 +457,16 @@ TEST(NotReadyRustlsSocketTest, DoReadAndDoWriteReturnClose) {
   EXPECT_TRUE(socket.canFlushClose());
 }
 
-TEST_F(RustlsImplTest, UpstreamCreateTransportSocketReturnsNotReadyOnSniOverride) {
+TEST_F(RustlsImplTest, UpstreamCreateTransportSocketHonorsSniOverride) {
   RustlsUpstreamTransportSocketConfigFactory factory;
   envoy::extensions::transport_sockets::rustls::v3::RustlsUpstreamTlsContext config;
   config.set_sni("static.example.com");
   auto factory_or = factory.createTransportSocketFactory(config, context_);
   ASSERT_TRUE(factory_or.ok()) << factory_or.status().message();
 
-  // Build TransportSocketOptions that set a per-connection SNI override. The upstream factory
-  // rejects it until per-connection options are plumbed through the dynamic-modules SDK.
+  // A per-connection SNI override is now honored (Route B): it is forwarded to the rustls module
+  // instead of producing a NotReady stub. The factory returns a real socket that attempts the
+  // connection with the override server name.
   auto options = std::make_shared<Network::TransportSocketOptionsImpl>(
       /*override_server_name=*/"override.example.com",
       /*override_verify_san_list=*/std::vector<std::string>{},
@@ -473,14 +474,12 @@ TEST_F(RustlsImplTest, UpstreamCreateTransportSocketReturnsNotReadyOnSniOverride
       /*fallback_alpn=*/std::vector<std::string>{});
 
   auto socket = factory_or.value()->createTransportSocket(options, nullptr);
-  // createTransportSocket must NEVER return nullptr. It returns a NotReady stub instead because
-  // ConnectionImpl dereferences the returned pointer without a null-check.
   ASSERT_NE(socket, nullptr);
-  // The socket reports a clear failure reason and closes on any I/O.
-  EXPECT_THAT(std::string(socket->failureReason()), testing::HasSubstr("not supported"));
-  Buffer::OwnedImpl buf;
-  EXPECT_EQ(socket->doRead(buf).action_, Network::PostIoAction::Close);
-  EXPECT_EQ(socket->doWrite(buf, false).action_, Network::PostIoAction::Close);
+  // It is a real dynamic-module socket, not the NotReady stub, so it carries no "not supported"
+  // failure reason and is not a NotReadyRustlsSocket.
+  EXPECT_EQ(dynamic_cast<NotReadyRustlsSocket*>(socket.get()), nullptr);
+  EXPECT_THAT(std::string(socket->failureReason()),
+              testing::Not(testing::HasSubstr("not supported")));
 }
 
 TEST_F(RustlsImplTest, UpstreamCreateTransportSocketReturnsNotReadyOnAlpnOverride) {

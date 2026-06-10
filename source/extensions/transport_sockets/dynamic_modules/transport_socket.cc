@@ -113,6 +113,12 @@ absl::StatusOr<DynamicModuleTransportSocketConfigSharedPtr> newDynamicModuleTran
   auto on_ktls_state = dynamic_module->getFunctionPointer<OnTransportSocketKtlsStateType>(
       "envoy_dynamic_module_on_transport_socket_ktls_state");
 
+  // Optional. Only modules that honor a per-connection server-name (SNI) override export this. A
+  // module that does not is still valid and simply keeps its configured default server name.
+  auto on_set_server_name_override =
+      dynamic_module->getFunctionPointer<OnTransportSocketSetServerNameOverrideType>(
+          "envoy_dynamic_module_on_transport_socket_set_server_name_override");
+
   auto config = std::make_shared<DynamicModuleTransportSocketConfig>(
       implements_secure_transport, is_upstream, std::move(dynamic_module));
 
@@ -131,6 +137,9 @@ absl::StatusOr<DynamicModuleTransportSocketConfigSharedPtr> newDynamicModuleTran
   if (on_ktls_state.ok()) {
     config->on_ktls_state_ = on_ktls_state.value();
   }
+  if (on_set_server_name_override.ok()) {
+    config->on_set_server_name_override_ = on_set_server_name_override.value();
+  }
 
   envoy_dynamic_module_type_envoy_buffer name_buffer = {socket_name.data(), socket_name.size()};
   envoy_dynamic_module_type_envoy_buffer config_buffer = {socket_config.data(),
@@ -145,11 +154,21 @@ absl::StatusOr<DynamicModuleTransportSocketConfigSharedPtr> newDynamicModuleTran
 }
 
 DynamicModuleTransportSocket::DynamicModuleTransportSocket(
-    DynamicModuleTransportSocketConfigSharedPtr config)
-    : config_(std::move(config)) {
+    DynamicModuleTransportSocketConfigSharedPtr config, std::string server_name_override)
+    : config_(std::move(config)), server_name_override_(std::move(server_name_override)) {
   in_module_socket_ = config_->on_new_(config_->in_module_config_, this);
   if (in_module_socket_ == nullptr) {
     ENVOY_LOG(error, "dynamic module failed to create transport socket; connection will be closed");
+    return;
+  }
+  // Forward the per-connection SNI override to the module once, right after on_new and before any
+  // I/O or on_connected. Only modules that export the optional hook receive it; the rest keep their
+  // configured default server name. Skipped entirely when there is no override, so the common path
+  // pays nothing.
+  if (config_->on_set_server_name_override_ != nullptr && !server_name_override_.empty()) {
+    envoy_dynamic_module_type_envoy_buffer name = {server_name_override_.data(),
+                                                   server_name_override_.size()};
+    config_->on_set_server_name_override_(this, in_module_socket_, name);
   }
 }
 
@@ -255,7 +274,7 @@ OptRef<const Network::KtlsBytestreamInfo> DynamicModuleTransportSocket::ktlsByte
   const bool trusted_peer = config_->isUpstream();
   int fd = -1;
   const bool installed = config_->on_ktls_state_(const_cast<DynamicModuleTransportSocket*>(this),
-                                                  in_module_socket_, &fd);
+                                                 in_module_socket_, &fd);
   // Report a populated info with installed=false rather than an empty OptRef when kTLS is not (yet)
   // installed, including userspace-TLS fallback. The body-splice gate depends on telling a secure
   // transport whose kTLS is not installed apart from a plaintext raw_buffer socket (the base empty
@@ -271,8 +290,13 @@ DynamicModuleDownstreamTransportSocketFactory::createDownstreamTransportSocket()
 }
 
 Network::TransportSocketPtr DynamicModuleUpstreamTransportSocketFactory::createTransportSocket(
-    Network::TransportSocketOptionsConstSharedPtr, Upstream::HostDescriptionConstSharedPtr) const {
-  return std::make_unique<DynamicModuleTransportSocket>(config_);
+    Network::TransportSocketOptionsConstSharedPtr options,
+    Upstream::HostDescriptionConstSharedPtr) const {
+  std::string server_name_override;
+  if (options != nullptr && options->serverNameOverride().has_value()) {
+    server_name_override = options->serverNameOverride().value();
+  }
+  return std::make_unique<DynamicModuleTransportSocket>(config_, std::move(server_name_override));
 }
 
 } // namespace DynamicModules

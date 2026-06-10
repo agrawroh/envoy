@@ -417,6 +417,10 @@ pub trait TransportSocket<ETS: EnvoyTransportSocket + ?Sized> {
   fn ktls_state(&self, _envoy: &mut ETS) -> (bool, i32) {
     (false, -1)
   }
+  /// Supplies a per-connection server name (SNI) override, called once after the socket is created
+  /// and before `on_connected` when the connection carries an override (e.g. a cluster with
+  /// `auto_sni`). Defaults to a no-op. Only sockets that vary SNI per connection override it.
+  fn on_set_server_name_override(&mut self, _envoy: &mut ETS, _name: &str) {}
 }
 
 // Internal Implementation Types
@@ -795,4 +799,147 @@ pub unsafe extern "C" fn envoy_dynamic_module_on_transport_socket_ktls_state(
     crate::log_ffi_panic("envoy_dynamic_module_on_transport_socket_ktls_state", panic);
     false
   })
+}
+
+/// # Safety
+///
+/// This is an FFI function called by Envoy. All pointer arguments must be valid as guaranteed
+/// by the Envoy dynamic module ABI. `name` is owned by Envoy and valid only for the duration of
+/// the call.
+#[no_mangle]
+pub unsafe extern "C" fn envoy_dynamic_module_on_transport_socket_set_server_name_override(
+  transport_socket_envoy_ptr: abi::envoy_dynamic_module_type_transport_socket_envoy_ptr,
+  transport_socket_module_ptr: abi::envoy_dynamic_module_type_transport_socket_module_ptr,
+  name: abi::envoy_dynamic_module_type_envoy_buffer,
+) {
+  let _ = catch_unwind(AssertUnwindSafe(|| {
+    let name_bytes =
+      unsafe { crate::ffi_helpers::slice_from_raw_or_empty(name.ptr as *const u8, name.length) };
+    let name_str = match std::str::from_utf8(name_bytes) {
+      Ok(s) => s,
+      Err(_) => {
+        crate::envoy_log_error!(
+          "transport socket server name override is not valid UTF-8; ignoring it."
+        );
+        return;
+      },
+    };
+    let wrapper = unsafe { &mut *(transport_socket_module_ptr as *mut TransportSocketWrapper) };
+    let mut envoy = EnvoyTransportSocketImpl::new(transport_socket_envoy_ptr);
+    wrapper
+      .socket
+      .on_set_server_name_override(&mut envoy, name_str);
+  }))
+  .map_err(|panic| {
+    crate::log_ffi_panic(
+      "envoy_dynamic_module_on_transport_socket_set_server_name_override",
+      panic,
+    );
+  });
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::cell::RefCell;
+  use std::rc::Rc;
+
+  /// Test socket that records the last server-name override it received into a shared cell. Only
+  /// `on_set_server_name_override` is exercised; the remaining hooks are never called in this test.
+  struct RecordingSocket {
+    recorded: Rc<RefCell<Option<String>>>,
+  }
+
+  impl TransportSocket<EnvoyTransportSocketImpl> for RecordingSocket {
+    fn on_set_callbacks(&mut self, _envoy: &mut EnvoyTransportSocketImpl) {}
+    fn on_connected(&mut self, _envoy: &mut EnvoyTransportSocketImpl) {}
+    fn on_do_read(&mut self, _envoy: &mut EnvoyTransportSocketImpl) -> IoResult {
+      unimplemented!()
+    }
+    fn on_do_write(
+      &mut self,
+      _envoy: &mut EnvoyTransportSocketImpl,
+      _end_stream: bool,
+    ) -> IoResult {
+      unimplemented!()
+    }
+    fn on_close(
+      &mut self,
+      _envoy: &mut EnvoyTransportSocketImpl,
+      _event: ConnectionEvent,
+      _abort_reset: bool,
+    ) {
+    }
+    fn get_protocol(&self, _envoy: &mut EnvoyTransportSocketImpl) -> String {
+      String::new()
+    }
+    fn get_failure_reason(&self, _envoy: &mut EnvoyTransportSocketImpl) -> String {
+      String::new()
+    }
+    fn can_flush_close(&self, _envoy: &mut EnvoyTransportSocketImpl) -> bool {
+      true
+    }
+    fn start_secure_transport(&mut self, _envoy: &mut EnvoyTransportSocketImpl) -> bool {
+      false
+    }
+    fn on_set_server_name_override(&mut self, _envoy: &mut EnvoyTransportSocketImpl, name: &str) {
+      *self.recorded.borrow_mut() = Some(name.to_owned());
+    }
+  }
+
+  // Boxes a recording socket into a wrapper pointer the way `on_transport_socket_new` does, so the
+  // extern wrapper can be driven directly. The returned cell observes what the trait method saw.
+  fn wrap() -> (*mut TransportSocketWrapper, Rc<RefCell<Option<String>>>) {
+    let recorded = Rc::new(RefCell::new(None));
+    let socket = RecordingSocket {
+      recorded: recorded.clone(),
+    };
+    let raw = Box::into_raw(Box::new(TransportSocketWrapper {
+      socket: Box::new(socket),
+    }));
+    (raw, recorded)
+  }
+
+  #[test]
+  fn set_server_name_override_dispatches_to_trait() {
+    let (raw, recorded) = wrap();
+    let name = "override.example.com";
+    let buffer = abi::envoy_dynamic_module_type_envoy_buffer {
+      ptr: name.as_ptr() as *const _,
+      length: name.len(),
+    };
+    unsafe {
+      envoy_dynamic_module_on_transport_socket_set_server_name_override(
+        std::ptr::null_mut(),
+        raw as abi::envoy_dynamic_module_type_transport_socket_module_ptr,
+        buffer,
+      );
+      drop(Box::from_raw(raw));
+    }
+    assert_eq!(recorded.borrow().as_deref(), Some("override.example.com"));
+  }
+
+  #[test]
+  fn set_server_name_override_ignores_invalid_utf8() {
+    let (raw, recorded) = wrap();
+    // 0xFF is never valid UTF-8, so the wrapper logs and skips the dispatch rather than calling the
+    // trait with lossy bytes.
+    let bytes = [0xFFu8, 0xFE, 0xFD];
+    let buffer = abi::envoy_dynamic_module_type_envoy_buffer {
+      ptr: bytes.as_ptr() as *const _,
+      length: bytes.len(),
+    };
+    unsafe {
+      envoy_dynamic_module_on_transport_socket_set_server_name_override(
+        std::ptr::null_mut(),
+        raw as abi::envoy_dynamic_module_type_transport_socket_module_ptr,
+        buffer,
+      );
+      drop(Box::from_raw(raw));
+    }
+    assert!(
+      recorded.borrow().is_none(),
+      "invalid UTF-8 must not reach the trait method"
+    );
+  }
 }
