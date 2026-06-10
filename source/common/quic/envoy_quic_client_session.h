@@ -78,6 +78,15 @@ public:
   void StartDraining() override;
 
   quic::HttpDatagramSupport LocalHttpDatagramSupport() override { return http_datagram_support_; }
+
+  // quic::QuicSpdySession
+  // Advertises WebTransport only when it is latched on in setHttp3Options(). Flag flips apply to
+  // new connections only.
+  quic::WebTransportHttp3VersionSet LocallySupportedWebTransportVersions() const override {
+    return web_transport_enabled_ ? quic::kDefaultSupportedWebTransportVersions
+                                  : quic::WebTransportHttp3VersionSet();
+  }
+
   std::vector<std::string> GetAlpnsToOffer() const override;
   void OnConfigNegotiated() override;
   void OnSconePacket(quic::QuicBandwidth bandwidth) override;
@@ -153,6 +162,8 @@ private:
   OptRef<QuicTransportSocketFactoryBase> transport_socket_factory_;
   std::vector<std::string> configured_alpns_;
   quic::HttpDatagramSupport http_datagram_support_ = quic::HttpDatagramSupport::kNone;
+  // Whether to advertise WebTransport support, latched once in setHttp3Options().
+  bool web_transport_enabled_ = false;
   const bool session_handles_migration_;
   QuicNetworkConnectivityObserverPtr network_connectivity_observer_;
   OptRef<EnvoyQuicNetworkObserverRegistry> registry_;

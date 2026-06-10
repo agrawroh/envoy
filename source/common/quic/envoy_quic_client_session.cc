@@ -12,6 +12,7 @@
 #include "source/common/quic/quic_filter_manager_connection_impl.h"
 #include "source/common/quic/quic_network_connectivity_observer_impl.h"
 #include "source/common/quic/scone_state.h"
+#include "source/common/runtime/runtime_features.h"
 
 #include "quiche/quic/core/quic_bandwidth.h"
 
@@ -255,6 +256,13 @@ std::unique_ptr<quic::QuicCryptoClientStreamBase> EnvoyQuicClientSession::Create
 void EnvoyQuicClientSession::setHttp3Options(
     const envoy::config::core::v3::Http3ProtocolOptions& http3_options) {
   QuicFilterManagerConnectionImpl::setHttp3Options(http3_options);
+  // Latch before any early return. The client advertises WebTransport in its SETTINGS only when the
+  // cluster opts in and HTTP/3 datagrams are on. QUICHE enables extended CONNECT on the client once
+  // the server's SETTINGS arrive. Flag flips apply to new connections only.
+  web_transport_enabled_ =
+      Runtime::runtimeFeatureEnabled("envoy.reloadable_features.web_transport") &&
+      http3_options_->web_transport_options().enabled() &&
+      LocalHttpDatagramSupport() != quic::HttpDatagramSupport::kNone;
   if (http3_options_->disable_qpack()) {
     DisableHuffmanEncoding();
     DisableCookieCrumbling();
