@@ -127,6 +127,9 @@ private:
   // onWebTransportSettingsReceived. Null when no CONNECT is waiting.
   Http::RequestHeaderMapPtr deferred_web_transport_connect_headers_;
   bool deferred_web_transport_connect_end_stream_{false};
+  // True while replaying a buffered CONNECT, so it stays a WebTransport CONNECT across a runtime
+  // guard flip.
+  bool replaying_web_transport_connect_{false};
   // Invoked once the WebTransport CONNECT has been written so the proxy can set up relaying.
   std::function<void()> web_transport_connect_ready_cb_;
 };

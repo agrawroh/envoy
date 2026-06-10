@@ -77,11 +77,14 @@ Http::Status EnvoyQuicClientStream::encodeHeaders(const Http::RequestHeaderMap& 
   }
 
   // A WebTransport extended CONNECT keeps the scheme, path and protocol pseudo-headers, and skips
-  // capsule setup because QUICHE registers itself as the stream datagram visitor.
+  // capsule setup because QUICHE registers itself as the stream datagram visitor. A replay of a
+  // buffered CONNECT stays a WebTransport CONNECT even if the runtime guard flipped meanwhile, so
+  // the pseudo-headers are not stripped.
   const bool web_transport_connect =
-      Runtime::runtimeFeatureEnabled("envoy.reloadable_features.web_transport") &&
-      headers.Protocol() != nullptr &&
-      headers.getProtocolValue() == Http::Headers::get().ProtocolValues.WebTransport;
+      replaying_web_transport_connect_ ||
+      (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.web_transport") &&
+       headers.Protocol() != nullptr &&
+       headers.getProtocolValue() == Http::Headers::get().ProtocolValues.WebTransport);
   // QUICHE only mints the session when the peer has advertised WebTransport, which is known once
   // its SETTINGS arrive. Buffer the CONNECT until then so it is not sent early and silently
   // dropped.
@@ -174,7 +177,9 @@ void EnvoyQuicClientStream::onWebTransportSettingsReceived() {
   // Replay the buffered CONNECT. encodeHeaders now sees the SETTINGS and sends it instead of
   // buffering again.
   Http::RequestHeaderMapPtr headers = std::move(deferred_web_transport_connect_headers_);
+  replaying_web_transport_connect_ = true;
   Http::Status status = encodeHeaders(*headers, deferred_web_transport_connect_end_stream_);
+  replaying_web_transport_connect_ = false;
   if (!status.ok()) {
     ENVOY_STREAM_LOG(debug, "deferred WebTransport CONNECT failed: {}.", *this, status.message());
   }
