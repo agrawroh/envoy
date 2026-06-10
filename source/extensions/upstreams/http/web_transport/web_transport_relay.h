@@ -22,15 +22,20 @@ class WebTransportStreamRelay {
 public:
   WebTransportStreamRelay(Envoy::Http::WebTransportStream& incoming,
                           Envoy::Http::WebTransportStream& mirror);
+  // Detaches the End callbacks so a stream that outlives the relay does not reach a freed End.
+  ~WebTransportStreamRelay();
 
 private:
-  // One end of the relayed stream pair. Routes the stream's events to the relay.
+  // One end of the relayed stream pair. Routes the stream's events to the relay. Its callbacks are
+  // registered on the stream for the life of the relay and detached when the relay is destroyed.
   class End : public Envoy::Http::WebTransportStreamCallbacks {
   public:
     End(WebTransportStreamRelay& relay, bool incoming) : relay_(relay), incoming_(incoming) {}
 
     // Http::WebTransportStreamCallbacks
     void onWebTransportStreamData() override { relay_.pump(incoming_); }
+    // When this stream can write again, resume the pump whose destination is this stream, which
+    // reads from the opposite direction.
     void onWebTransportStreamCanWrite() override { relay_.pump(!incoming_); }
     void onWebTransportStreamReset(uint32_t error_code) override {
       relay_.onReset(incoming_, error_code);

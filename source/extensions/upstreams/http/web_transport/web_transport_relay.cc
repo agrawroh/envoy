@@ -24,6 +24,11 @@ WebTransportStreamRelay::WebTransportStreamRelay(Envoy::Http::WebTransportStream
   pump(true);
 }
 
+WebTransportStreamRelay::~WebTransportStreamRelay() {
+  incoming_.setWebTransportStreamCallbacks(nullptr);
+  mirror_.setWebTransportStreamCallbacks(nullptr);
+}
+
 void WebTransportStreamRelay::pump(bool from_incoming) {
   Envoy::Http::WebTransportStream& source = stream(from_incoming);
   Envoy::Http::WebTransportStream& destination = stream(!from_incoming);
@@ -119,6 +124,9 @@ void WebTransportRelay::relayStream(Direction from, Envoy::Http::WebTransportStr
 }
 
 void WebTransportRelay::onSessionClosed(Direction which) {
+  // Tear down the stream relays now, while the closing session's stream adapters are still alive,
+  // so the per-stream End callbacks detach cleanly.
+  stream_relays_.clear();
   Envoy::Http::WebTransportSession*& closed = session(which);
   if (closed != nullptr) {
     // Detach so a late event cannot reach the relay after the session closes, and drop the pointer

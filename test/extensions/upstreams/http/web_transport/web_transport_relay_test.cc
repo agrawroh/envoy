@@ -226,6 +226,79 @@ TEST_F(WebTransportRelayTest, StreamRejectedWhenPeerCannotOpen) {
   EXPECT_TRUE(incoming.reset_);
 }
 
+// A unidirectional stream is mirrored and its data forwarded.
+TEST_F(WebTransportRelayTest, RelaysUnidirectionalStream) {
+  FakeWebTransportStream mirror(false);
+  upstream_.next_outgoing_ = &mirror;
+  WebTransportRelay relay(downstream_, upstream_, callbacks_);
+
+  FakeWebTransportStream incoming(false);
+  incoming.readable_ = "uni";
+  downstream_.callbacks_->onWebTransportStreamIncoming(incoming, false);
+  EXPECT_EQ("uni", mirror.written_);
+}
+
+// A bidirectional stream forwards data in the mirror to incoming direction too.
+TEST_F(WebTransportRelayTest, RelaysBidirectionalReverseDirection) {
+  FakeWebTransportStream mirror(true);
+  upstream_.next_outgoing_ = &mirror;
+  WebTransportRelay relay(downstream_, upstream_, callbacks_);
+
+  FakeWebTransportStream incoming(true);
+  downstream_.callbacks_->onWebTransportStreamIncoming(incoming, true);
+
+  mirror.readable_ = "back";
+  mirror.callbacks_->onWebTransportStreamData();
+  EXPECT_EQ("back", incoming.written_);
+}
+
+// A stop sending received on one stream is propagated to its mirror.
+TEST_F(WebTransportRelayTest, StreamStopSendingPropagated) {
+  FakeWebTransportStream mirror(true);
+  upstream_.next_outgoing_ = &mirror;
+  WebTransportRelay relay(downstream_, upstream_, callbacks_);
+
+  FakeWebTransportStream incoming(true);
+  downstream_.callbacks_->onWebTransportStreamIncoming(incoming, true);
+  incoming.callbacks_->onWebTransportStreamStopSending(9);
+  EXPECT_TRUE(mirror.stop_sending_);
+  EXPECT_EQ(9, mirror.stop_sending_code_);
+}
+
+// Data carrying the end of stream is held while the peer is blocked and the end is delivered once
+// the peer can write again.
+TEST_F(WebTransportRelayTest, StreamFinFlushesAfterBackpressure) {
+  FakeWebTransportStream mirror(true);
+  mirror.can_write_ = false;
+  upstream_.next_outgoing_ = &mirror;
+  WebTransportRelay relay(downstream_, upstream_, callbacks_);
+
+  FakeWebTransportStream incoming(true);
+  incoming.readable_ = "bye";
+  incoming.read_fin_ = true;
+  downstream_.callbacks_->onWebTransportStreamIncoming(incoming, true);
+  EXPECT_TRUE(mirror.written_.empty());
+  EXPECT_FALSE(mirror.wrote_fin_);
+
+  mirror.can_write_ = true;
+  mirror.callbacks_->onWebTransportStreamCanWrite();
+  EXPECT_EQ("bye", mirror.written_);
+  EXPECT_TRUE(mirror.wrote_fin_);
+}
+
+// A stream that ends without data forwards the end of stream to the mirror.
+TEST_F(WebTransportRelayTest, RelaysLoneFin) {
+  FakeWebTransportStream mirror(true);
+  upstream_.next_outgoing_ = &mirror;
+  WebTransportRelay relay(downstream_, upstream_, callbacks_);
+
+  FakeWebTransportStream incoming(true);
+  incoming.read_fin_ = true;
+  downstream_.callbacks_->onWebTransportStreamIncoming(incoming, true);
+  EXPECT_TRUE(mirror.written_.empty());
+  EXPECT_TRUE(mirror.wrote_fin_);
+}
+
 } // namespace
 } // namespace WebTransport
 } // namespace Http
