@@ -25,6 +25,8 @@ public:
     callbacks_ = callbacks;
   }
   void sendWebTransportDatagram(absl::string_view) override {}
+  bool canOpenWebTransportStream(bool) const override { return false; }
+  Envoy::Http::WebTransportStream* openWebTransportStream(bool) override { return nullptr; }
 
   bool limit_exceeded_{false};
   Envoy::Http::WebTransportSessionCallbacks* callbacks_{nullptr};

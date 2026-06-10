@@ -1,5 +1,9 @@
 #pragma once
 
+#include <memory>
+#include <string>
+#include <vector>
+
 #include "envoy/http/web_transport.h"
 
 #include "source/common/common/logger.h"
@@ -10,11 +14,63 @@ namespace Upstreams {
 namespace Http {
 namespace WebTransport {
 
-// Relays datagrams between a downstream WebTransport session and an upstream one. The relay
-// registers on both sessions and forwards each received datagram to the peer. When a session
-// closes the relay detaches from it and stops forwarding, then notifies the owner once so the
-// owner can tear the proxied flow down. The relay also detaches from any still open session on
-// destruction, so no session is ever left holding a callback into a freed relay.
+// Relays one WebTransport data stream onto a mirror stream on the peer session, in both directions
+// for a bidirectional stream. Reads are gated on the peer being writable, so a slow peer applies
+// backpressure to the source. A stream that closes resolves to a no-op in the session, so the relay
+// holds the pair for the life of the session relay.
+class WebTransportStreamRelay {
+public:
+  WebTransportStreamRelay(Envoy::Http::WebTransportStream& incoming,
+                          Envoy::Http::WebTransportStream& mirror);
+
+private:
+  // One end of the relayed stream pair. Routes the stream's events to the relay.
+  class End : public Envoy::Http::WebTransportStreamCallbacks {
+  public:
+    End(WebTransportStreamRelay& relay, bool incoming) : relay_(relay), incoming_(incoming) {}
+
+    // Http::WebTransportStreamCallbacks
+    void onWebTransportStreamData() override { relay_.pump(incoming_); }
+    void onWebTransportStreamCanWrite() override { relay_.pump(!incoming_); }
+    void onWebTransportStreamReset(uint32_t error_code) override {
+      relay_.onReset(incoming_, error_code);
+    }
+    void onWebTransportStreamStopSending(uint32_t error_code) override {
+      relay_.onStopSending(incoming_, error_code);
+    }
+
+  private:
+    WebTransportStreamRelay& relay_;
+    const bool incoming_;
+  };
+
+  // Moves readable bytes from the source stream to the peer, holding bytes a blocked peer cannot
+  // accept yet. from_incoming selects the source direction.
+  void pump(bool from_incoming);
+  void onReset(bool on_incoming, uint32_t error_code);
+  void onStopSending(bool on_incoming, uint32_t error_code);
+  Envoy::Http::WebTransportStream& stream(bool incoming) { return incoming ? incoming_ : mirror_; }
+
+  Envoy::Http::WebTransportStream& incoming_;
+  Envoy::Http::WebTransportStream& mirror_;
+  End incoming_end_;
+  End mirror_end_;
+  // Bytes read from one side that the other side could not accept yet, flushed on the next write
+  // opportunity. Indexed by source direction.
+  std::string incoming_pending_;
+  std::string mirror_pending_;
+  bool incoming_pending_fin_{false};
+  bool mirror_pending_fin_{false};
+  bool incoming_done_{false};
+  bool mirror_done_{false};
+};
+
+// Relays datagrams and data streams between a downstream WebTransport session and an upstream one.
+// The relay registers on both sessions and forwards each received datagram to the peer and mirrors
+// each opened stream onto the peer. When a session closes the relay detaches from it and stops
+// forwarding, then notifies the owner once so the owner can tear the proxied flow down. The relay
+// also detaches from any still open session on destruction, so no session is ever left holding a
+// callback into a freed relay.
 class WebTransportRelay : protected Logger::Loggable<Logger::Id::upstream> {
 public:
   // Notified once when either session closes.
@@ -42,6 +98,11 @@ private:
       relay_.forwardDatagram(direction_, datagram);
     }
     void onWebTransportSessionClosed() override { relay_.onSessionClosed(direction_); }
+    void onWebTransportStreamIncoming(Envoy::Http::WebTransportStream& stream,
+                                      bool bidirectional) override {
+      relay_.relayStream(direction_, stream, bidirectional);
+    }
+    void onCanCreateWebTransportStream(bool) override {}
 
   private:
     WebTransportRelay& relay_;
@@ -50,6 +111,7 @@ private:
 
   void forwardDatagram(Direction from, absl::string_view datagram);
   void onSessionClosed(Direction which);
+  void relayStream(Direction from, Envoy::Http::WebTransportStream& incoming, bool bidirectional);
   Envoy::Http::WebTransportSession*& session(Direction direction) {
     return direction == Direction::Downstream ? downstream_ : upstream_;
   }
@@ -61,6 +123,7 @@ private:
   // session.
   Envoy::Http::WebTransportSession* downstream_;
   Envoy::Http::WebTransportSession* upstream_;
+  std::vector<std::unique_ptr<WebTransportStreamRelay>> stream_relays_;
   bool notified_{false};
 };
 

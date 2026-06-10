@@ -48,6 +48,15 @@ void EnvoyQuicWebTransportSession::sendWebTransportDatagram(absl::string_view da
   session_->SendOrQueueDatagram(datagram);
 }
 
+bool EnvoyQuicWebTransportSession::canOpenWebTransportStream(bool bidirectional) const {
+  return bidirectional ? session_->CanOpenNextOutgoingBidirectionalStream()
+                       : session_->CanOpenNextOutgoingUnidirectionalStream();
+}
+
+Http::WebTransportStream* EnvoyQuicWebTransportSession::openWebTransportStream(bool bidirectional) {
+  return openTrackedWebTransportStream(*session_, streams_, bidirectional);
+}
+
 void EnvoyQuicWebTransportSession::releaseActiveGauge() {
   if (active_gauge_held_) {
     stats_.sessions_active_.dec();
@@ -82,6 +91,32 @@ void EnvoyQuicWebTransportSession::Visitor::OnDatagramReceived(absl::string_view
   bridge_->stats_.datagrams_rx_.inc();
   if (bridge_->callbacks_ != nullptr) {
     bridge_->callbacks_->onWebTransportDatagram(datagram);
+  }
+}
+
+void EnvoyQuicWebTransportSession::Visitor::OnIncomingBidirectionalStreamAvailable() {
+  if (bridge_ != nullptr && bridge_->callbacks_ != nullptr) {
+    acceptIncomingWebTransportStreams(*bridge_->session_, bridge_->streams_, *bridge_->callbacks_,
+                                      true);
+  }
+}
+
+void EnvoyQuicWebTransportSession::Visitor::OnIncomingUnidirectionalStreamAvailable() {
+  if (bridge_ != nullptr && bridge_->callbacks_ != nullptr) {
+    acceptIncomingWebTransportStreams(*bridge_->session_, bridge_->streams_, *bridge_->callbacks_,
+                                      false);
+  }
+}
+
+void EnvoyQuicWebTransportSession::Visitor::OnCanCreateNewOutgoingBidirectionalStream() {
+  if (bridge_ != nullptr && bridge_->callbacks_ != nullptr) {
+    bridge_->callbacks_->onCanCreateWebTransportStream(true);
+  }
+}
+
+void EnvoyQuicWebTransportSession::Visitor::OnCanCreateNewOutgoingUnidirectionalStream() {
+  if (bridge_ != nullptr && bridge_->callbacks_ != nullptr) {
+    bridge_->callbacks_->onCanCreateWebTransportStream(false);
   }
 }
 

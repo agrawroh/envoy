@@ -59,5 +59,41 @@ void EnvoyQuicClientWebTransportSession::Visitor::OnDatagramReceived(absl::strin
   }
 }
 
+void EnvoyQuicClientWebTransportSession::Visitor::OnIncomingBidirectionalStreamAvailable() {
+  if (bridge_ != nullptr && bridge_->callbacks_ != nullptr) {
+    acceptIncomingWebTransportStreams(*bridge_->session_, bridge_->streams_, *bridge_->callbacks_,
+                                      true);
+  }
+}
+
+void EnvoyQuicClientWebTransportSession::Visitor::OnIncomingUnidirectionalStreamAvailable() {
+  if (bridge_ != nullptr && bridge_->callbacks_ != nullptr) {
+    acceptIncomingWebTransportStreams(*bridge_->session_, bridge_->streams_, *bridge_->callbacks_,
+                                      false);
+  }
+}
+
+void EnvoyQuicClientWebTransportSession::Visitor::OnCanCreateNewOutgoingBidirectionalStream() {
+  if (bridge_ != nullptr && bridge_->callbacks_ != nullptr) {
+    bridge_->callbacks_->onCanCreateWebTransportStream(true);
+  }
+}
+
+void EnvoyQuicClientWebTransportSession::Visitor::OnCanCreateNewOutgoingUnidirectionalStream() {
+  if (bridge_ != nullptr && bridge_->callbacks_ != nullptr) {
+    bridge_->callbacks_->onCanCreateWebTransportStream(false);
+  }
+}
+
+bool EnvoyQuicClientWebTransportSession::canOpenWebTransportStream(bool bidirectional) const {
+  return bidirectional ? session_->CanOpenNextOutgoingBidirectionalStream()
+                       : session_->CanOpenNextOutgoingUnidirectionalStream();
+}
+
+Http::WebTransportStream*
+EnvoyQuicClientWebTransportSession::openWebTransportStream(bool bidirectional) {
+  return openTrackedWebTransportStream(*session_, streams_, bidirectional);
+}
+
 } // namespace Quic
 } // namespace Envoy

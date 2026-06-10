@@ -23,6 +23,8 @@ public:
   MOCK_METHOD(void, setWebTransportSessionCallbacks, (Http::WebTransportSessionCallbacks*),
               (override));
   MOCK_METHOD(void, sendWebTransportDatagram, (absl::string_view), (override));
+  MOCK_METHOD(bool, canOpenWebTransportStream, (bool), (const, override));
+  MOCK_METHOD(Http::WebTransportStream*, openWebTransportStream, (bool), (override));
 };
 
 class WebTransportFilterTest : public testing::Test {

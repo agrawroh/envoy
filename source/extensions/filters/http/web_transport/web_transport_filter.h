@@ -26,6 +26,9 @@ public:
   void onWebTransportSessionReady() override {}
   void onWebTransportDatagram(absl::string_view datagram) override;
   void onWebTransportSessionClosed() override;
+  // This reference handler echoes datagrams only and does not relay data streams.
+  void onWebTransportStreamIncoming(Http::WebTransportStream&, bool) override {}
+  void onCanCreateWebTransportStream(bool) override {}
 
 private:
   Http::WebTransportSession* session_{nullptr};

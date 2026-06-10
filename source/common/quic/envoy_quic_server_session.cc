@@ -120,6 +120,12 @@ quic::QuicSpdyStream* EnvoyQuicServerSession::CreateIncomingStream(quic::QuicStr
 }
 
 quic::QuicSpdyStream* EnvoyQuicServerSession::CreateOutgoingBidirectionalStream() {
+  // WebTransport may try to open a server initiated stream to mirror an upstream one. Envoy does
+  // not create server initiated WebTransport streams yet, so report failure rather than crash, and
+  // the relay resets the unmirrored stream. Other server initiated streams remain disallowed.
+  if (web_transport_enabled_) {
+    return nullptr;
+  }
   IS_ENVOY_BUG("Unexpected disallowed server initiated stream");
   return nullptr;
 }

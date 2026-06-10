@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -13,9 +14,59 @@ namespace Http {
 namespace WebTransport {
 namespace {
 
+// A WebTransport stream that serves queued readable bytes, records writes, and gates writes on a
+// settable flag so a test can drive backpressure.
+class FakeWebTransportStream : public Envoy::Http::WebTransportStream {
+public:
+  explicit FakeWebTransportStream(bool bidirectional) : bidirectional_(bidirectional) {}
+
+  bool bidirectional() const override { return bidirectional_; }
+  void
+  setWebTransportStreamCallbacks(Envoy::Http::WebTransportStreamCallbacks* callbacks) override {
+    callbacks_ = callbacks;
+  }
+  Envoy::Http::WebTransportStreamReadResult
+  readWebTransportStream(absl::Span<char> buffer) override {
+    const size_t count = std::min(buffer.size(), readable_.size());
+    std::copy_n(readable_.begin(), count, buffer.begin());
+    readable_.erase(0, count);
+    const bool end = readable_.empty() && read_fin_;
+    return {count, end};
+  }
+  bool writeWebTransportStream(absl::string_view data, bool end_stream) override {
+    if (!can_write_) {
+      return false;
+    }
+    written_.append(data.data(), data.size());
+    wrote_fin_ = wrote_fin_ || end_stream;
+    return true;
+  }
+  bool canWriteWebTransportStream() const override { return can_write_; }
+  void resetWebTransportStream(uint32_t error_code) override {
+    reset_ = true;
+    reset_code_ = error_code;
+  }
+  void stopSendingWebTransportStream(uint32_t error_code) override {
+    stop_sending_ = true;
+    stop_sending_code_ = error_code;
+  }
+
+  const bool bidirectional_;
+  Envoy::Http::WebTransportStreamCallbacks* callbacks_{nullptr};
+  std::string readable_;
+  bool read_fin_{false};
+  bool can_write_{true};
+  std::string written_;
+  bool wrote_fin_{false};
+  bool reset_{false};
+  uint32_t reset_code_{0};
+  bool stop_sending_{false};
+  uint32_t stop_sending_code_{0};
+};
+
 // A WebTransport session that records sent datagrams and exposes the registered callbacks so a
-// test can drive received datagrams and close events. When notify_on_destroy_ is set the
-// destructor notifies its consumer, mimicking the session bridge teardown.
+// test can drive received datagrams, opened streams and close events. When notify_on_destroy_ is
+// set the destructor notifies its consumer, mimicking the session bridge teardown.
 class FakeWebTransportSession : public Envoy::Http::WebTransportSession {
 public:
   ~FakeWebTransportSession() override {
@@ -31,10 +82,14 @@ public:
   void sendWebTransportDatagram(absl::string_view datagram) override {
     sent_.emplace_back(datagram);
   }
+  bool canOpenWebTransportStream(bool) const override { return can_open_; }
+  Envoy::Http::WebTransportStream* openWebTransportStream(bool) override { return next_outgoing_; }
 
   Envoy::Http::WebTransportSessionCallbacks* callbacks_{nullptr};
   std::vector<std::string> sent_;
   bool notify_on_destroy_{false};
+  bool can_open_{true};
+  Envoy::Http::WebTransportStream* next_outgoing_{nullptr};
 };
 
 // Counts relay close notifications.
@@ -114,10 +169,61 @@ TEST_F(WebTransportRelayTest, SurvivesSessionDestroyedFirst) {
 
   downstream.reset();
   EXPECT_EQ(1, callbacks_.closed_count_);
-
-  // A datagram from the still open upstream is not forwarded to the freed session.
   upstream_.callbacks_->onWebTransportDatagram("pong");
-  // The relay still detaches cleanly from the open upstream on destruction.
+}
+
+// An incoming stream is mirrored onto the peer session and its data is forwarded.
+TEST_F(WebTransportRelayTest, MirrorsStreamAndForwardsData) {
+  FakeWebTransportStream mirror(true);
+  upstream_.next_outgoing_ = &mirror;
+  WebTransportRelay relay(downstream_, upstream_, callbacks_);
+
+  FakeWebTransportStream incoming(true);
+  incoming.readable_ = "hello";
+  downstream_.callbacks_->onWebTransportStreamIncoming(incoming, true);
+
+  EXPECT_NE(nullptr, incoming.callbacks_);
+  EXPECT_EQ("hello", mirror.written_);
+}
+
+// A blocked peer applies backpressure, and the held bytes flush once it can write again.
+TEST_F(WebTransportRelayTest, StreamBackpressureHoldsThenFlushes) {
+  FakeWebTransportStream mirror(true);
+  mirror.can_write_ = false;
+  upstream_.next_outgoing_ = &mirror;
+  WebTransportRelay relay(downstream_, upstream_, callbacks_);
+
+  FakeWebTransportStream incoming(true);
+  incoming.readable_ = "hello";
+  downstream_.callbacks_->onWebTransportStreamIncoming(incoming, true);
+  EXPECT_TRUE(mirror.written_.empty());
+
+  mirror.can_write_ = true;
+  mirror.callbacks_->onWebTransportStreamCanWrite();
+  EXPECT_EQ("hello", mirror.written_);
+}
+
+// A reset received on one stream is propagated to its mirror.
+TEST_F(WebTransportRelayTest, StreamResetPropagated) {
+  FakeWebTransportStream mirror(true);
+  upstream_.next_outgoing_ = &mirror;
+  WebTransportRelay relay(downstream_, upstream_, callbacks_);
+
+  FakeWebTransportStream incoming(true);
+  downstream_.callbacks_->onWebTransportStreamIncoming(incoming, true);
+  incoming.callbacks_->onWebTransportStreamReset(7);
+  EXPECT_TRUE(mirror.reset_);
+  EXPECT_EQ(7, mirror.reset_code_);
+}
+
+// When the peer session cannot open a mirror the incoming stream is reset rather than relayed.
+TEST_F(WebTransportRelayTest, StreamRejectedWhenPeerCannotOpen) {
+  upstream_.can_open_ = false;
+  WebTransportRelay relay(downstream_, upstream_, callbacks_);
+
+  FakeWebTransportStream incoming(true);
+  downstream_.callbacks_->onWebTransportStreamIncoming(incoming, true);
+  EXPECT_TRUE(incoming.reset_);
 }
 
 } // namespace

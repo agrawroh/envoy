@@ -3,6 +3,7 @@
 #include "envoy/http/web_transport.h"
 
 #include "source/common/common/logger.h"
+#include "source/common/quic/envoy_quic_web_transport_stream.h"
 
 #include "quiche/quic/core/http/web_transport_http3.h"
 
@@ -29,6 +30,8 @@ public:
     callbacks_ = callbacks;
   }
   void sendWebTransportDatagram(absl::string_view datagram) override;
+  bool canOpenWebTransportStream(bool bidirectional) const override;
+  Http::WebTransportStream* openWebTransportStream(bool bidirectional) override;
 
 private:
   // QUICHE session visitor. The QUICHE session owns it and outlives the bridge, so it holds a back
@@ -42,11 +45,11 @@ private:
     void OnSessionReady() override;
     void OnSessionClosed(webtransport::SessionErrorCode error_code,
                          const std::string& error_message) override;
-    void OnIncomingBidirectionalStreamAvailable() override {}
-    void OnIncomingUnidirectionalStreamAvailable() override {}
+    void OnIncomingBidirectionalStreamAvailable() override;
+    void OnIncomingUnidirectionalStreamAvailable() override;
     void OnDatagramReceived(absl::string_view datagram) override;
-    void OnCanCreateNewOutgoingBidirectionalStream() override {}
-    void OnCanCreateNewOutgoingUnidirectionalStream() override {}
+    void OnCanCreateNewOutgoingBidirectionalStream() override;
+    void OnCanCreateNewOutgoingUnidirectionalStream() override;
 
   private:
     EnvoyQuicClientWebTransportSession* bridge_;
@@ -55,6 +58,7 @@ private:
   quic::WebTransportHttp3* session_;
   Http::WebTransportSessionCallbacks* callbacks_{nullptr};
   Visitor* visitor_{nullptr};
+  WebTransportStreamList streams_;
   bool closed_{false};
 };
 

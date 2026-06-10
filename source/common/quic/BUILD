@@ -306,6 +306,7 @@ envoy_cc_library(
     srcs = envoy_select_enable_http3(["envoy_quic_web_transport_session.cc"]),
     hdrs = envoy_select_enable_http3(["envoy_quic_web_transport_session.h"]),
     deps = envoy_select_enable_http3([
+        ":envoy_quic_web_transport_stream_lib",
         ":web_transport_stats_lib",
         "//envoy/http:web_transport_interface",
         "//source/common/common:assert_lib",
@@ -317,10 +318,24 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "envoy_quic_web_transport_stream_lib",
+    srcs = envoy_select_enable_http3(["envoy_quic_web_transport_stream.cc"]),
+    hdrs = envoy_select_enable_http3(["envoy_quic_web_transport_stream.h"]),
+    deps = envoy_select_enable_http3([
+        "//envoy/http:web_transport_interface",
+        "@quiche//:quic_core_web_transport_interface_lib",
+        "@quiche//:quiche_common_mem_slice",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/types:span",
+    ]),
+)
+
+envoy_cc_library(
     name = "envoy_quic_client_web_transport_session_lib",
     srcs = envoy_select_enable_http3(["envoy_quic_client_web_transport_session.cc"]),
     hdrs = envoy_select_enable_http3(["envoy_quic_client_web_transport_session.h"]),
     deps = envoy_select_enable_http3([
+        ":envoy_quic_web_transport_stream_lib",
         "//envoy/http:web_transport_interface",
         "//source/common/common:logger_lib",
         "@quiche//:quic_core_http_spdy_session_lib",
