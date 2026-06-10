@@ -1300,6 +1300,19 @@ TEST_F(EnvoyQuicServerSessionTest, WebTransportConfiguredSessionLimit) {
   EXPECT_TRUE(envoy_quic_session_.webTransportSessionLimitReached());
 }
 
+// A new WebTransport session is refused when the accept load shed point is shedding load.
+TEST_F(EnvoyQuicServerSessionTest, WebTransportSheddingLoad) {
+  installReadFilter();
+  EXPECT_FALSE(envoy_quic_session_.webTransportSheddingLoad());
+
+  NiceMock<Server::MockLoadShedPoint> shed_point;
+  envoy_quic_session_.setWebTransportAcceptLoadShedPoint(&shed_point);
+  EXPECT_CALL(shed_point, shouldShedLoad()).WillOnce(testing::Return(true));
+  EXPECT_TRUE(envoy_quic_session_.webTransportSheddingLoad());
+  EXPECT_CALL(shed_point, shouldShedLoad()).WillOnce(testing::Return(false));
+  EXPECT_FALSE(envoy_quic_session_.webTransportSheddingLoad());
+}
+
 // An incoming WebTransport unidirectional stream is a QUICHE-internal stream, not an
 // EnvoyQuicStream. The connection watermark callbacks must skip it instead of dereferencing a null
 // cast result.

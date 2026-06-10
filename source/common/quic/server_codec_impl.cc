@@ -34,6 +34,8 @@ QuicHttpServerConnectionImpl::QuicHttpServerConnectionImpl(
       overload_manager.getLoadShedPoint(
           Server::LoadShedPointName::get().H3ServerGoAwayAndCloseOnDispatch),
       overload_manager.getLoadShedPoint(Server::LoadShedPointName::get().H3ServerGoAwayOnDispatch));
+  quic_session.setWebTransportAcceptLoadShedPoint(overload_manager.getLoadShedPoint(
+      Server::LoadShedPointName::get().WebTransportAcceptSession));
 }
 
 void QuicHttpServerConnectionImpl::onUnderlyingConnectionAboveWriteBufferHighWatermark() {

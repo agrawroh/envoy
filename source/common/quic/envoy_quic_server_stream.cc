@@ -133,8 +133,10 @@ OptRef<Http::WebTransportSession> EnvoyQuicServerStream::webTransport() {
   }
   if (web_transport_session_ == nullptr) {
     auto& connection = *static_cast<EnvoyQuicServerSession*>(session());
-    const bool session_limit_exceeded = connection.webTransportSessionLimitReached();
-    if (session_limit_exceeded) {
+    // Refuse the session when over the per-connection cap or when the connection is shedding load.
+    const bool rejected =
+        connection.webTransportSessionLimitReached() || connection.webTransportSheddingLoad();
+    if (rejected) {
       connection.webTransportStats().sessions_rejected_.inc();
     } else {
       // Reserve a slot against the per-connection cap now, in lockstep with the limit check, and
@@ -143,7 +145,7 @@ OptRef<Http::WebTransportSession> EnvoyQuicServerStream::webTransport() {
       web_transport_session_reserved_ = true;
     }
     web_transport_session_ = std::make_unique<EnvoyQuicWebTransportSession>(
-        web_transport(), connection.webTransportStats(), session_limit_exceeded);
+        web_transport(), connection.webTransportStats(), rejected);
   }
   return *web_transport_session_;
 }

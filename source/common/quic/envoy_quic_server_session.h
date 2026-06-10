@@ -93,6 +93,16 @@ public:
     should_send_go_away_on_dispatch_ = should_send_go_away_on_dispatch;
   }
 
+  void setWebTransportAcceptLoadShedPoint(Server::LoadShedPoint* web_transport_accept) {
+    web_transport_accept_load_shed_point_ = web_transport_accept;
+  }
+
+  // Whether the connection is shedding load, so a new WebTransport session should be refused.
+  bool webTransportSheddingLoad() {
+    return web_transport_accept_load_shed_point_ != nullptr &&
+           web_transport_accept_load_shed_point_->shouldShedLoad();
+  }
+
   // quic::QuicSession
   void OnConnectionClosed(const quic::QuicConnectionCloseFrame& frame,
                           quic::ConnectionCloseSource source) override;
@@ -205,6 +215,7 @@ private:
   // Load shed points for H3 GoAway
   Server::LoadShedPoint* should_send_go_away_and_close_on_dispatch_ = nullptr;
   Server::LoadShedPoint* should_send_go_away_on_dispatch_ = nullptr;
+  Server::LoadShedPoint* web_transport_accept_load_shed_point_ = nullptr;
   Http::SessionIdleListInterface* session_idle_list_;
   bool h3_go_away_sent_ = false;
   bool on_connection_closed_called_ = false;
