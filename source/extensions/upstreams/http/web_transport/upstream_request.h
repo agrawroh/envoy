@@ -127,6 +127,14 @@ private:
   // the relay while it is on the stack. Owned here so it is cancelled if this upstream is destroyed
   // first.
   Event::SchedulableCallbackPtr teardown_callback_;
+  // True while encodeHeaders runs, so a synchronous rejection is returned as an error there rather
+  // than as a deferred reset.
+  bool encoding_headers_{false};
+  // Set when the relay is refused, carried into the encodeHeaders error or the reset details.
+  absl::optional<std::string> reject_reason_;
+  // Reason and details for the deferred reset, defaulting to the relay close case.
+  Envoy::Http::StreamResetReason teardown_reason_{Envoy::Http::StreamResetReason::RemoteReset};
+  std::string teardown_details_;
 };
 
 } // namespace WebTransport

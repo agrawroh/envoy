@@ -24,9 +24,8 @@ WebTransportUpstream::WebTransportUpstream(Router::UpstreamToDownstream& upstrea
   // The downstream connection drives both sides of the relay, so reset on its dispatcher.
   OptRef<const Network::Connection> connection = upstream_request_.connection();
   if (connection.has_value()) {
-    teardown_callback_ = connection->dispatcher().createSchedulableCallback([this]() {
-      upstream_request_.onResetStream(Envoy::Http::StreamResetReason::RemoteReset, "");
-    });
+    teardown_callback_ = connection->dispatcher().createSchedulableCallback(
+        [this]() { upstream_request_.onResetStream(teardown_reason_, teardown_details_); });
   }
 }
 
@@ -89,7 +88,18 @@ WebTransportUpstream::encodeHeaders(const Envoy::Http::RequestHeaderMap& headers
   // from the ready callback rather than inline. The callback fires once the CONNECT is written and
   // webTransport() is definitive.
   request_encoder_->setWebTransportConnectReadyCallback([this]() { setupRelay(); });
-  return request_encoder_->encodeHeaders(headers, end_stream);
+  encoding_headers_ = true;
+  Envoy::Http::Status status = request_encoder_->encodeHeaders(headers, end_stream);
+  encoding_headers_ = false;
+  if (!status.ok()) {
+    return status;
+  }
+  // When the upstream SETTINGS were already in, the relay was set up or rejected inline. Surface a
+  // rejection as a local error response rather than a stream reset.
+  if (reject_reason_.has_value()) {
+    return absl::InternalError(*reject_reason_);
+  }
+  return Envoy::Http::okStatus();
 }
 
 void WebTransportUpstream::setupRelay() {
@@ -100,8 +110,16 @@ void WebTransportUpstream::setupRelay() {
   if (!upstream_session.has_value() || !downstream_session.has_value() ||
       downstream_session->sessionLimitExceeded()) {
     stats_.sessions_rejected_.inc();
-    // Defer the reset so this never re-enters the encoder from inside its own ready callback.
-    if (teardown_callback_ != nullptr) {
+    reject_reason_ = !upstream_session.has_value() ? "upstream did not negotiate WebTransport"
+                     : !downstream_session.has_value()
+                         ? "no downstream WebTransport session"
+                         : "downstream WebTransport session limit exceeded";
+    // A CONNECT sent inline is rejected by encodeHeaders above. A deferred CONNECT has already
+    // returned, so reset the stream with the same reason. A missing teardown callback means there
+    // is no connection to reset on, which does not happen for a proxied request.
+    if (!encoding_headers_ && teardown_callback_ != nullptr) {
+      teardown_reason_ = Envoy::Http::StreamResetReason::LocalReset;
+      teardown_details_ = *reject_reason_;
       teardown_callback_->scheduleCallbackNextIteration();
     }
     return;

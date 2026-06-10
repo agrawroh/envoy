@@ -35,7 +35,7 @@ public:
 
 // A request encoder whose WebTransport session is controllable by the test. By default it fires the
 // ready callback inline from encodeHeaders, mirroring an upstream that already advertised
-// WebTransport; set auto_fire_ready_ to false to model a CONNECT deferred until SETTINGS arrive.
+// WebTransport. Set auto_fire_ready_ to false to model a CONNECT deferred until SETTINGS arrive.
 class FakeRequestEncoder : public Envoy::Http::MockRequestEncoder {
 public:
   OptRef<Envoy::Http::WebTransportSession> webTransport() override { return session_; }
@@ -125,12 +125,13 @@ TEST_F(WebTransportUpstreamTest, EncodeHeadersDeferredUntilReady) {
   EXPECT_EQ(1, gauge("sessions_active"));
 }
 
-// Without an upstream session the upstream did not negotiate WebTransport, so the relay is refused.
+// Without an upstream session the upstream did not negotiate WebTransport, so an inline CONNECT is
+// refused with an error response.
 TEST_F(WebTransportUpstreamTest, EncodeHeadersWithoutUpstreamSessionFails) {
   upstream_to_downstream_.session_ = downstream_session_;
   WebTransportUpstream upstream(upstream_to_downstream_, &encoder_, *store_.rootScope());
 
-  EXPECT_TRUE(upstream.encodeHeaders(connectHeaders(), false).ok());
+  EXPECT_FALSE(upstream.encodeHeaders(connectHeaders(), false).ok());
   EXPECT_EQ(nullptr, downstream_session_.callbacks_);
   EXPECT_EQ(1, counter("sessions_rejected"));
 }
@@ -140,7 +141,7 @@ TEST_F(WebTransportUpstreamTest, EncodeHeadersWithoutDownstreamSessionFails) {
   encoder_.session_ = upstream_session_;
   WebTransportUpstream upstream(upstream_to_downstream_, &encoder_, *store_.rootScope());
 
-  EXPECT_TRUE(upstream.encodeHeaders(connectHeaders(), false).ok());
+  EXPECT_FALSE(upstream.encodeHeaders(connectHeaders(), false).ok());
   EXPECT_EQ(nullptr, upstream_session_.callbacks_);
   EXPECT_EQ(1, counter("sessions_rejected"));
 }
@@ -152,7 +153,22 @@ TEST_F(WebTransportUpstreamTest, EncodeHeadersOverDownstreamLimitFails) {
   upstream_to_downstream_.session_ = downstream_session_;
   WebTransportUpstream upstream(upstream_to_downstream_, &encoder_, *store_.rootScope());
 
+  EXPECT_FALSE(upstream.encodeHeaders(connectHeaders(), false).ok());
+  EXPECT_EQ(nullptr, downstream_session_.callbacks_);
+  EXPECT_EQ(1, counter("sessions_rejected"));
+}
+
+// A CONNECT deferred until SETTINGS that the upstream then declines is refused once the ready
+// callback fires.
+TEST_F(WebTransportUpstreamTest, DeferredConnectWithoutUpstreamSessionFails) {
+  upstream_to_downstream_.session_ = downstream_session_;
+  encoder_.auto_fire_ready_ = false;
+  WebTransportUpstream upstream(upstream_to_downstream_, &encoder_, *store_.rootScope());
+
   EXPECT_TRUE(upstream.encodeHeaders(connectHeaders(), false).ok());
+  EXPECT_EQ(0, counter("sessions_rejected"));
+
+  encoder_.fireReady();
   EXPECT_EQ(nullptr, downstream_session_.callbacks_);
   EXPECT_EQ(1, counter("sessions_rejected"));
 }
