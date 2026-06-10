@@ -40,6 +40,8 @@ using OnTransportSocketCanFlushCloseType =
     decltype(&envoy_dynamic_module_on_transport_socket_can_flush_close);
 using OnTransportSocketStartSecureTransportType =
     decltype(&envoy_dynamic_module_on_transport_socket_start_secure_transport);
+using OnTransportSocketKtlsStateType =
+    decltype(&envoy_dynamic_module_on_transport_socket_ktls_state);
 
 /**
  * Configuration holding the resolved dynamic module, ABI function pointers, and the in-module
@@ -49,7 +51,7 @@ using OnTransportSocketStartSecureTransportType =
 class DynamicModuleTransportSocketConfig {
 public:
   DynamicModuleTransportSocketConfig(
-      bool implements_secure_transport,
+      bool implements_secure_transport, bool is_upstream,
       Envoy::Extensions::DynamicModules::DynamicModulePtr dynamic_module);
 
   ~DynamicModuleTransportSocketConfig();
@@ -70,11 +72,16 @@ public:
   OnTransportSocketGetFailureReasonType on_get_failure_reason_ = nullptr;
   OnTransportSocketCanFlushCloseType on_can_flush_close_ = nullptr;
   OnTransportSocketStartSecureTransportType on_start_secure_transport_ = nullptr;
+  // Optional. Only modules that offer kernel TLS (e.g. rustls with kTLS offload) export this. It
+  // stays null for modules that do not, in which case the socket reports no kTLS bytestream.
+  OnTransportSocketKtlsStateType on_ktls_state_ = nullptr;
 
   bool implementsSecureTransport() const { return implements_secure_transport_; }
+  bool isUpstream() const { return is_upstream_; }
 
 private:
   const bool implements_secure_transport_;
+  const bool is_upstream_;
   Envoy::Extensions::DynamicModules::DynamicModulePtr dynamic_module_;
 };
 
@@ -112,6 +119,10 @@ public:
   void onConnected() override;
   Ssl::ConnectionInfoConstSharedPtr ssl() const override { return nullptr; }
   bool startSecureTransport() override;
+  // Reports kernel TLS install state and the raw fd so a higher layer (e.g. the tcp_proxy splice
+  // fast path) can splice() directly on the kTLS socket. Modules that do not export the kTLS-state
+  // hook leave the base behavior (an empty OptRef, meaning no kTLS bytestream).
+  OptRef<const Network::KtlsBytestreamInfo> ktlsBytestreamInfo() const override;
   void configureInitialCongestionWindow(uint64_t, std::chrono::microseconds) override {}
 
   // Accessors for the ABI callbacks. These are only valid on the connection's worker thread.
@@ -129,6 +140,8 @@ private:
   Buffer::Instance* current_write_buffer_ = nullptr;
   // Backing store for the string view returned by failureReason.
   mutable std::string failure_reason_;
+  // Backing store for the OptRef returned by ktlsBytestreamInfo (refreshed per call).
+  mutable Network::KtlsBytestreamInfo ktls_info_storage_;
 };
 
 /**

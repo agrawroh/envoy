@@ -15,7 +15,6 @@ envoy_cc_library(
     hdrs = ["rustls_impl.h"],
     deps = [
         "//envoy/buffer:buffer_interface",
-        "//envoy/network:io_handle_interface",
         "//envoy/network:transport_socket_interface",
         "//envoy/registry",
         "//envoy/server:transport_socket_config_interface",
@@ -25,7 +24,7 @@ envoy_cc_library(
         "//source/common/network:transport_socket_options_lib",
         "//source/common/protobuf:utility_lib",
         "//source/extensions/dynamic_modules:dynamic_modules_lib",
-        "//source/extensions/dynamic_modules/abi",
+        "//source/extensions/transport_sockets/dynamic_modules:transport_socket_lib",
         "@envoy_api//envoy/extensions/transport_sockets/rustls/v3:pkg_cc_proto",
     ],
 )
@@ -34,6 +33,10 @@ envoy_cc_extension(
     name = "config",
     deps = [
         ":rustls_lib",
+        # The shared dynamic-module transport socket ABI callbacks (alwayslink). The rustls socket
+        # reuses these strong definitions rather than providing its own, so they are linked exactly
+        # once even when envoy.transport_sockets.dynamic_modules is also in the build.
+        "//source/extensions/transport_sockets/dynamic_modules:abi_impl",
         "//source/extensions/transport_sockets/rustls/rust:rustls_ktls_static",
     ],
 )

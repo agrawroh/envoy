@@ -36,9 +36,9 @@ toPostIoAction(envoy_dynamic_module_type_transport_socket_post_io_action action)
 } // namespace
 
 DynamicModuleTransportSocketConfig::DynamicModuleTransportSocketConfig(
-    bool implements_secure_transport,
+    bool implements_secure_transport, bool is_upstream,
     Envoy::Extensions::DynamicModules::DynamicModulePtr dynamic_module)
-    : implements_secure_transport_(implements_secure_transport),
+    : implements_secure_transport_(implements_secure_transport), is_upstream_(is_upstream),
       dynamic_module_(std::move(dynamic_module)) {}
 
 DynamicModuleTransportSocketConfig::~DynamicModuleTransportSocketConfig() {
@@ -108,8 +108,13 @@ absl::StatusOr<DynamicModuleTransportSocketConfigSharedPtr> newDynamicModuleTran
           "envoy_dynamic_module_on_transport_socket_start_secure_transport");
   RETURN_IF_NOT_OK_REF(on_start_secure_transport.status());
 
-  auto config = std::make_shared<DynamicModuleTransportSocketConfig>(implements_secure_transport,
-                                                                     std::move(dynamic_module));
+  // Optional. Only kTLS-capable modules (e.g. rustls with kTLS offload) export this. A module that
+  // does not is still valid and simply reports no kTLS bytestream.
+  auto on_ktls_state = dynamic_module->getFunctionPointer<OnTransportSocketKtlsStateType>(
+      "envoy_dynamic_module_on_transport_socket_ktls_state");
+
+  auto config = std::make_shared<DynamicModuleTransportSocketConfig>(
+      implements_secure_transport, is_upstream, std::move(dynamic_module));
 
   config->on_factory_config_destroy_ = on_config_destroy.value();
   config->on_new_ = on_new.value();
@@ -123,6 +128,9 @@ absl::StatusOr<DynamicModuleTransportSocketConfigSharedPtr> newDynamicModuleTran
   config->on_get_failure_reason_ = on_get_failure_reason.value();
   config->on_can_flush_close_ = on_can_flush_close.value();
   config->on_start_secure_transport_ = on_start_secure_transport.value();
+  if (on_ktls_state.ok()) {
+    config->on_ktls_state_ = on_ktls_state.value();
+  }
 
   envoy_dynamic_module_type_envoy_buffer name_buffer = {socket_name.data(), socket_name.size()};
   envoy_dynamic_module_type_envoy_buffer config_buffer = {socket_config.data(),
@@ -234,6 +242,27 @@ bool DynamicModuleTransportSocket::startSecureTransport() {
     return false;
   }
   return config_->on_start_secure_transport_(this, in_module_socket_);
+}
+
+OptRef<const Network::KtlsBytestreamInfo> DynamicModuleTransportSocket::ktlsBytestreamInfo() const {
+  // Only kTLS-capable modules export the hook. Without it this is an ordinary userspace transport,
+  // so fall back to the base behavior (an empty OptRef, meaning no kTLS bytestream).
+  if (in_module_socket_ == nullptr || config_->on_ktls_state_ == nullptr) {
+    return {};
+  }
+  // trusted_peer follows the socket direction. Only the upstream leg connects to a peer Envoy
+  // chose, while a downstream listener may face untrusted clients. It gates TLS_RX_EXPECT_NO_PAD.
+  const bool trusted_peer = config_->isUpstream();
+  int fd = -1;
+  const bool installed = config_->on_ktls_state_(const_cast<DynamicModuleTransportSocket*>(this),
+                                                  in_module_socket_, &fd);
+  // Report a populated info with installed=false rather than an empty OptRef when kTLS is not (yet)
+  // installed, including userspace-TLS fallback. The body-splice gate depends on telling a secure
+  // transport whose kTLS is not installed apart from a plaintext raw_buffer socket (the base empty
+  // OptRef). Writing raw plaintext into a userspace-secure socket would bypass its encryption, so a
+  // non-installed secure socket must never be mistaken for plaintext.
+  ktls_info_storage_ = {installed && fd >= 0, installed && fd >= 0 ? fd : -1, trusted_peer};
+  return ktls_info_storage_;
 }
 
 Network::TransportSocketPtr

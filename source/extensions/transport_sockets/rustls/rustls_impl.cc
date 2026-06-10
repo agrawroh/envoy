@@ -1,17 +1,14 @@
 #include "source/extensions/transport_sockets/rustls/rustls_impl.h"
 
-#include <algorithm>
-#include <cerrno>
-#include <cstddef>
+#include <string>
+#include <vector>
 
-#include "envoy/buffer/buffer.h"
-#include "envoy/common/platform.h"
-#include "envoy/event/file_event.h"
 #include "envoy/extensions/transport_sockets/rustls/v3/rustls.pb.h"
 #include "envoy/extensions/transport_sockets/rustls/v3/rustls.pb.validate.h"
-#include "envoy/network/io_handle.h"
 
 #include "source/common/protobuf/utility.h"
+#include "source/extensions/dynamic_modules/dynamic_modules.h"
+#include "source/extensions/transport_sockets/dynamic_modules/transport_socket.h"
 
 #include "absl/strings/str_cat.h"
 
@@ -25,271 +22,52 @@ namespace {
 // The static module name for the `rustls` `kTLS` Rust module.
 constexpr absl::string_view RustlsModuleName = "rustls_ktls_static";
 
-Network::PostIoAction
-toPostIoAction(const envoy_dynamic_module_type_transport_socket_post_io_action a) {
-  return a == envoy_dynamic_module_type_transport_socket_post_io_action_Close
-             ? Network::PostIoAction::Close
-             : Network::PostIoAction::KeepOpen;
-}
-
-} // namespace
-
-// -- RustlsTransportSocketConfig ----------------------------------------------
-
-absl::StatusOr<RustlsTransportSocketConfigSharedPtr>
-RustlsTransportSocketConfig::create(const bool is_upstream, const absl::string_view socket_name,
-                                    const absl::string_view socket_config_bytes) {
-  // The `rustls` module is statically linked and registered at process init. A failure here is a
-  // build/linkage error, but propagate via `Status` (not `RELEASE_ASSERT`) so a future packaging
-  // bug doesn't crash the proxy on first config push.
-  auto module_or = DynamicModules::newDynamicModuleByName(RustlsModuleName, /*do_not_close=*/true);
+// Loads the statically linked rustls module and builds a shared dynamic-module transport socket
+// config from the validated proto serialized to JSON, also returning the JSON so the factory can
+// fold it into its connection-pool hash key. The rustls socket always terminates TLS, so it always
+// implements secure transport.
+absl::StatusOr<DynamicModuleTransportSocketConfigSharedPtr>
+createRustlsConfig(bool is_upstream, const Protobuf::Message& validated_proto,
+                   std::string& config_json_out) {
+  if (auto status = Protobuf::util::MessageToJsonString(validated_proto, &config_json_out);
+      !status.ok()) {
+    return absl::InternalError(
+        absl::StrCat("rustls: MessageToJsonString failed: ", status.message()));
+  }
+  // The rustls module is statically linked and registered at process init. A failure here is a
+  // build/linkage error, but propagate via Status (not RELEASE_ASSERT) so a future packaging bug
+  // doesn't crash the proxy on first config push.
+  auto module_or = Envoy::Extensions::DynamicModules::newDynamicModuleByName(
+      RustlsModuleName, /*do_not_close=*/true);
   if (!module_or.ok()) {
     return absl::InternalError(
         absl::StrCat("rustls: failed to load static module: ", module_or.status().message()));
   }
-
-  auto config = std::make_shared<RustlsTransportSocketConfig>(is_upstream, std::string(socket_name),
-                                                              std::string(socket_config_bytes),
-                                                              std::move(*module_or));
-
-#define RESOLVE_SYMBOL(field, symbol)                                                              \
-  do {                                                                                             \
-    auto fn = config->dynamic_module_->getFunctionPointer<decltype(config->field)>(symbol);        \
-    if (!fn.ok()) {                                                                                \
-      return absl::InternalError(                                                                  \
-          absl::StrCat("rustls: missing ABI symbol ", (symbol), ": ", fn.status().message()));     \
-    }                                                                                              \
-    config->field = *fn;                                                                           \
-  } while (0)
-
-  RESOLVE_SYMBOL(on_factory_config_destroy_,
-                 "envoy_dynamic_module_on_transport_socket_factory_config_destroy");
-  RESOLVE_SYMBOL(on_socket_new_, "envoy_dynamic_module_on_transport_socket_new");
-  RESOLVE_SYMBOL(on_socket_destroy_, "envoy_dynamic_module_on_transport_socket_destroy");
-  RESOLVE_SYMBOL(on_set_callbacks_, "envoy_dynamic_module_on_transport_socket_set_callbacks");
-  RESOLVE_SYMBOL(on_on_connected_, "envoy_dynamic_module_on_transport_socket_on_connected");
-  RESOLVE_SYMBOL(on_do_read_, "envoy_dynamic_module_on_transport_socket_do_read");
-  RESOLVE_SYMBOL(on_do_write_, "envoy_dynamic_module_on_transport_socket_do_write");
-  RESOLVE_SYMBOL(on_close_, "envoy_dynamic_module_on_transport_socket_close");
-  RESOLVE_SYMBOL(on_get_protocol_, "envoy_dynamic_module_on_transport_socket_get_protocol");
-  RESOLVE_SYMBOL(on_get_failure_reason_,
-                 "envoy_dynamic_module_on_transport_socket_get_failure_reason");
-  RESOLVE_SYMBOL(on_can_flush_close_, "envoy_dynamic_module_on_transport_socket_can_flush_close");
-  RESOLVE_SYMBOL(on_ktls_state_, "envoy_dynamic_module_on_transport_socket_ktls_state");
-
-  // Resolve the factory config new symbol separately (only needed during create).
-  auto on_factory_new_or =
-      config->dynamic_module_->getFunctionPointer<OnTransportSocketFactoryConfigNewType>(
-          "envoy_dynamic_module_on_transport_socket_factory_config_new");
-  if (!on_factory_new_or.ok()) {
-    return absl::InternalError(absl::StrCat(
-        "rustls: missing ABI symbol envoy_dynamic_module_on_transport_socket_factory_config_new: ",
-        on_factory_new_or.status().message()));
-  }
-
-#undef RESOLVE_SYMBOL
-
-  const envoy_dynamic_module_type_envoy_buffer name_buf = {config->socketName().data(),
-                                                           config->socketName().size()};
-  const envoy_dynamic_module_type_envoy_buffer cfg_buf = {config->socketConfigBytes().data(),
-                                                          config->socketConfigBytes().size()};
-  config->in_module_factory_config_ = (*on_factory_new_or)(
-      static_cast<envoy_dynamic_module_type_transport_socket_factory_config_envoy_ptr>(
-          config.get()),
-      name_buf, cfg_buf, is_upstream);
-
-  if (config->in_module_factory_config_ == nullptr) {
-    return absl::InvalidArgumentError(
-        "Rustls module rejected the transport socket factory configuration.");
-  }
-
-  return config;
+  return DynamicModules::newDynamicModuleTransportSocketConfig(
+      std::string(RustlsModuleName), config_json_out, is_upstream,
+      /*implements_secure_transport=*/true, std::move(*module_or));
 }
 
-RustlsTransportSocketConfig::RustlsTransportSocketConfig(
-    const bool is_upstream, std::string socket_name, std::string socket_config_bytes,
-    DynamicModules::DynamicModulePtr dynamic_module)
-    : is_upstream_(is_upstream), socket_name_(std::move(socket_name)),
-      socket_config_bytes_(std::move(socket_config_bytes)),
-      dynamic_module_(std::move(dynamic_module)) {}
-
-RustlsTransportSocketConfig::~RustlsTransportSocketConfig() {
-  if (in_module_factory_config_ != nullptr && on_factory_config_destroy_ != nullptr) {
-    on_factory_config_destroy_(in_module_factory_config_);
-    in_module_factory_config_ = nullptr;
-  }
-}
-
-// -- RustlsTransportSocket ----------------------------------------------------
-
-RustlsTransportSocket::RustlsTransportSocket(
-    RustlsTransportSocketConfigSharedPtr config,
-    Network::TransportSocketOptionsConstSharedPtr /*options*/,
-    Upstream::HostDescriptionConstSharedPtr /*host*/)
-    : config_(std::move(config)) {
-  // `options` and `host` are accepted for forward-compatibility with the
-  // `Network::TransportSocketFactory::createTransportSocket` interface, but they are
-  // intentionally not consumed here: per-connection SNI / ALPN / SAN-match-list overrides are
-  // pre-screened in `RustlsUpstreamTransportSocketFactory::createTransportSocket` and routed
-  // through `NotReadyRustlsSocket`. If a future change adds true per-connection plumbing
-  // (extending the dynamic-modules SDK ABI), wire `options`/`host` into the rustls module here.
-  socket_module_ = config_->on_socket_new_(config_->in_module_factory_config_, thisAsEnvoyPtr());
-  // Allocation failure (e.g. process OOM) is surfaced via `socketModuleAllocated()`. The factory
-  // returns a `NotReadyRustlsSocket` in that case so the connection layer reports a clean
-  // connect failure rather than carrying a dead socket forward.
-}
-
-RustlsTransportSocket::~RustlsTransportSocket() {
-  if (socket_module_ != nullptr) {
-    config_->on_socket_destroy_(socket_module_);
-    socket_module_ = nullptr;
-  }
-}
-
-void RustlsTransportSocket::setTransportSocketCallbacks(
-    Network::TransportSocketCallbacks& callbacks) {
-  callbacks_ = &callbacks;
-  if (socket_module_ != nullptr) {
-    config_->on_set_callbacks_(thisAsEnvoyPtr(), socket_module_);
-  }
-}
-
-void RustlsTransportSocket::refreshProtocolString() const {
-  auto* mutable_this = const_cast<RustlsTransportSocket*>(this);
-  mutable_this->protocol_storage_.clear();
-  if (socket_module_ == nullptr) {
-    return;
-  }
-  envoy_dynamic_module_type_module_buffer out{nullptr, 0};
-  config_->on_get_protocol_(mutable_this->thisAsEnvoyPtr(), socket_module_, &out);
-  if (out.ptr != nullptr && out.length > 0) {
-    mutable_this->protocol_storage_.assign(out.ptr, out.length);
-  }
-}
-
-void RustlsTransportSocket::refreshFailureReasonString() const {
-  auto* mutable_this = const_cast<RustlsTransportSocket*>(this);
-  // Don't `clear()` aggressively: the canonical TLS socket retains its failure_reason_ for
-  // the socket's lifetime (BoringSSL's `SslSocket::failureReason()` appends, never replaces).
-  // If the Rust module is gone or returns an empty buffer, keep the last reason so
-  // post-mortem callers like `ConnectionImpl::transportFailureReason()` still get a useful
-  // string. Only overwrite when the module hands back a non-empty new reason.
-  if (socket_module_ == nullptr) {
-    return;
-  }
-  envoy_dynamic_module_type_module_buffer out{nullptr, 0};
-  config_->on_get_failure_reason_(mutable_this->thisAsEnvoyPtr(), socket_module_, &out);
-  if (out.ptr != nullptr && out.length > 0) {
-    mutable_this->failure_reason_storage_.assign(out.ptr, out.length);
-  }
-}
-
-std::string RustlsTransportSocket::protocol() const {
-  refreshProtocolString();
-  return protocol_storage_;
-}
-
-absl::string_view RustlsTransportSocket::failureReason() const {
-  refreshFailureReasonString();
-  return failure_reason_storage_;
-}
-
-bool RustlsTransportSocket::canFlushClose() {
-  if (socket_module_ == nullptr) {
-    return true;
-  }
-  return config_->on_can_flush_close_(thisAsEnvoyPtr(), socket_module_);
-}
-
-OptRef<const Network::KtlsBytestreamInfo> RustlsTransportSocket::ktlsBytestreamInfo() const {
-  // trusted_peer follows the socket direction. Only the upstream leg connects to a peer Envoy
-  // chose, while downstream listeners may face untrusted clients. It gates TLS_RX_EXPECT_NO_PAD.
-  const bool trusted_peer = config_->isUpstream();
-  // On a failed or closing socket report installed=false rather than an empty OptRef, so the
-  // body-splice gate rejects it. An empty OptRef means a plaintext raw_buffer socket (the base
-  // default), and a failing rustls socket must never be mistaken for that and spliced as plaintext.
-  if (socket_module_ == nullptr || !failureReason().empty()) {
-    ktls_info_storage_ = {/*installed=*/false, /*fd=*/-1, trusted_peer};
-    return ktls_info_storage_;
-  }
-  int fd = -1;
-  const bool installed = config_->on_ktls_state_(
-      const_cast<RustlsTransportSocket*>(this)->thisAsEnvoyPtr(), socket_module_, &fd);
-  if (!installed || fd < 0) {
-    // Report a populated info with installed=false rather than an empty OptRef. This distinguishes
-    // a rustls TLS socket whose kTLS is not (yet) installed, including userspace-TLS fallback,
-    // from a plaintext raw_buffer socket, which has no KtlsBytestreamInfo at all (the base default
-    // empty OptRef). The body-splice gate depends on that distinction. Writing raw plaintext into a
-    // userspace-TLS socket would bypass encryption, so a non-installed rustls socket must NOT be
-    // treated as "plaintext or kTLS" the way ssl()==nullptr alone would suggest.
-    ktls_info_storage_ = {/*installed=*/false, /*fd=*/-1, trusted_peer};
-    return ktls_info_storage_;
-  }
-  ktls_info_storage_ = {/*installed=*/true, fd, trusted_peer};
-  return ktls_info_storage_;
-}
-
-void RustlsTransportSocket::closeSocket(const Network::ConnectionEvent event,
-                                        bool /*abort_reset*/) {
-  // TODO(rust-ktls B2): thread `abort_reset` through the on_close ABI so the Rust side can
-  // suppress the TLS close_notify / kTLS shutdown alert on a RST teardown (mirrors
-  // SslSocket::closeSocket gated on ssl_socket_report_connection_reset).
-  if (socket_module_ == nullptr) {
-    return;
-  }
-  const auto abi_event = static_cast<envoy_dynamic_module_type_network_connection_event>(event);
-  config_->on_close_(thisAsEnvoyPtr(), socket_module_, abi_event);
-}
-
-void RustlsTransportSocket::onConnected() {
-  if (socket_module_ == nullptr) {
-    return;
-  }
-  config_->on_on_connected_(thisAsEnvoyPtr(), socket_module_);
-}
-
-Network::IoResult RustlsTransportSocket::doRead(Buffer::Instance& buffer) {
-  if (socket_module_ == nullptr) {
-    return {Network::PostIoAction::Close, 0, false, absl::nullopt};
-  }
-  active_read_buffer_ = &buffer;
-  const envoy_dynamic_module_type_transport_socket_io_result abi_result =
-      config_->on_do_read_(thisAsEnvoyPtr(), socket_module_);
-  active_read_buffer_ = nullptr;
-  return {toPostIoAction(abi_result.action), abi_result.bytes_processed, abi_result.end_stream_read,
-          absl::nullopt};
-}
-
-Network::IoResult RustlsTransportSocket::doWrite(Buffer::Instance& buffer, const bool end_stream) {
-  if (socket_module_ == nullptr) {
-    return {Network::PostIoAction::Close, 0, false, absl::nullopt};
-  }
-  active_write_buffer_ = &buffer;
-  const envoy_dynamic_module_type_transport_socket_io_result abi_result =
-      config_->on_do_write_(thisAsEnvoyPtr(), socket_module_, buffer.length(), end_stream);
-  active_write_buffer_ = nullptr;
-  return {toPostIoAction(abi_result.action), abi_result.bytes_processed, false, absl::nullopt};
-}
+} // namespace
 
 // -- RustlsUpstreamTransportSocketFactory -------------------------------------
 
 RustlsUpstreamTransportSocketFactory::RustlsUpstreamTransportSocketFactory(
-    RustlsTransportSocketConfigSharedPtr config, std::string default_sni,
-    std::vector<std::string> alpn_protocols, const bool implements_secure_transport)
+    DynamicModuleTransportSocketConfigSharedPtr config, std::string default_sni,
+    std::vector<std::string> alpn_protocols, std::string socket_config_bytes)
     : config_(std::move(config)), default_sni_(std::move(default_sni)),
       alpn_protocols_(std::move(alpn_protocols)),
-      implements_secure_transport_(implements_secure_transport) {}
+      socket_config_bytes_(std::move(socket_config_bytes)) {}
 
 Network::TransportSocketPtr RustlsUpstreamTransportSocketFactory::createTransportSocket(
     Network::TransportSocketOptionsConstSharedPtr options,
-    Upstream::HostDescriptionConstSharedPtr host) const {
-  // The current rustls socket builds one rustls `ClientConfig` per factory and clones it into
-  // every connection. Per-connection TransportSocketOptions overrides for SNI, ALPN, and SAN
-  // match list cannot be honored yet. Return a `NotReadyRustlsSocket` stub when any override is
-  // set; the connection layer surfaces this as `upstream_cx_connect_fail` with the failure
-  // reason in `failureReason()`. (Returning a real nullptr is NOT safe here. `ConnectionImpl`
-  // dereferences `transport_socket_` without a null-check at construction time, see
-  // `source/common/network/connection_impl.cc:110`.)
+    Upstream::HostDescriptionConstSharedPtr) const {
+  // The rustls socket builds one rustls `ClientConfig` per factory and clones it into every
+  // connection. Per-connection TransportSocketOptions overrides for SNI, ALPN, and SAN match list
+  // cannot be honored yet. Return a `NotReadyRustlsSocket` stub when any override is set; the
+  // connection layer surfaces this as `upstream_cx_connect_fail` with the failure reason in
+  // `failureReason()`. (Returning a real nullptr is NOT safe here. `ConnectionImpl` dereferences
+  // `transport_socket_` without a null-check at construction time.)
   if (options != nullptr) {
     const bool has_sni_override =
         options->serverNameOverride().has_value() && !options->serverNameOverride()->empty();
@@ -297,9 +75,9 @@ Network::TransportSocketPtr RustlsUpstreamTransportSocketFactory::createTranspor
     const bool has_san_override = !options->verifySubjectAltNameListOverride().empty();
     // `applicationProtocolFallback` is set by the HTTP/2 connection pool (e.g. `{"h2",
     // "http/1.1"}`) when the static ALPN list is empty. Without honoring it, a cluster that
-    // expects ALPN-driven protocol selection would silently negotiate an ALPN-empty handshake
-    // and downgrade, surfaced as a stealth protocol mismatch. Refuse the connection so the
-    // operator gets a clear `upstream_cx_connect_fail` instead.
+    // expects ALPN-driven protocol selection would silently negotiate an ALPN-empty handshake and
+    // downgrade, surfaced as a stealth protocol mismatch. Refuse the connection so the operator
+    // gets a clear `upstream_cx_connect_fail` instead.
     const bool has_alpn_fallback_unbacked =
         !options->applicationProtocolFallback().empty() && alpn_protocols_.empty();
     if (has_sni_override || has_alpn_override || has_san_override || has_alpn_fallback_unbacked) {
@@ -315,29 +93,21 @@ Network::TransportSocketPtr RustlsUpstreamTransportSocketFactory::createTranspor
           "alpn_protocols list) are not supported by this extension");
     }
   }
-  auto socket =
-      std::make_unique<RustlsTransportSocket>(config_, std::move(options), std::move(host));
-  if (!socket->socketModuleAllocated()) {
-    // Module-side allocation failed (e.g. process OOM).
-    return std::make_unique<NotReadyRustlsSocket>(
-        "rustls: per-socket allocation in the Rust module returned nullptr");
-  }
-  return socket;
+  return std::make_unique<DynamicModules::DynamicModuleTransportSocket>(config_);
 }
 
 void RustlsUpstreamTransportSocketFactory::hashKey(
     std::vector<uint8_t>& key, Network::TransportSocketOptionsConstSharedPtr options) const {
-  // Mix the factory-static bits only: socket name + a NUL separator + serialized proto config +
-  // a NUL separator + default SNI + ALPN list. The NUL between name and cfg prevents
-  // prefix-attack collisions on configs whose concatenated bytes happen to overlap. The base
-  // class call below handles per-connection options (SNI/SAN/ALPN overrides, ALPN fallback,
-  // shared filter-state objects); duplicating those bits here would create case-sensitivity
-  // and encoding mismatches with the base class and silently re-partition the connection pool.
-  const absl::string_view name = config_->socketName();
+  // Mix the factory-static bits: the static module name + a NUL separator + the serialized proto
+  // config + a NUL separator + default SNI + the ALPN list. The NUL between name and config
+  // prevents prefix-attack collisions on configs whose concatenated bytes happen to overlap. The
+  // base class call below handles per-connection options (SNI/SAN/ALPN overrides, ALPN fallback,
+  // shared filter-state objects); duplicating those bits here would create encoding mismatches with
+  // the base class and silently re-partition the connection pool.
+  const absl::string_view name = RustlsModuleName;
   key.insert(key.end(), name.begin(), name.end());
   key.push_back('\0');
-  const absl::string_view cfg = config_->socketConfigBytes();
-  key.insert(key.end(), cfg.begin(), cfg.end());
+  key.insert(key.end(), socket_config_bytes_.begin(), socket_config_bytes_.end());
   key.push_back('\0');
   key.insert(key.end(), default_sni_.begin(), default_sni_.end());
   for (const auto& alpn : alpn_protocols_) {
@@ -349,19 +119,9 @@ void RustlsUpstreamTransportSocketFactory::hashKey(
 
 // -- RustlsDownstreamTransportSocketFactory -----------------------------------
 
-RustlsDownstreamTransportSocketFactory::RustlsDownstreamTransportSocketFactory(
-    RustlsTransportSocketConfigSharedPtr config, const bool implements_secure_transport)
-    : config_(std::move(config)), implements_secure_transport_(implements_secure_transport) {}
-
 Network::TransportSocketPtr
 RustlsDownstreamTransportSocketFactory::createDownstreamTransportSocket() const {
-  auto socket = std::make_unique<RustlsTransportSocket>(config_, /*options=*/nullptr,
-                                                        /*host=*/nullptr);
-  if (!socket->socketModuleAllocated()) {
-    return std::make_unique<NotReadyRustlsSocket>(
-        "rustls: per-socket allocation in the Rust module returned nullptr");
-  }
-  return socket;
+  return std::make_unique<DynamicModules::DynamicModuleTransportSocket>(config_);
 }
 
 // -- Config factories ---------------------------------------------------------
@@ -380,19 +140,13 @@ RustlsUpstreamTransportSocketConfigFactory::createTransportSocketFactory(
       config, context.messageValidationVisitor());
 
   std::string config_json;
-  if (auto status = Protobuf::util::MessageToJsonString(proto, &config_json); !status.ok()) {
-    return absl::InternalError(
-        absl::StrCat("rustls: MessageToJsonString failed: ", status.message()));
-  }
-
-  auto config_or =
-      RustlsTransportSocketConfig::create(/*is_upstream=*/true, RustlsModuleName, config_json);
-  RETURN_IF_NOT_OK(config_or.status());
+  auto config_or = createRustlsConfig(/*is_upstream=*/true, proto, config_json);
+  RETURN_IF_NOT_OK_REF(config_or.status());
 
   return std::make_unique<RustlsUpstreamTransportSocketFactory>(
       std::move(*config_or), proto.sni(),
       std::vector<std::string>(proto.alpn_protocols().begin(), proto.alpn_protocols().end()),
-      /*implements_secure_transport=*/true);
+      std::move(config_json));
 }
 
 ProtobufTypes::MessagePtr RustlsDownstreamTransportSocketConfigFactory::createEmptyConfigProto() {
@@ -409,17 +163,10 @@ RustlsDownstreamTransportSocketConfigFactory::createTransportSocketFactory(
       config, context.messageValidationVisitor());
 
   std::string config_json;
-  if (auto status = Protobuf::util::MessageToJsonString(proto, &config_json); !status.ok()) {
-    return absl::InternalError(
-        absl::StrCat("rustls: MessageToJsonString failed: ", status.message()));
-  }
+  auto config_or = createRustlsConfig(/*is_upstream=*/false, proto, config_json);
+  RETURN_IF_NOT_OK_REF(config_or.status());
 
-  auto config_or =
-      RustlsTransportSocketConfig::create(/*is_upstream=*/false, RustlsModuleName, config_json);
-  RETURN_IF_NOT_OK(config_or.status());
-
-  return std::make_unique<RustlsDownstreamTransportSocketFactory>(
-      std::move(*config_or), /*implements_secure_transport=*/true);
+  return std::make_unique<RustlsDownstreamTransportSocketFactory>(std::move(*config_or));
 }
 
 REGISTER_FACTORY(RustlsUpstreamTransportSocketConfigFactory,
@@ -432,193 +179,3 @@ REGISTER_FACTORY(RustlsDownstreamTransportSocketConfigFactory,
 } // namespace TransportSockets
 } // namespace Extensions
 } // namespace Envoy
-
-// -- ABI Callback Implementations ---------------------------------------------
-// These extern "C" functions are called by the Rust module to interact with
-// Envoy buffers, I/O handles, and transport socket callbacks.
-
-using Envoy::Extensions::TransportSockets::Rustls::RustlsTransportSocket;
-
-extern "C" {
-
-void* envoy_dynamic_module_callback_transport_socket_get_io_handle(
-    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr) {
-  auto* socket = static_cast<RustlsTransportSocket*>(transport_socket_envoy_ptr);
-  if (socket->transportCallbacks() == nullptr) {
-    return nullptr;
-  }
-  return static_cast<void*>(&(socket->transportCallbacks()->ioHandle()));
-}
-
-int64_t envoy_dynamic_module_callback_transport_socket_io_handle_read(void* io_handle, char* buffer,
-                                                                      size_t length,
-                                                                      size_t* bytes_read) {
-  if (bytes_read == nullptr || io_handle == nullptr) {
-    return -EINVAL;
-  }
-  auto* handle = static_cast<Envoy::Network::IoHandle*>(io_handle);
-  Envoy::Buffer::RawSlice slice{buffer, length};
-  const auto result = handle->readv(length, &slice, 1);
-  if (!result.ok()) {
-    *bytes_read = 0;
-    return -static_cast<int64_t>(result.err_->getSystemErrorCode());
-  }
-  *bytes_read = static_cast<size_t>(result.return_value_);
-  return 0;
-}
-
-int64_t envoy_dynamic_module_callback_transport_socket_io_handle_write(void* io_handle,
-                                                                       const char* buffer,
-                                                                       size_t length,
-                                                                       size_t* bytes_written) {
-  if (bytes_written == nullptr || io_handle == nullptr) {
-    return -EINVAL;
-  }
-  auto* handle = static_cast<Envoy::Network::IoHandle*>(io_handle);
-  Envoy::Buffer::RawSlice slice{const_cast<char*>(buffer), length};
-  const auto result = handle->writev(&slice, 1);
-  if (!result.ok()) {
-    *bytes_written = 0;
-    return -static_cast<int64_t>(result.err_->getSystemErrorCode());
-  }
-  *bytes_written = static_cast<size_t>(result.return_value_);
-  return 0;
-}
-
-int envoy_dynamic_module_callback_transport_socket_io_handle_fd(void* io_handle) {
-  if (io_handle == nullptr) {
-    return -1;
-  }
-  auto* handle = static_cast<Envoy::Network::IoHandle*>(io_handle);
-  os_fd_t fd = handle->fdDoNotUse();
-  return static_cast<int>(fd);
-}
-
-void envoy_dynamic_module_callback_transport_socket_read_buffer_drain(
-    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr,
-    size_t length) {
-  auto* socket = static_cast<RustlsTransportSocket*>(transport_socket_envoy_ptr);
-  Envoy::Buffer::Instance* buf = socket->activeReadBuffer();
-  if (buf == nullptr) {
-    return;
-  }
-  buf->drain(length);
-}
-
-void envoy_dynamic_module_callback_transport_socket_read_buffer_add(
-    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr,
-    const char* data, size_t length) {
-  auto* socket = static_cast<RustlsTransportSocket*>(transport_socket_envoy_ptr);
-  Envoy::Buffer::Instance* buf = socket->activeReadBuffer();
-  if (buf == nullptr || data == nullptr) {
-    return;
-  }
-  buf->add(data, length);
-}
-
-size_t envoy_dynamic_module_callback_transport_socket_read_buffer_length(
-    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr) {
-  auto* socket = static_cast<RustlsTransportSocket*>(transport_socket_envoy_ptr);
-  Envoy::Buffer::Instance* buf = socket->activeReadBuffer();
-  if (buf == nullptr) {
-    return 0;
-  }
-  return static_cast<size_t>(buf->length());
-}
-
-void envoy_dynamic_module_callback_transport_socket_write_buffer_drain(
-    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr,
-    size_t length) {
-  auto* socket = static_cast<RustlsTransportSocket*>(transport_socket_envoy_ptr);
-  Envoy::Buffer::Instance* buf = socket->activeWriteBuffer();
-  if (buf == nullptr) {
-    return;
-  }
-  buf->drain(length);
-}
-
-void envoy_dynamic_module_callback_transport_socket_write_buffer_get_slices(
-    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr,
-    envoy_dynamic_module_type_envoy_buffer* slices, size_t* slices_count) {
-  auto* socket = static_cast<RustlsTransportSocket*>(transport_socket_envoy_ptr);
-  if (slices_count == nullptr) {
-    return;
-  }
-  Envoy::Buffer::Instance* buf = socket->activeWriteBuffer();
-  if (buf == nullptr) {
-    *slices_count = 0;
-    return;
-  }
-  const auto raw = buf->getRawSlices(std::nullopt);
-  if (slices == nullptr) {
-    *slices_count = raw.size();
-    return;
-  }
-  const size_t max_out = *slices_count;
-  const size_t n = std::min(max_out, raw.size());
-  for (size_t i = 0; i < n; ++i) {
-    slices[i].ptr = static_cast<char*>(raw[i].mem_);
-    slices[i].length = raw[i].len_;
-  }
-  *slices_count = n;
-}
-
-size_t envoy_dynamic_module_callback_transport_socket_write_buffer_length(
-    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr) {
-  auto* socket = static_cast<RustlsTransportSocket*>(transport_socket_envoy_ptr);
-  Envoy::Buffer::Instance* buf = socket->activeWriteBuffer();
-  if (buf == nullptr) {
-    return 0;
-  }
-  return static_cast<size_t>(buf->length());
-}
-
-void envoy_dynamic_module_callback_transport_socket_raise_event(
-    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr,
-    envoy_dynamic_module_type_network_connection_event event) {
-  auto* socket = static_cast<RustlsTransportSocket*>(transport_socket_envoy_ptr);
-  if (socket->transportCallbacks() == nullptr) {
-    return;
-  }
-  socket->transportCallbacks()->raiseEvent(static_cast<Envoy::Network::ConnectionEvent>(event));
-}
-
-bool envoy_dynamic_module_callback_transport_socket_should_drain_read_buffer(
-    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr) {
-  auto* socket = static_cast<RustlsTransportSocket*>(transport_socket_envoy_ptr);
-  if (socket->transportCallbacks() == nullptr) {
-    return false;
-  }
-  return socket->transportCallbacks()->shouldDrainReadBuffer();
-}
-
-void envoy_dynamic_module_callback_transport_socket_set_is_readable(
-    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr) {
-  auto* socket = static_cast<RustlsTransportSocket*>(transport_socket_envoy_ptr);
-  if (socket->transportCallbacks() == nullptr) {
-    return;
-  }
-  socket->transportCallbacks()->setTransportSocketIsReadable();
-}
-
-void envoy_dynamic_module_callback_transport_socket_set_is_writable(
-    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr) {
-  auto* socket = static_cast<RustlsTransportSocket*>(transport_socket_envoy_ptr);
-  if (socket->transportCallbacks() == nullptr) {
-    return;
-  }
-  // Re-arm the writable event so ConnectionImpl re-drives doWrite when the socket drains. This is
-  // the same primitive ConnectionImpl uses to self-schedule a write after a partial flush.
-  socket->transportCallbacks()->ioHandle().activateFileEvents(Envoy::Event::FileReadyType::Write);
-}
-
-void envoy_dynamic_module_callback_transport_socket_flush_write_buffer(
-    envoy_dynamic_module_type_transport_socket_envoy_ptr transport_socket_envoy_ptr) {
-  auto* socket = static_cast<RustlsTransportSocket*>(transport_socket_envoy_ptr);
-  if (socket->transportCallbacks() == nullptr) {
-    return;
-  }
-  socket->transportCallbacks()->flushWriteBuffer();
-}
-
-} // extern "C"

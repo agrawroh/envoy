@@ -58,6 +58,43 @@ returnNullTransportSocket(envoy_dynamic_module_type_transport_socket_factory_con
   return nullptr;
 }
 
+// Stubs for the optional kTLS-state hook, used to exercise DynamicModuleTransportSocket's
+// ktlsBytestreamInfo without a real kTLS-capable module.
+extern "C" envoy_dynamic_module_type_transport_socket_module_ptr
+returnSentinelTransportSocket(envoy_dynamic_module_type_transport_socket_factory_config_module_ptr,
+                              envoy_dynamic_module_type_transport_socket_envoy_ptr) {
+  return reinterpret_cast<envoy_dynamic_module_type_transport_socket_module_ptr>(0x1);
+}
+
+extern "C" void noopDestroyTransportSocket(envoy_dynamic_module_type_transport_socket_module_ptr) {}
+
+extern "C" bool ktlsStateInstalled(envoy_dynamic_module_type_transport_socket_envoy_ptr,
+                                   envoy_dynamic_module_type_transport_socket_module_ptr,
+                                   int* fd_out) {
+  if (fd_out != nullptr) {
+    *fd_out = 42;
+  }
+  return true;
+}
+
+extern "C" bool ktlsStateNotInstalled(envoy_dynamic_module_type_transport_socket_envoy_ptr,
+                                      envoy_dynamic_module_type_transport_socket_module_ptr,
+                                      int* fd_out) {
+  if (fd_out != nullptr) {
+    *fd_out = -1;
+  }
+  return false;
+}
+
+extern "C" bool ktlsStateInstalledNegativeFd(envoy_dynamic_module_type_transport_socket_envoy_ptr,
+                                             envoy_dynamic_module_type_transport_socket_module_ptr,
+                                             int* fd_out) {
+  if (fd_out != nullptr) {
+    *fd_out = -1;
+  }
+  return true;
+}
+
 // Tests for the upstream and downstream config factories.
 class DynamicModuleTransportSocketConfigTest : public testing::Test {
 public:
@@ -401,7 +438,8 @@ TEST_F(DynamicModuleTransportSocketTest, DoReadUsesConfiguredKey) {
 TEST_F(DynamicModuleTransportSocketTest, NullInModuleSocketDegradesSafely) {
   // Simulate a module whose on_new returns null. The socket must degrade safely instead of
   // dereferencing the null in-module pointer.
-  auto config = std::make_shared<DynamicModuleTransportSocketConfig>(false, nullptr);
+  auto config =
+      std::make_shared<DynamicModuleTransportSocketConfig>(false, /*is_upstream=*/false, nullptr);
   config->on_new_ = returnNullTransportSocket;
 
   std::unique_ptr<DynamicModuleTransportSocket> socket;
@@ -586,6 +624,71 @@ TEST_F(DynamicModuleTransportSocketTest, OnConnectedRecordsFailureWhenFdUnavaila
   EXPECT_CALL(callbacks_, raiseEvent(Network::ConnectionEvent::Connected));
   socket->onConnected();
   EXPECT_EQ("missing socket fd", socket->failureReason());
+}
+
+// Builds a DynamicModuleTransportSocket directly from a config with stubbed function pointers so
+// the kTLS-state hook can be exercised without a real kTLS-capable module.
+Network::TransportSocketPtr makeSocketWithKtlsHook(bool is_upstream,
+                                                   OnTransportSocketKtlsStateType hook) {
+  auto config = std::make_shared<DynamicModuleTransportSocketConfig>(
+      /*implements_secure_transport=*/true, is_upstream, nullptr);
+  config->on_new_ = returnSentinelTransportSocket;
+  config->on_destroy_ = noopDestroyTransportSocket;
+  config->on_ktls_state_ = hook;
+  return std::make_unique<DynamicModuleTransportSocket>(config);
+}
+
+TEST(DynamicModuleKtlsBytestreamInfoTest, EmptyWhenModuleDoesNotExportHook) {
+  // A module that does not export the optional kTLS-state hook (on_ktls_state_ stays null) reports
+  // no kTLS bytestream. The empty OptRef tells the splice gate this is an ordinary userspace
+  // socket. SDK-built modules always export the hook, so this null-hook path applies to modules
+  // that omit the symbol.
+  auto socket = makeSocketWithKtlsHook(/*is_upstream=*/true, nullptr);
+  EXPECT_FALSE(socket->ktlsBytestreamInfo().has_value());
+}
+
+TEST(DynamicModuleKtlsBytestreamInfoTest, ReportsInstalledFdAndTrustedPeerForUpstream) {
+  auto socket = makeSocketWithKtlsHook(/*is_upstream=*/true, ktlsStateInstalled);
+  auto info = socket->ktlsBytestreamInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_TRUE(info->installed);
+  EXPECT_EQ(42, info->fd);
+  // trusted_peer follows the socket direction. The upstream leg connects to a peer Envoy chose.
+  EXPECT_TRUE(info->trusted_peer);
+}
+
+TEST(DynamicModuleKtlsBytestreamInfoTest, ReportsNotInstalledButPopulatedForDownstream) {
+  auto socket = makeSocketWithKtlsHook(/*is_upstream=*/false, ktlsStateNotInstalled);
+  auto info = socket->ktlsBytestreamInfo();
+  // Populated (not empty) so the splice gate tells a secure socket whose kTLS is not installed
+  // apart from a plaintext raw_buffer socket. installed=false, fd sanitized to -1, and a downstream
+  // listener faces untrusted clients so trusted_peer is false.
+  ASSERT_TRUE(info.has_value());
+  EXPECT_FALSE(info->installed);
+  EXPECT_EQ(-1, info->fd);
+  EXPECT_FALSE(info->trusted_peer);
+}
+
+TEST(DynamicModuleKtlsBytestreamInfoTest, NegativeFdIsReportedAsNotInstalled) {
+  // A hook that returns installed=true but a negative fd must be sanitized to installed=false so
+  // the splice gate never tries to splice() on an invalid descriptor.
+  auto socket = makeSocketWithKtlsHook(/*is_upstream=*/true, ktlsStateInstalledNegativeFd);
+  auto info = socket->ktlsBytestreamInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_FALSE(info->installed);
+  EXPECT_EQ(-1, info->fd);
+}
+
+TEST(DynamicModuleKtlsBytestreamInfoTest, InstalledDownstreamIsNotTrustedPeer) {
+  // trusted_peer derives purely from the socket direction, independent of install state. A
+  // downstream listener faces untrusted clients, so even an installed kTLS socket reports
+  // trusted_peer false (the splice gate uses this to withhold TLS_RX_EXPECT_NO_PAD).
+  auto socket = makeSocketWithKtlsHook(/*is_upstream=*/false, ktlsStateInstalled);
+  auto info = socket->ktlsBytestreamInfo();
+  ASSERT_TRUE(info.has_value());
+  EXPECT_TRUE(info->installed);
+  EXPECT_EQ(42, info->fd);
+  EXPECT_FALSE(info->trusted_peer);
 }
 } // namespace
 } // namespace DynamicModules

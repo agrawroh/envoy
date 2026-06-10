@@ -42,12 +42,8 @@ envoy_extension_cc_test(
     ],
     deps = [
         "//source/common/buffer:buffer_lib",
-        "//source/common/network:io_socket_error_lib",
         "//source/common/network:transport_socket_options_lib",
-        "//source/extensions/dynamic_modules/abi",
         "//source/extensions/transport_sockets/rustls:config",
-        "//test/mocks/network:io_handle_mocks",
-        "//test/mocks/network:network_mocks",
         "//test/mocks/server:server_factory_context_mocks",
         "//test/test_common:environment_lib",
         "@envoy_api//envoy/extensions/transport_sockets/rustls/v3:pkg_cc_proto",
