@@ -1,4 +1,6 @@
+#include <array>
 #include <functional>
+#include <memory>
 
 #include "envoy/http/web_transport.h"
 
@@ -60,8 +62,71 @@ private:
   std::function<void()> on_reset_;
 };
 
-// An upstream side session consumer that echoes every datagram back. Makes the FakeUpstream act as
-// a WebTransport echo server for the proxy tests.
+// A client stream visitor that reads received bytes into a buffer and runs a callback once the peer
+// closes the stream.
+class CapturingStreamVisitor : public webtransport::StreamVisitor {
+public:
+  CapturingStreamVisitor(webtransport::Stream& stream, std::function<void()> on_fin)
+      : stream_(stream), on_fin_(std::move(on_fin)) {}
+
+  void OnCanRead() override {
+    const webtransport::Stream::ReadResult result = stream_.Read(&received_);
+    if (result.fin) {
+      on_fin_();
+    }
+  }
+  void OnCanWrite() override {}
+  void OnResetStreamReceived(webtransport::StreamErrorCode) override {}
+  void OnStopSendingReceived(webtransport::StreamErrorCode) override {}
+  void OnWriteSideInDataRecvdState() override {}
+
+  const std::string& received() const { return received_; }
+
+private:
+  webtransport::Stream& stream_;
+  std::string received_;
+  std::function<void()> on_fin_;
+};
+
+// Echoes a relayed WebTransport data stream back to its sender, so the proxy stream relay is driven
+// in both directions. Reads on the stream and writes the same bytes back on the same bidirectional
+// stream, carrying the FIN through.
+class EchoUpstreamWebTransportStream : public Http::WebTransportStreamCallbacks {
+public:
+  explicit EchoUpstreamWebTransportStream(Http::WebTransportStream& stream) : stream_(stream) {
+    // Drain anything already buffered before the callbacks were registered.
+    pump();
+  }
+
+  void onWebTransportStreamData() override { pump(); }
+  void onWebTransportStreamCanWrite() override { pump(); }
+  void onWebTransportStreamReset(uint32_t) override {}
+  void onWebTransportStreamStopSending(uint32_t) override {}
+
+private:
+  void pump() {
+    std::array<char, 1024> buffer;
+    while (stream_.canWriteWebTransportStream()) {
+      const Http::WebTransportStreamReadResult result =
+          stream_.readWebTransportStream(absl::MakeSpan(buffer));
+      if (result.bytes_read == 0 && !result.end_stream) {
+        return;
+      }
+      if (!stream_.writeWebTransportStream(absl::string_view(buffer.data(), result.bytes_read),
+                                           result.end_stream)) {
+        return;
+      }
+      if (result.end_stream) {
+        return;
+      }
+    }
+  }
+
+  Http::WebTransportStream& stream_;
+};
+
+// An upstream side session consumer that echoes datagrams and data streams back. Makes the
+// FakeUpstream act as a WebTransport echo server for the proxy tests.
 class EchoUpstreamWebTransportCallbacks : public Http::WebTransportSessionCallbacks {
 public:
   explicit EchoUpstreamWebTransportCallbacks(Http::WebTransportSession& session)
@@ -72,11 +137,15 @@ public:
     session_.sendWebTransportDatagram(datagram);
   }
   void onWebTransportSessionClosed() override {}
-  void onWebTransportStreamIncoming(Http::WebTransportStream&, bool) override {}
+  void onWebTransportStreamIncoming(Http::WebTransportStream& stream, bool) override {
+    stream_echo_ = std::make_unique<EchoUpstreamWebTransportStream>(stream);
+    stream.setWebTransportStreamCallbacks(stream_echo_.get());
+  }
   void onCanCreateWebTransportStream(bool) override {}
 
 private:
   Http::WebTransportSession& session_;
+  std::unique_ptr<EchoUpstreamWebTransportStream> stream_echo_;
 };
 
 class WebTransportIntegrationTest : public QuicHttpIntegrationTestBase,
@@ -520,6 +589,67 @@ TEST_P(WebTransportIntegrationTest, ProxySubprotocolPassthrough) {
   ASSERT_FALSE(selected.empty());
   EXPECT_EQ("\"chat\"", selected[0]->value().getStringView());
 
+  codec_client_->close();
+}
+
+// A WebTransport data stream opened downstream is mirrored onto the upstream session by the relay,
+// the upstream echoes it back, and the echo is relayed to the downstream stream. Drives the
+// per-stream relay in both directions end to end.
+TEST_P(WebTransportIntegrationTest, ProxyStreamEcho) {
+#ifndef ENVOY_ENABLE_HTTP_DATAGRAMS
+  GTEST_SKIP() << "WebTransport requires HTTP/3 datagram support.";
+#endif
+  setupProxy();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto encoder_decoder = codec_client_->startRequest(proxyConnectHeaders());
+  request_encoder_ = &encoder_decoder.first;
+  auto response = std::move(encoder_decoder.second);
+
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForHeadersComplete());
+  OptRef<Http::WebTransportSession> upstream_session = upstream_request_->webTransport();
+  ASSERT_TRUE(upstream_session.has_value());
+  upstream_echo_ = std::make_unique<EchoUpstreamWebTransportCallbacks>(upstream_session.ref());
+  upstream_session->setWebTransportSessionCallbacks(upstream_echo_.get());
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, false);
+
+  response->waitForHeaders();
+  EXPECT_EQ("200", response->headers().getStatusValue());
+
+  quic::WebTransportHttp3* session = client_session_->GetWebTransportSession(
+      request_encoder_->getStream().codecStreamId().value());
+  ASSERT_NE(nullptr, session);
+
+  // Open a bidirectional stream, send data with a FIN, and read back the echo relayed from the
+  // upstream.
+  webtransport::Stream* stream = session->OpenOutgoingBidirectionalStream();
+  ASSERT_NE(nullptr, stream);
+  bool done = false;
+  auto visitor = std::make_unique<CapturingStreamVisitor>(*stream, [this, &done] {
+    done = true;
+    dispatcher_->exit();
+  });
+  CapturingStreamVisitor* visitor_ptr = visitor.get();
+  stream->SetVisitor(std::move(visitor));
+  EXPECT_TRUE(stream->Write("hello"));
+  EXPECT_TRUE(stream->SendFin());
+
+  bool timed_out = false;
+  Event::TimerPtr timer = dispatcher_->createTimer([this, &timed_out] {
+    timed_out = true;
+    dispatcher_->exit();
+  });
+  timer->enableTimer(TestUtility::DefaultTimeout);
+  while (!done && !timed_out) {
+    dispatcher_->run(Event::Dispatcher::RunType::Block);
+  }
+  ASSERT_FALSE(timed_out);
+  EXPECT_EQ("hello", visitor_ptr->received());
+
+  // Detach the echo before teardown closes the upstream session.
+  upstream_session->setWebTransportSessionCallbacks(nullptr);
   codec_client_->close();
 }
 
