@@ -161,6 +161,80 @@ TEST_F(RustlsImplTest, DownstreamWithTrustedCa) {
   EXPECT_TRUE(result.ok()) << result.status().message();
 }
 
+TEST_F(RustlsImplTest, DownstreamWithCrl) {
+  RustlsDownstreamTransportSocketConfigFactory factory;
+
+  envoy::extensions::transport_sockets::rustls::v3::RustlsDownstreamTlsContext config;
+  config.set_cert_chain(
+      TestEnvironment::runfilesPath("test/common/tls/test_data/selfsigned_cert.pem"));
+  config.set_private_key(
+      TestEnvironment::runfilesPath("test/common/tls/test_data/selfsigned_key.pem"));
+  config.set_trusted_ca(TestEnvironment::runfilesPath("test/common/tls/test_data/ca_cert.pem"));
+  config.set_crl(TestEnvironment::runfilesPath("test/common/tls/test_data/ca_cert.crl"));
+
+  auto result = factory.createTransportSocketFactory(config, context_, {});
+  EXPECT_TRUE(result.ok()) << result.status().message();
+}
+
+TEST_F(RustlsImplTest, DownstreamRejectsCrlWithoutTrustedCa) {
+  RustlsDownstreamTransportSocketConfigFactory factory;
+
+  envoy::extensions::transport_sockets::rustls::v3::RustlsDownstreamTlsContext config;
+  config.set_cert_chain(
+      TestEnvironment::runfilesPath("test/common/tls/test_data/selfsigned_cert.pem"));
+  config.set_private_key(
+      TestEnvironment::runfilesPath("test/common/tls/test_data/selfsigned_key.pem"));
+  // A CRL with no trusted_ca is meaningless and is rejected at config-load time.
+  config.set_crl(TestEnvironment::runfilesPath("test/common/tls/test_data/ca_cert.crl"));
+
+  auto result = factory.createTransportSocketFactory(config, context_, {});
+  EXPECT_FALSE(result.ok());
+}
+
+TEST_F(RustlsImplTest, DownstreamRejectsCrlWithNoCrlBlocks) {
+  RustlsDownstreamTransportSocketConfigFactory factory;
+
+  envoy::extensions::transport_sockets::rustls::v3::RustlsDownstreamTlsContext config;
+  config.set_cert_chain(
+      TestEnvironment::runfilesPath("test/common/tls/test_data/selfsigned_cert.pem"));
+  config.set_private_key(
+      TestEnvironment::runfilesPath("test/common/tls/test_data/selfsigned_key.pem"));
+  config.set_trusted_ca(TestEnvironment::runfilesPath("test/common/tls/test_data/ca_cert.pem"));
+  // The crl points at a cert file with no X509 CRL block, which is rejected fail-loud.
+  config.set_crl(TestEnvironment::runfilesPath("test/common/tls/test_data/ca_cert.pem"));
+
+  auto result = factory.createTransportSocketFactory(config, context_, {});
+  EXPECT_FALSE(result.ok());
+}
+
+TEST_F(RustlsImplTest, UpstreamWithTlsVersionBounds) {
+  RustlsUpstreamTransportSocketConfigFactory factory;
+
+  envoy::extensions::transport_sockets::rustls::v3::RustlsUpstreamTlsContext config;
+  config.set_sni("example.com");
+  config.set_tls_minimum_protocol_version(
+      envoy::extensions::transport_sockets::rustls::v3::TLSv1_3);
+  config.set_tls_maximum_protocol_version(
+      envoy::extensions::transport_sockets::rustls::v3::TLSv1_3);
+
+  auto result = factory.createTransportSocketFactory(config, context_);
+  EXPECT_TRUE(result.ok()) << result.status().message();
+}
+
+TEST_F(RustlsImplTest, UpstreamRejectsInvertedTlsVersionRange) {
+  RustlsUpstreamTransportSocketConfigFactory factory;
+
+  envoy::extensions::transport_sockets::rustls::v3::RustlsUpstreamTlsContext config;
+  config.set_sni("example.com");
+  config.set_tls_minimum_protocol_version(
+      envoy::extensions::transport_sockets::rustls::v3::TLSv1_3);
+  config.set_tls_maximum_protocol_version(
+      envoy::extensions::transport_sockets::rustls::v3::TLSv1_2);
+
+  auto result = factory.createTransportSocketFactory(config, context_);
+  EXPECT_FALSE(result.ok());
+}
+
 TEST_F(RustlsImplTest, DownstreamWithKtlsEnabled) {
   RustlsDownstreamTransportSocketConfigFactory factory;
 

@@ -10,10 +10,10 @@ use envoy_proxy_dynamic_modules_rust_sdk::{
   EnvoyTransportSocket, EnvoyTransportSocketImpl, IoResult, IoStatus, TransportSocket,
   TransportSocketFactoryConfig,
 };
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName};
 use rustls::{
   CipherSuite, ClientConfig, ClientConnection, Connection, ProtocolVersion, RootCertStore,
-  ServerConfig, ServerConnection,
+  ServerConfig, ServerConnection, SupportedProtocolVersion,
 };
 use serde::Deserialize;
 use std::io::{self, Cursor, Read, Write};
@@ -70,6 +70,81 @@ struct JsonConfig {
   /// SNI hostname for upstream client connections. If not specified, defaults to "localhost".
   #[serde(default)]
   sni: Option<String>,
+  /// Minimum acceptable TLS protocol version. Defaults to TLS_AUTO (rustls safe default range).
+  #[serde(default)]
+  tls_minimum_protocol_version: TlsVersion,
+  /// Maximum acceptable TLS protocol version. Defaults to TLS_AUTO (rustls safe default range).
+  #[serde(default)]
+  tls_maximum_protocol_version: TlsVersion,
+  /// PEM-encoded certificate revocation list for downstream client-cert verification, or path to
+  /// a PEM file. Only meaningful when trusted_ca is set.
+  #[serde(default)]
+  crl: Option<String>,
+}
+
+/// TLS protocol version bound, deserialized from the proto enum's JSON name. Mirrors the proto
+/// `TlsVersion` enum (TLS_AUTO / TLSv1_2 / TLSv1_3).
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+enum TlsVersion {
+  #[default]
+  #[serde(rename = "TLS_AUTO")]
+  Auto,
+  #[serde(rename = "TLSv1_2")]
+  Tls12,
+  #[serde(rename = "TLSv1_3")]
+  Tls13,
+}
+
+impl TlsVersion {
+  /// Ordering rank within the rustls-supported range. TLS 1.2 is the floor and TLS 1.3 the
+  /// ceiling, so an unset (Auto) minimum maps to 1.2 and an unset maximum maps to 1.3.
+  fn rank(self, is_max: bool) -> u8 {
+    match self {
+      TlsVersion::Auto => {
+        if is_max {
+          2
+        } else {
+          1
+        }
+      },
+      TlsVersion::Tls12 => 1,
+      TlsVersion::Tls13 => 2,
+    }
+  }
+}
+
+/// Resolves the configured (min, max) bound to an explicit rustls protocol-version list, or `None`
+/// when both are TLS_AUTO (use rustls's default range). Rejects an inverted range at config time.
+fn protocol_versions(
+  min: TlsVersion,
+  max: TlsVersion,
+) -> Result<Option<Vec<&'static SupportedProtocolVersion>>, String> {
+  let lo = min.rank(/*is_max=*/ false);
+  let hi = max.rank(/*is_max=*/ true);
+  if lo > hi {
+    return Err(format!(
+      "tls_minimum_protocol_version ({min:?}) is greater than tls_maximum_protocol_version ({max:?})"
+    ));
+  }
+  if min == TlsVersion::Auto && max == TlsVersion::Auto {
+    return Ok(None);
+  }
+  let mut versions: Vec<&'static SupportedProtocolVersion> = Vec::new();
+  if lo == 1 {
+    versions.push(&rustls::version::TLS12);
+  }
+  if hi == 2 {
+    versions.push(&rustls::version::TLS13);
+  }
+  Ok(Some(versions))
+}
+
+/// Parses zero or more PEM-encoded certificate revocation lists.
+fn parse_crls(pem: &[u8]) -> Result<Vec<CertificateRevocationListDer<'static>>, String> {
+  let mut cursor = Cursor::new(pem);
+  rustls_pemfile::crls(&mut cursor)
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| format!("failed to parse CRL PEM: {e}"))
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -174,18 +249,53 @@ impl RustlsFactoryConfig {
     let certs = parse_cert_chain(&cert_pem)?;
     let key = parse_private_key(&key_pem)?;
 
-    let builder = ServerConfig::builder();
-    let want_server_cert = match &cfg.trusted_ca {
-      Some(ca) if !ca.trim().is_empty() => {
-        let mut root_store = RootCertStore::empty();
-        let pem = load_pem_bytes(ca)?;
-        add_trusted_roots_from_pem(&pem, &mut root_store)?;
-        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
-          .build()
-          .map_err(|e| format!("client cert verifier: {e}"))?;
-        builder.with_client_cert_verifier(verifier)
-      },
-      _ => builder.with_no_client_auth(),
+    let has_trusted_ca = cfg
+      .trusted_ca
+      .as_ref()
+      .is_some_and(|s| !s.trim().is_empty());
+    let has_crl = cfg.crl.as_ref().is_some_and(|s| !s.trim().is_empty());
+    // A CRL only constrains client-certificate verification, which is enabled by trusted_ca, so a
+    // CRL without a trust store is a misconfiguration. Reject it at load time rather than silently
+    // accepting client certs the operator believes are being revocation-checked.
+    if has_crl && !has_trusted_ca {
+      return Err(
+        "`crl` requires `trusted_ca`; a CRL only applies to client-certificate verification, \
+         which is enabled by setting `trusted_ca`"
+          .to_string(),
+      );
+    }
+
+    let versions = protocol_versions(
+      cfg.tls_minimum_protocol_version,
+      cfg.tls_maximum_protocol_version,
+    )?;
+    let builder = match &versions {
+      Some(v) => ServerConfig::builder_with_protocol_versions(v),
+      None => ServerConfig::builder(),
+    };
+    let want_server_cert = if has_trusted_ca {
+      let mut root_store = RootCertStore::empty();
+      let pem = load_pem_bytes(cfg.trusted_ca.as_ref().unwrap())?;
+      add_trusted_roots_from_pem(&pem, &mut root_store)?;
+      let mut verifier_builder =
+        rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
+      if has_crl {
+        let crl_pem = load_pem_bytes(cfg.crl.as_ref().unwrap())?;
+        let crls = parse_crls(&crl_pem)?;
+        if crls.is_empty() {
+          return Err(
+            "`crl` was set but no CRL was parsed from it (expected PEM `X509 CRL` blocks)"
+              .to_string(),
+          );
+        }
+        verifier_builder = verifier_builder.with_crls(crls);
+      }
+      let verifier = verifier_builder
+        .build()
+        .map_err(|e| format!("client cert verifier: {e}"))?;
+      builder.with_client_cert_verifier(verifier)
+    } else {
+      builder.with_no_client_auth()
     };
 
     let mut server_config = want_server_cert
@@ -229,15 +339,21 @@ impl RustlsFactoryConfig {
       None
     };
 
+    let versions = protocol_versions(
+      cfg.tls_minimum_protocol_version,
+      cfg.tls_maximum_protocol_version,
+    )?;
+    let with_roots = match &versions {
+      Some(v) => ClientConfig::builder_with_protocol_versions(v),
+      None => ClientConfig::builder(),
+    }
+    .with_root_certificates(root_store);
     let mut client_config = if let Some((certs, key)) = client_cert {
-      ClientConfig::builder()
-        .with_root_certificates(root_store)
+      with_roots
         .with_client_auth_cert(certs, key)
         .map_err(|e| format!("client config (mTLS): {e}"))?
     } else {
-      ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth()
+      with_roots.with_no_client_auth()
     };
     client_config.alpn_protocols = alpn_from_config(&cfg);
     client_config.enable_secret_extraction = cfg.enable_ktls;
@@ -2547,6 +2663,9 @@ mod tests {
       enable_ktls: true,
       disable_ktls_rx: true,
       sni: None,
+      tls_minimum_protocol_version: TlsVersion::Auto,
+      tls_maximum_protocol_version: TlsVersion::Auto,
+      crl: None,
     };
     let result = RustlsFactoryConfig::validate_ktls_options(&bad_cfg);
     assert!(result.is_err(), "disable_ktls_rx: true must be rejected");
@@ -2569,6 +2688,9 @@ mod tests {
       enable_ktls: true,
       disable_ktls_rx: false,
       sni: None,
+      tls_minimum_protocol_version: TlsVersion::Auto,
+      tls_maximum_protocol_version: TlsVersion::Auto,
+      crl: None,
     };
     assert!(RustlsFactoryConfig::validate_ktls_options(&ok_cfg).is_ok());
 
@@ -2581,8 +2703,49 @@ mod tests {
       enable_ktls: false,
       disable_ktls_rx: true,
       sni: None,
+      tls_minimum_protocol_version: TlsVersion::Auto,
+      tls_maximum_protocol_version: TlsVersion::Auto,
+      crl: None,
     };
     assert!(RustlsFactoryConfig::validate_ktls_options(&benign_cfg).is_ok());
+  }
+
+  #[test]
+  fn protocol_versions_auto_is_default_range() {
+    // Both bounds unset means no explicit pinning, so rustls uses its own default range.
+    assert!(protocol_versions(TlsVersion::Auto, TlsVersion::Auto)
+      .unwrap()
+      .is_none());
+  }
+
+  #[test]
+  fn protocol_versions_restricts_to_requested_bounds() {
+    // TLS 1.3 only.
+    let v = protocol_versions(TlsVersion::Tls13, TlsVersion::Tls13)
+      .unwrap()
+      .unwrap();
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].version, ProtocolVersion::TLSv1_3);
+    // Auto minimum floors to 1.2, maximum pinned to 1.2, so TLS 1.2 only.
+    let v = protocol_versions(TlsVersion::Auto, TlsVersion::Tls12)
+      .unwrap()
+      .unwrap();
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].version, ProtocolVersion::TLSv1_2);
+    // Explicit 1.2 minimum with auto maximum spans both 1.2 and 1.3.
+    let v = protocol_versions(TlsVersion::Tls12, TlsVersion::Auto)
+      .unwrap()
+      .unwrap();
+    assert_eq!(v.len(), 2);
+  }
+
+  #[test]
+  fn protocol_versions_rejects_inverted_range() {
+    let err = protocol_versions(TlsVersion::Tls13, TlsVersion::Tls12).unwrap_err();
+    assert!(
+      err.contains("greater than"),
+      "error must explain the inversion: {err}"
+    );
   }
 
   #[test]

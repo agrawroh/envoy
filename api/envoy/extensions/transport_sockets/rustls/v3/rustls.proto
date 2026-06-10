@@ -13,6 +13,20 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 // [#protodoc-title: ``rustls`` transport socket]
 // [#extension: envoy.transport_sockets.rustls]
 
+// Bound on the negotiated TLS protocol version. Mirrors the names used by
+// :ref:`TlsParameters.TlsProtocol
+// <envoy_v3_api_enum_extensions.transport_sockets.tls.v3.TlsParameters.TlsProtocol>`.
+enum TlsVersion {
+  // Let ``rustls`` choose its safe default range (currently TLS 1.2 and TLS 1.3).
+  TLS_AUTO = 0;
+
+  // TLS 1.2.
+  TLSv1_2 = 1;
+
+  // TLS 1.3.
+  TLSv1_3 = 2;
+}
+
 // Configuration for upstream TLS connections using the ``rustls`` library with optional
 // kernel TLS (``kTLS``) offload on Linux. ``rustls`` is a pure Rust TLS implementation
 // that supports TLS 1.2 and TLS 1.3 with the ``ring`` cryptographic backend.
@@ -33,7 +47,8 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 //     ``verify_subject_alt_name``).
 //   * Certificate revocation (CRL / OCSP).
 //   * SDS-managed certificate rotation.
-//   * Fine-grained ``TlsParameters`` (cipher / version restrictions).
+//   * Cipher-suite restriction (``TlsParameters.cipher_suites``). Protocol-version bounds ARE
+//     supported, see ``tls_minimum_protocol_version`` / ``tls_maximum_protocol_version``.
 //
 //   **Authorization / observability gap**: ``Network::Connection::ssl()`` returns ``nullptr``
 //   for this transport socket. Filters and access-log formatters that consume TLS metadata —
@@ -47,7 +62,7 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 //
 //   For any of the above gaps, use :ref:`envoy.transport_sockets.tls
 //   <envoy_v3_api_msg_extensions.transport_sockets.tls.v3.UpstreamTlsContext>` instead.
-// [#next-free-field: 8]
+// [#next-free-field: 10]
 message RustlsUpstreamTlsContext {
   // PEM-encoded certificate chain for client authentication (mTLS). Can be inline PEM content
   // or a filesystem path to a PEM file.
@@ -99,6 +114,15 @@ message RustlsUpstreamTlsContext {
   //
   // Defaults to ``false``.
   bool disable_ktls_rx = 7;
+
+  // Minimum acceptable TLS protocol version. ``TLS_AUTO`` (the default) lets ``rustls`` pick its
+  // safe default range. If ``tls_maximum_protocol_version`` is also set it must be greater than or
+  // equal to this value, otherwise the config is rejected at load time.
+  TlsVersion tls_minimum_protocol_version = 8;
+
+  // Maximum acceptable TLS protocol version. ``TLS_AUTO`` (the default) lets ``rustls`` pick its
+  // safe default range.
+  TlsVersion tls_maximum_protocol_version = 9;
 }
 
 // Configuration for downstream TLS listeners using the ``rustls`` library with optional
@@ -110,9 +134,10 @@ message RustlsUpstreamTlsContext {
 //   :ref:`envoy.transport_sockets.tls
 //   <envoy_v3_api_msg_extensions.transport_sockets.tls.v3.DownstreamTlsContext>`. Not yet
 //   supported: SDS-managed certificate rotation, multi-cert (SNI-based selection) listeners,
-//   client certificate revocation (CRL / OCSP), fine-grained ``TlsParameters`` (cipher /
-//   version restrictions), and ``require_client_certificate``. Use the standard TLS extension
-//   if you need any of these.
+//   OCSP client-certificate revocation, cipher-suite restriction, and
+//   ``require_client_certificate``. Client-certificate revocation via CRL and protocol-version
+//   bounds ARE supported, see ``crl`` and ``tls_minimum_protocol_version``. Use the standard TLS
+//   extension if you need any of the unsupported items.
 //
 //   **Authorization / observability gap**: ``Network::Connection::ssl()`` returns ``nullptr``
 //   on the downstream side as well. Listeners whose filter chains rely on mTLS-authenticated
@@ -120,7 +145,7 @@ message RustlsUpstreamTlsContext {
 //   access-log fields will see those fields empty/unauthenticated. **Do not route untrusted
 //   downstream clients through this socket** until the ``Ssl::ConnectionInfo`` plumbing
 //   lands.
-// [#next-free-field: 7]
+// [#next-free-field: 10]
 message RustlsDownstreamTlsContext {
   // PEM-encoded certificate chain presented to connecting clients. Can be inline PEM content
   // or a filesystem path to a PEM file.
@@ -166,4 +191,20 @@ message RustlsDownstreamTlsContext {
   //
   // Defaults to ``false``.
   bool disable_ktls_rx = 6;
+
+  // Minimum acceptable TLS protocol version. ``TLS_AUTO`` (the default) lets ``rustls`` pick its
+  // safe default range. If ``tls_maximum_protocol_version`` is also set it must be greater than or
+  // equal to this value, otherwise the config is rejected at load time.
+  TlsVersion tls_minimum_protocol_version = 7;
+
+  // Maximum acceptable TLS protocol version. ``TLS_AUTO`` (the default) lets ``rustls`` pick its
+  // safe default range.
+  TlsVersion tls_maximum_protocol_version = 8;
+
+  // PEM-encoded certificate revocation list (CRL) used to reject revoked client certificates
+  // during mTLS verification. Can be inline PEM content or a filesystem path to a PEM file, and
+  // may contain multiple concatenated CRLs. Only meaningful when ``trusted_ca`` is set (client
+  // certificates are verified). The CRL is read once at config-load time and is not refreshed,
+  // so a rotated CRL requires a config update.
+  string crl = 9;
 }
