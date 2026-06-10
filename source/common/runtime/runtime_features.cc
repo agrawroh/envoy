@@ -134,7 +134,7 @@ FALSE_RUNTIME_GUARD(envoy_reloadable_features_test_feature_false);
 // descriptor_value fields by default.
 FALSE_RUNTIME_GUARD(
     envoy_reloadable_features_enable_formatter_for_ratelimit_action_descriptor_value);
-// TODO: Flip to true once WebTransport over HTTP/3 termination is complete.
+// TODO flip to true once WebTransport over HTTP/3 termination is complete.
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_web_transport);
 // TODO(adisuissa) reset to true to enable unified mux by default
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_unified_mux);
