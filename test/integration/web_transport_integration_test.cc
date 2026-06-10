@@ -179,7 +179,7 @@ protected:
   }
 
   WebTransportClientSession* client_session_{nullptr};
-  // Owned here so it outlives the upstream session it is registered on through test teardown.
+  // Registered on the upstream session for the life of the test and detached before teardown.
   std::unique_ptr<EchoUpstreamWebTransportCallbacks> upstream_echo_;
 };
 
@@ -383,6 +383,9 @@ TEST_P(WebTransportIntegrationTest, ProxyDatagramEcho) {
   test_server_->waitForCounter(clusterWebTransportStat("sessions_total"), testing::Eq(1));
   test_server_->waitForGauge(clusterWebTransportStat("sessions_active"), testing::Eq(1));
 
+  // Detach the echo before teardown closes the upstream session, so the closing session does not
+  // call back into the echo once it is freed.
+  upstream_session->setWebTransportSessionCallbacks(nullptr);
   codec_client_->close();
 }
 
