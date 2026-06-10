@@ -329,6 +329,38 @@ std::vector<std::string> EnvoyQuicClientSession::GetAlpnsToOffer() const {
                                    : configured_alpns_;
 }
 
+bool EnvoyQuicClientSession::OnSettingsFrame(const quic::SettingsFrame& frame) {
+  const bool result = quic::QuicSpdyClientSession::OnSettingsFrame(frame);
+  if (!result) {
+    return false;
+  }
+  // SETTINGS have been received, so SupportsWebTransport() is now definitive. Replay any buffered
+  // WebTransport CONNECTs. Move the set out first so a stream that registers during replay does not
+  // mutate the container being iterated, and re-resolve each id so a stream that closed meanwhile
+  // is skipped.
+  absl::flat_hash_set<quic::QuicStreamId> waiting =
+      std::move(streams_waiting_for_web_transport_settings_);
+  streams_waiting_for_web_transport_settings_.clear();
+  for (quic::QuicStreamId id : waiting) {
+    quic::QuicSpdyStream* stream = GetOrCreateSpdyDataStream(id);
+    if (stream == nullptr) {
+      continue;
+    }
+    static_cast<EnvoyQuicClientStream*>(stream)->onWebTransportSettingsReceived();
+  }
+  return true;
+}
+
+void EnvoyQuicClientSession::registerStreamWaitingForWebTransportSettings(
+    EnvoyQuicClientStream& stream) {
+  streams_waiting_for_web_transport_settings_.insert(stream.id());
+}
+
+void EnvoyQuicClientSession::unregisterStreamWaitingForWebTransportSettings(
+    EnvoyQuicClientStream& stream) {
+  streams_waiting_for_web_transport_settings_.erase(stream.id());
+}
+
 void EnvoyQuicClientSession::OnConfigNegotiated() {
   received_custom_transport_parameters_ = config()->received_custom_transport_parameters();
   if (config()->HasReceivedIPv6AlternateServerAddress()) {

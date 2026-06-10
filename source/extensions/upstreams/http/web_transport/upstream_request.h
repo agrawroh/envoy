@@ -110,6 +110,10 @@ public:
   void onRelayClosed() override;
 
 private:
+  // Wires the relay once the upstream CONNECT has been issued, or refuses it if either side did not
+  // negotiate WebTransport or the downstream is over its session limit. Runs from the encoder ready
+  // callback, which may fire after the upstream SETTINGS arrive.
+  void setupRelay();
   // Drops the active-session gauge once. Called on relay close and on destruction.
   void releaseActiveSession();
 

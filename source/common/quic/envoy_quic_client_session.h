@@ -12,6 +12,7 @@
 #include "source/common/quic/quic_transport_socket_factory.h"
 #include "source/common/quic/scone_state.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "quiche/quic/core/http/quic_spdy_client_session.h"
 
 namespace Envoy {
@@ -87,9 +88,18 @@ public:
                                   : quic::WebTransportHttp3VersionSet();
   }
 
+  // Drains the streams waiting for SETTINGS so a deferred WebTransport CONNECT can be sent once the
+  // peer has advertised WebTransport.
+  bool OnSettingsFrame(const quic::SettingsFrame& frame) override;
+
   std::vector<std::string> GetAlpnsToOffer() const override;
   void OnConfigNegotiated() override;
   void OnSconePacket(quic::QuicBandwidth bandwidth) override;
+
+  // Registers a stream whose WebTransport CONNECT is buffered until the peer SETTINGS arrive. The
+  // stream removes itself in OnClose if it closes first.
+  void registerStreamWaitingForWebTransportSettings(EnvoyQuicClientStream& stream);
+  void unregisterStreamWaitingForWebTransportSettings(EnvoyQuicClientStream& stream);
 
   // quic::QuicSpdyClientSessionBase
   bool ShouldKeepConnectionAlive() const override;
@@ -164,6 +174,9 @@ private:
   quic::HttpDatagramSupport http_datagram_support_ = quic::HttpDatagramSupport::kNone;
   // Whether to advertise WebTransport support, latched once in setHttp3Options().
   bool web_transport_enabled_ = false;
+  // Ids of streams whose WebTransport CONNECT is buffered until the peer SETTINGS arrive. Ids are
+  // re-resolved on drain so a stream that closed meanwhile is skipped.
+  absl::flat_hash_set<quic::QuicStreamId> streams_waiting_for_web_transport_settings_;
   const bool session_handles_migration_;
   QuicNetworkConnectivityObserverPtr network_connectivity_observer_;
   OptRef<EnvoyQuicNetworkObserverRegistry> registry_;

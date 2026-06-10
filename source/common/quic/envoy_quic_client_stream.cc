@@ -76,15 +76,31 @@ Http::Status EnvoyQuicClientStream::encodeHeaders(const Http::RequestHeaderMap& 
     return absl::CancelledError("encodeHeaders is called on write-closed stream.");
   }
 
-  local_end_stream_ = end_stream;
-  SendBufferMonitor::ScopedWatermarkBufferUpdater updater(this, this);
-  quiche::HttpHeaderBlock spdy_headers;
   // A WebTransport extended CONNECT keeps the scheme, path and protocol pseudo-headers, and skips
   // capsule setup because QUICHE registers itself as the stream datagram visitor.
-  [[maybe_unused]] const bool web_transport_connect =
+  const bool web_transport_connect =
       Runtime::runtimeFeatureEnabled("envoy.reloadable_features.web_transport") &&
       headers.Protocol() != nullptr &&
       headers.getProtocolValue() == Http::Headers::get().ProtocolValues.WebTransport;
+  // QUICHE only mints the session when the peer has advertised WebTransport, which is known once
+  // its SETTINGS arrive. Buffer the CONNECT until then so it is not sent early and silently
+  // dropped.
+  if (web_transport_connect) {
+    auto* client_session = static_cast<EnvoyQuicClientSession*>(session());
+    if (!client_session->SupportsWebTransport() && !client_session->settings_received()) {
+      ENVOY_STREAM_LOG(debug, "buffering WebTransport CONNECT until upstream SETTINGS arrive.",
+                       *this);
+      deferred_web_transport_connect_headers_ =
+          Http::createHeaderMap<Http::RequestHeaderMapImpl>(headers);
+      deferred_web_transport_connect_end_stream_ = end_stream;
+      client_session->registerStreamWaitingForWebTransportSettings(*this);
+      return Http::okStatus();
+    }
+  }
+
+  local_end_stream_ = end_stream;
+  SendBufferMonitor::ScopedWatermarkBufferUpdater updater(this, this);
+  quiche::HttpHeaderBlock spdy_headers;
 #ifndef ENVOY_ENABLE_UHV
   // Extended CONNECT to H/1 upgrade transformation has moved to UHV
   if (Http::Utility::isUpgrade(headers)) {
@@ -143,7 +159,25 @@ Http::Status EnvoyQuicClientStream::encodeHeaders(const Http::RequestHeaderMap& 
     }
     onLocalEndStream();
   }
+  // The CONNECT has been written and webTransport() now reflects whether the upstream negotiated
+  // WebTransport, so let the proxy set up relaying.
+  if (web_transport_connect && web_transport_connect_ready_cb_) {
+    web_transport_connect_ready_cb_();
+  }
   return Http::okStatus();
+}
+
+void EnvoyQuicClientStream::onWebTransportSettingsReceived() {
+  if (deferred_web_transport_connect_headers_ == nullptr) {
+    return;
+  }
+  // Replay the buffered CONNECT. encodeHeaders now sees the SETTINGS and sends it instead of
+  // buffering again.
+  Http::RequestHeaderMapPtr headers = std::move(deferred_web_transport_connect_headers_);
+  Http::Status status = encodeHeaders(*headers, deferred_web_transport_connect_end_stream_);
+  if (!status.ok()) {
+    ENVOY_STREAM_LOG(debug, "deferred WebTransport CONNECT failed: {}.", *this, status.message());
+  }
 }
 
 void EnvoyQuicClientStream::encodeTrailers(const Http::RequestTrailerMap& trailers) {
@@ -460,6 +494,12 @@ void EnvoyQuicClientStream::OnConnectionClosed(const quic::QuicConnectionCloseFr
 }
 
 void EnvoyQuicClientStream::OnClose() {
+  if (deferred_web_transport_connect_headers_ != nullptr) {
+    // The stream closed before SETTINGS arrived, so drop the buffered CONNECT and its registration.
+    static_cast<EnvoyQuicClientSession*>(session())->unregisterStreamWaitingForWebTransportSettings(
+        *this);
+    deferred_web_transport_connect_headers_.reset();
+  }
   destroy();
   quic::QuicSpdyClientStream::OnClose();
   if (isDoingWatermarkAccounting()) {

@@ -30,7 +30,12 @@ WebTransportUpstream::WebTransportUpstream(Router::UpstreamToDownstream& upstrea
   }
 }
 
-WebTransportUpstream::~WebTransportUpstream() { releaseActiveSession(); }
+WebTransportUpstream::~WebTransportUpstream() {
+  // Drop the ready callback so a late upstream SETTINGS frame cannot call back into this destroyed
+  // upstream.
+  request_encoder_->setWebTransportConnectReadyCallback(nullptr);
+  releaseActiveSession();
+}
 
 void WebTransportUpstream::releaseActiveSession() {
   if (session_active_recorded_) {
@@ -80,28 +85,32 @@ void WebTransportConnPool::onPoolReady(Envoy::Http::RequestEncoder& request_enco
 
 Envoy::Http::Status
 WebTransportUpstream::encodeHeaders(const Envoy::Http::RequestHeaderMap& headers, bool end_stream) {
-  Envoy::Http::Status status = request_encoder_->encodeHeaders(headers, end_stream);
-  if (!status.ok()) {
-    return status;
-  }
+  // The upstream CONNECT may be deferred until the upstream SETTINGS arrive, so set up the relay
+  // from the ready callback rather than inline. The callback fires once the CONNECT is written and
+  // webTransport() is definitive.
+  request_encoder_->setWebTransportConnectReadyCallback([this]() { setupRelay(); });
+  return request_encoder_->encodeHeaders(headers, end_stream);
+}
+
+void WebTransportUpstream::setupRelay() {
   // The upstream session exists once the extended CONNECT is sent and the upstream advertised
   // WebTransport. The downstream session is the CONNECT the router is proxying.
   OptRef<Envoy::Http::WebTransportSession> upstream_session = request_encoder_->webTransport();
   OptRef<Envoy::Http::WebTransportSession> downstream_session = upstream_request_.webTransport();
-  if (!upstream_session.has_value() || !downstream_session.has_value()) {
+  if (!upstream_session.has_value() || !downstream_session.has_value() ||
+      downstream_session->sessionLimitExceeded()) {
     stats_.sessions_rejected_.inc();
-    return absl::InternalError("upstream did not negotiate WebTransport");
-  }
-  if (downstream_session->sessionLimitExceeded()) {
-    stats_.sessions_rejected_.inc();
-    return absl::InternalError("downstream WebTransport session limit exceeded");
+    // Defer the reset so this never re-enters the encoder from inside its own ready callback.
+    if (teardown_callback_ != nullptr) {
+      teardown_callback_->scheduleCallbackNextIteration();
+    }
+    return;
   }
   relay_ =
       std::make_unique<WebTransportRelay>(downstream_session.ref(), upstream_session.ref(), *this);
   stats_.sessions_total_.inc();
   stats_.sessions_active_.inc();
   session_active_recorded_ = true;
-  return Envoy::Http::okStatus();
 }
 
 void WebTransportUpstream::resetStream() {
