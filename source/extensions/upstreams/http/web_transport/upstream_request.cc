@@ -15,6 +15,19 @@ namespace Upstreams {
 namespace Http {
 namespace WebTransport {
 
+WebTransportUpstream::WebTransportUpstream(Router::UpstreamToDownstream& upstream_request,
+                                           Envoy::Http::RequestEncoder* encoder)
+    : upstream_request_(upstream_request), request_encoder_(encoder) {
+  request_encoder_->getStream().addCallbacks(*this);
+  // The downstream connection drives both sides of the relay, so reset on its dispatcher.
+  OptRef<const Network::Connection> connection = upstream_request_.connection();
+  if (connection.has_value()) {
+    teardown_callback_ = connection->dispatcher().createSchedulableCallback([this]() {
+      upstream_request_.onResetStream(Envoy::Http::StreamResetReason::RemoteReset, "");
+    });
+  }
+}
+
 void WebTransportConnPool::newStream(GenericConnectionPoolCallbacks* callbacks) {
   callbacks_ = callbacks;
   // A reset can happen inline within the newStream() call, deleting this pool. Only store the
@@ -64,13 +77,14 @@ WebTransportUpstream::encodeHeaders(const Envoy::Http::RequestHeaderMap& headers
   // WebTransport. The downstream session is the CONNECT the router is proxying.
   OptRef<Envoy::Http::WebTransportSession> upstream_session = request_encoder_->webTransport();
   OptRef<Envoy::Http::WebTransportSession> downstream_session = upstream_request_.webTransport();
-  if (!upstream_session.has_value() || !downstream_session.has_value() ||
-      downstream_session->sessionLimitExceeded()) {
-    // The upstream did not negotiate WebTransport or the downstream is over its session limit.
-    // Reset rather than relay a half open session.
-    return absl::InternalError("cannot establish WebTransport relay");
+  if (!upstream_session.has_value() || !downstream_session.has_value()) {
+    return absl::InternalError("upstream did not negotiate WebTransport");
   }
-  relay_ = std::make_unique<WebTransportRelay>(downstream_session.ref(), upstream_session.ref());
+  if (downstream_session->sessionLimitExceeded()) {
+    return absl::InternalError("downstream WebTransport session limit exceeded");
+  }
+  relay_ =
+      std::make_unique<WebTransportRelay>(downstream_session.ref(), upstream_session.ref(), *this);
   return Envoy::Http::okStatus();
 }
 
@@ -79,6 +93,13 @@ void WebTransportUpstream::resetStream() {
   auto& stream = request_encoder_->getStream();
   stream.removeCallbacks(*this);
   stream.resetStream(Envoy::Http::StreamResetReason::LocalReset);
+}
+
+void WebTransportUpstream::onRelayClosed() {
+  // A session closed. Defer the reset so this callback can unwind before the relay is freed.
+  if (teardown_callback_ != nullptr) {
+    teardown_callback_->scheduleCallbackNextIteration();
+  }
 }
 
 } // namespace WebTransport

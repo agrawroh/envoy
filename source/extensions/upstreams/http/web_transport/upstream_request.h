@@ -2,6 +2,7 @@
 
 #include <memory>
 
+#include "envoy/event/schedulable_cb.h"
 #include "envoy/http/codec.h"
 #include "envoy/http/conn_pool.h"
 #include "envoy/upstream/thread_local_cluster.h"
@@ -60,13 +61,11 @@ private:
 // WebTransportRelay forwards datagrams in both directions.
 class WebTransportUpstream : public Router::GenericUpstream,
                              public Envoy::Http::StreamCallbacks,
+                             public WebTransportRelay::Callbacks,
                              protected Logger::Loggable<Logger::Id::upstream> {
 public:
   WebTransportUpstream(Router::UpstreamToDownstream& upstream_request,
-                       Envoy::Http::RequestEncoder* encoder)
-      : upstream_request_(upstream_request), request_encoder_(encoder) {
-    request_encoder_->getStream().addCallbacks(*this);
-  }
+                       Envoy::Http::RequestEncoder* encoder);
 
   // GenericUpstream
   void encodeData(Buffer::Instance& data, bool end_stream) override {
@@ -102,10 +101,17 @@ public:
     upstream_request_.onBelowWriteBufferLowWatermark();
   }
 
+  // WebTransportRelay::Callbacks
+  void onRelayClosed() override;
+
 private:
   Router::UpstreamToDownstream& upstream_request_;
   Envoy::Http::RequestEncoder* request_encoder_{};
   std::unique_ptr<WebTransportRelay> relay_;
+  // Resets the stream after a relay close unwinds, so the close callback never re-enters and frees
+  // the relay while it is on the stack. Owned here so it is cancelled if this upstream is destroyed
+  // first.
+  Event::SchedulableCallbackPtr teardown_callback_;
 };
 
 } // namespace WebTransport

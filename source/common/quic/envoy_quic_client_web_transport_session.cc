@@ -51,7 +51,10 @@ void EnvoyQuicClientWebTransportSession::Visitor::OnSessionClosed(
 }
 
 void EnvoyQuicClientWebTransportSession::Visitor::OnDatagramReceived(absl::string_view datagram) {
-  if (bridge_ != nullptr && bridge_->callbacks_ != nullptr) {
+  if (bridge_ == nullptr || bridge_->closed_) {
+    return;
+  }
+  if (bridge_->callbacks_ != nullptr) {
     bridge_->callbacks_->onWebTransportDatagram(datagram);
   }
 }

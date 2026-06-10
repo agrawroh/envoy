@@ -11,14 +11,21 @@ namespace Http {
 namespace WebTransport {
 
 // Relays datagrams between a downstream WebTransport session and an upstream one. The relay
-// registers on both sessions and forwards each received datagram to the peer. A session that closes
-// drops out of the relay, so the relay never forwards to or detaches from a freed session, and the
-// relay detaches from any still open session on destruction. Stream resets tear the proxied flow
-// down, so the relay does not propagate closure itself.
+// registers on both sessions and forwards each received datagram to the peer. When a session
+// closes the relay detaches from it and stops forwarding, then notifies the owner once so the
+// owner can tear the proxied flow down. The relay also detaches from any still open session on
+// destruction, so no session is ever left holding a callback into a freed relay.
 class WebTransportRelay : protected Logger::Loggable<Logger::Id::upstream> {
 public:
+  // Notified once when either session closes.
+  class Callbacks {
+  public:
+    virtual ~Callbacks() = default;
+    virtual void onRelayClosed() PURE;
+  };
+
   WebTransportRelay(Envoy::Http::WebTransportSession& downstream,
-                    Envoy::Http::WebTransportSession& upstream);
+                    Envoy::Http::WebTransportSession& upstream, Callbacks& callbacks);
   ~WebTransportRelay();
 
 private:
@@ -47,12 +54,14 @@ private:
     return direction == Direction::Downstream ? downstream_ : upstream_;
   }
 
+  Callbacks& callbacks_;
   Side downstream_side_;
   Side upstream_side_;
   // Nulled when the matching session closes so the relay neither forwards to nor detaches a freed
   // session.
   Envoy::Http::WebTransportSession* downstream_;
   Envoy::Http::WebTransportSession* upstream_;
+  bool notified_{false};
 };
 
 } // namespace WebTransport

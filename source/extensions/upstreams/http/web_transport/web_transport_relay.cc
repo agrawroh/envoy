@@ -7,9 +7,10 @@ namespace Http {
 namespace WebTransport {
 
 WebTransportRelay::WebTransportRelay(Envoy::Http::WebTransportSession& downstream,
-                                     Envoy::Http::WebTransportSession& upstream)
-    : downstream_side_(*this, Direction::Downstream), upstream_side_(*this, Direction::Upstream),
-      downstream_(&downstream), upstream_(&upstream) {
+                                     Envoy::Http::WebTransportSession& upstream,
+                                     Callbacks& callbacks)
+    : callbacks_(callbacks), downstream_side_(*this, Direction::Downstream),
+      upstream_side_(*this, Direction::Upstream), downstream_(&downstream), upstream_(&upstream) {
   downstream_->setWebTransportSessionCallbacks(&downstream_side_);
   upstream_->setWebTransportSessionCallbacks(&upstream_side_);
   ENVOY_LOG(debug, "WebTransport relay established");
@@ -32,9 +33,17 @@ void WebTransportRelay::forwardDatagram(Direction from, absl::string_view datagr
 }
 
 void WebTransportRelay::onSessionClosed(Direction which) {
-  // The closed session is going away. Drop the pointer so the relay stops forwarding to it and does
-  // not detach from it on destruction.
-  session(which) = nullptr;
+  Envoy::Http::WebTransportSession*& closed = session(which);
+  if (closed != nullptr) {
+    // Detach so a late event cannot reach the relay after the session closes, and drop the pointer
+    // so the relay stops forwarding to it.
+    closed->setWebTransportSessionCallbacks(nullptr);
+    closed = nullptr;
+  }
+  if (!notified_) {
+    notified_ = true;
+    callbacks_.onRelayClosed();
+  }
 }
 
 } // namespace WebTransport

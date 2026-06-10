@@ -76,7 +76,7 @@ void EnvoyQuicWebTransportSession::Visitor::OnSessionClosed(
 }
 
 void EnvoyQuicWebTransportSession::Visitor::OnDatagramReceived(absl::string_view datagram) {
-  if (bridge_ == nullptr) {
+  if (bridge_ == nullptr || bridge_->closed_) {
     return;
   }
   bridge_->stats_.datagrams_rx_.inc();

@@ -34,8 +34,11 @@ envoy_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":web_transport_relay_lib",
+        "//envoy/event:dispatcher_interface",
+        "//envoy/event:schedulable_cb_interface",
         "//envoy/http:codec_interface",
         "//envoy/http:conn_pool_interface",
+        "//envoy/network:connection_interface",
         "//envoy/upstream:thread_local_cluster_interface",
         "//envoy/upstream:upstream_interface",
         "//source/common/common:assert_lib",
