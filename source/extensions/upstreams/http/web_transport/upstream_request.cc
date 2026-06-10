@@ -60,17 +60,17 @@ WebTransportUpstream::encodeHeaders(const Envoy::Http::RequestHeaderMap& headers
   if (!status.ok()) {
     return status;
   }
-  // The upstream WebTransport session exists once the extended CONNECT is sent and the upstream has
-  // advertised WebTransport support. The downstream session is the WebTransport CONNECT the router
-  // is proxying. With both in hand, relay datagrams between them.
+  // The upstream session exists once the extended CONNECT is sent and the upstream advertised
+  // WebTransport. The downstream session is the CONNECT the router is proxying.
   OptRef<Envoy::Http::WebTransportSession> upstream_session = request_encoder_->webTransport();
   OptRef<Envoy::Http::WebTransportSession> downstream_session = upstream_request_.webTransport();
-  if (!upstream_session.has_value() || !downstream_session.has_value()) {
-    // The upstream did not negotiate WebTransport. Reset rather than relay a half open session.
-    return absl::InternalError("upstream did not negotiate WebTransport");
+  if (!upstream_session.has_value() || !downstream_session.has_value() ||
+      downstream_session->sessionLimitExceeded()) {
+    // The upstream did not negotiate WebTransport or the downstream is over its session limit.
+    // Reset rather than relay a half open session.
+    return absl::InternalError("cannot establish WebTransport relay");
   }
-  relay_ =
-      std::make_unique<WebTransportRelay>(downstream_session.ref(), upstream_session.ref(), *this);
+  relay_ = std::make_unique<WebTransportRelay>(downstream_session.ref(), upstream_session.ref());
   return Envoy::Http::okStatus();
 }
 
@@ -79,11 +79,6 @@ void WebTransportUpstream::resetStream() {
   auto& stream = request_encoder_->getStream();
   stream.removeCallbacks(*this);
   stream.resetStream(Envoy::Http::StreamResetReason::LocalReset);
-}
-
-void WebTransportUpstream::onRelayClosed() {
-  // Either session closed. Reset the upstream stream so the router tears down the proxied session.
-  upstream_request_.onResetStream(Envoy::Http::StreamResetReason::RemoteReset, "");
 }
 
 } // namespace WebTransport

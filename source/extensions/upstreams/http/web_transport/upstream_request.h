@@ -60,7 +60,6 @@ private:
 // WebTransportRelay forwards datagrams in both directions.
 class WebTransportUpstream : public Router::GenericUpstream,
                              public Envoy::Http::StreamCallbacks,
-                             public WebTransportRelay::Callbacks,
                              protected Logger::Loggable<Logger::Id::upstream> {
 public:
   WebTransportUpstream(Router::UpstreamToDownstream& upstream_request,
@@ -102,9 +101,6 @@ public:
   void onBelowWriteBufferLowWatermark() override {
     upstream_request_.onBelowWriteBufferLowWatermark();
   }
-
-  // WebTransportRelay::Callbacks
-  void onRelayClosed() override;
 
 private:
   Router::UpstreamToDownstream& upstream_request_;

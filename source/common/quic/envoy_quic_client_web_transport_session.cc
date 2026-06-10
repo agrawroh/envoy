@@ -17,6 +17,11 @@ EnvoyQuicClientWebTransportSession::~EnvoyQuicClientWebTransportSession() {
   if (visitor_ != nullptr) {
     visitor_->detach();
   }
+  // Tell a consumer the session is gone if it was not already closed, so it drops its reference
+  // before this bridge is freed.
+  if (!closed_ && callbacks_ != nullptr) {
+    callbacks_->onWebTransportSessionClosed();
+  }
 }
 
 void EnvoyQuicClientWebTransportSession::sendWebTransportDatagram(absl::string_view datagram) {

@@ -16,3 +16,15 @@ envoy_cc_test(
         "//source/extensions/upstreams/http/web_transport:web_transport_relay_lib",
     ],
 )
+
+envoy_cc_test(
+    name = "upstream_request_test",
+    srcs = ["upstream_request_test.cc"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/extensions/upstreams/http/web_transport:upstream_request_lib",
+        "//test/mocks/http:http_mocks",
+        "//test/mocks/router:router_mocks",
+        "//test/test_common:utility_lib",
+    ],
+)

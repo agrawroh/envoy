@@ -11,51 +11,48 @@ namespace Http {
 namespace WebTransport {
 
 // Relays datagrams between a downstream WebTransport session and an upstream one. The relay
-// registers callbacks on both sessions and forwards each received datagram to the peer. When
-// either session closes it notifies the owner once so the owner can tear down the stream. The
-// relay detaches from both sessions on destruction, so neither session is left with a dangling
-// callback.
+// registers on both sessions and forwards each received datagram to the peer. A session that closes
+// drops out of the relay, so the relay never forwards to or detaches from a freed session, and the
+// relay detaches from any still open session on destruction. Stream resets tear the proxied flow
+// down, so the relay does not propagate closure itself.
 class WebTransportRelay : protected Logger::Loggable<Logger::Id::upstream> {
 public:
-  // Notified once when either session closes.
-  class Callbacks {
-  public:
-    virtual ~Callbacks() = default;
-    virtual void onRelayClosed() PURE;
-  };
-
   WebTransportRelay(Envoy::Http::WebTransportSession& downstream,
-                    Envoy::Http::WebTransportSession& upstream, Callbacks& callbacks);
+                    Envoy::Http::WebTransportSession& upstream);
+  ~WebTransportRelay();
 
 private:
-  // One direction of the relay. Forwards datagrams received on its own session to the peer and
-  // reports a close back to the relay.
+  enum class Direction { Downstream, Upstream };
+
+  // Routes one session's events to the relay. The relay owns both Side objects.
   class Side : public Envoy::Http::WebTransportSessionCallbacks {
   public:
-    Side(WebTransportRelay& relay, Envoy::Http::WebTransportSession& self,
-         Envoy::Http::WebTransportSession& peer);
-    ~Side() override { self_.setWebTransportSessionCallbacks(nullptr); }
+    Side(WebTransportRelay& relay, Direction direction) : relay_(relay), direction_(direction) {}
 
     // Http::WebTransportSessionCallbacks
     void onWebTransportSessionReady() override {}
     void onWebTransportDatagram(absl::string_view datagram) override {
-      peer_.sendWebTransportDatagram(datagram);
+      relay_.forwardDatagram(direction_, datagram);
     }
-    void onWebTransportSessionClosed() override { relay_.onSideClosed(); }
+    void onWebTransportSessionClosed() override { relay_.onSessionClosed(direction_); }
 
   private:
     WebTransportRelay& relay_;
-    Envoy::Http::WebTransportSession& self_;
-    Envoy::Http::WebTransportSession& peer_;
+    const Direction direction_;
   };
 
-  // Notifies the owner the first time either session closes.
-  void onSideClosed();
+  void forwardDatagram(Direction from, absl::string_view datagram);
+  void onSessionClosed(Direction which);
+  Envoy::Http::WebTransportSession*& session(Direction direction) {
+    return direction == Direction::Downstream ? downstream_ : upstream_;
+  }
 
-  Callbacks& callbacks_;
   Side downstream_side_;
   Side upstream_side_;
-  bool closed_{false};
+  // Nulled when the matching session closes so the relay neither forwards to nor detaches a freed
+  // session.
+  Envoy::Http::WebTransportSession* downstream_;
+  Envoy::Http::WebTransportSession* upstream_;
 };
 
 } // namespace WebTransport
