@@ -177,6 +177,9 @@ private:
   friend class UpstreamCodecFilter;
   friend class UpstreamRequestFilterManagerCallbacks;
   friend class SpliceCoordinator;
+  // Test-only: lets the splice coordinator unit test set the private members the coordinator reads
+  // (upstream_, router_sent_end_stream_) and observe on_reset_stream_in_progress_.
+  friend class SpliceCoordinatorTest;
   StreamInfo::UpstreamTiming& upstreamTiming() {
     return stream_info_.upstreamInfo()->upstreamTiming();
   }

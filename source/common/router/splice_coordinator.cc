@@ -371,7 +371,7 @@ void SpliceCoordinator::engage() {
   }
   spliced_body_bytes_ = content_length_ - buffered;
 
-  auto pump = std::make_unique<TcpProxy::SplicePump>(
+  auto pump = splice_pump_factory_(
       down_fd.value(), up_fd.value(), /*up_is_ktls=*/true,
       upstream_request_.parent_.callbacks()->dispatcher(),
       [this](TcpProxy::SpliceCompletion status) { onSpliceComplete(status); },

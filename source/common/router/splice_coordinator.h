@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 #include "envoy/buffer/buffer.h"
@@ -93,6 +94,18 @@ public:
   bool armedForRequest() const { return armed_ && direction_ == Direction::Upload; }
   bool engaged() const { return splice_pump_ != nullptr; }
 
+  // Builds the in-kernel pump engage() drives. Defaults to constructing the real
+  // TcpProxy::SplicePump and exists only so the coordinator's unit test can inject a deterministic
+  // test double; the default is byte-identical to constructing the pump inline, so a release build
+  // is unchanged.
+  using SplicePumpFactory = std::function<TcpProxy::SplicePumpPtr(
+      os_fd_t down_fd, os_fd_t up_fd, bool up_is_ktls, Event::Dispatcher& dispatcher,
+      TcpProxy::SplicePump::CompletionCb on_complete, TcpProxy::SplicePump::BytesCb on_u2d_bytes,
+      TcpProxy::SplicePump::BytesCb on_d2u_bytes)>;
+  void setSplicePumpFactoryForTest(SplicePumpFactory factory) {
+    splice_pump_factory_ = std::move(factory);
+  }
+
 private:
   // Minimum Content-Length worth splicing. Below this the in-kernel setup cost outweighs the saved
   // copies, and the body usually fits in the read that carried the headers anyway.
@@ -152,6 +165,16 @@ private:
   // detached, so no route/HCM timer is driven by I/O). Re-armed by every byte callback.
   Event::TimerPtr progress_watchdog_;
   TcpProxy::SplicePumpPtr splice_pump_;
+  // Constructs the pump at engage. The default produces the real TcpProxy::SplicePump exactly as an
+  // inline make_unique would; only the unit test replaces it with a deterministic double.
+  SplicePumpFactory splice_pump_factory_{
+      [](os_fd_t down_fd, os_fd_t up_fd, bool up_is_ktls, Event::Dispatcher& dispatcher,
+         TcpProxy::SplicePump::CompletionCb on_complete, TcpProxy::SplicePump::BytesCb on_u2d_bytes,
+         TcpProxy::SplicePump::BytesCb on_d2u_bytes) {
+        return std::make_unique<TcpProxy::SplicePump>(
+            down_fd, up_fd, up_is_ktls, dispatcher, std::move(on_complete), std::move(on_u2d_bytes),
+            std::move(on_d2u_bytes));
+      }};
   // The borrowed legs held while a splice is in flight so finalize() can re-arm their file events.
   OptRef<Network::Connection> upstream_connection_;
   OptRef<Network::Connection> downstream_connection_;

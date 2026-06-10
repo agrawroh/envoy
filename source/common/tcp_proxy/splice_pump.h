@@ -65,7 +65,11 @@ public:
   SplicePump(os_fd_t down_fd, os_fd_t up_fd, bool up_is_ktls, Event::Dispatcher& dispatcher,
              CompletionCb on_complete, BytesCb on_upstream_to_downstream,
              BytesCb on_downstream_to_upstream);
-  ~SplicePump();
+  // The setup methods below and the destructor are virtual so the L7 body-splice coordinator's
+  // unit test can substitute a no-op test double through its pump factory and drive completion
+  // deterministically without a real kernel splice. They run once per splice at setup, never per
+  // byte, so the virtual dispatch has no effect on the throughput hot path.
+  virtual ~SplicePump();
 
   // Optional pre-step for callers (the L7 body-splice coordinator) that must create the pipes
   // BEFORE doing anything irreversible, the coordinator extracts the sink connection's pending
@@ -73,7 +77,7 @@ public:
   // fallback is still available. Creates only the requested directions (the bounded body-splice
   // uses one), and is idempotent: prepare() lazily creates both directions only if neither exists.
   // Returns false on pipe2() failure. The L4 path and tests skip this and call prepare() directly.
-  bool createPipes(bool need_u2d, bool need_d2u);
+  virtual bool createPipes(bool need_u2d, bool need_d2u);
   // Phase 1, called before detaching the ConnectionImpl FileEvents. Creates the pipes (if not
   // already created via createPipes) and queues the pre-engage chunks the buffered path already
   // read just before engage, so they precede any spliced bytes and ordering is preserved.
@@ -82,7 +86,7 @@ public:
   // socket (the upload engage, e.g. a PUT body); exactly one is non-empty per engage. Returns false
   // only on unrecoverable setup failure such as pipe creation, in which case the caller must not
   // detach and should re-deliver on the buffered path.
-  bool prepare(std::string initial_u2d, std::string initial_d2u);
+  virtual bool prepare(std::string initial_u2d, std::string initial_d2u);
   // Switches the pump into bounded mode. Called between prepare() and arm(). Each direction with a
   // byte limit moves exactly that many bytes read from its source socket, then the pump completes
   // with SpliceCompletion::BoundsReached and leaves both sockets intact for keep-alive reuse. A
@@ -91,10 +95,10 @@ public:
   // and exclude any pre-engage chunk handed to prepare(), which is delivered and accounted
   // separately. The HTTP body-splice runs one direction at a time (a response body up to down, or a
   // request body down to up), so exactly one limit is set per engage.
-  void setBounds(absl::optional<uint64_t> u2d_limit, absl::optional<uint64_t> d2u_limit);
+  virtual void setBounds(absl::optional<uint64_t> u2d_limit, absl::optional<uint64_t> d2u_limit);
   // Phase 2, called after detaching the ConnectionImpl FileEvents. Installs the pump's FileEvents
   // and primes the first pass.
-  void arm();
+  virtual void arm();
 
 private:
   struct Pipe {
