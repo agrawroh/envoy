@@ -318,6 +318,10 @@ public:
     }
     return {};
   }
+  // Routes the relay's downstream WebTransport session lookup back to the downstream request.
+  OptRef<Http::WebTransportSession> webTransport() override {
+    return upstream_request_.webTransport();
+  }
   // If the filter manager determines a decoder filter has available, tell
   // the router to resume the flow of data from downstream.
   void onDecoderFilterBelowWriteBufferLowWatermark() override {
