@@ -22,6 +22,7 @@ envoy_cc_test(
     srcs = ["upstream_request_test.cc"],
     rbe_pool = "6gig",
     deps = [
+        "//source/common/stats:isolated_store_lib",
         "//source/extensions/upstreams/http/web_transport:upstream_request_lib",
         "//test/mocks/http:http_mocks",
         "//test/mocks/router:router_mocks",

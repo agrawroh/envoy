@@ -39,10 +39,12 @@ envoy_cc_library(
         "//envoy/http:codec_interface",
         "//envoy/http:conn_pool_interface",
         "//envoy/network:connection_interface",
+        "//envoy/stats:stats_interface",
         "//envoy/upstream:thread_local_cluster_interface",
         "//envoy/upstream:upstream_interface",
         "//source/common/common:assert_lib",
         "//source/common/common:minimal_logger_lib",
+        "//source/common/quic:web_transport_stats_lib",
         "//source/common/router:router_lib",
     ],
 )

@@ -1,3 +1,4 @@
+#include "source/common/stats/isolated_store_impl.h"
 #include "source/extensions/upstreams/http/web_transport/upstream_request.h"
 
 #include "test/mocks/http/stream_encoder.h"
@@ -56,6 +57,16 @@ protected:
                                                  {":authority", "host"}};
   }
 
+  uint64_t counter(absl::string_view name) {
+    return store_.counterFromString(absl::StrCat("webtransport.", name)).value();
+  }
+  uint64_t gauge(absl::string_view name) {
+    return store_
+        .gaugeFromString(absl::StrCat("webtransport.", name), Stats::Gauge::ImportMode::Accumulate)
+        .value();
+  }
+
+  Stats::IsolatedStoreImpl store_;
   NiceMock<FakeRequestEncoder> encoder_;
   NiceMock<FakeUpstreamToDownstream> upstream_to_downstream_;
   FakeWebTransportSession upstream_session_;
@@ -66,26 +77,29 @@ protected:
 TEST_F(WebTransportUpstreamTest, EncodeHeadersEstablishesRelay) {
   encoder_.session_ = upstream_session_;
   upstream_to_downstream_.session_ = downstream_session_;
-  WebTransportUpstream upstream(upstream_to_downstream_, &encoder_);
+  WebTransportUpstream upstream(upstream_to_downstream_, &encoder_, *store_.rootScope());
 
   EXPECT_TRUE(upstream.encodeHeaders(connectHeaders(), false).ok());
   EXPECT_NE(nullptr, upstream_session_.callbacks_);
   EXPECT_NE(nullptr, downstream_session_.callbacks_);
+  EXPECT_EQ(1, counter("sessions_total"));
+  EXPECT_EQ(1, gauge("sessions_active"));
 }
 
 // Without an upstream session the upstream did not negotiate WebTransport, so the relay is refused.
 TEST_F(WebTransportUpstreamTest, EncodeHeadersWithoutUpstreamSessionFails) {
   upstream_to_downstream_.session_ = downstream_session_;
-  WebTransportUpstream upstream(upstream_to_downstream_, &encoder_);
+  WebTransportUpstream upstream(upstream_to_downstream_, &encoder_, *store_.rootScope());
 
   EXPECT_FALSE(upstream.encodeHeaders(connectHeaders(), false).ok());
   EXPECT_EQ(nullptr, downstream_session_.callbacks_);
+  EXPECT_EQ(1, counter("sessions_rejected"));
 }
 
 // Without a downstream session there is nothing to proxy, so the relay is refused.
 TEST_F(WebTransportUpstreamTest, EncodeHeadersWithoutDownstreamSessionFails) {
   encoder_.session_ = upstream_session_;
-  WebTransportUpstream upstream(upstream_to_downstream_, &encoder_);
+  WebTransportUpstream upstream(upstream_to_downstream_, &encoder_, *store_.rootScope());
 
   EXPECT_FALSE(upstream.encodeHeaders(connectHeaders(), false).ok());
   EXPECT_EQ(nullptr, upstream_session_.callbacks_);
@@ -96,7 +110,7 @@ TEST_F(WebTransportUpstreamTest, EncodeHeadersOverDownstreamLimitFails) {
   encoder_.session_ = upstream_session_;
   downstream_session_.limit_exceeded_ = true;
   upstream_to_downstream_.session_ = downstream_session_;
-  WebTransportUpstream upstream(upstream_to_downstream_, &encoder_);
+  WebTransportUpstream upstream(upstream_to_downstream_, &encoder_, *store_.rootScope());
 
   EXPECT_FALSE(upstream.encodeHeaders(connectHeaders(), false).ok());
   EXPECT_EQ(nullptr, downstream_session_.callbacks_);

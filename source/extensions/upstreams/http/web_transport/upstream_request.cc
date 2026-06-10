@@ -16,8 +16,10 @@ namespace Http {
 namespace WebTransport {
 
 WebTransportUpstream::WebTransportUpstream(Router::UpstreamToDownstream& upstream_request,
-                                           Envoy::Http::RequestEncoder* encoder)
-    : upstream_request_(upstream_request), request_encoder_(encoder) {
+                                           Envoy::Http::RequestEncoder* encoder,
+                                           Stats::Scope& scope)
+    : upstream_request_(upstream_request), request_encoder_(encoder),
+      stats_(Quic::WebTransportStats::atomicGet(stats_atomic_, scope)) {
   request_encoder_->getStream().addCallbacks(*this);
   // The downstream connection drives both sides of the relay, so reset on its dispatcher.
   OptRef<const Network::Connection> connection = upstream_request_.connection();
@@ -25,6 +27,15 @@ WebTransportUpstream::WebTransportUpstream(Router::UpstreamToDownstream& upstrea
     teardown_callback_ = connection->dispatcher().createSchedulableCallback([this]() {
       upstream_request_.onResetStream(Envoy::Http::StreamResetReason::RemoteReset, "");
     });
+  }
+}
+
+WebTransportUpstream::~WebTransportUpstream() { releaseActiveSession(); }
+
+void WebTransportUpstream::releaseActiveSession() {
+  if (session_active_recorded_) {
+    stats_.sessions_active_.dec();
+    session_active_recorded_ = false;
   }
 }
 
@@ -61,8 +72,8 @@ void WebTransportConnPool::onPoolReady(Envoy::Http::RequestEncoder& request_enco
                                        StreamInfo::StreamInfo& info,
                                        absl::optional<Envoy::Http::Protocol> protocol) {
   conn_pool_stream_handle_ = nullptr;
-  auto upstream =
-      std::make_unique<WebTransportUpstream>(callbacks_->upstreamToDownstream(), &request_encoder);
+  auto upstream = std::make_unique<WebTransportUpstream>(callbacks_->upstreamToDownstream(),
+                                                         &request_encoder, cluster_scope_);
   callbacks_->onPoolReady(std::move(upstream), host,
                           request_encoder.getStream().connectionInfoProvider(), info, protocol);
 }
@@ -78,13 +89,18 @@ WebTransportUpstream::encodeHeaders(const Envoy::Http::RequestHeaderMap& headers
   OptRef<Envoy::Http::WebTransportSession> upstream_session = request_encoder_->webTransport();
   OptRef<Envoy::Http::WebTransportSession> downstream_session = upstream_request_.webTransport();
   if (!upstream_session.has_value() || !downstream_session.has_value()) {
+    stats_.sessions_rejected_.inc();
     return absl::InternalError("upstream did not negotiate WebTransport");
   }
   if (downstream_session->sessionLimitExceeded()) {
+    stats_.sessions_rejected_.inc();
     return absl::InternalError("downstream WebTransport session limit exceeded");
   }
   relay_ =
       std::make_unique<WebTransportRelay>(downstream_session.ref(), upstream_session.ref(), *this);
+  stats_.sessions_total_.inc();
+  stats_.sessions_active_.inc();
+  session_active_recorded_ = true;
   return Envoy::Http::okStatus();
 }
 
@@ -96,6 +112,7 @@ void WebTransportUpstream::resetStream() {
 }
 
 void WebTransportUpstream::onRelayClosed() {
+  releaseActiveSession();
   // A session closed. Defer the reset so this callback can unwind before the relay is freed.
   if (teardown_callback_ != nullptr) {
     teardown_callback_->scheduleCallbackNextIteration();

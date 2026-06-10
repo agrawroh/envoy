@@ -5,10 +5,12 @@
 #include "envoy/event/schedulable_cb.h"
 #include "envoy/http/codec.h"
 #include "envoy/http/conn_pool.h"
+#include "envoy/stats/scope.h"
 #include "envoy/upstream/thread_local_cluster.h"
 
 #include "source/common/common/assert.h"
 #include "source/common/common/logger.h"
+#include "source/common/quic/web_transport_stats.h"
 #include "source/common/router/upstream_request.h"
 #include "source/extensions/upstreams/http/web_transport/web_transport_relay.h"
 
@@ -27,7 +29,8 @@ public:
                        Upstream::ThreadLocalCluster& thread_local_cluster,
                        Upstream::ResourcePriority priority,
                        absl::optional<Envoy::Http::Protocol> downstream_protocol,
-                       Upstream::LoadBalancerContext* ctx) {
+                       Upstream::LoadBalancerContext* ctx)
+      : cluster_scope_(thread_local_cluster.info()->statsScope()) {
     pool_data_ = thread_local_cluster.httpConnPool(host, priority, downstream_protocol, ctx);
   }
   ~WebTransportConnPool() override {
@@ -51,6 +54,7 @@ public:
                    absl::optional<Envoy::Http::Protocol> protocol) override;
 
 private:
+  Stats::Scope& cluster_scope_;
   absl::optional<Envoy::Upstream::HttpPoolData> pool_data_;
   Envoy::Http::ConnectionPool::Cancellable* conn_pool_stream_handle_{};
   Router::GenericConnectionPoolCallbacks* callbacks_{};
@@ -65,7 +69,8 @@ class WebTransportUpstream : public Router::GenericUpstream,
                              protected Logger::Loggable<Logger::Id::upstream> {
 public:
   WebTransportUpstream(Router::UpstreamToDownstream& upstream_request,
-                       Envoy::Http::RequestEncoder* encoder);
+                       Envoy::Http::RequestEncoder* encoder, Stats::Scope& scope);
+  ~WebTransportUpstream() override;
 
   // GenericUpstream
   void encodeData(Buffer::Instance& data, bool end_stream) override {
@@ -105,8 +110,14 @@ public:
   void onRelayClosed() override;
 
 private:
+  // Drops the active-session gauge once. Called on relay close and on destruction.
+  void releaseActiveSession();
+
   Router::UpstreamToDownstream& upstream_request_;
   Envoy::Http::RequestEncoder* request_encoder_{};
+  Quic::WebTransportStats::AtomicPtr stats_atomic_;
+  Quic::WebTransportStats& stats_;
+  bool session_active_recorded_{false};
   std::unique_ptr<WebTransportRelay> relay_;
   // Resets the stream after a relay close unwinds, so the close callback never re-enters and frees
   // the relay while it is on the stack. Owned here so it is cancelled if this upstream is destroyed
