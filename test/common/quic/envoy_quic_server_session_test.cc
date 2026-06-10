@@ -1208,8 +1208,8 @@ TEST_F(EnvoyQuicServerSessionTest, DisableQpack) {
   installReadFilter();
 }
 
-// WebTransport is advertised only when the runtime flag is enabled, extended CONNECT is allowed,
-// and HTTP/3 datagrams are compiled in.
+// WebTransport is advertised only when the runtime flag is enabled, the listener opts in, extended
+// CONNECT is allowed, and HTTP/3 datagrams are compiled in.
 TEST_F(EnvoyQuicServerSessionTest, WebTransportEnabledWhenConfigured) {
 #ifndef ENVOY_ENABLE_HTTP_DATAGRAMS
   GTEST_SKIP() << "WebTransport requires HTTP/3 datagram support.";
@@ -1218,6 +1218,7 @@ TEST_F(EnvoyQuicServerSessionTest, WebTransportEnabledWhenConfigured) {
   scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "true"}});
 
   envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.mutable_web_transport_options()->set_enabled(true);
   http3_options.set_allow_extended_connect(true);
   envoy_quic_session_.setHttp3Options(http3_options);
 
@@ -1226,10 +1227,27 @@ TEST_F(EnvoyQuicServerSessionTest, WebTransportEnabledWhenConfigured) {
   installReadFilter();
 }
 
-// WebTransport stays off when the runtime flag is disabled, even with extended CONNECT allowed.
+// WebTransport stays off when the runtime flag is disabled, even with the listener opted in and
+// extended CONNECT allowed.
 TEST_F(EnvoyQuicServerSessionTest, WebTransportDisabledWithoutRuntimeFlag) {
   TestScopedRuntime scoped_runtime;
   scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "false"}});
+
+  envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.mutable_web_transport_options()->set_enabled(true);
+  http3_options.set_allow_extended_connect(true);
+  envoy_quic_session_.setHttp3Options(http3_options);
+
+  EXPECT_FALSE(envoy_quic_session_.LocallySupportedWebTransportVersions().Any());
+
+  installReadFilter();
+}
+
+// WebTransport stays off when the listener does not opt in, even with the runtime flag on and
+// extended CONNECT allowed.
+TEST_F(EnvoyQuicServerSessionTest, WebTransportDisabledWithoutListenerOptIn) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "true"}});
 
   envoy::config::core::v3::Http3ProtocolOptions http3_options;
   http3_options.set_allow_extended_connect(true);
@@ -1247,12 +1265,26 @@ TEST_F(EnvoyQuicServerSessionTest, WebTransportDisabledWithoutExtendedConnect) {
   scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "true"}});
 
   envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.mutable_web_transport_options()->set_enabled(true);
   http3_options.set_allow_extended_connect(false);
   envoy_quic_session_.setHttp3Options(http3_options);
 
   EXPECT_FALSE(envoy_quic_session_.LocallySupportedWebTransportVersions().Any());
 
   installReadFilter();
+}
+
+// The per-connection WebTransport session limit is reached when the cap is full and frees a slot
+// when a session closes.
+TEST_F(EnvoyQuicServerSessionTest, WebTransportSessionLimit) {
+  installReadFilter();
+  EXPECT_FALSE(envoy_quic_session_.webTransportSessionLimitReached());
+  for (uint32_t i = 0; i < 16; ++i) {
+    envoy_quic_session_.onWebTransportSessionOpened();
+  }
+  EXPECT_TRUE(envoy_quic_session_.webTransportSessionLimitReached());
+  envoy_quic_session_.onWebTransportSessionClosed();
+  EXPECT_FALSE(envoy_quic_session_.webTransportSessionLimitReached());
 }
 
 // An incoming WebTransport unidirectional stream is a QUICHE-internal stream, not an
@@ -1266,6 +1298,7 @@ TEST_F(EnvoyQuicServerSessionTest, WatermarkCallbacksSkipWebTransportStreams) {
   TestScopedRuntime scoped_runtime;
   scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "true"}});
   envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.mutable_web_transport_options()->set_enabled(true);
   http3_options.set_allow_extended_connect(true);
   envoy_quic_session_.setHttp3Options(http3_options);
 

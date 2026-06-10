@@ -217,11 +217,12 @@ void EnvoyQuicServerSession::setHttp3Options(
           quic::QuicTime::Delta::FromMilliseconds(memory_reduction_timeout_ms));
     }
   }
-  // Latch before set_allow_extended_connect(). Only enable when extended CONNECT and HTTP/3
-  // datagrams are both on, because QUICHE forbids disabling extended CONNECT once WebTransport is
-  // negotiated.
+  // Latch before set_allow_extended_connect(). Only enable when the listener opts in and extended
+  // CONNECT and HTTP/3 datagrams are both on, because QUICHE forbids disabling extended CONNECT
+  // once WebTransport is negotiated.
   web_transport_enabled_ =
       Runtime::runtimeFeatureEnabled("envoy.reloadable_features.web_transport") &&
+      http3_options_->web_transport_options().enabled() &&
       http3_options_->allow_extended_connect() &&
       LocalHttpDatagramSupport() != quic::HttpDatagramSupport::kNone;
   set_allow_extended_connect(http3_options_->allow_extended_connect());

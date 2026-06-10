@@ -64,6 +64,12 @@ Http::Status EnvoyQuicClientStream::encodeHeaders(const Http::RequestHeaderMap& 
   local_end_stream_ = end_stream;
   SendBufferMonitor::ScopedWatermarkBufferUpdater updater(this, this);
   quiche::HttpHeaderBlock spdy_headers;
+  // A WebTransport extended CONNECT keeps the scheme, path and protocol pseudo-headers, and skips
+  // capsule setup because QUICHE registers itself as the stream datagram visitor.
+  [[maybe_unused]] const bool web_transport_connect =
+      Runtime::runtimeFeatureEnabled("envoy.reloadable_features.web_transport") &&
+      headers.Protocol() != nullptr &&
+      headers.getProtocolValue() == Http::Headers::get().ProtocolValues.WebTransport;
 #ifndef ENVOY_ENABLE_UHV
   // Extended CONNECT to H/1 upgrade transformation has moved to UHV
   if (Http::Utility::isUpgrade(headers)) {
@@ -78,7 +84,7 @@ Http::Status EnvoyQuicClientStream::encodeHeaders(const Http::RequestHeaderMap& 
     spdy_headers = envoyHeadersToHttp2HeaderBlock(*modified_headers);
   } else if (headers.Method()) {
     spdy_headers = envoyHeadersToHttp2HeaderBlock(headers);
-    if (headers.Method()->value() == "CONNECT") {
+    if (headers.Method()->value() == "CONNECT" && !web_transport_connect) {
       Http::RequestHeaderMapPtr modified_headers =
           Http::createHeaderMap<Http::RequestHeaderMapImpl>(headers);
       modified_headers->remove(Http::Headers::get().Scheme);
@@ -99,8 +105,8 @@ Http::Status EnvoyQuicClientStream::encodeHeaders(const Http::RequestHeaderMap& 
   }
 #endif
 #ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
-  if (Http::HeaderUtility::isCapsuleProtocol(headers) ||
-      Http::HeaderUtility::isConnectUdpRequest(headers)) {
+  if (!web_transport_connect && (Http::HeaderUtility::isCapsuleProtocol(headers) ||
+                                 Http::HeaderUtility::isConnectUdpRequest(headers))) {
     useCapsuleProtocol();
     if (Http::HeaderUtility::isConnectUdpRequest(headers)) {
       // HTTP/3 Datagrams sent over CONNECT-UDP are already congestion controlled, so make it

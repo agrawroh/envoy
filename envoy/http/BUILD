@@ -71,6 +71,15 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "web_transport_interface",
+    hdrs = ["web_transport.h"],
+    deps = [
+        "//envoy/common:pure_lib",
+        "@abseil-cpp//absl/strings",
+    ],
+)
+
+envoy_cc_library(
     name = "codes_interface",
     hdrs = ["codes.h"],
     deps = ["//envoy/stats:stats_interface"],

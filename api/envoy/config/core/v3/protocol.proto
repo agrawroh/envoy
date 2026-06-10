@@ -802,7 +802,7 @@ message GrpcProtocolOptions {
 }
 
 // A message which allows using HTTP/3.
-// [#next-free-field: 10]
+// [#next-free-field: 11]
 message Http3ProtocolOptions {
   QuicProtocolOptions quic_protocol_options = 1;
 
@@ -850,6 +850,18 @@ message Http3ProtocolOptions {
   // As defined in RFC 9110, https://www.rfc-editor.org/rfc/rfc9110.html#section-5.5:
   // an obs-text character is a character in the range %x80-FF
   google.protobuf.BoolValue disallow_obs_text = 9;
+
+  // Configures WebTransport over HTTP/3 for this listener. WebTransport is also gated behind the
+  // ``envoy.reloadable_features.web_transport`` runtime guard and is disabled by default.
+  WebTransportOptions web_transport_options = 10
+      [(xds.annotations.v3.field_status).work_in_progress = true];
+}
+
+// Configuration for WebTransport over HTTP/3.
+message WebTransportOptions {
+  // Whether to enable WebTransport over HTTP/3 on this listener. Has effect only when extended
+  // CONNECT is allowed and the build includes HTTP/3 datagram support.
+  bool enabled = 1;
 }
 
 // A message to control transformations to the :scheme header

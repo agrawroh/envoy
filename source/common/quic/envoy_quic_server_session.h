@@ -11,6 +11,7 @@
 #include "source/common/quic/quic_filter_manager_connection_impl.h"
 #include "source/common/quic/quic_stat_names.h"
 #include "source/common/quic/send_buffer_monitor.h"
+#include "source/common/quic/web_transport_stats.h"
 
 #include "quiche/quic/core/http/quic_server_session_base.h"
 #include "quiche/quic/core/quic_crypto_server_stream.h"
@@ -131,6 +132,19 @@ public:
 
   using quic::QuicSession::PerformActionOnActiveStreams;
 
+  // WebTransport stats for this connection, in the webtransport sub-scope.
+  WebTransportStats& webTransportStats() {
+    return WebTransportStats::atomicGet(web_transport_stats_, stats_scope_);
+  }
+
+  // Per-connection WebTransport session accounting. A new session is refused once the active count
+  // reaches the cap.
+  bool webTransportSessionLimitReached() const {
+    return active_web_transport_sessions_ >= MaxConcurrentWebTransportSessions;
+  }
+  void onWebTransportSessionOpened() { ++active_web_transport_sessions_; }
+  void onWebTransportSessionClosed() { --active_web_transport_sessions_; }
+
 protected:
   // quic::QuicServerSessionBase
   std::unique_ptr<quic::QuicCryptoServerStreamBase>
@@ -183,6 +197,10 @@ private:
   quic::HttpDatagramSupport http_datagram_support_ = quic::HttpDatagramSupport::kNone;
   // Whether to advertise WebTransport support, latched once in setHttp3Options().
   bool web_transport_enabled_ = false;
+  // Maximum concurrent WebTransport sessions per connection.
+  static constexpr uint32_t MaxConcurrentWebTransportSessions = 16;
+  uint32_t active_web_transport_sessions_ = 0;
+  WebTransportStats::AtomicPtr web_transport_stats_;
   std::unique_ptr<quic::QuicConnectionDebugVisitor> debug_visitor_;
   // Load shed points for H3 GoAway
   Server::LoadShedPoint* should_send_go_away_and_close_on_dispatch_ = nullptr;
