@@ -21,12 +21,16 @@ Http::WebTransportStream* openTrackedWebTransportStream(webtransport::Session& s
                                                         WebTransportStreamList& streams,
                                                         bool bidirectional);
 
+// Number of tracked adapters whose QUICHE stream is still open.
+uint32_t liveWebTransportStreamCount(const WebTransportStreamList& streams);
+
 // Accepts every pending incoming stream of the given kind, tracking each adapter and notifying the
-// session callbacks.
-void acceptIncomingWebTransportStreams(webtransport::Session& session,
-                                       WebTransportStreamList& streams,
-                                       Http::WebTransportSessionCallbacks& callbacks,
-                                       bool bidirectional);
+// session callbacks. When max_streams is non-zero, a stream that would exceed the live count is
+// reset instead of relayed. Returns the number of streams rejected this way.
+uint32_t acceptIncomingWebTransportStreams(webtransport::Session& session,
+                                           WebTransportStreamList& streams,
+                                           Http::WebTransportSessionCallbacks& callbacks,
+                                           bool bidirectional, uint32_t max_streams);
 
 // Adapts a vendored QUICHE WebTransport stream to the Envoy Http::WebTransportStream interface so
 // the router relay can move bytes without including QUICHE headers. The adapter holds the stream id
@@ -39,6 +43,9 @@ public:
   EnvoyQuicWebTransportStream(webtransport::Session& session, webtransport::StreamId id,
                               bool bidirectional);
   ~EnvoyQuicWebTransportStream() override;
+
+  // Whether the underlying QUICHE stream is still open. A closed stream resolves to nullptr.
+  bool isOpen() const { return stream() != nullptr; }
 
   // Http::WebTransportStream
   bool bidirectional() const override { return bidirectional_; }

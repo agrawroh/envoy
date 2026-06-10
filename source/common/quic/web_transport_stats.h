@@ -19,6 +19,7 @@ namespace Quic {
   COUNTER(sessions_total)                                                                          \
   COUNTER(sessions_rejected)                                                                       \
   COUNTER(sessions_unclaimed)                                                                      \
+  COUNTER(streams_rejected_per_session)                                                            \
   COUNTER(datagrams_rx)                                                                            \
   COUNTER(datagrams_tx)                                                                            \
   GAUGE(sessions_active, Accumulate)

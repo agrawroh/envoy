@@ -145,7 +145,8 @@ OptRef<Http::WebTransportSession> EnvoyQuicServerStream::webTransport() {
       web_transport_session_reserved_ = true;
     }
     web_transport_session_ = std::make_unique<EnvoyQuicWebTransportSession>(
-        web_transport(), connection.webTransportStats(), rejected);
+        web_transport(), connection.webTransportStats(), rejected,
+        connection.maxWebTransportStreamsPerSession());
   }
   return *web_transport_session_;
 }

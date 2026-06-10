@@ -44,6 +44,22 @@ private:
   std::function<void()> on_datagram_;
 };
 
+// A client stream visitor that runs a callback when the peer resets the stream.
+class ResetWaitingStreamVisitor : public webtransport::StreamVisitor {
+public:
+  explicit ResetWaitingStreamVisitor(std::function<void()> on_reset)
+      : on_reset_(std::move(on_reset)) {}
+
+  void OnCanRead() override {}
+  void OnCanWrite() override {}
+  void OnResetStreamReceived(webtransport::StreamErrorCode) override { on_reset_(); }
+  void OnStopSendingReceived(webtransport::StreamErrorCode) override {}
+  void OnWriteSideInDataRecvdState() override {}
+
+private:
+  std::function<void()> on_reset_;
+};
+
 // An upstream side session consumer that echoes every datagram back. Makes the FakeUpstream act as
 // a WebTransport echo server for the proxy tests.
 class EchoUpstreamWebTransportCallbacks : public Http::WebTransportSessionCallbacks {
@@ -326,6 +342,55 @@ TEST_P(WebTransportIntegrationTest, CapsuleProtocolHeaderAccepted) {
   response->waitForHeaders();
   EXPECT_EQ("200", response->headers().getStatusValue());
   EXPECT_FALSE(response->complete());
+
+  codec_client_->close();
+}
+
+// A per-session stream cap refuses streams beyond the limit. The terminating filter is datagram
+// only, so an accepted stream just sits while the over-limit one is reset.
+TEST_P(WebTransportIntegrationTest, MaxStreamsPerSession) {
+#ifndef ENVOY_ENABLE_HTTP_DATAGRAMS
+  GTEST_SKIP() << "WebTransport requires HTTP/3 datagram support.";
+#endif
+  config_helper_.addConfigModifier(
+      [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+             hcm) {
+        hcm.mutable_http3_protocol_options()
+            ->mutable_web_transport_options()
+            ->mutable_max_streams_per_session()
+            ->set_value(1);
+      });
+  setup();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  IntegrationStreamDecoderPtr response;
+  quic::WebTransportHttp3* session = establishWebTransportSession(response);
+  ASSERT_NE(nullptr, session);
+
+  // The first stream is within the cap. The second exceeds it and the server resets it.
+  webtransport::Stream* first = session->OpenOutgoingBidirectionalStream();
+  ASSERT_NE(nullptr, first);
+  EXPECT_TRUE(first->Write("a"));
+  webtransport::Stream* second = session->OpenOutgoingBidirectionalStream();
+  ASSERT_NE(nullptr, second);
+  bool reset = false;
+  second->SetVisitor(std::make_unique<ResetWaitingStreamVisitor>([this, &reset] {
+    reset = true;
+    dispatcher_->exit();
+  }));
+  EXPECT_TRUE(second->Write("b"));
+
+  bool timed_out = false;
+  Event::TimerPtr timer = dispatcher_->createTimer([this, &timed_out] {
+    timed_out = true;
+    dispatcher_->exit();
+  });
+  timer->enableTimer(TestUtility::DefaultTimeout);
+  while (!reset && !timed_out) {
+    dispatcher_->run(Event::Dispatcher::RunType::Block);
+  }
+  ASSERT_FALSE(timed_out);
+  test_server_->waitForCounter(webTransportStat("streams_rejected_per_session"), testing::Eq(1));
 
   codec_client_->close();
 }

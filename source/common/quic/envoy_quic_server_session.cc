@@ -234,6 +234,8 @@ void EnvoyQuicServerSession::setHttp3Options(
       LocalHttpDatagramSupport() != quic::HttpDatagramSupport::kNone;
   max_web_transport_sessions_ =
       PROTOBUF_GET_WRAPPED_OR_DEFAULT(http3_options_->web_transport_options(), max_sessions, 16);
+  max_web_transport_streams_per_session_ = PROTOBUF_GET_WRAPPED_OR_DEFAULT(
+      http3_options_->web_transport_options(), max_streams_per_session, 0);
   set_allow_extended_connect(http3_options_->allow_extended_connect());
   if (http3_options_->disable_qpack()) {
     DisableHuffmanEncoding();

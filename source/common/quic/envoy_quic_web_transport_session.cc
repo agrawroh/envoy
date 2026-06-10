@@ -48,12 +48,24 @@ void EnvoyQuicWebTransportSession::sendWebTransportDatagram(absl::string_view da
   session_->SendOrQueueDatagram(datagram);
 }
 
+bool EnvoyQuicWebTransportSession::streamLimitReached() const {
+  return max_streams_per_session_ != 0 &&
+         liveWebTransportStreamCount(streams_) >= max_streams_per_session_;
+}
+
 bool EnvoyQuicWebTransportSession::canOpenWebTransportStream(bool bidirectional) const {
+  if (streamLimitReached()) {
+    return false;
+  }
   return bidirectional ? session_->CanOpenNextOutgoingBidirectionalStream()
                        : session_->CanOpenNextOutgoingUnidirectionalStream();
 }
 
 Http::WebTransportStream* EnvoyQuicWebTransportSession::openWebTransportStream(bool bidirectional) {
+  if (streamLimitReached()) {
+    stats_.streams_rejected_per_session_.inc();
+    return nullptr;
+  }
   return openTrackedWebTransportStream(*session_, streams_, bidirectional);
 }
 
@@ -96,15 +108,17 @@ void EnvoyQuicWebTransportSession::Visitor::OnDatagramReceived(absl::string_view
 
 void EnvoyQuicWebTransportSession::Visitor::OnIncomingBidirectionalStreamAvailable() {
   if (bridge_ != nullptr && bridge_->callbacks_ != nullptr) {
-    acceptIncomingWebTransportStreams(*bridge_->session_, bridge_->streams_, *bridge_->callbacks_,
-                                      true);
+    bridge_->stats_.streams_rejected_per_session_.add(acceptIncomingWebTransportStreams(
+        *bridge_->session_, bridge_->streams_, *bridge_->callbacks_, true,
+        bridge_->max_streams_per_session_));
   }
 }
 
 void EnvoyQuicWebTransportSession::Visitor::OnIncomingUnidirectionalStreamAvailable() {
   if (bridge_ != nullptr && bridge_->callbacks_ != nullptr) {
-    acceptIncomingWebTransportStreams(*bridge_->session_, bridge_->streams_, *bridge_->callbacks_,
-                                      false);
+    bridge_->stats_.streams_rejected_per_session_.add(acceptIncomingWebTransportStreams(
+        *bridge_->session_, bridge_->streams_, *bridge_->callbacks_, false,
+        bridge_->max_streams_per_session_));
   }
 }
 

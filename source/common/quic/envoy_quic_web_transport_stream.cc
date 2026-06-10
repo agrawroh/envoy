@@ -21,18 +21,36 @@ Http::WebTransportStream* openTrackedWebTransportStream(webtransport::Session& s
   return streams.back().get();
 }
 
-void acceptIncomingWebTransportStreams(webtransport::Session& session,
-                                       WebTransportStreamList& streams,
-                                       Http::WebTransportSessionCallbacks& callbacks,
-                                       bool bidirectional) {
+uint32_t liveWebTransportStreamCount(const WebTransportStreamList& streams) {
+  uint32_t count = 0;
+  for (const auto& stream : streams) {
+    if (stream->isOpen()) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+uint32_t acceptIncomingWebTransportStreams(webtransport::Session& session,
+                                           WebTransportStreamList& streams,
+                                           Http::WebTransportSessionCallbacks& callbacks,
+                                           bool bidirectional, uint32_t max_streams) {
+  uint32_t rejected = 0;
   for (webtransport::Stream* stream = bidirectional ? session.AcceptIncomingBidirectionalStream()
                                                     : session.AcceptIncomingUnidirectionalStream();
        stream != nullptr; stream = bidirectional ? session.AcceptIncomingBidirectionalStream()
                                                  : session.AcceptIncomingUnidirectionalStream()) {
+    if (max_streams != 0 && liveWebTransportStreamCount(streams) >= max_streams) {
+      // Over the per-session stream cap, so refuse this stream rather than relay it.
+      stream->ResetWithUserCode(0);
+      ++rejected;
+      continue;
+    }
     streams.push_back(std::make_unique<EnvoyQuicWebTransportStream>(session, stream->GetStreamId(),
                                                                     bidirectional));
     callbacks.onWebTransportStreamIncoming(*streams.back(), bidirectional);
   }
+  return rejected;
 }
 
 EnvoyQuicWebTransportStream::EnvoyQuicWebTransportStream(webtransport::Session& session,

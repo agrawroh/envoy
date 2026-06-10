@@ -154,6 +154,10 @@ public:
   }
   void onWebTransportSessionOpened() { ++active_web_transport_sessions_; }
   void onWebTransportSessionClosed() { --active_web_transport_sessions_; }
+  // Per-session WebTransport stream cap. Zero means no Envoy level limit.
+  uint32_t maxWebTransportStreamsPerSession() const {
+    return max_web_transport_streams_per_session_;
+  }
 
 protected:
   // quic::QuicServerSessionBase
@@ -209,6 +213,9 @@ private:
   bool web_transport_enabled_ = false;
   // Maximum concurrent WebTransport sessions per connection, latched in setHttp3Options().
   uint32_t max_web_transport_sessions_ = 16;
+  // Maximum concurrent WebTransport streams per session, latched in setHttp3Options(). Zero means
+  // no Envoy level limit.
+  uint32_t max_web_transport_streams_per_session_ = 0;
   uint32_t active_web_transport_sessions_ = 0;
   WebTransportStats::AtomicPtr web_transport_stats_;
   std::unique_ptr<quic::QuicConnectionDebugVisitor> debug_visitor_;

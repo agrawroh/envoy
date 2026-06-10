@@ -21,8 +21,9 @@ class EnvoyQuicWebTransportSession : public Http::WebTransportSession,
                                      protected Logger::Loggable<Logger::Id::connection> {
 public:
   EnvoyQuicWebTransportSession(quic::WebTransportHttp3* session, WebTransportStats& stats,
-                               bool session_limit_exceeded)
-      : session_(session), stats_(stats), session_limit_exceeded_(session_limit_exceeded) {}
+                               bool session_limit_exceeded, uint32_t max_streams_per_session)
+      : session_(session), stats_(stats), session_limit_exceeded_(session_limit_exceeded),
+        max_streams_per_session_(max_streams_per_session) {}
   ~EnvoyQuicWebTransportSession() override;
 
   // Installs the QUICHE session visitor and marks the session ready. Must be called after the 2xx
@@ -65,6 +66,8 @@ private:
 
   // Drops the active-session gauge once. Called from the close path and the destructor.
   void releaseActiveGauge();
+  // Whether the per-session stream cap is set and reached by the live stream count.
+  bool streamLimitReached() const;
 
   quic::WebTransportHttp3* session_;
   WebTransportStats& stats_;
@@ -72,6 +75,7 @@ private:
   Visitor* visitor_{nullptr};
   WebTransportStreamList streams_;
   const bool session_limit_exceeded_;
+  const uint32_t max_streams_per_session_;
   bool accepted_{false};
   bool closed_{false};
   bool active_gauge_held_{false};
