@@ -167,6 +167,17 @@ public:
     return inner_encoder_->http1StreamEncoderOptions();
   }
 
+  // Forward the kTLS body-splice finalization to the inner encoder. Without this forward the call
+  // lands on the RequestEncoder default no-op and a spliced response is never finalized: the
+  // upstream codec stays mid-message, the downstream response never receives its terminal
+  // end-of-stream, and the next keep-alive request on either connection wedges. Both the
+  // CodecClient ActiveRequest and the HTTP/1.1 conn-pool stream wrapper stack this class between
+  // the router and the codec encoder.
+  void completeSplicedResponse(uint64_t response_body_bytes) override {
+    ASSERT(inner_encoder_);
+    inner_encoder_->completeSplicedResponse(response_body_bytes);
+  }
+
 protected:
   RequestEncoderWrapper(RequestEncoder* inner) : inner_encoder_(inner) {}
 

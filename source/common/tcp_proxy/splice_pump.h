@@ -66,13 +66,21 @@ public:
              BytesCb on_downstream_to_upstream);
   ~SplicePump();
 
-  // Phase 1, called before detaching the ConnectionImpl FileEvents. Creates the pipes and queues
-  // the pre-engage chunks the buffered path already read just before engage, so they precede any
-  // spliced bytes and ordering is preserved. `initial_u2d` is the decrypted upstream chunk bound
-  // for the downstream socket (the download engage, e.g. a GET response). `initial_d2u` is the
-  // downstream chunk bound for the upstream socket (the upload engage, e.g. a PUT body); exactly
-  // one is non-empty per engage. Returns false only on unrecoverable setup failure such as pipe
-  // creation, in which case the caller must not detach and should re-deliver on the buffered path.
+  // Optional pre-step for callers (the L7 body-splice coordinator) that must create the pipes
+  // BEFORE doing anything irreversible — the coordinator extracts the sink connection's pending
+  // write to hand to prepare(), so a pipe2() failure must be observable while the buffered-path
+  // fallback is still available. Creates only the requested directions (the bounded body-splice
+  // uses one), and is idempotent: prepare() lazily creates both directions only if neither exists.
+  // Returns false on pipe2() failure. The L4 path and tests skip this and call prepare() directly.
+  bool createPipes(bool need_u2d, bool need_d2u);
+  // Phase 1, called before detaching the ConnectionImpl FileEvents. Creates the pipes (if not
+  // already created via createPipes) and queues the pre-engage chunks the buffered path already read
+  // just before engage, so they precede any spliced bytes and ordering is preserved. `initial_u2d`
+  // is the decrypted upstream chunk bound for the downstream socket (the download engage, e.g. a GET
+  // response). `initial_d2u` is the downstream chunk bound for the upstream socket (the upload
+  // engage, e.g. a PUT body); exactly one is non-empty per engage. Returns false only on
+  // unrecoverable setup failure such as pipe creation, in which case the caller must not detach and
+  // should re-deliver on the buffered path.
   bool prepare(std::string initial_u2d, std::string initial_d2u);
   // Switches the pump into bounded mode. Called between prepare() and arm(). Each direction with a
   // byte limit moves exactly that many bytes read from its source socket, then the pump completes
@@ -99,6 +107,10 @@ private:
   absl::Status onUpReady(uint32_t events);
   void pump();
   bool drainUpstreamControlMessage();
+  // MSG_PEEK the upstream socket on bounded-download completion: returns true iff a DATA record is
+  // queued past the Content-Length boundary (which makes the connection unsafe to pool-reuse). A
+  // queued control record (NewSessionTicket / alert) peeks as an error and is treated as benign.
+  bool upstreamHasExtraneousData();
   void sendUpstreamCloseNotify();
   void maybeHalfCloseOrComplete();
   void complete(SpliceCompletion status);
@@ -111,9 +123,9 @@ private:
   BytesCb on_u2d_bytes_;
   BytesCb on_d2u_bytes_;
 
-  // Bounded-mode state (HTTP body-splice). bounded_ is set by setBounds(). Each limit, when present,
-  // caps the bytes read from that direction's source socket so the splice stops exactly on the
-  // Content-Length boundary and the next keep-alive message stays in the socket. The *_read_
+  // Bounded-mode state (HTTP body-splice). bounded_ is set by setBounds(). Each limit, when
+  // present, caps the bytes read from that direction's source socket so the splice stops exactly on
+  // the Content-Length boundary and the next keep-alive message stays in the socket. The *_read_
   // counters track bytes already read from each source.
   bool bounded_{false};
   absl::optional<uint64_t> u2d_limit_;

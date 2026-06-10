@@ -192,10 +192,17 @@ FALSE_RUNTIME_GUARD(envoy_reloadable_features_disable_quic_ip_packet_info_socket
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_tcp_proxy_l4_connection_pool);
 
 // L7 HTTP/1.1 kTLS body-splice fast-path (ships dark). When enabled, the router relays a
-// Content-Length response body from a kTLS upstream socket to the downstream socket with an
-// in-kernel splice that bypasses Envoy's userspace buffers and the encoder filter chain. Defaults
-// off; only engages when both legs are HTTP/1.1 real sockets, the upstream has kernel TLS
-// installed, the downstream is plaintext or kTLS, and the response is Content-Length framed.
+// Content-Length body with an in-kernel splice that bypasses Envoy's userspace buffers and the
+// codec filter chains, in either direction: a response body from a kTLS upstream socket to the
+// downstream socket (download), or a request body from the downstream socket to a kTLS-TX upstream
+// (upload). Defaults off; only engages when both legs are HTTP/1.1 real sockets, the upstream has
+// kernel TLS installed and is a trusted peer, the other leg is plaintext or installed-kTLS (never
+// userspace TLS), and the body is Content-Length framed and at least 64 KiB. Because the spliced
+// body bypasses the filter chains, it must not be enabled alongside body-transforming or
+// Content-Length-mutating filters. Spliced bytes also bypass the connection-level
+// downstream_cx_*/upstream_cx_* byte counters (per-stream access-log bytes and the new
+// cluster.<name>.http1_ktls_splice.* counters remain correct), so cx-counter dashboards will
+// under-report on flag ramp. Requires Linux with kTLS-splice support (verified on 6.17).
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_http1_ktls_body_splice);
 
 // A flag to set the maximum TLS version for google_grpc client to TLS1.2, when needed for

@@ -226,8 +226,10 @@ private:
   std::unique_ptr<UpstreamRequestFilterManagerCallbacks> filter_manager_callbacks_;
   std::unique_ptr<Http::FilterManager> filter_manager_;
 
-  // Drives the L7 kTLS body-splice fast path for this request's response. Lazily created when a
-  // response first becomes splice-eligible; null on every connection that never qualifies.
+  // Drives the L7 kTLS body-splice fast path for this request, in either direction: the response
+  // body (download) or the request body (upload, which read-disables the downstream source while it
+  // waits to engage). Lazily created when a message first becomes splice-eligible; null on every
+  // connection that never qualifies.
   std::unique_ptr<SpliceCoordinator> splice_coordinator_;
 
   // The number of outstanding readDisable to be called with parameter value true.

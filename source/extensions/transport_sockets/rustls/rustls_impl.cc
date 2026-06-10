@@ -209,12 +209,21 @@ OptRef<const Network::KtlsBytestreamInfo> RustlsTransportSocket::ktlsBytestreamI
   int fd = -1;
   const bool installed = config_->on_ktls_state_(
       const_cast<RustlsTransportSocket*>(this)->thisAsEnvoyPtr(), socket_module_, &fd);
-  if (!installed || fd < 0) {
-    return {};
-  }
   // trusted_peer follows the socket direction. Only the upstream leg connects to a peer Envoy
   // chose, while downstream listeners may face untrusted clients. It gates TLS_RX_EXPECT_NO_PAD.
-  ktls_info_storage_ = {/*installed=*/true, fd, /*trusted_peer=*/config_->isUpstream()};
+  const bool trusted_peer = config_->isUpstream();
+  if (!installed || fd < 0) {
+    // Report a populated info with installed=false rather than an empty OptRef. This distinguishes
+    // a rustls TLS socket whose kTLS is not (yet) installed — including userspace-TLS fallback —
+    // from a plaintext raw_buffer socket, which has no KtlsBytestreamInfo at all (the base default
+    // empty OptRef). The body-splice gate depends on that distinction: writing raw plaintext into a
+    // userspace-TLS socket would bypass encryption, so a non-installed rustls socket must NOT be
+    // treated as "plaintext or kTLS" the way ssl()==nullptr alone would suggest. It also lets the
+    // upload engage poll tell "kTLS still installing" (retry) from "not a kTLS socket" (give up).
+    ktls_info_storage_ = {/*installed=*/false, /*fd=*/-1, trusted_peer};
+    return ktls_info_storage_;
+  }
+  ktls_info_storage_ = {/*installed=*/true, fd, trusted_peer};
   return ktls_info_storage_;
 }
 

@@ -131,6 +131,14 @@ public:
   virtual FilterConfig& config() PURE;
 
   /*
+   * Disables any further retries for this stream. Used by the kTLS body-splice fast path: once an
+   * upload splice streams the request body raw off the downstream socket (past the router's
+   * retry-buffer accounting), a retry could only replay the buffered prefix — a short, corrupt
+   * request — and a truncated splice leaves the downstream parser desynced, so retries must stop.
+   */
+  virtual void disableRetries() PURE;
+
+  /*
    * @returns the various timeouts for this stream.
    */
   virtual TimeoutData timeout() PURE;

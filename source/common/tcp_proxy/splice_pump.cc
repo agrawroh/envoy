@@ -40,8 +40,16 @@ ControlAction classifyKtlsControlRecord(uint8_t record_type, const uint8_t* data
       if (data[pos] != kTlsHandshakeNewSessionTicket) {
         return ControlAction::Close;
       }
+      // A handshake message whose 4-byte header is split across two TLS records would need
+      // cross-record reassembly, which this classifier does not do (it inspects one record at a
+      // time). Treat a truncated header as fatal rather than silently discarding it. This is
+      // intentionally STRICTER than the rustls userspace fallback's classifier, which tolerates the
+      // split and continues: on the splice path there is no userspace TLS state machine to resume a
+      // reassembled message, so a fragmented post-handshake message we cannot fully classify is
+      // closed rather than risk misframing. S3/s2n sends small, unfragmented NewSessionTickets, so
+      // this is not reached in practice.
       if (pos + 4 > len) {
-        break;
+        return ControlAction::Close;
       }
       const size_t msg_len = (static_cast<size_t>(data[pos + 1]) << 16) |
                              (static_cast<size_t>(data[pos + 2]) << 8) |
@@ -67,6 +75,9 @@ namespace {
 // /proc/sys/fs/pipe-max-size. The pre-engage chunk goes straight to the downstream socket, so the
 // pipe size does not bound it.
 constexpr size_t kPipeCapacity = 1024 * 1024;
+// Floor used only if both F_SETPIPE_SZ and F_GETPIPE_SZ fail to report a size. The kernel's
+// default pipe is 16 pages (64 KiB); assume that minimum so accounting never overstates capacity.
+constexpr size_t kFallbackPipeCapacity = 64 * 1024;
 // Upper bound on non-DATA kTLS control records drained in one pump pass. A trusted upstream sends
 // a handful of NewSessionTickets, so a large run signals a misbehaving peer and we close.
 constexpr int kMaxControlRecordsPerPass = 1024;
@@ -91,21 +102,42 @@ SplicePump::~SplicePump() {
   }
 }
 
+bool SplicePump::createPipes(bool need_u2d, bool need_d2u) {
+  // Allocate only the directions the caller will actually use. The bounded HTTP body-splice runs a
+  // single direction per engage, so creating only that pipe halves the per-message fd cost (2 fds
+  // and one F_SETPIPE_SZ instead of 4 and two) and the pipe-page footprint that, under load, drives
+  // the per-user pipe-pages accounting. The L4 path and tests need both.
+  if (need_u2d && u2d_.read_fd < 0) {
+    int u2d[2];
+    if (::pipe2(u2d, O_NONBLOCK | O_CLOEXEC) != 0) {
+      ENVOY_LOG(warn, "splice pump u2d pipe2 failed, {}", std::strerror(errno));
+      return false;
+    }
+    u2d_.read_fd = u2d[0];
+    u2d_.write_fd = u2d[1];
+  }
+  if (need_d2u && d2u_.read_fd < 0) {
+    int d2u[2];
+    if (::pipe2(d2u, O_NONBLOCK | O_CLOEXEC) != 0) {
+      ENVOY_LOG(warn, "splice pump d2u pipe2 failed, {}", std::strerror(errno));
+      return false;
+    }
+    d2u_.read_fd = d2u[0];
+    d2u_.write_fd = d2u[1];
+  }
+  return true;
+}
+
 bool SplicePump::prepare(std::string initial_u2d, std::string initial_d2u) {
-  int u2d[2];
-  if (::pipe2(u2d, O_NONBLOCK | O_CLOEXEC) != 0) {
-    ENVOY_LOG(warn, "splice pump u2d pipe2 failed, {}", std::strerror(errno));
-    return false;
+  // Lazily create both pipes when the caller did not pre-create them (the L4 path and unit tests
+  // call prepare() directly). The L7 coordinator instead calls createPipes() first — before it
+  // irreversibly extracts the sink's pending write — so a pipe-creation failure there falls back to
+  // the buffered path rather than corrupting an already-drained connection.
+  if (u2d_.read_fd < 0 && d2u_.read_fd < 0) {
+    if (!createPipes(/*need_u2d=*/true, /*need_d2u=*/true)) {
+      return false;
+    }
   }
-  u2d_.read_fd = u2d[0];
-  u2d_.write_fd = u2d[1];
-  int d2u[2];
-  if (::pipe2(d2u, O_NONBLOCK | O_CLOEXEC) != 0) {
-    ENVOY_LOG(warn, "splice pump d2u pipe2 failed, {}", std::strerror(errno));
-    return false;
-  }
-  d2u_.read_fd = d2u[0];
-  d2u_.write_fd = d2u[1];
 
   // Write the pre-engage decrypted upstream chunk straight to the downstream socket so it precedes
   // any spliced u2d bytes and ordering is preserved. It can exceed the pipe capacity, so it goes to
@@ -173,11 +205,27 @@ void SplicePump::setBounds(absl::optional<uint64_t> u2d_limit, absl::optional<ui
 }
 
 void SplicePump::arm() {
-  // Best-effort enlarge both pipes. On failure the kernel keeps the default size.
-  ::fcntl(u2d_.write_fd, F_SETPIPE_SZ, static_cast<int>(kPipeCapacity));
-  u2d_.capacity = kPipeCapacity;
-  ::fcntl(d2u_.write_fd, F_SETPIPE_SZ, static_cast<int>(kPipeCapacity));
-  d2u_.capacity = kPipeCapacity;
+  // Enlarge each created pipe and record the capacity the kernel ACTUALLY gave us, not the size we
+  // asked for. F_SETPIPE_SZ returns the (page-rounded) size on success; if it fails — EPERM past
+  // fs.pipe-user-pages-soft for an unprivileged process, or a clamp to fs.pipe-max-size — the pipe
+  // keeps a smaller size and F_GETPIPE_SZ reports it. Trusting the requested 1 MiB while the real
+  // pipe is a few pages makes the section-(2)/(4) `in_pipe < capacity` guard splice into a full
+  // pipe, get EAGAIN, and misattribute it to the source socket — a stall or false-EOF truncation.
+  // Mirrors OSD's zerocopy proxy, which accounts the real F_GETPIPE_SZ size.
+  auto size_pipe = [](Pipe& pipe) {
+    if (pipe.write_fd < 0) {
+      return;
+    }
+    const int set = ::fcntl(pipe.write_fd, F_SETPIPE_SZ, static_cast<int>(kPipeCapacity));
+    if (set > 0) {
+      pipe.capacity = static_cast<size_t>(set);
+      return;
+    }
+    const int got = ::fcntl(pipe.write_fd, F_GETPIPE_SZ);
+    pipe.capacity = got > 0 ? static_cast<size_t>(got) : kFallbackPipeCapacity;
+  };
+  size_pipe(u2d_);
+  size_pipe(d2u_);
 
   up_file_event_ = dispatcher_.createFileEvent(
       up_fd_, [this](uint32_t events) { return onUpReady(events); }, Event::FileTriggerType::Edge,
@@ -246,12 +294,31 @@ void SplicePump::pump() {
   // genuine backpressure.
   up_writable_ = true;
   down_writable_ = true;
-  // SPLICE_F_MOVE is advisory. SPLICE_F_MORE is not set so the downstream write is not corked.
-  const unsigned flags = SPLICE_F_NONBLOCK | SPLICE_F_MOVE;
+  // SPLICE_F_MOVE is advisory. SPLICE_F_MORE is added per direction on the pipe->socket drains when
+  // more bytes are still expected from that direction's source, so the kernel keeps the open TCP
+  // segment (plaintext downstream) or the open TLS record (kTLS-TX upstream) un-flushed and
+  // coalesces up to a full segment / 16 KiB record instead of emitting a runt at every pipe-drain
+  // boundary. It is cleared on the final drains (source exhausted or byte budget met) so the tail
+  // flushes immediately with no cork latency. Refills (socket->pipe) never set it. Mirrors OSD's
+  // `will_transfer_more`.
+  const unsigned base_flags = SPLICE_F_NONBLOCK | SPLICE_F_MOVE;
   int control_records = 0;
   bool progress = true;
   while (progress) {
     progress = false;
+
+    // More body still expected toward each sink, used to drive SPLICE_F_MORE on this pass's drains.
+    // SPLICE_F_MORE is set ONLY in bounded mode (the L7 body-splice), where the Content-Length
+    // budget makes "more is coming" exact and the final drain provably clears it. The unbounded L4
+    // pass-through has no end-of-message signal (a keep-alive upstream never EOFs), so leaving MORE
+    // set would cork every response's final segment for ~200 ms (a latency regression for tunneled
+    // request/response protocols) — there it stays unset, exactly as before this fast path.
+    const bool u2d_more_expected =
+        bounded_ && u2d_limit_.has_value() && u2d_read_ < u2d_limit_.value();
+    const bool d2u_more_expected =
+        bounded_ && d2u_limit_.has_value() && d2u_read_ < d2u_limit_.value();
+    const unsigned u2d_out_flags = base_flags | (u2d_more_expected ? SPLICE_F_MORE : 0u);
+    const unsigned d2u_out_flags = base_flags | (d2u_more_expected ? SPLICE_F_MORE : 0u);
 
     // (1a) Flush any stashed pre-engage chunk to downstream FIRST (ordering: it precedes u2d).
     while (down_writable_ && pending_down_off_ < pending_down_.size()) {
@@ -277,7 +344,8 @@ void SplicePump::pump() {
 
     // (1b) Drain u2d pipe -> downstream socket (only after the stashed chunk is fully delivered).
     while (down_writable_ && u2d_.in_pipe > 0 && pending_down_off_ >= pending_down_.size()) {
-      const ssize_t n = ::splice(u2d_.read_fd, nullptr, down_fd_, nullptr, u2d_.in_pipe, flags);
+      const ssize_t n =
+          ::splice(u2d_.read_fd, nullptr, down_fd_, nullptr, u2d_.in_pipe, u2d_out_flags);
       if (n > 0) {
         u2d_.in_pipe -= static_cast<size_t>(n);
         on_u2d_bytes_(static_cast<uint64_t>(n));
@@ -306,7 +374,7 @@ void SplicePump::pump() {
       if (bounded_) {
         want = std::min(want, static_cast<size_t>(u2d_limit_.value() - u2d_read_));
       }
-      const ssize_t n = ::splice(up_fd_, nullptr, u2d_.write_fd, nullptr, want, flags);
+      const ssize_t n = ::splice(up_fd_, nullptr, u2d_.write_fd, nullptr, want, base_flags);
       if (n > 0) {
         u2d_.in_pipe += static_cast<size_t>(n);
         u2d_read_ += static_cast<uint64_t>(n);
@@ -315,12 +383,25 @@ void SplicePump::pump() {
         up_read_eof_ = true;
         break;
       } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        up_readable_ = false;
-        up_eagain_this_pass_ = true; // upstream RX is empty right now, authoritative for completion
-        // A prior Closed event (EPOLLRDHUP) plus a drained read side is the real EOF; splice() on a
-        // half-closed socket returns EAGAIN, never 0, so this is the only way we learn it closed.
-        if (up_closed_) {
-          up_read_eof_ = true;
+        // EAGAIN reading the source is only authoritative ("the upstream RX is empty right now")
+        // when the pipe still had room — i.e. the read failed because the socket is drained, not
+        // because the destination pipe is full. Pipe capacity is slot-accounted (one page slot per
+        // spliced skb), so a pipe can be slot-full while in_pipe (bytes) is below capacity, or our
+        // capacity estimate can be stale; in that case the EAGAIN means pipe-full, not
+        // socket-empty, and claiming the source is drained (or, with EPOLLRDHUP latched, EOF) would
+        // stall the tail or truncate a valid response. Only make the authoritative claim when the
+        // pipe is empty; otherwise stop reading this pass and let the next pipe drain re-attempt
+        // with the latch still set. (HAProxy raw_sock.c uses the same in_pipe>0 => pipe-full
+        // disambiguation.)
+        if (u2d_.in_pipe == 0) {
+          up_readable_ = false;
+          up_eagain_this_pass_ = true;
+          // A prior Closed event (EPOLLRDHUP) plus a drained read side is the real EOF; splice() on
+          // a half-closed socket returns EAGAIN, never 0, so this is the only way we learn it
+          // closed.
+          if (up_closed_) {
+            up_read_eof_ = true;
+          }
         }
         break;
       } else if (errno == EINTR) {
@@ -373,7 +454,8 @@ void SplicePump::pump() {
     // kTLS-TX socket encrypts in-kernel and the kernel frames the spliced bytes into TLS records.
     // Only after the stashed chunk is fully delivered, so ordering holds.
     while (up_writable_ && d2u_.in_pipe > 0 && pending_up_off_ >= pending_up_.size()) {
-      const ssize_t n = ::splice(d2u_.read_fd, nullptr, up_fd_, nullptr, d2u_.in_pipe, flags);
+      const ssize_t n =
+          ::splice(d2u_.read_fd, nullptr, up_fd_, nullptr, d2u_.in_pipe, d2u_out_flags);
       if (n > 0) {
         d2u_.in_pipe -= static_cast<size_t>(n);
         on_d2u_bytes_(static_cast<uint64_t>(n));
@@ -394,16 +476,17 @@ void SplicePump::pump() {
     }
 
     // (4) Fill d2u pipe <- downstream socket (read the plaintext request and upload body), only
-    // after draining toward the upstream so the bounded pipe releases backpressure first. In bounded
-    // mode this direction is read only while it has a byte budget left, and never beyond it; an
-    // inactive direction (no limit) is skipped so the next request stays in the downstream socket.
+    // after draining toward the upstream so the bounded pipe releases backpressure first. In
+    // bounded mode this direction is read only while it has a byte budget left, and never beyond
+    // it; an inactive direction (no limit) is skipped so the next request stays in the downstream
+    // socket.
     while (down_readable_ && !down_read_eof_ && d2u_.in_pipe < d2u_.capacity &&
            (!bounded_ || (d2u_limit_.has_value() && d2u_read_ < d2u_limit_.value()))) {
       size_t want = d2u_.capacity - d2u_.in_pipe;
       if (bounded_) {
         want = std::min(want, static_cast<size_t>(d2u_limit_.value() - d2u_read_));
       }
-      const ssize_t n = ::splice(down_fd_, nullptr, d2u_.write_fd, nullptr, want, flags);
+      const ssize_t n = ::splice(down_fd_, nullptr, d2u_.write_fd, nullptr, want, base_flags);
       if (n > 0) {
         d2u_.in_pipe += static_cast<size_t>(n);
         d2u_read_ += static_cast<uint64_t>(n);
@@ -422,17 +505,25 @@ void SplicePump::pump() {
         }
         break;
       } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        down_readable_ = false;
-        // A prior Closed event (EPOLLRDHUP) plus a drained read side is the real client EOF.
-        // splice() on a half-closed socket returns EAGAIN, not 0, so without this the pump never
-        // learns the client closed and leaks the connection under keep-alive churn. Re-arm the
-        // upstream read so section (2) performs a final authoritative drain (delivering any
-        // buffered response) before completion gates on it, exactly as the n==0 arm does.
-        if (down_closed_ && !down_read_eof_) {
-          down_read_eof_ = true;
-          if (!up_read_eof_ && !up_readable_) {
-            up_readable_ = true;
-            progress = true;
+        // EAGAIN here is authoritative ("client send side drained") only when the d2u pipe had
+        // room; a full pipe (slot- or byte-full) also yields EAGAIN and must not be read as
+        // socket-empty or promoted to EOF, or a slow/large upload would false-truncate. Only act
+        // when the pipe is empty; otherwise stop reading this pass and let the next pipe drain
+        // re-attempt with the latch still set. (Same in_pipe>0 => pipe-full disambiguation as
+        // section (2).)
+        if (d2u_.in_pipe == 0) {
+          down_readable_ = false;
+          // A prior Closed event (EPOLLRDHUP) plus a drained read side is the real client EOF.
+          // splice() on a half-closed socket returns EAGAIN, not 0, so without this the pump never
+          // learns the client closed and leaks the connection under keep-alive churn. Re-arm the
+          // upstream read so section (2) performs a final authoritative drain (delivering any
+          // buffered response) before completion gates on it, exactly as the n==0 arm does.
+          if (down_closed_ && !down_read_eof_) {
+            down_read_eof_ = true;
+            if (!up_read_eof_ && !up_readable_) {
+              up_readable_ = true;
+              progress = true;
+            }
           }
         }
         break;
@@ -522,6 +613,18 @@ bool SplicePump::drainUpstreamControlMessage() {
   return false; // all ControlActions are handled above
 }
 
+bool SplicePump::upstreamHasExtraneousData() {
+  // Peek (consume nothing) for one application-data byte. A queued control record yields EINVAL/EIO
+  // (no cmsg buffer supplied) and an empty RX yields EAGAIN — both mean "no extraneous DATA". Only
+  // a successful peek of >0 bytes is a real post-Content-Length data record.
+  uint8_t b;
+  ssize_t n;
+  do {
+    n = ::recv(up_fd_, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+  } while (n < 0 && errno == EINTR);
+  return n > 0;
+}
+
 void SplicePump::sendUpstreamCloseNotify() {
   // Emit a TLS close_notify alert on the kTLS TX socket via the TLS_SET_RECORD_TYPE control
   // message before the FIN, so a strict peer does not treat the request or upload as truncated.
@@ -569,13 +672,26 @@ void SplicePump::maybeHalfCloseOrComplete() {
     // A direction is done when it is inactive, or it has read its full budget and flushed both the
     // pre-engage chunk and the pipe to its destination. The sockets are left intact for the caller
     // to resume the codecs once every active direction is done.
-    const bool u2d_done = !u2d_limit_.has_value() ||
-                          (u2d_read_ >= u2d_limit_.value() && u2d_.in_pipe == 0 &&
-                           pending_down_off_ >= pending_down_.size());
-    const bool d2u_done = !d2u_limit_.has_value() ||
-                          (d2u_read_ >= d2u_limit_.value() && d2u_.in_pipe == 0 &&
-                           pending_up_off_ >= pending_up_.size());
+    const bool u2d_done =
+        !u2d_limit_.has_value() || (u2d_read_ >= u2d_limit_.value() && u2d_.in_pipe == 0 &&
+                                    pending_down_off_ >= pending_down_.size());
+    const bool d2u_done =
+        !d2u_limit_.has_value() || (d2u_read_ >= d2u_limit_.value() && d2u_.in_pipe == 0 &&
+                                    pending_up_off_ >= pending_up_.size());
     if (u2d_done && d2u_done) {
+      // A bounded download leaves the upstream connection for keep-alive reuse, so it must hold no
+      // bytes past the Content-Length boundary. The normal H1 client codec rejects "extraneous data
+      // after response complete" and closes the connection; the splice skipped the codec, so prove
+      // the same invariant here. A trusted-but-misbehaving (or compromised) upstream that sent more
+      // than Content-Length would otherwise leave a crafted response queued on a pooled connection
+      // that a different downstream client then reuses — cross-client response smuggling. Only a
+      // peeked DATA record counts as extraneous; a queued control record (e.g. a NewSessionTicket,
+      // which S3/s2n sends) is benign and the rustls socket drains it on the next read.
+      if (u2d_limit_.has_value() && upstreamHasExtraneousData()) {
+        ENVOY_LOG(debug, "splice pump: extraneous upstream data past Content-Length, not reusable");
+        complete(SpliceCompletion::Closed);
+        return;
+      }
       complete(SpliceCompletion::BoundsReached);
     }
     return;
@@ -658,6 +774,7 @@ SplicePump::SplicePump(os_fd_t down_fd, os_fd_t up_fd, bool up_is_ktls,
       on_d2u_bytes_(std::move(on_downstream_to_upstream)) {}
 
 SplicePump::~SplicePump() = default;
+bool SplicePump::createPipes(bool, bool) { return false; }
 bool SplicePump::prepare(std::string, std::string) { return false; }
 void SplicePump::setBounds(absl::optional<uint64_t>, absl::optional<uint64_t>) {}
 void SplicePump::arm() {}
@@ -665,6 +782,7 @@ absl::Status SplicePump::onUpReady(uint32_t) { return absl::OkStatus(); }
 absl::Status SplicePump::onDownReady(uint32_t) { return absl::OkStatus(); }
 void SplicePump::pump() {}
 bool SplicePump::drainUpstreamControlMessage() { return false; }
+bool SplicePump::upstreamHasExtraneousData() { return false; }
 void SplicePump::sendUpstreamCloseNotify() {}
 void SplicePump::maybeHalfCloseOrComplete() {}
 void SplicePump::complete(SpliceCompletion) {}

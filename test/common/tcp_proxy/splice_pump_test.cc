@@ -361,14 +361,43 @@ TEST_F(SplicePumpIoTest, ClientCloseCompletesWithKeepAliveUpstream) {
   EXPECT_TRUE(completed_);
 }
 
-// Bounded download: the pump splices exactly the Content-Length budget from the upstream to the
-// downstream, then completes with BoundsReached and leaves the bytes beyond the budget (the next
-// keep-alive message) untouched in the upstream socket.
-TEST_F(SplicePumpIoTest, BoundedDownloadStopsAtLimit) {
-  buildAndArmBounded(/*u2d_limit=*/absl::make_optional<uint64_t>(8192), /*d2u_limit=*/absl::nullopt);
+// Bounded download: the pump reads exactly the Content-Length budget from the upstream and never
+// over-reads (the bytes past the budget stay untouched in the socket). On a download an H1 upstream
+// sends nothing past the response body until asked, so bytes still queued past the budget are
+// extraneous; the pump completes Closed (not BoundsReached) so the connection is not pool-reused —
+// the anti-smuggling defense that replaces the H1 client codec's "extraneous data after response
+// complete" check that the splice bypasses.
+TEST_F(SplicePumpIoTest, BoundedDownloadExtraneousDataIsNotReusable) {
+  buildAndArmBounded(/*u2d_limit=*/absl::make_optional<uint64_t>(8192),
+                     /*d2u_limit=*/absl::nullopt);
   const std::string body(20000, 'b');
-  ASSERT_EQ(static_cast<ssize_t>(body.size()),
-            ::write(up_.test_end, body.data(), body.size()));
+  ASSERT_EQ(static_cast<ssize_t>(body.size()), ::write(up_.test_end, body.data(), body.size()));
+  std::string received;
+  runUntil([&]() {
+    received += readAll(down_.test_end);
+    return completed_;
+  });
+  received += readAll(down_.test_end);
+  EXPECT_TRUE(completed_);
+  ASSERT_TRUE(completion_.has_value());
+  // 8192 budget bytes were delivered, but the surplus past Content-Length marks the connection
+  // unreusable.
+  EXPECT_EQ(SpliceCompletion::Closed, completion_.value());
+  EXPECT_EQ(8192u, received.size());
+  EXPECT_EQ(body.substr(0, 8192), received);
+  EXPECT_EQ(8192u, u2d_bytes_);
+  // The bytes past the budget were never read by the pump; they stay in the upstream socket.
+  const std::string leftover = readAll(up_.pump_end);
+  EXPECT_EQ(body.size() - 8192, leftover.size());
+}
+
+// Bounded download with exactly Content-Length available completes BoundsReached and leaves both
+// sockets intact for keep-alive reuse (no extraneous data past the boundary).
+TEST_F(SplicePumpIoTest, BoundedDownloadStopsAtLimit) {
+  buildAndArmBounded(/*u2d_limit=*/absl::make_optional<uint64_t>(8192),
+                     /*d2u_limit=*/absl::nullopt);
+  const std::string body(8192, 'b');
+  ASSERT_EQ(static_cast<ssize_t>(body.size()), ::write(up_.test_end, body.data(), body.size()));
   std::string received;
   runUntil([&]() {
     received += readAll(down_.test_end);
@@ -379,19 +408,16 @@ TEST_F(SplicePumpIoTest, BoundedDownloadStopsAtLimit) {
   ASSERT_TRUE(completion_.has_value());
   EXPECT_EQ(SpliceCompletion::BoundsReached, completion_.value());
   EXPECT_EQ(8192u, received.size());
-  EXPECT_EQ(body.substr(0, 8192), received);
+  EXPECT_EQ(body, received);
   EXPECT_EQ(8192u, u2d_bytes_);
-  // The bytes past the budget stay queued in the upstream socket for the next message.
-  const std::string leftover = readAll(up_.pump_end);
-  EXPECT_EQ(body.size() - 8192, leftover.size());
 }
 
 // Bounded upload: symmetric to the download case in the downstream-to-upstream direction.
 TEST_F(SplicePumpIoTest, BoundedUploadStopsAtLimit) {
-  buildAndArmBounded(/*u2d_limit=*/absl::nullopt, /*d2u_limit=*/absl::make_optional<uint64_t>(8192));
+  buildAndArmBounded(/*u2d_limit=*/absl::nullopt,
+                     /*d2u_limit=*/absl::make_optional<uint64_t>(8192));
   const std::string body(20000, 'u');
-  ASSERT_EQ(static_cast<ssize_t>(body.size()),
-            ::write(down_.test_end, body.data(), body.size()));
+  ASSERT_EQ(static_cast<ssize_t>(body.size()), ::write(down_.test_end, body.data(), body.size()));
   std::string received;
   runUntil([&]() {
     received += readAll(up_.test_end);
@@ -413,8 +439,7 @@ TEST_F(SplicePumpIoTest, BoundedDownloadDeliversPreEngageThenLimit) {
   buildAndArmBounded(/*u2d_limit=*/absl::make_optional<uint64_t>(4096), /*d2u_limit=*/absl::nullopt,
                      /*initial_u2d=*/"PREFIX");
   const std::string body(4096, 'p');
-  ASSERT_EQ(static_cast<ssize_t>(body.size()),
-            ::write(up_.test_end, body.data(), body.size()));
+  ASSERT_EQ(static_cast<ssize_t>(body.size()), ::write(up_.test_end, body.data(), body.size()));
   std::string received;
   runUntil([&]() {
     received += readAll(down_.test_end);
@@ -431,10 +456,10 @@ TEST_F(SplicePumpIoTest, BoundedDownloadDeliversPreEngageThenLimit) {
 // Bounded completion never half-closes the downstream write side, so a subsequent read observes
 // EAGAIN rather than EOF and the connection can carry the next keep-alive message.
 TEST_F(SplicePumpIoTest, BoundedCompletionLeavesSocketsOpen) {
-  buildAndArmBounded(/*u2d_limit=*/absl::make_optional<uint64_t>(4096), /*d2u_limit=*/absl::nullopt);
+  buildAndArmBounded(/*u2d_limit=*/absl::make_optional<uint64_t>(4096),
+                     /*d2u_limit=*/absl::nullopt);
   const std::string body(4096, 'k');
-  ASSERT_EQ(static_cast<ssize_t>(body.size()),
-            ::write(up_.test_end, body.data(), body.size()));
+  ASSERT_EQ(static_cast<ssize_t>(body.size()), ::write(up_.test_end, body.data(), body.size()));
   std::string received;
   runUntil([&]() {
     received += readAll(down_.test_end);
@@ -453,10 +478,10 @@ TEST_F(SplicePumpIoTest, BoundedCompletionLeavesSocketsOpen) {
 // A source EOF before the byte budget is met is a truncated message, so the bounded pump completes
 // with Closed and the caller must reset rather than reuse the connection.
 TEST_F(SplicePumpIoTest, BoundedDownloadPrematureCloseCompletesClosed) {
-  buildAndArmBounded(/*u2d_limit=*/absl::make_optional<uint64_t>(8192), /*d2u_limit=*/absl::nullopt);
+  buildAndArmBounded(/*u2d_limit=*/absl::make_optional<uint64_t>(8192),
+                     /*d2u_limit=*/absl::nullopt);
   const std::string body(4096, 'q'); // fewer than the budget
-  ASSERT_EQ(static_cast<ssize_t>(body.size()),
-            ::write(up_.test_end, body.data(), body.size()));
+  ASSERT_EQ(static_cast<ssize_t>(body.size()), ::write(up_.test_end, body.data(), body.size()));
   ::close(up_.test_end);
   up_.test_end = -1;
   std::string received;
@@ -467,6 +492,48 @@ TEST_F(SplicePumpIoTest, BoundedDownloadPrematureCloseCompletesClosed) {
   EXPECT_TRUE(completed_);
   ASSERT_TRUE(completion_.has_value());
   EXPECT_EQ(SpliceCompletion::Closed, completion_.value());
+}
+
+// Regression for the pipe-full backpressure path: a body several times the pipe capacity must
+// transfer in full with no truncation and no stall, even when the downstream is drained only
+// intermittently so the pipe repeatedly fills. This exercises the refill-after-drain loop and the
+// EAGAIN-with-bytes-in-pipe handling (a full-pipe EAGAIN must NOT be mistaken for a drained
+// source).
+TEST_F(SplicePumpIoTest, BoundedDownloadLargerThanPipeTransfersInFull) {
+  // 3 MiB >> the pump's 1 MiB pipe and >> the socketpair buffers, so both the pipe and the sink
+  // socket backpressure repeatedly during the transfer.
+  constexpr uint64_t kBody = 3u * 1024 * 1024;
+  buildAndArmBounded(/*u2d_limit=*/absl::make_optional<uint64_t>(kBody),
+                     /*d2u_limit=*/absl::nullopt);
+
+  std::string body(kBody, '\0');
+  for (uint64_t i = 0; i < kBody; i++) {
+    body[i] = static_cast<char>('A' + (i % 26));
+  }
+  std::string received;
+  size_t written = 0;
+  // Feed the source and drain the sink incrementally across dispatcher passes so neither the pipe
+  // nor the sink socket can hold the whole body at once.
+  runUntil(
+      [&]() {
+        if (written < body.size()) {
+          const ssize_t w = ::write(up_.test_end, body.data() + written, body.size() - written);
+          if (w > 0) {
+            written += static_cast<size_t>(w);
+          }
+        }
+        received += readAll(down_.test_end);
+        return completed_;
+      },
+      /*max_iters=*/100000);
+  received += readAll(down_.test_end);
+
+  EXPECT_TRUE(completed_);
+  ASSERT_TRUE(completion_.has_value());
+  EXPECT_EQ(SpliceCompletion::BoundsReached, completion_.value());
+  EXPECT_EQ(kBody, received.size());
+  EXPECT_EQ(body, received); // byte-exact, no truncation or reorder
+  EXPECT_EQ(kBody, u2d_bytes_);
 }
 #endif
 

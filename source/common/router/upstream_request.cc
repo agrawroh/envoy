@@ -318,23 +318,24 @@ void UpstreamRequest::decodeHeaders(Http::ResponseHeaderMapPtr&& headers, bool e
   maybeHandleDeferredReadDisable();
   ASSERT(headers.get());
 
-  // Offer this response to the kTLS body-splice fast path. Arm before forwarding the headers so the
-  // Content-Length can be read, then forward them, then schedule the engage so it runs after the
-  // headers' downstream write is activated. When armed, the headers still flow downstream normally
-  // and the body is spliced once the scheduled engage runs.
+  // Offer this response to the kTLS body-splice fast path. Arm (reads the Content-Length) and
+  // schedule the engage BEFORE forwarding the headers, so no coordinator member is touched after
+  // onUpstreamHeaders() — which may tear this UpstreamRequest down (e.g. an internal redirect that
+  // recreates the downstream stream). The engage callback runs at the end of this dispatch, after
+  // the headers' downstream write has been activated, and is cancelled if this request is destroyed
+  // first; engage() also re-resolves both legs and abandons to the buffered path if either is gone.
   bool splice_armed = false;
   if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.http1_ktls_body_splice")) {
     if (splice_coordinator_ == nullptr) {
       splice_coordinator_ = std::make_unique<SpliceCoordinator>(*this);
     }
     splice_armed = splice_coordinator_->maybeArmForResponse(*headers, end_stream);
+    if (splice_armed) {
+      splice_coordinator_->scheduleEngage();
+    }
   }
 
   parent_.onUpstreamHeaders(response_code, std::move(headers), *this, end_stream);
-
-  if (splice_armed) {
-    splice_coordinator_->scheduleEngage();
-  }
 }
 
 void UpstreamRequest::maybeHandleDeferredReadDisable() {
