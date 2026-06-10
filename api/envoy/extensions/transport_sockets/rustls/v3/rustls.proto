@@ -45,10 +45,12 @@ enum TlsVersion {
 //   * Per-connection ALPN override.
 //   * Per-connection SAN match list override (``match_typed_subject_alt_names`` /
 //     ``verify_subject_alt_name``).
-//   * Certificate revocation (CRL / OCSP).
+//   * OCSP server-certificate revocation.
 //   * SDS-managed certificate rotation.
 //   * Cipher-suite restriction (``TlsParameters.cipher_suites``). Protocol-version bounds ARE
 //     supported, see ``tls_minimum_protocol_version`` / ``tls_maximum_protocol_version``.
+//     Server-certificate revocation via CRL is also supported, see ``crl``, but the CRL is read
+//     once at config load and is not refreshed.
 //
 //   **Authorization / observability gap**: ``Network::Connection::ssl()`` returns ``nullptr``
 //   for this transport socket. Filters and access-log formatters that consume TLS metadata —
@@ -62,7 +64,7 @@ enum TlsVersion {
 //
 //   For any of the above gaps, use :ref:`envoy.transport_sockets.tls
 //   <envoy_v3_api_msg_extensions.transport_sockets.tls.v3.UpstreamTlsContext>` instead.
-// [#next-free-field: 10]
+// [#next-free-field: 11]
 message RustlsUpstreamTlsContext {
   // PEM-encoded certificate chain for client authentication (mTLS). Can be inline PEM content
   // or a filesystem path to a PEM file.
@@ -123,6 +125,14 @@ message RustlsUpstreamTlsContext {
   // Maximum acceptable TLS protocol version. ``TLS_AUTO`` (the default) lets ``rustls`` pick its
   // safe default range.
   TlsVersion tls_maximum_protocol_version = 9;
+
+  // PEM-encoded certificate revocation list (CRL) used to reject revoked server certificates
+  // during server-certificate verification. Can be inline PEM content or a filesystem path to a
+  // PEM file, and may contain multiple concatenated CRLs. The trust store is always present
+  // (``trusted_ca`` or the bundled ``webpki`` roots), so a CRL is always meaningful here. The CRL
+  // is read once at config-load time and is not refreshed, so a rotated CRL requires a config
+  // update.
+  string crl = 10;
 }
 
 // Configuration for downstream TLS listeners using the ``rustls`` library with optional

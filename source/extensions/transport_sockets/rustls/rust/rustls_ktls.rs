@@ -76,8 +76,9 @@ struct JsonConfig {
   /// Maximum acceptable TLS protocol version. Defaults to TLS_AUTO (rustls safe default range).
   #[serde(default)]
   tls_maximum_protocol_version: TlsVersion,
-  /// PEM-encoded certificate revocation list for downstream client-cert verification, or path to
-  /// a PEM file. Only meaningful when trusted_ca is set.
+  /// PEM-encoded certificate revocation list, or path to a PEM file. On the downstream side it
+  /// revokes client certificates and is only meaningful when trusted_ca is set. On the upstream
+  /// side it revokes server certificates against the always-present trust store.
   #[serde(default)]
   crl: Option<String>,
 }
@@ -343,11 +344,32 @@ impl RustlsFactoryConfig {
       cfg.tls_minimum_protocol_version,
       cfg.tls_maximum_protocol_version,
     )?;
-    let with_roots = match &versions {
+    let builder = match &versions {
       Some(v) => ClientConfig::builder_with_protocol_versions(v),
       None => ClientConfig::builder(),
-    }
-    .with_root_certificates(root_store);
+    };
+    // A CRL constrains server-certificate verification. Unlike the downstream side, the upstream
+    // always has a trust store (trusted_ca or the bundled webpki roots), so there is no
+    // crl-without-trust-store case to guard. When a CRL is set, build an explicit webpki verifier
+    // with the CRLs and use it instead of the default `with_root_certificates` verifier.
+    let has_crl = cfg.crl.as_ref().is_some_and(|s| !s.trim().is_empty());
+    let with_roots = if has_crl {
+      let crl_pem = load_pem_bytes(cfg.crl.as_ref().unwrap())?;
+      let crls = parse_crls(&crl_pem)?;
+      if crls.is_empty() {
+        return Err(
+          "`crl` was set but no CRL was parsed from it (expected PEM `X509 CRL` blocks)"
+            .to_string(),
+        );
+      }
+      let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+        .with_crls(crls)
+        .build()
+        .map_err(|e| format!("server cert verifier: {e}"))?;
+      builder.with_webpki_verifier(verifier)
+    } else {
+      builder.with_root_certificates(root_store)
+    };
     let mut client_config = if let Some((certs, key)) = client_cert {
       with_roots
         .with_client_auth_cert(certs, key)
@@ -2746,6 +2768,82 @@ mod tests {
       err.contains("greater than"),
       "error must explain the inversion: {err}"
     );
+  }
+
+  // Test CA certificate and a CRL it issued, taken from test/common/tls/test_data. The CRL's
+  // nextUpdate is 2034, so it is not expired at build time.
+  const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIID3TCCAsWgAwIBAgIUNKrDZYyTSTWgLuOgEc3KS3ygqDkwDQYJKoZIhvcNAQEL\n\
+BQAwdjELMAkGA1UEBhMCVVMxEzARBgNVBAgMCkNhbGlmb3JuaWExFjAUBgNVBAcM\n\
+DVNhbiBGcmFuY2lzY28xDTALBgNVBAoMBEx5ZnQxGTAXBgNVBAsMEEx5ZnQgRW5n\n\
+aW5lZXJpbmcxEDAOBgNVBAMMB1Rlc3QgQ0EwHhcNMjQwODIxMTkxNDAyWhcNMjYw\n\
+ODIxMTkxNDAyWjB2MQswCQYDVQQGEwJVUzETMBEGA1UECAwKQ2FsaWZvcm5pYTEW\n\
+MBQGA1UEBwwNU2FuIEZyYW5jaXNjbzENMAsGA1UECgwETHlmdDEZMBcGA1UECwwQ\n\
+THlmdCBFbmdpbmVlcmluZzEQMA4GA1UEAwwHVGVzdCBDQTCCASIwDQYJKoZIhvcN\n\
+AQEBBQADggEPADCCAQoCggEBAI93/9Eb8ZunwMRAsFRS+NZr/yDdkRx20rtJaYqD\n\
+UGEQ/YqWyqP8SjvVKzIscuh+c8ZtpTg6rq+gevxYttlZONCBNnibSXRizLVUFWDQ\n\
+hRmjhv3VknCGPvxN1pqurV28xqKtyRnHovRY2nt8vZOjxiQOwJNxzFWYQ5aEAYnw\n\
+vMbTQwf3rmnvZIiFZ3OX/pGyHt3S+vHneZTZXinNiq7YaP46chyhINsfLTDPJLNv\n\
+fAyHC5T1D6aSADl/mQykluV/fB60jvu3vcAwoSrsSFFXgqfwkqpdFF/73+Qrh5QT\n\
+TiFHBmdSS+t4kFw4hHU9Gmky9M/R1YO/Wc1KkwgxwjhiDbUCAwEAAaNjMGEwDwYD\n\
+VR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFA+gzyW9WBd+\n\
+CB52mGXJQ68fT4VWMB8GA1UdIwQYMBaAFA+gzyW9WBd+CB52mGXJQ68fT4VWMA0G\n\
+CSqGSIb3DQEBCwUAA4IBAQBt4YqiHnUgcuF23ZV8tmtPZKSUWwJSpiQU31UICCve\n\
+Vau9Ib7JyL4DpLboGnEluQPGiRdctKTBTC+vTNfA93/TzRSKfvK6jPQML2njc5yT\n\
+3hFr8sYkyGsz2olwaizItGbUpl1PPUuZ46owSO9mSV5kgN7+oHvG2yxFbpsBxZsI\n\
+AWxkBL9/+9P9pneAI1guWjclh/GANXm8p6aRBtXuskKb78xHQLSrv5lDIg3RGwzR\n\
+0FpigcT9u5I3JRRcgUrP1TT2cC5w47UxoHr+xfL2eDEJ4/Ws3sdstn0rvciVNZ3V\n\
+LroqaYTk2HjHno+Xw7KnGFOnlx0lK1pfYg7RCAUGQqdv\n\
+-----END CERTIFICATE-----\n";
+
+  const TEST_CRL_PEM: &str = "-----BEGIN X509 CRL-----\n\
+MIIB+DCB4QIBATANBgkqhkiG9w0BAQsFADB2MQswCQYDVQQGEwJVUzETMBEGA1UE\n\
+CAwKQ2FsaWZvcm5pYTEWMBQGA1UEBwwNU2FuIEZyYW5jaXNjbzENMAsGA1UECgwE\n\
+THlmdDEZMBcGA1UECwwQTHlmdCBFbmdpbmVlcmluZzEQMA4GA1UEAwwHVGVzdCBD\n\
+QRcNMjQwODIxMTkxNDExWhcNMzQwODE5MTkxNDExWjAnMCUCFDqzcIiLuhgHHdG+\n\
+r3TnjGE+SQVlFw0yNDA4MjExOTE0MTFaoA4wDDAKBgNVHRQEAwIBADANBgkqhkiG\n\
+9w0BAQsFAAOCAQEAPe7WB3XT2rBs/2K+/G7s0EAeIlgdv2H/QXhBb3gLA+mUpLTH\n\
+cPgvkdnSEKw6x6g+erI1pAqew6ZiEbaSf4SLCYKTQhpzHH2cmwJ+chwplFnSIcVl\n\
+2FQOmQ1xf/lIZRf3hgPTGTzws6ptBoPGsOo+IqQ06+ggCAXXuHoNhHzKAkw3k5g+\n\
+W+fPfQEUkJWCrDmM7Nhu50bf+cSPQl9qw4Z42K86pqp7w1sw5STo4Lp2MoKCT/3b\n\
+8X4wBB8hTvMdOJozwUjWnf8PbgXRTOfuoCR9eycLTbMUS1GazYKLfjMLESFR3rqp\n\
+tnY4u9DRKVqDzKPVPzz8BXzdJicwWlqVdO2I+w==\n\
+-----END X509 CRL-----\n";
+
+  fn upstream_cfg_with_crl(crl: Option<String>) -> JsonConfig {
+    JsonConfig {
+      cert_chain: String::new(),
+      private_key: String::new(),
+      trusted_ca: Some(TEST_CA_PEM.to_string()),
+      alpn_protocols: None,
+      enable_ktls: false,
+      disable_ktls_rx: false,
+      sni: Some("example.com".to_string()),
+      tls_minimum_protocol_version: TlsVersion::Auto,
+      tls_maximum_protocol_version: TlsVersion::Auto,
+      crl,
+    }
+  }
+
+  #[test]
+  fn upstream_with_crl_builds_ok() {
+    // A trusted CA plus a valid CRL it issued builds an upstream config with revocation checking.
+    let cfg = upstream_cfg_with_crl(Some(TEST_CRL_PEM.to_string()));
+    let result = RustlsFactoryConfig::new_upstream(cfg);
+    assert!(result.is_ok(), "{:?}", result.err());
+  }
+
+  #[test]
+  fn upstream_rejects_crl_with_no_crl_blocks() {
+    // Pointing `crl` at a certificate PEM with no X509 CRL block is rejected fail-loud.
+    let cfg = upstream_cfg_with_crl(Some(TEST_CA_PEM.to_string()));
+    match RustlsFactoryConfig::new_upstream(cfg) {
+      Ok(_) => panic!("expected an error for a CRL PEM with no CRL blocks"),
+      Err(err) => assert!(
+        err.contains("no CRL was parsed"),
+        "error must explain the missing CRL blocks: {err}"
+      ),
+    }
   }
 
   #[test]

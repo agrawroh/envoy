@@ -235,6 +235,31 @@ TEST_F(RustlsImplTest, UpstreamRejectsInvertedTlsVersionRange) {
   EXPECT_FALSE(result.ok());
 }
 
+TEST_F(RustlsImplTest, UpstreamWithServerCrl) {
+  RustlsUpstreamTransportSocketConfigFactory factory;
+
+  envoy::extensions::transport_sockets::rustls::v3::RustlsUpstreamTlsContext config;
+  config.set_sni("example.com");
+  config.set_trusted_ca(TestEnvironment::runfilesPath("test/common/tls/test_data/ca_cert.pem"));
+  config.set_crl(TestEnvironment::runfilesPath("test/common/tls/test_data/ca_cert.crl"));
+
+  auto result = factory.createTransportSocketFactory(config, context_);
+  EXPECT_TRUE(result.ok()) << result.status().message();
+}
+
+TEST_F(RustlsImplTest, UpstreamRejectsServerCrlWithNoCrlBlocks) {
+  RustlsUpstreamTransportSocketConfigFactory factory;
+
+  envoy::extensions::transport_sockets::rustls::v3::RustlsUpstreamTlsContext config;
+  config.set_sni("example.com");
+  config.set_trusted_ca(TestEnvironment::runfilesPath("test/common/tls/test_data/ca_cert.pem"));
+  // The crl points at a cert file with no X509 CRL block, which is rejected fail-loud.
+  config.set_crl(TestEnvironment::runfilesPath("test/common/tls/test_data/ca_cert.pem"));
+
+  auto result = factory.createTransportSocketFactory(config, context_);
+  EXPECT_FALSE(result.ok());
+}
+
 TEST_F(RustlsImplTest, DownstreamWithKtlsEnabled) {
   RustlsDownstreamTransportSocketConfigFactory factory;
 
