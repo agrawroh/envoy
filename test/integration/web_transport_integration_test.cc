@@ -1,5 +1,7 @@
 #include <functional>
 
+#include "envoy/http/web_transport.h"
+
 #include "test/integration/quic_http_integration_test.h"
 
 #include "quiche/quic/core/http/web_transport_http3.h"
@@ -42,6 +44,25 @@ private:
   std::function<void()> on_datagram_;
 };
 
+// An upstream side session consumer that echoes every datagram back. Makes the FakeUpstream act as
+// a WebTransport echo server for the proxy tests.
+class EchoUpstreamWebTransportCallbacks : public Http::WebTransportSessionCallbacks {
+public:
+  explicit EchoUpstreamWebTransportCallbacks(Http::WebTransportSession& session)
+      : session_(session) {}
+
+  void onWebTransportSessionReady() override {}
+  void onWebTransportDatagram(absl::string_view datagram) override {
+    session_.sendWebTransportDatagram(datagram);
+  }
+  void onWebTransportSessionClosed() override {}
+  void onWebTransportStreamIncoming(Http::WebTransportStream&, bool) override {}
+  void onCanCreateWebTransportStream(bool) override {}
+
+private:
+  Http::WebTransportSession& session_;
+};
+
 class WebTransportIntegrationTest : public QuicHttpIntegrationTestBase,
                                     public testing::TestWithParam<Network::Address::IpVersion> {
 public:
@@ -73,6 +94,51 @@ typed_config:
                                           {":scheme", "https"},
                                           {":path", "/"},
                                           {":authority", "host"}};
+  }
+
+  // Enables the runtime guard and configures Envoy to proxy a WebTransport CONNECT to an HTTP/3
+  // upstream rather than terminate it. The cluster and the upstream both opt into WebTransport so
+  // it is negotiated on the upstream connection.
+  void setupProxy() {
+    config_helper_.addRuntimeOverride("envoy.reloadable_features.web_transport", "true");
+    setUpstreamProtocol(Http::CodecType::HTTP3);
+    config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+      ConfigHelper::HttpProtocolOptions protocol_options;
+      protocol_options.mutable_explicit_http_config()
+          ->mutable_http3_protocol_options()
+          ->mutable_web_transport_options()
+          ->set_enabled(true);
+      ConfigHelper::setProtocolOptions(*bootstrap.mutable_static_resources()->mutable_clusters(0),
+                                       protocol_options);
+    });
+    config_helper_.addConfigModifier(
+        [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+               hcm) {
+          hcm.mutable_http3_protocol_options()->set_allow_extended_connect(true);
+          hcm.mutable_http3_protocol_options()->mutable_web_transport_options()->set_enabled(true);
+          auto* route = hcm.mutable_route_config()->mutable_virtual_hosts(0)->mutable_routes(0);
+          route->mutable_match()->mutable_connect_matcher();
+          auto* upgrade = route->mutable_route()->add_upgrade_configs();
+          upgrade->set_upgrade_type("webtransport");
+          upgrade->mutable_connect_config();
+        });
+    upstreamConfig().http3_options_.mutable_web_transport_options()->set_enabled(true);
+    initialize();
+  }
+
+  // A WebTransport CONNECT whose authority matches the upstream certificate SAN so the proxy can
+  // open the upstream QUIC connection.
+  Http::TestRequestHeaderMapImpl proxyConnectHeaders() {
+    return Http::TestRequestHeaderMapImpl{{":method", "CONNECT"},
+                                          {":protocol", "webtransport"},
+                                          {":scheme", "https"},
+                                          {":path", "/"},
+                                          {":authority", "sni.lyft.com"}};
+  }
+
+  // Name of a WebTransport stat on the upstream cluster scope.
+  std::string clusterWebTransportStat(absl::string_view name) {
+    return absl::StrCat("cluster.cluster_0.webtransport.", name);
   }
 
   // Name of a WebTransport stat in this listener sub-scope.
@@ -113,6 +179,8 @@ protected:
   }
 
   WebTransportClientSession* client_session_{nullptr};
+  // Owned here so it outlives the upstream session it is registered on through test teardown.
+  std::unique_ptr<EchoUpstreamWebTransportCallbacks> upstream_echo_;
 };
 
 INSTANTIATE_TEST_SUITE_P(IpVersions, WebTransportIntegrationTest,
@@ -258,6 +326,62 @@ TEST_P(WebTransportIntegrationTest, CapsuleProtocolHeaderAccepted) {
   response->waitForHeaders();
   EXPECT_EQ("200", response->headers().getStatusValue());
   EXPECT_FALSE(response->complete());
+
+  codec_client_->close();
+}
+
+// A WebTransport CONNECT is proxied to an HTTP/3 upstream and a datagram round-trips through the
+// relay. Drives the SETTINGS gated upstream CONNECT and the datagram relay end to end.
+TEST_P(WebTransportIntegrationTest, ProxyDatagramEcho) {
+#ifndef ENVOY_ENABLE_HTTP_DATAGRAMS
+  GTEST_SKIP() << "WebTransport requires HTTP/3 datagram support.";
+#endif
+  setupProxy();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  // The downstream CONNECT is forwarded to the upstream by the router.
+  auto encoder_decoder = codec_client_->startRequest(proxyConnectHeaders());
+  request_encoder_ = &encoder_decoder.first;
+  auto response = std::move(encoder_decoder.second);
+
+  // The upstream receives the forwarded CONNECT. Claim the session, then accept it with a 200.
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForHeadersComplete());
+  OptRef<Http::WebTransportSession> upstream_session = upstream_request_->webTransport();
+  ASSERT_TRUE(upstream_session.has_value());
+  upstream_echo_ = std::make_unique<EchoUpstreamWebTransportCallbacks>(upstream_session.ref());
+  upstream_session->setWebTransportSessionCallbacks(upstream_echo_.get());
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, false);
+
+  // The downstream sees the 200 and the session is live on both sides.
+  response->waitForHeaders();
+  EXPECT_EQ("200", response->headers().getStatusValue());
+
+  quic::WebTransportHttp3* session = client_session_->GetWebTransportSession(
+      request_encoder_->getStream().codecStreamId().value());
+  ASSERT_NE(nullptr, session);
+
+  auto visitor = std::make_unique<CapturingWebTransportVisitor>([this] { dispatcher_->exit(); });
+  CapturingWebTransportVisitor* visitor_ptr = visitor.get();
+  session->SetVisitor(std::move(visitor));
+  session->SendOrQueueDatagram("ping");
+
+  // Run the client until the echoed datagram arrives, with a timeout guard.
+  bool timed_out = false;
+  Event::TimerPtr timer = dispatcher_->createTimer([this, &timed_out] {
+    timed_out = true;
+    dispatcher_->exit();
+  });
+  timer->enableTimer(TestUtility::DefaultTimeout);
+  while (visitor_ptr->received().empty() && !timed_out) {
+    dispatcher_->run(Event::Dispatcher::RunType::Block);
+  }
+  ASSERT_FALSE(timed_out);
+  EXPECT_EQ("ping", visitor_ptr->received()[0]);
+
+  test_server_->waitForCounter(clusterWebTransportStat("sessions_total"), testing::Eq(1));
+  test_server_->waitForGauge(clusterWebTransportStat("sessions_active"), testing::Eq(1));
 
   codec_client_->close();
 }
