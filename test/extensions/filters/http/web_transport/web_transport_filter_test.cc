@@ -72,12 +72,15 @@ TEST_F(WebTransportFilterTest, EchoesDatagram) {
       {":method", "CONNECT"}, {":protocol", "webtransport"}, {":authority", "example.com"}};
   filter_.decodeHeaders(headers, false);
 
+  // Each datagram echoes back and resets the stream idle timer.
+  EXPECT_CALL(decoder_callbacks_, resetIdleTimer());
   EXPECT_CALL(session_, sendWebTransportDatagram(absl::string_view("ping")));
   filter_.onWebTransportDatagram("ping");
 
-  // After the session closes the filter stops echoing.
+  // After the session closes the filter stops echoing and stops resetting the idle timer.
   filter_.onWebTransportSessionClosed();
   EXPECT_CALL(session_, sendWebTransportDatagram(_)).Times(0);
+  EXPECT_CALL(decoder_callbacks_, resetIdleTimer()).Times(0);
   filter_.onWebTransportDatagram("late");
 }
 

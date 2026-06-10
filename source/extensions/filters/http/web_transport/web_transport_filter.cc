@@ -36,6 +36,8 @@ Http::FilterHeadersStatus WebTransportFilter::decodeHeaders(Http::RequestHeaderM
 
 void WebTransportFilter::onWebTransportDatagram(absl::string_view datagram) {
   if (session_ != nullptr) {
+    // Session activity keeps the stream alive, so reset the idle timer on each datagram.
+    decoder_callbacks_->resetIdleTimer();
     ENVOY_LOG(trace, "echoing WebTransport datagram of {} bytes", datagram.size());
     session_->sendWebTransportDatagram(datagram);
   }
