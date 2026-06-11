@@ -123,12 +123,16 @@ private:
   // Consumes response bytes, parsing the response header block and counting the response body.
   bool consumeResponse(absl::string_view data);
 
-  // Parses the just-completed request header block (`leg_.headers`). Sets request_body_len_ and
-  // request_connection_close_, applies every request-side smuggling rejection. Returns false (after
-  // reject()) on any rejection.
+  // Parses the just-completed request header block (`request_.headers`). Captures request_method_
+  // and request_content_length_, seeds request_.body_remaining with the Content-Length body, and
+  // applies every request-side smuggling rejection. Connection: close is handled inline (it makes
+  // the exchange non-poolable, so it calls reject() directly rather than setting a flag). Returns
+  // false (after reject()) on any rejection.
   bool parseRequestHeaders();
-  // Parses the just-completed response header block. Sets response body length from status + CL and
-  // response_connection_close_, applies the response-side rejections. Returns false on rejection.
+  // Parses the just-completed response header block (`response_.headers`). Derives the response
+  // body length from the status code + Content-Length (seeding response_.body_remaining) and
+  // applies the response-side rejections. Connection: close is handled inline via reject(), as on
+  // the request side. Returns false on rejection.
   bool parseResponseHeaders();
 
   // Recomputes verdict_ once both legs may have advanced. ExchangeComplete only when BOTH legs are

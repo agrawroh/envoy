@@ -52,14 +52,14 @@ enum TlsVersion {
 //     once at config load and is not refreshed.
 //
 //   **Authorization / observability gap**: ``Network::Connection::ssl()`` returns ``nullptr``
-//   for this transport socket. Filters and access-log formatters that consume TLS metadata
-//   (notably ``envoy.filters.http.rbac`` / ``envoy.filters.network.rbac`` (the
-//   ``AuthenticatedMatcher`` and URI/DNS-SAN principal matchers), ``envoy.filters.http.ext_authz``
-//   (peer-cert subject/SAN propagation), and access-log operators ``%DOWNSTREAM_TLS_VERSION%``
-//   / ``%DOWNSTREAM_TLS_CIPHER%`` / ``%DOWNSTREAM_PEER_CERT*%`` / ``%UPSTREAM_TLS_*%``) will
-//   behave as if the connection were plaintext. **Do not route through this socket from a
-//   listener whose filter chain depends on TLS-derived principals or audit fields** until the
-//   ``Ssl::ConnectionInfo`` plumbing lands.
+//   for this transport socket, so filters and access-log formatters that consume TLS metadata
+//   behave as if the connection were plaintext. The ``AuthenticatedMatcher`` and URI/DNS-SAN
+//   principal matchers in ``envoy.filters.http.rbac`` and ``envoy.filters.network.rbac`` see no
+//   authenticated peer; ``envoy.filters.http.ext_authz`` propagates no peer-cert subject or SAN;
+//   and the access-log operators ``%DOWNSTREAM_TLS_VERSION%``, ``%DOWNSTREAM_TLS_CIPHER%``,
+//   ``%DOWNSTREAM_PEER_CERT*%``, and ``%UPSTREAM_TLS_*%`` are all empty. **Do not route through
+//   this socket from a listener whose filter chain depends on TLS-derived principals or audit
+//   fields** until the ``Ssl::ConnectionInfo`` plumbing lands.
 //
 //   For any of the above gaps, use :ref:`envoy.transport_sockets.tls
 //   <envoy_v3_api_msg_extensions.transport_sockets.tls.v3.UpstreamTlsContext>` instead.

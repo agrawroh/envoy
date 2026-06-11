@@ -50,6 +50,13 @@ namespace TcpProxy {
 // Type alias for UpstreamConnectMode to simplify usage throughout this file.
 using UpstreamConnectMode = envoy::extensions::filters::network::tcp_proxy::v3::UpstreamConnectMode;
 
+std::string poolHostKey(absl::string_view cluster, absl::string_view sni, absl::string_view addr) {
+  // NUL separators keep the three segments unambiguous (no SNI or cluster name contains a NUL), so
+  // (cluster, sni, addr) maps to a distinct key and a connection handshaked for one SNI is never
+  // checked out for another at the same address.
+  return absl::StrCat(cluster, absl::string_view("\0", 1), sni, absl::string_view("\0", 1), addr);
+}
+
 const std::string& PerConnectionCluster::key() {
   CONSTRUCT_ON_FIRST_USE(std::string, "envoy.tcp_proxy.cluster");
 }
@@ -907,8 +914,7 @@ bool Filter::maybeTunnel(Upstream::ThreadLocalCluster& cluster) {
            transport_socket_options_->serverNameOverride().has_value())
               ? absl::string_view(transport_socket_options_->serverNameOverride().value())
               : absl::string_view{};
-      pool_host_key_ = absl::StrCat(cluster_name, absl::string_view("\0", 1), sni,
-                                    absl::string_view("\0", 1), host->address()->asStringView());
+      pool_host_key_ = poolHostKey(cluster_name, sni, host->address()->asStringView());
       pool_eligible_ = true;
       frame_tracker_ = std::make_unique<HttpFrameTracker>();
       if (tryCheckoutPooledUpstream(pool_host_key_, host)) {
@@ -1506,20 +1512,25 @@ bool Filter::maybeEngageSplice(Buffer::Instance& data, bool from_upstream) {
   if (down_fd == INVALID_SOCKET || up_fd == INVALID_SOCKET) {
     return false;
   }
-  // Downstream-sink safety gate (mirrors SpliceCoordinator::sinkLegIsRawOrKtls). The L4 pump relays
-  // raw bytes in BOTH directions, so the downstream leg must be plaintext (raw_buffer) or installed
-  // kTLS, never userspace TLS. A non-null ssl() means a userspace-TLS socket (e.g. BoringSSL
-  // `tls`); a rustls socket reports ssl()==nullptr but is only safe once kTLS is actually
-  // installed. Without this gate, decrypted upstream plaintext would be spliced onto a
-  // userspace-TLS downstream (cleartext on the wire) and the downstream's ciphertext relayed up as
-  // the upload body.
-  if (down.ssl() != nullptr) {
-    ENVOY_CONN_LOG(debug, "L4 splice skip: downstream sink is userspace TLS (ssl present)", down);
+  // Downstream-leg safety gate via the shared predicate (the same one the L7 SpliceCoordinator
+  // uses). The L4 pump relays raw bytes in BOTH directions, so the downstream leg must be plaintext
+  // (raw_buffer) or installed kTLS, never userspace TLS: otherwise decrypted upstream plaintext
+  // would be spliced onto a userspace-TLS downstream (cleartext on the wire) and the downstream's
+  // ciphertext relayed up as the upload body. This is the authoritative gate for the downstream
+  // leg; the callers' own checks are a fast-path.
+  if (!spliceLegIsRawOrKtls(down)) {
+    ENVOY_CONN_LOG(debug, "L4 splice skip: downstream leg is not plaintext or installed-kTLS",
+                   down);
     return false;
   }
-  if (OptRef<const Network::KtlsBytestreamInfo> down_ktls = down.ktlsBytestreamInfo();
-      down_ktls.has_value() && !down_ktls->installed) {
-    ENVOY_CONN_LOG(debug, "L4 splice skip: downstream sink kTLS not yet installed", down);
+  // Upstream-leg safety gate. The pump reads decrypted plaintext off the upstream (download) and
+  // frames TLS records on writes into it (upload), so the upstream MUST be genuinely kTLS-installed
+  // AND a trusted peer, not merely raw-or-kTLS. The callers hardcode this and trust it; re-prove it
+  // here so this chokepoint is the authoritative guarantee for BOTH legs, symmetric with the L7
+  // engage() re-validation.
+  OptRef<const Network::KtlsBytestreamInfo> up_info = up->ktlsBytestreamInfo();
+  if (!up_info.has_value() || !up_info->installed || !up_info->trusted_peer) {
+    ENVOY_CONN_LOG(debug, "L4 splice skip: upstream leg is not installed-kTLS + trusted", down);
     return false;
   }
   // Do not engage while the upstream write buffer is backed up. The pump relays the request and

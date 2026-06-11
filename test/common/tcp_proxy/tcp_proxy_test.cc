@@ -357,39 +357,6 @@ TEST_P(TcpProxyTest, ExplicitFactory) {
   upstream_callbacks_->onEvent(Network::ConnectionEvent::LocalClose);
 }
 
-// The L4 splice engage gate rejects when the upstream reports kTLS not installed, so upstream data
-// stays on the buffered path.
-TEST_P(TcpProxyTest, SpliceNotEngagedWhenKtlsNotInstalled) {
-  setup(1);
-  raiseEventUpstreamConnected(0);
-
-  Network::KtlsBytestreamInfo ktls_info{/*installed=*/false, /*fd=*/-1, /*trusted_peer=*/true};
-  ON_CALL(*upstream_connections_.at(0), ktlsBytestreamInfo())
-      .WillByDefault(
-          testing::Return(makeOptRefFromPtr<const Network::KtlsBytestreamInfo>(&ktls_info)));
-
-  Buffer::OwnedImpl response("world");
-  EXPECT_CALL(filter_callbacks_.connection_, write(BufferEqual(&response), _));
-  upstream_callbacks_->onUpstreamData(response, false);
-}
-
-// The L4 splice engage gate rejects an untrusted peer, so upstream data stays on the buffered
-// path. Only the upstream leg is ever queried, so a downstream-style untrusted socket cannot be
-// spliced.
-TEST_P(TcpProxyTest, SpliceNotEngagedWhenPeerUntrusted) {
-  setup(1);
-  raiseEventUpstreamConnected(0);
-
-  Network::KtlsBytestreamInfo ktls_info{/*installed=*/true, /*fd=*/0, /*trusted_peer=*/false};
-  ON_CALL(*upstream_connections_.at(0), ktlsBytestreamInfo())
-      .WillByDefault(
-          testing::Return(makeOptRefFromPtr<const Network::KtlsBytestreamInfo>(&ktls_info)));
-
-  Buffer::OwnedImpl response("world");
-  EXPECT_CALL(filter_callbacks_.connection_, write(BufferEqual(&response), _));
-  upstream_callbacks_->onUpstreamData(response, false);
-}
-
 // Fixtures and helpers for the Filter-level L4 splice engage tests. These need real socket fds (the
 // pump splices on them) and the kill-switch enabled, so they are kept apart from the negative cases
 // above (which stay buffered with the flag default-off).
@@ -514,6 +481,113 @@ TEST_P(TcpProxySpliceTest, SpliceNotEngagedWhenDownstreamUserspaceTls) {
   EXPECT_CALL(filter_callbacks_.connection_, write(BufferEqual(&response), _));
   upstream_callbacks_->onUpstreamData(response, false);
   EXPECT_EQ(0U, config_->stats().splice_pump_engaged_total_.value());
+}
+
+// The L4 splice upstream-leg gate rejects when the upstream reports kTLS NOT installed, even with a
+// splice-eligible (plaintext) downstream sink and the kill-switch on. The exchange stays on the
+// buffered path. On the TcpProxySpliceTest fixture (real fds, flag enabled) so the kTLS-installed
+// gate is genuinely exercised rather than short-circuited by the default-off kill-switch.
+TEST_P(TcpProxySpliceTest, SpliceNotEngagedWhenKtlsNotInstalled) {
+  setup(1);
+  raiseEventUpstreamConnected(0);
+
+  wireSocket(filter_callbacks_.connection_, down_socket_, down_io_, down_socket_ptr_, down_fds_[1]);
+  wireSocket(*upstream_connections_.at(0), up_socket_, up_io_, up_socket_ptr_, up_fds_[1]);
+
+  // Downstream sink is plaintext raw (splice-eligible), so the ONLY reason the splice does not
+  // engage is the upstream's kTLS-not-installed gate.
+  ON_CALL(filter_callbacks_.connection_, ssl()).WillByDefault(Return(nullptr));
+  ON_CALL(*upstream_connections_.at(0), aboveHighWatermark()).WillByDefault(Return(false));
+  Network::KtlsBytestreamInfo ktls_info{/*installed=*/false, /*fd=*/-1, /*trusted_peer=*/true};
+  ON_CALL(*upstream_connections_.at(0), ktlsBytestreamInfo())
+      .WillByDefault(
+          testing::Return(makeOptRefFromPtr<const Network::KtlsBytestreamInfo>(&ktls_info)));
+
+  Buffer::OwnedImpl response("world");
+  EXPECT_CALL(filter_callbacks_.connection_, write(BufferEqual(&response), _));
+  upstream_callbacks_->onUpstreamData(response, false);
+  EXPECT_EQ(0U, config_->stats().splice_pump_engaged_total_.value());
+}
+
+// The L4 splice upstream-leg gate rejects an untrusted peer, even with a splice-eligible
+// (plaintext) downstream sink and the kill-switch on. The exchange stays on the buffered path. On
+// the TcpProxySpliceTest fixture so the trusted_peer gate is genuinely exercised.
+TEST_P(TcpProxySpliceTest, SpliceNotEngagedWhenPeerUntrusted) {
+  setup(1);
+  raiseEventUpstreamConnected(0);
+
+  wireSocket(filter_callbacks_.connection_, down_socket_, down_io_, down_socket_ptr_, down_fds_[1]);
+  wireSocket(*upstream_connections_.at(0), up_socket_, up_io_, up_socket_ptr_, up_fds_[1]);
+
+  // Downstream sink is plaintext raw (splice-eligible) and the upstream has kTLS installed, so the
+  // ONLY reason the splice does not engage is the untrusted-peer gate.
+  ON_CALL(filter_callbacks_.connection_, ssl()).WillByDefault(Return(nullptr));
+  ON_CALL(*upstream_connections_.at(0), aboveHighWatermark()).WillByDefault(Return(false));
+  Network::KtlsBytestreamInfo ktls_info{/*installed=*/true, up_fds_[1], /*trusted_peer=*/false};
+  ON_CALL(*upstream_connections_.at(0), ktlsBytestreamInfo())
+      .WillByDefault(
+          testing::Return(makeOptRefFromPtr<const Network::KtlsBytestreamInfo>(&ktls_info)));
+
+  Buffer::OwnedImpl response("world");
+  EXPECT_CALL(filter_callbacks_.connection_, write(BufferEqual(&response), _));
+  upstream_callbacks_->onUpstreamData(response, false);
+  EXPECT_EQ(0U, config_->stats().splice_pump_engaged_total_.value());
+}
+
+// G3, SEC-1 upload direction: a userspace-TLS downstream SOURCE (ssl() != nullptr) on the
+// onData/upload path is NEVER spliced, even with a kTLS-installed + trusted upstream and the
+// kill-switch on. Splicing the upload off a userspace-TLS source would relay its ciphertext as the
+// request body, so the exchange stays on the buffered path (the body is written upstream).
+TEST_P(TcpProxySpliceTest, SpliceNotEngagedOnUploadWhenDownstreamUserspaceTls) {
+  setup(1);
+  raiseEventUpstreamConnected(0);
+
+  wireSocket(filter_callbacks_.connection_, down_socket_, down_io_, down_socket_ptr_, down_fds_[1]);
+  wireSocket(*upstream_connections_.at(0), up_socket_, up_io_, up_socket_ptr_, up_fds_[1]);
+
+  // Downstream source exposes a non-null ssl() (userspace TLS); the upstream is splice-eligible.
+  auto ssl_info = std::make_shared<NiceMock<Ssl::MockConnectionInfo>>();
+  ON_CALL(filter_callbacks_.connection_, ssl()).WillByDefault(Return(ssl_info));
+  ON_CALL(*upstream_connections_.at(0), aboveHighWatermark()).WillByDefault(Return(false));
+  Network::KtlsBytestreamInfo ktls_info{/*installed=*/true, up_fds_[1], /*trusted_peer=*/true};
+  ON_CALL(*upstream_connections_.at(0), ktlsBytestreamInfo())
+      .WillByDefault(
+          testing::Return(makeOptRefFromPtr<const Network::KtlsBytestreamInfo>(&ktls_info)));
+
+  // No splice: the upload body is relayed upstream through the buffered write() and the pump never
+  // arms.
+  Buffer::OwnedImpl request("upload-body");
+  EXPECT_CALL(*upstream_connections_.at(0), write(BufferEqual(&request), false));
+  filter_->onData(request, false);
+  EXPECT_EQ(0U, config_->stats().splice_pump_engaged_total_.value());
+}
+
+// G1, SEC-2: the warm-pool checkout/checkin key folds in the per-connection SNI override, so a
+// connection handshaked for SNI A at an address is never checked out for SNI B at that same
+// address (which would send the wrong certificate's session to the new peer).
+TEST(TcpProxyPoolHostKeyTest, SniIsPartOfTheKey) {
+  // Two distinct SNI overrides at the SAME cluster and address yield DIFFERENT keys.
+  const std::string key_a = poolHostKey("cluster", "sni-a.example.com", "10.0.0.1:443");
+  const std::string key_b = poolHostKey("cluster", "sni-b.example.com", "10.0.0.1:443");
+  EXPECT_NE(key_a, key_b);
+
+  // Same SNI, same cluster, same address is the same key (a warm connection is reusable).
+  EXPECT_EQ(key_a, poolHostKey("cluster", "sni-a.example.com", "10.0.0.1:443"));
+
+  // A different cluster at the same SNI and address is also a different key.
+  EXPECT_NE(key_a, poolHostKey("other", "sni-a.example.com", "10.0.0.1:443"));
+}
+
+// The no-override path yields the cluster + NUL + NUL + addr form (an empty SNI segment), and is
+// distinct from any non-empty-SNI key at the same cluster and address.
+TEST(TcpProxyPoolHostKeyTest, NoOverrideKeyForm) {
+  const std::string addr = "10.0.0.1:443";
+  const std::string expected =
+      absl::StrCat("cluster", absl::string_view("\0", 1), absl::string_view("\0", 1), addr);
+  EXPECT_EQ(expected, poolHostKey("cluster", "", addr));
+
+  // The empty-SNI key must not collide with a real SNI's key at the same cluster + address.
+  EXPECT_NE(poolHostKey("cluster", "", addr), poolHostKey("cluster", "sni-a.example.com", addr));
 }
 
 // Test nothing bad happens if an invalid factory is configured.

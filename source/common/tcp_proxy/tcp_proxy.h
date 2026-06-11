@@ -109,6 +109,15 @@ struct OnDemandStats {
 class Drainer;
 class UpstreamDrainManager;
 
+// Derives the Phase-2 warm-connection-pool checkout/checkin key from the cluster name, the
+// effective per-connection SNI override, and the upstream "ip:port" address, NUL-separated. SNI and
+// cluster are folded in so a connection handshaked for one SNI (or cluster) at an address is never
+// checked out for another at that same address (which would send the wrong certificate's session to
+// the new peer). `sni` is empty when no serverNameOverride applies. Free function so the exact byte
+// layout is directly unit-testable. The NUL separators are part of the contract; reusing the bytes
+// for a different SNI must produce a different key.
+std::string poolHostKey(absl::string_view cluster, absl::string_view sni, absl::string_view addr);
+
 /**
  * Route is an individual resolved route for a connection.
  */
@@ -848,7 +857,10 @@ protected:
   // only a kTLS-capable upstream still installing is held, so non-kTLS/mock upstreams stay on the
   // buffered path. The held body is spliced once kTLS installs and the (small) headers have flushed
   // (maybeEngageSplice's watermark check enforces ordering). Bounded retries; on exhaustion the
-  // body is flushed normally.
+  // body is flushed normally. SIZE IS BOUNDED to a single downstream read: the move() that fills
+  // this buffer is immediately followed by readDisable(true) on the downstream connection, so no
+  // further reads accumulate here while the poll runs; reads are re-enabled when the body is
+  // spliced or flushed.
   Buffer::OwnedImpl deferred_upload_buffer_;
   Event::SchedulableCallbackPtr ktls_engage_schedulable_;
   uint32_t ktls_engage_attempts_{0};

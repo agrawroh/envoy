@@ -73,10 +73,14 @@ private:
   // released it and the next checkout that rebinds it to a live Filter. A pooled GenericUpstream
   // outlives the Filter that minted it; without this sink the connection's read callbacks would
   // still point at that destroyed Filter, so an idle-window upstream byte OR close event would
-  // deref freed memory (use-after-free). This sink belongs to the pool (stable lifetime) and treats
-  // any idle-window activity as "this connection is no longer reusable": it closes the connection,
-  // so the pool's checkout/maintenance clean-checks then discard it. The same instance is shared by
-  // every idle connection (it is stateless).
+  // deref freed memory (use-after-free). This sink belongs to the pool (stable lifetime) and is
+  // intentionally INERT: it only logs. It does NOT close the connection or touch pools_, because it
+  // can fire synchronously while a pools_ scan (e.g. a checkout clean-check) is mid-iteration, and
+  // a close would re-enter and corrupt the deque/map. Disposal is therefore deferred: leaving an
+  // unexpected byte buffered (not draining it) makes the next checkout's MSG_PEEK clean-check see
+  // it and discard the entry, and a peer close leaves the connection Closed for the checkout/
+  // maintenance clean-checks to evict. The same instance is shared by every idle connection (it is
+  // stateless).
   class IdleUpstreamCallbacks : public Tcp::ConnectionPool::UpstreamCallbacks,
                                 public Logger::Loggable<Logger::Id::pool> {
   public:
@@ -90,7 +94,6 @@ private:
 
   struct Entry {
     GenericUpstreamPtr upstream;
-    uint32_t usage_count{0};
     MonotonicTime idle_since;
   };
 

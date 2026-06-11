@@ -143,10 +143,9 @@ private:
   OptRef<Network::Connection> upstreamConnection();
   OptRef<Network::Connection> downstreamConnection();
   // True iff `connection` is safe to splice raw bytes into (a download sink) or out of (an upload
-  // source) without bypassing in-place encryption. It must be a plaintext (raw_buffer) socket, or a
-  // connection whose own kTLS is installed (the kernel still encrypts the raw bytes the pump
-  // writes). A userspace-TLS rustls socket reports ssl()==nullptr yet is NOT safe, so that signal
-  // alone is not proof and this requires the positive kTLS signal.
+  // source) without bypassing in-place encryption. Thin wrapper over the shared
+  // TcpProxy::spliceLegIsRawOrKtls predicate so the L7 coordinator and the L4 tcp_proxy chokepoint
+  // gate on one definition; see that function for the two-signal rationale.
   static bool sinkLegIsRawOrKtls(Network::Connection& connection);
   // Liveness on byte movement: re-arms the no-progress watchdog and refreshes the per-try and HCM
   // stream idle timers (which no codec event refreshes while the splice bypasses the codec).

@@ -187,28 +187,10 @@ void SpliceCoordinator::abandon() {
 }
 
 bool SpliceCoordinator::sinkLegIsRawOrKtls(Network::Connection& connection) {
-  // Splicing raw bytes into (download sink) or out of (upload source) a userspace-TLS socket would
-  // bypass its in-place encryption, plaintext on the wire, or relayed ciphertext. Two signals are
-  // both required:
-  //   1. ssl() == nullptr. A userspace-TLS socket that exposes Ssl::ConnectionInfo, e.g. the
-  //      BoringSSL `tls` transport socket, reports a non-null ssl(); reject it. This is the ONLY
-  //      thing that distinguishes a BoringSSL/standard-TLS leg, which does not expose
-  //      KtlsBytestreamInfo at all (it inherits the empty base default, indistinguishable from
-  //      plaintext on that signal alone).
-  //   2. The KtlsBytestreamInfo signal then separates a rustls socket (which always reports
-  //      ssl()==nullptr) running userspace TLS (installed=false, reject) from one with kTLS
-  //      installed (safe) and from a plaintext raw_buffer socket (no info at all, safe).
-  // Net: plaintext raw_buffer (ssl null, no info) and installed-kTLS rustls (ssl null, installed)
-  // pass; BoringSSL-userspace (ssl non-null) and rustls-userspace/pending (ssl null, installed
-  // false) are rejected.
-  if (connection.ssl() != nullptr) {
-    return false;
-  }
-  OptRef<const Network::KtlsBytestreamInfo> info = connection.ktlsBytestreamInfo();
-  if (!info.has_value()) {
-    return true; // no TLS-capable transport: plaintext raw socket, safe to splice
-  }
-  return info->installed; // rustls: safe only when kTLS is actually installed
+  // Delegate to the shared leg-eligibility predicate (source/common/tcp_proxy/splice_pump.h) so the
+  // L7 coordinator and the L4 tcp_proxy chokepoint gate on one definition. See spliceLegIsRawOrKtls
+  // for the two-signal rationale (ssl()==nullptr plus the kTLS-installed signal).
+  return TcpProxy::spliceLegIsRawOrKtls(connection);
 }
 
 void SpliceCoordinator::onSpliceProgress() {

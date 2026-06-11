@@ -132,7 +132,6 @@ void UpstreamPool::checkin(absl::string_view host_key, GenericUpstreamPtr upstre
 
   Entry entry;
   entry.upstream = std::move(upstream);
-  entry.usage_count = 0;
   entry.idle_since = dispatcher_.timeSource().monotonicTime();
   entries.push_back(std::move(entry));
 }

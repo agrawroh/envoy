@@ -69,6 +69,7 @@ envoy_cc_library(
         "//envoy/network:connection_interface",
         "//envoy/network:io_handle_interface",
         "//envoy/network:socket_interface",
+        "//envoy/network:transport_socket_interface",
         "//source/common/common:assert_lib",
         "//source/common/common:minimal_logger_lib",
         "@abseil-cpp//absl/status",

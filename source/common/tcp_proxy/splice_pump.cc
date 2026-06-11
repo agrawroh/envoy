@@ -5,6 +5,10 @@
 #include <cstdint>
 #include <cstring>
 
+// spliceLegIsRawOrKtls dereferences KtlsBytestreamInfo, which envoy/network/connection.h only
+// forward-declares; the full struct lives here.
+#include "envoy/network/transport_socket.h"
+
 #if defined(__linux__)
 #include <fcntl.h>
 #include <linux/tls.h>
@@ -66,6 +70,17 @@ ControlAction classifyKtlsControlRecord(uint8_t record_type, const uint8_t* data
   default:
     return ControlAction::Close;
   }
+}
+
+bool spliceLegIsRawOrKtls(Network::Connection& connection) {
+  if (connection.ssl() != nullptr) {
+    return false;
+  }
+  OptRef<const Network::KtlsBytestreamInfo> info = connection.ktlsBytestreamInfo();
+  if (!info.has_value()) {
+    return true; // no TLS-capable transport: plaintext raw socket, safe to splice
+  }
+  return info->installed; // rustls: safe only when kTLS is actually installed
 }
 
 #if defined(__linux__)

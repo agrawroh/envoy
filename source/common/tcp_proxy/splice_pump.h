@@ -40,6 +40,24 @@ enum class SpliceCompletion {
 // here for unit testing.
 ControlAction classifyKtlsControlRecord(uint8_t record_type, const uint8_t* data, size_t len);
 
+// True iff `connection` is safe to splice raw bytes into (a download sink) or out of (an upload
+// source) without bypassing in-place encryption. Splicing raw bytes through a userspace-TLS socket
+// would put plaintext on the wire (download) or relay ciphertext as a body (upload). Two signals
+// are both required:
+//   1. ssl() == nullptr. A userspace-TLS socket that exposes Ssl::ConnectionInfo, e.g. the
+//      BoringSSL `tls` transport socket, reports a non-null ssl(); reject it. This is the only
+//      signal that distinguishes a BoringSSL/standard-TLS leg, which does not expose
+//      KtlsBytestreamInfo at all (indistinguishable from plaintext on the kTLS signal alone).
+//   2. The KtlsBytestreamInfo signal then separates a rustls socket (which always reports
+//      ssl()==nullptr) running userspace TLS (installed=false, reject) from one with kTLS installed
+//      (safe, the kernel still encrypts the raw bytes the pump writes) and from a plaintext
+//      raw_buffer socket (no info at all, safe).
+// Net: plaintext raw_buffer (ssl null, no info) and installed-kTLS rustls (ssl null, installed)
+// pass; BoringSSL-userspace (ssl non-null) and rustls-userspace/pending (ssl null, installed false)
+// are rejected. Shared by the L4 tcp_proxy chokepoint and the L7 router SpliceCoordinator so both
+// gate on one definition.
+bool spliceLegIsRawOrKtls(Network::Connection& connection);
+
 // Kernel splice() pump for the TCP proxy L4 fast-path. It moves bytes between a downstream
 // plaintext socket and an upstream kernel-TLS (kTLS) socket entirely in-kernel through two Unix
 // pipes, bypassing Envoy's userspace buffers and filter chain. Crypto stays in the kernel on the

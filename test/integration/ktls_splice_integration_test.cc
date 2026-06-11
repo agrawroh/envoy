@@ -166,6 +166,57 @@ public:
     return response;
   }
 
+  // Sends an upload PUT with a Content-Length-framed body of `body_size` bytes to the fake kTLS
+  // upstream, drives the upstream to return a body-less 200, and asserts the upstream received the
+  // request body byte-for-byte. Returns the response so the caller can assert on the splice
+  // counters.
+  //
+  // The request headers and body are sent in separate steps, mirroring the download sequencing the
+  // runDownload comment documents. The headers are flushed first (startRequest sends them and
+  // flushWrite pushes them out) and the test waits for the upstream connection and stream before
+  // sending the body. The upload coordinator arms on the request headers, read-disables the
+  // downstream source to hold the body in the kernel, and polls engage() until the upstream
+  // connects and its kTLS-TX is installed (both complete only after the request headers are
+  // written). Sending the body only after the headers have reached the upstream lets engage()
+  // commit first, then the body that follows is spliced downstream to upstream.
+  IntegrationStreamDecoderPtr runUpload(uint64_t body_size) {
+    codec_client_ = makeHttpConnection(lookupPort("http"));
+    auto encoder_decoder = codec_client_->startRequest(
+        Http::TestRequestHeaderMapImpl{{":method", "PUT"},
+                                       {":path", "/upload"},
+                                       {":scheme", "http"},
+                                       {":authority", "host"},
+                                       {"content-length", absl::StrCat(body_size)}});
+    auto& encoder = encoder_decoder.first;
+    auto response = std::move(encoder_decoder.second);
+
+    // Wait for the upstream connection and the new stream, but NOT for end-of-stream: the request
+    // headers have flushed (so the upstream connect that the scheduled engage() polls for has been
+    // driven), yet the body is still held back. waitForNextUpstreamRequest cannot be used here
+    // because it also waits for the upstream stream to complete, which never happens until the body
+    // below is sent.
+    RELEASE_ASSERT(
+        fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_),
+        "no upstream connection");
+    RELEASE_ASSERT(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_),
+                   "no upstream stream");
+
+    const std::string body = makeBody(body_size);
+    codec_client_->sendData(encoder, body, true);
+
+    RELEASE_ASSERT(upstream_request_->waitForEndStream(*dispatcher_), "upload did not complete");
+    // FakeStream::body() drains the accumulated body, so snapshot it once and assert on the copy.
+    const std::string received = upstream_request_->body().toString();
+    EXPECT_EQ(body_size, received.size());
+    EXPECT_EQ(body, received);
+
+    upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+    RELEASE_ASSERT(response->waitForEndStream(), "upload response did not complete");
+    EXPECT_TRUE(response->complete());
+    EXPECT_EQ("200", response->headers().getStatusValue());
+    return response;
+  }
+
   FakeKtlsConfigFactory config_factory_;
   Registry::InjectFactory<Server::Configuration::UpstreamTransportSocketConfigFactory>
       registered_config_factory_{config_factory_};
@@ -194,6 +245,79 @@ TEST_P(KtlsSpliceIntegrationTest, DownloadAboveThresholdEngagesSplice) {
 TEST_P(KtlsSpliceIntegrationTest, DownloadBelowThresholdDoesNotEngage) {
   initializeWithFakeKtlsUpstream();
   auto response = runDownload(MinSpliceBodyBytes - 1);
+  const Stats::CounterSharedPtr engaged =
+      test_server_->counter("cluster.cluster_0.http1_ktls_splice.engaged");
+  EXPECT_EQ(0, engaged == nullptr ? 0 : engaged->value());
+}
+
+// A 128 KiB PUT body (>= the 64 KiB floor) over the fake-kTLS upstream engages the upload splice
+// (downstream source to kTLS-TX upstream sink) and the upstream still receives the body
+// byte-for-byte. The engaged counter assertion is what proves the request-body fast-path actually
+// fired rather than the buffered path silently carrying the bytes. This is the upload mirror of
+// DownloadAboveThresholdEngagesSplice.
+TEST_P(KtlsSpliceIntegrationTest, UploadAboveThresholdEngagesSplice) {
+  initializeWithFakeKtlsUpstream();
+  auto response = runUpload(128 * 1024);
+  test_server_->waitForCounter("cluster.cluster_0.http1_ktls_splice.engaged", testing::Ge(1));
+  EXPECT_EQ(1, test_server_->counter("cluster.cluster_0.http1_ktls_splice.engaged")->value());
+  // A clean upload reaches the Content-Length boundary, so it completes rather than truncates.
+  const Stats::CounterSharedPtr truncated =
+      test_server_->counter("cluster.cluster_0.http1_ktls_splice.truncated");
+  EXPECT_EQ(0, truncated == nullptr ? 0 : truncated->value());
+}
+
+// Truncation: a download whose upstream advertises a Content-Length, then sends fewer body bytes
+// than promised and closes the connection mid-body. The downstream must observe a reset /
+// incomplete response rather than a clean, complete 200, so a peer that disappears mid-body can
+// never be mistaken for a fully delivered body.
+//
+// SCOPE (read before changing). The strongest version of this test would drive the truncation on an
+// ENGAGED splice (Content-Length >= the 64 KiB floor) and assert the truncated counter. That path
+// cannot be exercised end-to-end here today: once engage() commits it detaches both legs'
+// ConnectionImpl file events so the in-kernel SplicePump owns the fds, and finalize()'s truncation
+// branch force-closes the borrowed upstream WITHOUT first reinstalling the downstream (sink) leg's
+// file event. The force-close cascade (ConnectionImpl::closeInternal) then calls enableFileEvents()
+// on that still-detached downstream leg and trips the "Null file_event_" ENVOY_BUG
+// (source/common/network/io_socket_handle_impl.cc), which aborts the process in a debug build.
+// That is a real defect in the engaged-splice teardown (SpliceCoordinator::finalize / reset), which
+// this test does not own; the engaged-path truncated/completed accounting is covered with mocks by
+// SpliceCoordinatorTest.CompleteTruncated and CompleteErrorRoutesToTruncation in
+// test/common/router/splice_coordinator_test.cc, where the mock upstream close is a no-op and so
+// does not run the cascade.
+//
+// To stay deterministic and crash-free while still pinning the customer-visible truncation
+// contract, this drives a SUB-threshold body so the splice never arms (no leg is ever detached) and
+// the buffered path carries the bytes. The assertions therefore are: the splice did not engage, and
+// the truncated response is surfaced downstream as a reset / incomplete rather than a clean 200.
+TEST_P(KtlsSpliceIntegrationTest, DownloadTruncationSurfacesIncompleteResponse) {
+  initializeWithFakeKtlsUpstream();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeHeaderOnlyRequest(Http::TestRequestHeaderMapImpl{
+      {":method", "GET"}, {":path", "/download"}, {":scheme", "http"}, {":authority", "host"}});
+
+  // Below the 64 KiB floor, so the splice stays disarmed and the bytes flow through the buffered
+  // path; the truncation handling under test is the codec/router path, not the splice.
+  constexpr uint64_t content_length = MinSpliceBodyBytes - 1;
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(
+      Http::TestResponseHeaderMapImpl{{":status", "200"},
+                                      {"content-length", absl::StrCat(content_length)}},
+      false);
+  response->waitForHeaders();
+
+  // Send strictly fewer bytes than the advertised Content-Length, then close the upstream so the
+  // body is cut mid-transfer.
+  const std::string partial = makeBody(content_length / 2);
+  Buffer::OwnedImpl partial_data(partial);
+  upstream_request_->encodeData(partial_data, false);
+  RELEASE_ASSERT(fake_upstream_connection_->close(), "failed to close upstream");
+
+  // The downstream stream is reset / left incomplete: no clean end-of-stream with the full body.
+  ASSERT_TRUE(response->waitForAnyTermination());
+  EXPECT_FALSE(response->complete());
+
+  // The splice never armed for a sub-threshold body, so its engaged counter is absent (lazily
+  // created on first engage) or zero.
   const Stats::CounterSharedPtr engaged =
       test_server_->counter("cluster.cluster_0.http1_ktls_splice.engaged");
   EXPECT_EQ(0, engaged == nullptr ? 0 : engaged->value());
