@@ -138,14 +138,16 @@ public:
   }
   void onWebTransportSessionClosed() override {}
   void onWebTransportStreamIncoming(Http::WebTransportStream& stream, bool) override {
-    stream_echo_ = std::make_unique<EchoUpstreamWebTransportStream>(stream);
-    stream.setWebTransportStreamCallbacks(stream_echo_.get());
+    // Hold each echo for the life of the session so a second stream does not destroy the first
+    // while its callbacks are still registered.
+    stream_echoes_.push_back(std::make_unique<EchoUpstreamWebTransportStream>(stream));
+    stream.setWebTransportStreamCallbacks(stream_echoes_.back().get());
   }
   void onCanCreateWebTransportStream(bool) override {}
 
 private:
   Http::WebTransportSession& session_;
-  std::unique_ptr<EchoUpstreamWebTransportStream> stream_echo_;
+  std::vector<std::unique_ptr<EchoUpstreamWebTransportStream>> stream_echoes_;
 };
 
 class WebTransportIntegrationTest : public QuicHttpIntegrationTestBase,

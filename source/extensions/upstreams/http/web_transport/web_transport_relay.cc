@@ -15,9 +15,11 @@ constexpr size_t MaxStreamReadSize = 16 * 1024;
 constexpr uint32_t StreamGoneErrorCode = 0;
 } // namespace
 
-WebTransportStreamRelay::WebTransportStreamRelay(Envoy::Http::WebTransportStream& incoming,
+WebTransportStreamRelay::WebTransportStreamRelay(WebTransportRelay& owner,
+                                                 Envoy::Http::WebTransportStream& incoming,
                                                  Envoy::Http::WebTransportStream& mirror)
-    : incoming_(incoming), mirror_(mirror), incoming_end_(*this, true), mirror_end_(*this, false) {
+    : owner_(owner), incoming_(incoming), mirror_(mirror), incoming_end_(*this, true),
+      mirror_end_(*this, false) {
   incoming_.setWebTransportStreamCallbacks(&incoming_end_);
   mirror_.setWebTransportStreamCallbacks(&mirror_end_);
   // Drain anything already buffered on the incoming stream.
@@ -30,25 +32,34 @@ WebTransportStreamRelay::~WebTransportStreamRelay() {
 }
 
 void WebTransportStreamRelay::pump(bool from_incoming) {
+  if (pumpData(from_incoming)) {
+    // Forwarded traffic keeps the proxied session alive, so reset the downstream idle timer.
+    owner_.signalActivity();
+  }
+}
+
+bool WebTransportStreamRelay::pumpData(bool from_incoming) {
   Envoy::Http::WebTransportStream& source = stream(from_incoming);
   Envoy::Http::WebTransportStream& destination = stream(!from_incoming);
   std::string& pending = from_incoming ? incoming_pending_ : mirror_pending_;
   bool& pending_fin = from_incoming ? incoming_pending_fin_ : mirror_pending_fin_;
   bool& done = from_incoming ? incoming_done_ : mirror_done_;
+  bool moved = false;
   if (done) {
-    return;
+    return moved;
   }
 
   // Flush bytes held from an earlier blocked write before reading more.
   if (!pending.empty()) {
     if (!destination.canWriteWebTransportStream() ||
         !destination.writeWebTransportStream(pending, pending_fin)) {
-      return;
+      return moved;
     }
+    moved = true;
     pending.clear();
     if (pending_fin) {
       done = true;
-      return;
+      return moved;
     }
   }
 
@@ -59,20 +70,24 @@ void WebTransportStreamRelay::pump(bool from_incoming) {
     Envoy::Http::WebTransportStreamReadResult result =
         source.readWebTransportStream(absl::MakeSpan(buffer));
     if (result.bytes_read == 0 && !result.end_stream) {
-      return;
+      return moved;
     }
     absl::string_view data(buffer.data(), result.bytes_read);
     if (!destination.writeWebTransportStream(data, result.end_stream)) {
       // Hold the bytes and the end flag until the destination can write again.
       pending.assign(data.data(), data.size());
       pending_fin = result.end_stream;
-      return;
+      return moved;
+    }
+    if (result.bytes_read > 0) {
+      moved = true;
     }
     if (result.end_stream) {
       done = true;
-      return;
+      return moved;
     }
   }
+  return moved;
 }
 
 void WebTransportStreamRelay::onReset(bool on_incoming, uint32_t error_code) {
@@ -123,7 +138,7 @@ void WebTransportRelay::relayStream(Direction from, Envoy::Http::WebTransportStr
     incoming.resetWebTransportStream(StreamGoneErrorCode);
     return;
   }
-  stream_relays_.push_back(std::make_unique<WebTransportStreamRelay>(incoming, *mirror));
+  stream_relays_.push_back(std::make_unique<WebTransportStreamRelay>(*this, incoming, *mirror));
   callbacks_.onWebTransportActivity();
 }
 

@@ -14,13 +14,15 @@ namespace Upstreams {
 namespace Http {
 namespace WebTransport {
 
+class WebTransportRelay;
+
 // Relays one WebTransport data stream onto a mirror stream on the peer session, in both directions
 // for a bidirectional stream. Reads are gated on the peer being writable, so a slow peer applies
 // backpressure to the source. A stream that closes resolves to a no-op in the session, so the relay
 // holds the pair for the life of the session relay.
 class WebTransportStreamRelay {
 public:
-  WebTransportStreamRelay(Envoy::Http::WebTransportStream& incoming,
+  WebTransportStreamRelay(WebTransportRelay& owner, Envoy::Http::WebTransportStream& incoming,
                           Envoy::Http::WebTransportStream& mirror);
   // Detaches the End callbacks so a stream that outlives the relay does not reach a freed End.
   ~WebTransportStreamRelay();
@@ -49,13 +51,18 @@ private:
     const bool incoming_;
   };
 
-  // Moves readable bytes from the source stream to the peer, holding bytes a blocked peer cannot
-  // accept yet. from_incoming selects the source direction.
+  // Moves readable bytes from the source stream to the peer and signals relay activity when bytes
+  // are forwarded, so the owner can keep a busy session alive. from_incoming selects the source
+  // direction.
   void pump(bool from_incoming);
+  // Moves readable bytes from the source to the peer, holding bytes a blocked peer cannot accept
+  // yet. Returns true when any bytes are forwarded. from_incoming selects the source direction.
+  bool pumpData(bool from_incoming);
   void onReset(bool on_incoming, uint32_t error_code);
   void onStopSending(bool on_incoming, uint32_t error_code);
   Envoy::Http::WebTransportStream& stream(bool incoming) { return incoming ? incoming_ : mirror_; }
 
+  WebTransportRelay& owner_;
   Envoy::Http::WebTransportStream& incoming_;
   Envoy::Http::WebTransportStream& mirror_;
   End incoming_end_;
@@ -122,9 +129,14 @@ private:
   void forwardDatagram(Direction from, absl::string_view datagram);
   void onSessionClosed(Direction which);
   void relayStream(Direction from, Envoy::Http::WebTransportStream& incoming, bool bidirectional);
+  // Signals relay activity to the owner so a busy session is not reaped. Called by a per stream
+  // relay when it forwards bytes between the two sessions.
+  void signalActivity() { callbacks_.onWebTransportActivity(); }
   Envoy::Http::WebTransportSession*& session(Direction direction) {
     return direction == Direction::Downstream ? downstream_ : upstream_;
   }
+
+  friend class WebTransportStreamRelay;
 
   Callbacks& callbacks_;
   Side downstream_side_;

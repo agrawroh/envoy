@@ -84,6 +84,14 @@ TEST_F(UpstreamRequestTest, TestAccessors) {
   upstream_request_->decodeHeaders(std::move(response_headers), false);
 }
 
+// A relayed WebTransport activity notification resets the downstream stream idle timer, so a busy
+// proxied session is not reaped while the relay forwards datagrams or stream data.
+TEST_F(UpstreamRequestTest, WebTransportActivityResetsDownstreamIdleTimer) {
+  initialize();
+  EXPECT_CALL(router_filter_interface_.callbacks_, resetIdleTimer());
+  upstream_request_->onWebTransportActivity();
+}
+
 // UpstreamRequest is responsible for adding proper gRPC annotations to spans.
 TEST_F(UpstreamRequestTest, DecodeHeadersGrpcSpanAnnotations) {
   envoy::extensions::filters::http::router::v3::Router router_proto;
