@@ -133,8 +133,8 @@ private:
   void forwardDatagram(Direction from, absl::string_view datagram);
   void onSessionClosed(Direction which);
   void relayStream(Direction from, Envoy::Http::WebTransportStream& incoming, bool bidirectional);
-  // Signals relay activity to the owner so a busy session is not reaped. Called by a per stream
-  // relay when it forwards bytes between the two sessions.
+  // Signals relay activity to the owner so a busy session is not reaped. Called when a stream is
+  // opened and when a relayed stream sees read or write activity.
   void signalActivity() { callbacks_.onWebTransportActivity(); }
   Envoy::Http::WebTransportSession*& session(Direction direction) {
     return direction == Direction::Downstream ? downstream_ : upstream_;
