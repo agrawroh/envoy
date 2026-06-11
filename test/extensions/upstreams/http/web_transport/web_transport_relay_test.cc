@@ -189,12 +189,12 @@ TEST_F(WebTransportRelayTest, MirrorsStreamAndForwardsData) {
 
   EXPECT_NE(nullptr, incoming.callbacks_);
   EXPECT_EQ("hello", mirror.written_);
-  // Relaying signals activity once for the stream open and once for the forwarded initial data.
-  EXPECT_EQ(2, callbacks_.activity_count_);
+  // Relaying the stream signals activity for the open. The initial data drains on the same open.
+  EXPECT_EQ(1, callbacks_.activity_count_);
 }
 
-// Data forwarded on an already open relayed stream signals activity, so a session whose only
-// traffic is a long lived stream is kept alive.
+// Data arriving on an already open relayed stream signals activity, so a session whose only traffic
+// is a long lived stream is kept alive even while the peer is write blocked.
 TEST_F(WebTransportRelayTest, StreamDataSignalsActivity) {
   FakeWebTransportStream mirror(true);
   upstream_.next_outgoing_ = &mirror;
@@ -210,6 +210,13 @@ TEST_F(WebTransportRelayTest, StreamDataSignalsActivity) {
   incoming.callbacks_->onWebTransportStreamData();
   EXPECT_EQ("more", mirror.written_);
   EXPECT_EQ(2, callbacks_.activity_count_);
+
+  // Data that arrives while the peer cannot accept it still signals activity even though no bytes
+  // are forwarded yet.
+  mirror.can_write_ = false;
+  incoming.readable_ = "blocked";
+  incoming.callbacks_->onWebTransportStreamData();
+  EXPECT_EQ(3, callbacks_.activity_count_);
 }
 
 // A blocked peer applies backpressure, and the held bytes flush once it can write again.

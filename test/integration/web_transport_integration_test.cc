@@ -97,6 +97,8 @@ public:
     // Drain anything already buffered before the callbacks were registered.
     pump();
   }
+  // Detach so a stream that outlives this echo does not reach a freed callback.
+  ~EchoUpstreamWebTransportStream() override { stream_.setWebTransportStreamCallbacks(nullptr); }
 
   void onWebTransportStreamData() override { pump(); }
   void onWebTransportStreamCanWrite() override { pump(); }

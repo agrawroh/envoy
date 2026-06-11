@@ -18,6 +18,9 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 // [#extension: envoy.filters.http.web_transport]
 
 // Terminates WebTransport over HTTP/3 sessions and echoes received datagrams back to the client.
-// This is a reference handler for the WebTransport termination path and takes no configuration.
+// When the client offers subprotocols in the ``wt-available-protocols`` request header, the
+// reference handler selects the most preferred offer and returns it in the ``wt-protocol`` response
+// header. This is a reference handler for the WebTransport termination path and takes no
+// configuration.
 message WebTransport {
 }

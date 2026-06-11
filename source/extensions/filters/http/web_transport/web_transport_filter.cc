@@ -2,6 +2,7 @@
 
 #include "source/common/http/header_map_impl.h"
 
+#include "absl/status/statusor.h"
 #include "quiche/web_transport/web_transport_headers.h"
 
 namespace Envoy {

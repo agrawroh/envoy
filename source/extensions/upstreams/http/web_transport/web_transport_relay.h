@@ -35,10 +35,16 @@ private:
     End(WebTransportStreamRelay& relay, bool incoming) : relay_(relay), incoming_(incoming) {}
 
     // Http::WebTransportStreamCallbacks
-    void onWebTransportStreamData() override { relay_.pump(incoming_); }
+    void onWebTransportStreamData() override {
+      relay_.notifyActivity();
+      relay_.pump(incoming_);
+    }
     // When this stream can write again, resume the pump whose destination is this stream, which
     // reads from the opposite direction.
-    void onWebTransportStreamCanWrite() override { relay_.pump(!incoming_); }
+    void onWebTransportStreamCanWrite() override {
+      relay_.notifyActivity();
+      relay_.pump(!incoming_);
+    }
     void onWebTransportStreamReset(uint32_t error_code) override {
       relay_.onReset(incoming_, error_code);
     }
@@ -51,13 +57,11 @@ private:
     const bool incoming_;
   };
 
-  // Moves readable bytes from the source stream to the peer and signals relay activity when bytes
-  // are forwarded, so the owner can keep a busy session alive. from_incoming selects the source
-  // direction.
+  // Moves readable bytes from the source stream to the peer, holding bytes a blocked peer cannot
+  // accept yet. from_incoming selects the source direction.
   void pump(bool from_incoming);
-  // Moves readable bytes from the source to the peer, holding bytes a blocked peer cannot accept
-  // yet. Returns true when any bytes are forwarded. from_incoming selects the source direction.
-  bool pumpData(bool from_incoming);
+  // Tells the owner the relayed stream saw read or write activity, so a busy session is not reaped.
+  void notifyActivity();
   void onReset(bool on_incoming, uint32_t error_code);
   void onStopSending(bool on_incoming, uint32_t error_code);
   Envoy::Http::WebTransportStream& stream(bool incoming) { return incoming ? incoming_ : mirror_; }

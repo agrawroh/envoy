@@ -31,35 +31,28 @@ WebTransportStreamRelay::~WebTransportStreamRelay() {
   mirror_.setWebTransportStreamCallbacks(nullptr);
 }
 
-void WebTransportStreamRelay::pump(bool from_incoming) {
-  if (pumpData(from_incoming)) {
-    // Forwarded traffic keeps the proxied session alive, so reset the downstream idle timer.
-    owner_.signalActivity();
-  }
-}
+void WebTransportStreamRelay::notifyActivity() { owner_.signalActivity(); }
 
-bool WebTransportStreamRelay::pumpData(bool from_incoming) {
+void WebTransportStreamRelay::pump(bool from_incoming) {
   Envoy::Http::WebTransportStream& source = stream(from_incoming);
   Envoy::Http::WebTransportStream& destination = stream(!from_incoming);
   std::string& pending = from_incoming ? incoming_pending_ : mirror_pending_;
   bool& pending_fin = from_incoming ? incoming_pending_fin_ : mirror_pending_fin_;
   bool& done = from_incoming ? incoming_done_ : mirror_done_;
-  bool moved = false;
   if (done) {
-    return moved;
+    return;
   }
 
   // Flush bytes held from an earlier blocked write before reading more.
   if (!pending.empty()) {
     if (!destination.canWriteWebTransportStream() ||
         !destination.writeWebTransportStream(pending, pending_fin)) {
-      return moved;
+      return;
     }
-    moved = true;
     pending.clear();
     if (pending_fin) {
       done = true;
-      return moved;
+      return;
     }
   }
 
@@ -70,24 +63,20 @@ bool WebTransportStreamRelay::pumpData(bool from_incoming) {
     Envoy::Http::WebTransportStreamReadResult result =
         source.readWebTransportStream(absl::MakeSpan(buffer));
     if (result.bytes_read == 0 && !result.end_stream) {
-      return moved;
+      return;
     }
     absl::string_view data(buffer.data(), result.bytes_read);
     if (!destination.writeWebTransportStream(data, result.end_stream)) {
       // Hold the bytes and the end flag until the destination can write again.
       pending.assign(data.data(), data.size());
       pending_fin = result.end_stream;
-      return moved;
-    }
-    if (result.bytes_read > 0) {
-      moved = true;
+      return;
     }
     if (result.end_stream) {
       done = true;
-      return moved;
+      return;
     }
   }
-  return moved;
 }
 
 void WebTransportStreamRelay::onReset(bool on_incoming, uint32_t error_code) {
