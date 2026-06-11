@@ -11,8 +11,8 @@
 namespace Envoy {
 namespace TcpProxy {
 
-// Security-critical HTTP/1.1 frame tracker for the Phase-2 pooled buffered-relay path (see
-// UPSTREAM_POOL_DESIGN.md). The pool can only return a connection whose request/response exchange
+// Security-critical HTTP/1.1 frame tracker for the Phase-2 pooled buffered-relay path. The pool can
+// only return a connection whose request/response exchange
 // finished on a clean message boundary; a spliced (unbounded) connection can never be returned. So
 // the buffered relay feeds every request-direction and response-direction byte through this
 // tracker, which finds the HTTP/1.1 message boundaries (headers terminated by CRLFCRLF, then a
@@ -85,8 +85,8 @@ public:
 
   // True once the request header block has been fully parsed, so requestMethod() and
   // requestContentLength() are known. False while still buffering the request headers, and false if
-  // the request was already rejected (NotPoolable). The Phase-2 pool router uses this to decide --
-  // per request, before any byte is spliced -- whether to keep an exchange on the buffered,
+  // the request was already rejected (NotPoolable). The Phase-2 pool router uses this to decide,
+  // per request and before any byte is spliced, whether to keep an exchange on the buffered,
   // returnable path (a small upload) or hand it to the L4 splice fast-path.
   bool requestHeadersParsed() const {
     return request_.phase != Phase::Headers && verdict_ != Verdict::NotPoolable;
@@ -96,9 +96,6 @@ public:
   // The request body length from Content-Length (0 if absent). Unlike the internal body counter
   // this does not decrement as body bytes arrive. Valid once requestHeadersParsed() is true.
   uint64_t requestContentLength() const { return request_content_length_; }
-  // The response status code parsed from the status line (0 until response headers parse).
-  // TEMP-DIAG.
-  uint32_t responseStatusCode() const { return response_status_code_; }
 
 private:
   // One direction's parse state. The request and the response are framed identically (header block
@@ -157,8 +154,6 @@ private:
   // stable copy of the declared body length; request_.body_remaining decrements as body bytes
   // arrive.
   uint64_t request_content_length_{0};
-  // TEMP-DIAG: response status code captured at parse time, for the 2xx-vs-error funnel.
-  uint32_t response_status_code_{0};
 };
 
 } // namespace TcpProxy

@@ -815,20 +815,15 @@ pub unsafe extern "C" fn envoy_dynamic_module_on_transport_socket_set_server_nam
   let _ = catch_unwind(AssertUnwindSafe(|| {
     let name_bytes =
       unsafe { crate::ffi_helpers::slice_from_raw_or_empty(name.ptr as *const u8, name.length) };
-    let name_str = match std::str::from_utf8(name_bytes) {
-      Ok(s) => s,
-      Err(_) => {
-        crate::envoy_log_error!(
-          "transport socket server name override is not valid UTF-8; ignoring it."
-        );
-        return;
-      },
-    };
+    // A non-UTF-8 override must fail closed, just like a malformed-but-UTF-8 one: decode lossily
+    // and still dispatch to the trait so the implementation's validation (e.g. `ServerName::try_from`)
+    // rejects it and the connection fails, rather than silently falling back to the factory SNI.
+    let name_str = String::from_utf8_lossy(name_bytes);
     let wrapper = unsafe { &mut *(transport_socket_module_ptr as *mut TransportSocketWrapper) };
     let mut envoy = EnvoyTransportSocketImpl::new(transport_socket_envoy_ptr);
     wrapper
       .socket
-      .on_set_server_name_override(&mut envoy, name_str);
+      .on_set_server_name_override(&mut envoy, &name_str);
   }))
   .map_err(|panic| {
     crate::log_ffi_panic(
@@ -920,10 +915,11 @@ mod tests {
   }
 
   #[test]
-  fn set_server_name_override_ignores_invalid_utf8() {
+  fn set_server_name_override_dispatches_invalid_utf8_lossily() {
     let (raw, recorded) = wrap();
-    // 0xFF is never valid UTF-8, so the wrapper logs and skips the dispatch rather than calling the
-    // trait with lossy bytes.
+    // 0xFF is never valid UTF-8. The wrapper decodes lossily and STILL dispatches to the trait, so
+    // the implementation's own validation (e.g. `ServerName::try_from`) rejects it and the
+    // connection fails closed, rather than silently falling back to the factory-default SNI.
     let bytes = [0xFFu8, 0xFE, 0xFD];
     let buffer = abi::envoy_dynamic_module_type_envoy_buffer {
       ptr: bytes.as_ptr() as *const _,
@@ -937,9 +933,12 @@ mod tests {
       );
       drop(Box::from_raw(raw));
     }
-    assert!(
-      recorded.borrow().is_none(),
-      "invalid UTF-8 must not reach the trait method"
+    // `from_utf8_lossy` maps each invalid byte to U+FFFD, which is not a valid SNI; the point is
+    // that the bytes reached the trait at all.
+    assert_eq!(
+      recorded.borrow().as_deref(),
+      Some(String::from_utf8_lossy(&bytes).as_ref()),
+      "invalid UTF-8 must reach the trait (lossily) so it can fail closed"
     );
   }
 }

@@ -141,7 +141,7 @@ void UpstreamPool::IdleUpstreamCallbacks::onUpstreamData(Buffer::Instance& data,
   // This sink exists only to keep an idle pooled connection from delivering bytes to the destroyed
   // Filter that minted it. In practice it never fires: the connection is read-disabled at check-in,
   // so no read event is delivered while it sits in the pool. If it ever does fire, do NOT drain the
-  // bytes -- leaving them buffered is what makes the next checkout's MSG_PEEK clean-check see
+  // bytes. Leaving them buffered is what makes the next checkout's MSG_PEEK clean-check see
   // leftover data and discard the connection (draining would hide the leftover and risk reuse). We
   // also do not close here, to avoid mutating pools_ from inside a connection callback; the
   // clean-check handles disposal.

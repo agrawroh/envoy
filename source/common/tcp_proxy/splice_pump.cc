@@ -724,14 +724,18 @@ void SplicePump::maybeHalfCloseOrComplete() {
   // left the connection open (returned it to its pool) keeps d2u_drained false forever, so neither
   // the both-drained path above nor the client-close path below fires, and the pump holds both
   // sockets and the two pipes until the worker recycles. This is the dominant leak under PUT churn.
-  if (u2d_drained && down_write_shutdown_) {
+  // Require the upload side to be quiescent first (nothing in the d2u pipe and the pre-engage
+  // upload fully flushed), so an in-flight upload still draining toward the upstream is not
+  // truncated on a half-duplex tunnel.
+  if (u2d_drained && down_write_shutdown_ && d2u_.in_pipe == 0 &&
+      pending_up_off_ >= pending_up_.size()) {
     complete(SpliceCompletion::Closed);
     return;
   }
   // The client closed its send side (d2u_drained), the request was fully relayed, and the upstream
   // write was half-closed. A keep-alive upstream such as S3 does not send EOF, so waiting for
   // up_read_eof_ would hold both sockets and the two pipes open forever. We complete only once the
-  // upstream has been AUTHORITATIVELY drained this pass (up_eagain_this_pass_ -- a real EAGAIN
+  // upstream has been AUTHORITATIVELY drained this pass (up_eagain_this_pass_, a real EAGAIN
   // observed now), never off the cross-pass up_readable_ latch whose false value can be stale and
   // does not prove the RX buffer is empty. Completing off the stale latch would close the upstream
   // NoFlush while response bytes still sit unread and truncate them. The section (4) EOF arm

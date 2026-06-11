@@ -27,8 +27,6 @@ namespace TcpProxy {
 // churn reuses already-handshaked, kTLS-installed upstream connections instead of paying a TLS
 // handshake + kTLS install per request. Ported in spirit from OSD's zerocopy-proxy
 // connection_pool.rs, but as a thread-local (single-worker-confined) object, so no mutex is needed.
-// See UPSTREAM_POOL_DESIGN.md for the full design, the splice-vs-pool decision rule, the HTTP/1.1
-// framing boundary detection that makes a connection returnable, and the phased plan.
 //
 // Only the BUFFERED relay path pools: a spliced connection cannot be returned because the splice
 // pump hijacks its raw fd. The Filter decides per request whether to splice (large GET, 1:1,

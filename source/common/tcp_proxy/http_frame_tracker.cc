@@ -26,7 +26,7 @@ struct HeaderLine {
 
 // Splits the accumulated header block (request/status line + header lines, NOT including the final
 // CRLFCRLF) into the first line and the list of header lines. Returns false if any header line is
-// malformed (no colon, empty name, or obs-fold continuation) -- all of which OSD's httparse-backed
+// malformed (no colon, empty name, or obs-fold continuation), all of which OSD's httparse-backed
 // path would reject, and which are smuggling-relevant. `header_block` must already have been
 // bare-LF-checked by the caller.
 bool splitHeaderBlock(absl::string_view header_block, absl::string_view& first_line,
@@ -200,7 +200,7 @@ bool extractHostNoPort(const std::vector<HeaderLine>& headers, std::string& host
 // host match). `target` is the request-line target. `headers` carry the Host header. Returns false
 // on a dangerous target shape or a request-line authority that disagrees with Host.
 bool validateRequestTarget(absl::string_view target, const std::vector<HeaderLine>& headers) {
-  // asterisk-form and empty are not origin/absolute-form -- reject.
+  // asterisk-form and empty are not origin/absolute-form, so reject.
   if (target.empty() || target == "*") {
     return false;
   }
@@ -467,9 +467,9 @@ bool HttpFrameTracker::parseRequestHeaders() {
     return false;
   }
 
-  // HEAD / DELETE are routed off the pool path by design (UPSTREAM_POOL_DESIGN.md: non-framable ->
-  // buffered, NOT pooled). HEAD in particular has a body-framing asymmetry (the response is
-  // bodyless regardless of its Content-Length) that we do not pool.
+  // HEAD / DELETE are routed off the pool path by design (non-framable, so buffered but NOT
+  // pooled). HEAD in particular has a body-framing asymmetry (the response is bodyless regardless
+  // of its Content-Length) that we do not pool.
   if (request_method_ == "HEAD" || request_method_ == "DELETE") {
     reject("non-poolable method");
     return false;
@@ -481,7 +481,7 @@ bool HttpFrameTracker::parseRequestHeaders() {
   }
 
   // Content-Length framing. Missing CL on a body-bearing method would make the request
-  // close-delimited (unframable) -- but for the methods we pool (GET/PUT/POST) a missing CL means a
+  // close-delimited (unframable), but for the methods we pool (GET/PUT/POST) a missing CL means a
   // zero-length body (OSD treats missing CL on PUT as 0, server.rs:593). We mirror that: absent ->
   // 0; invalid -> reject.
   uint64_t cl = 0;
@@ -538,7 +538,6 @@ bool HttpFrameTracker::parseResponseHeaders() {
     reject("malformed status code");
     return false;
   }
-  response_status_code_ = code; // TEMP-DIAG.
 
   // OSD rejects Transfer-Encoding on the poolable path (server.rs:459-476 falls back to copy and
   // does NOT pool). Treat TE response as non-poolable.
@@ -554,7 +553,7 @@ bool HttpFrameTracker::parseResponseHeaders() {
   }
 
   // 1xx interim responses are NOT a final response (server.rs:424-426 / 699-701). The exchange is
-  // not complete and the connection is in an ambiguous interim state for our purposes -- a final
+  // not complete and the connection is in an ambiguous interim state for our purposes. A final
   // response should have terminated 100-continue at the proxy. Reject.
   if (code >= 100 && code <= 199) {
     reject("1xx interim response not final");

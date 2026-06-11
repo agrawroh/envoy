@@ -153,7 +153,7 @@ private:
   // Backing store for the OptRef returned by ktlsBytestreamInfo (refreshed per call).
   mutable Network::KtlsBytestreamInfo ktls_info_storage_;
   // Per-connection SNI override, empty when there is none. Forwarded to the module via the optional
-  // set-server-name hook in setTransportSocketCallbacks.
+  // set-server-name hook in the constructor (right after on_new, before on_set_callbacks).
   const std::string server_name_override_;
 };
 

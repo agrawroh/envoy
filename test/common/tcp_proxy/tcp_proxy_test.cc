@@ -1,3 +1,5 @@
+#include <sys/socket.h>
+
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -31,6 +33,8 @@
 #include "test/common/tcp_proxy/tcp_proxy_test_base.h"
 #include "test/common/upstream/utility.h"
 #include "test/mocks/buffer/mocks.h"
+#include "test/mocks/event/mocks.h"
+#include "test/mocks/network/io_handle.h"
 #include "test/mocks/network/mocks.h"
 #include "test/mocks/server/factory_context.h"
 #include "test/mocks/ssl/mocks.h"
@@ -384,6 +388,132 @@ TEST_P(TcpProxyTest, SpliceNotEngagedWhenPeerUntrusted) {
   Buffer::OwnedImpl response("world");
   EXPECT_CALL(filter_callbacks_.connection_, write(BufferEqual(&response), _));
   upstream_callbacks_->onUpstreamData(response, false);
+}
+
+// Fixtures and helpers for the Filter-level L4 splice engage tests. These need real socket fds (the
+// pump splices on them) and the kill-switch enabled, so they are kept apart from the negative cases
+// above (which stay buffered with the flag default-off).
+class TcpProxySpliceTest : public TcpProxyTest {
+public:
+  TcpProxySpliceTest() {
+    // Enable the L4 splice kill-switch for this fixture (defaults off in production).
+    scoped_runtime_.mergeValues({{"envoy.reloadable_features.tcp_proxy_l4_ktls_splice", "true"}});
+    RELEASE_ASSERT(::socketpair(AF_UNIX, SOCK_STREAM, 0, down_fds_) == 0, "socketpair failed");
+    RELEASE_ASSERT(::socketpair(AF_UNIX, SOCK_STREAM, 0, up_fds_) == 0, "socketpair failed");
+  }
+
+  ~TcpProxySpliceTest() override {
+    // The ConnectionSocketPtrs are non-owning wrappers around stack mocks; release so the
+    // unique_ptr does not double-free a stack object. The socketpair fds are closed here.
+    down_socket_ptr_.release();
+    up_socket_ptr_.release();
+    for (int fd : {down_fds_[0], down_fds_[1], up_fds_[0], up_fds_[1]}) {
+      if (fd >= 0) {
+        ::close(fd);
+      }
+    }
+  }
+
+  // Wires `c` so getSocket()->ioHandle().fdDoNotUse() returns `fd`, resetFileEvents() is a no-op,
+  // and a non-internal (IP) local address is present so maybeEngageSplice accepts the leg.
+  void wireSocket(NiceMock<Network::MockConnection>& c, NiceMock<Network::MockConnectionSocket>& s,
+                  NiceMock<Network::MockIoHandle>& io, Network::ConnectionSocketPtr& sptr,
+                  os_fd_t fd) {
+    sptr.reset(&s);
+    ON_CALL(c, getSocket()).WillByDefault(ReturnRef(sptr));
+    ON_CALL(s, ioHandle()).WillByDefault(ReturnRef(io));
+    ON_CALL(testing::Const(s), ioHandle()).WillByDefault(ReturnRef(io));
+    ON_CALL(io, fdDoNotUse()).WillByDefault(Return(fd));
+    c.connectionInfoSetter().setLocalAddress(
+        Network::Utility::parseInternetAddressAndPortNoThrow("127.0.0.1:80"));
+  }
+  void wireSocket(NiceMock<Network::MockClientConnection>& c,
+                  NiceMock<Network::MockConnectionSocket>& s, NiceMock<Network::MockIoHandle>& io,
+                  Network::ConnectionSocketPtr& sptr, os_fd_t fd) {
+    sptr.reset(&s);
+    ON_CALL(c, getSocket()).WillByDefault(ReturnRef(sptr));
+    ON_CALL(s, ioHandle()).WillByDefault(ReturnRef(io));
+    ON_CALL(testing::Const(s), ioHandle()).WillByDefault(ReturnRef(io));
+    ON_CALL(io, fdDoNotUse()).WillByDefault(Return(fd));
+    c.connectionInfoSetter().setLocalAddress(
+        Network::Utility::parseInternetAddressAndPortNoThrow("127.0.0.2:80"));
+  }
+
+  NiceMock<Network::MockConnectionSocket> down_socket_;
+  NiceMock<Network::MockConnectionSocket> up_socket_;
+  NiceMock<Network::MockIoHandle> down_io_;
+  NiceMock<Network::MockIoHandle> up_io_;
+  Network::ConnectionSocketPtr down_socket_ptr_;
+  Network::ConnectionSocketPtr up_socket_ptr_;
+  int down_fds_[2]{-1, -1};
+  int up_fds_[2]{-1, -1};
+};
+
+INSTANTIATE_TEST_SUITE_P(WithOrWithoutUpstream, TcpProxySpliceTest,
+                         ::testing::ValuesIn(TcpProxyTestBase::getRuntimeFlagsForTest()));
+
+// POSITIVE engage: with the kill-switch on, a kTLS-installed, trusted upstream and a plaintext
+// downstream sink splice. The pump is armed (a real file event is created per fd) and the active
+// gauge ticks. The pre-engage response chunk is handed to the pump rather than written downstream.
+TEST_P(TcpProxySpliceTest, SpliceEngagesOnRealSocketsWhenKtlsInstalled) {
+  setup(1);
+  raiseEventUpstreamConnected(0);
+
+  wireSocket(filter_callbacks_.connection_, down_socket_, down_io_, down_socket_ptr_, down_fds_[1]);
+  wireSocket(*upstream_connections_.at(0), up_socket_, up_io_, up_socket_ptr_, up_fds_[1]);
+
+  // Downstream sink is plaintext raw (ssl()==nullptr, no kTLS info). Upstream has kTLS installed
+  // and is trusted.
+  ON_CALL(filter_callbacks_.connection_, ssl()).WillByDefault(Return(nullptr));
+  ON_CALL(*upstream_connections_.at(0), aboveHighWatermark()).WillByDefault(Return(false));
+  Network::KtlsBytestreamInfo ktls_info{/*installed=*/true, up_fds_[1], /*trusted_peer=*/true};
+  ON_CALL(*upstream_connections_.at(0), ktlsBytestreamInfo())
+      .WillByDefault(
+          testing::Return(makeOptRefFromPtr<const Network::KtlsBytestreamInfo>(&ktls_info)));
+
+  // arm() creates one file event per fd on the shared dispatcher; hand back fresh mocks.
+  EXPECT_CALL(filter_callbacks_.connection_.dispatcher_, createFileEvent_(_, _, _, _))
+      .Times(2)
+      .WillRepeatedly(Invoke([](os_fd_t, Event::FileReadyCb, Event::FileTriggerType, uint32_t) {
+        return new NiceMock<Event::MockFileEvent>();
+      }));
+
+  // The pre-engage response chunk goes to the pump (written directly to the downstream socket), so
+  // it is NOT relayed through the connection's write().
+  EXPECT_CALL(filter_callbacks_.connection_, write(_, _)).Times(0);
+  Buffer::OwnedImpl response("world");
+  upstream_callbacks_->onUpstreamData(response, false);
+
+  EXPECT_EQ(1U, config_->stats().splice_pump_engaged_total_.value());
+  EXPECT_EQ(1U, config_->stats().splice_pump_active_.value());
+  EXPECT_EQ(0U, response.length()); // drained into the pump
+}
+
+// SEC-1: a userspace-TLS downstream sink (ssl() != nullptr) is NEVER spliced even though the
+// upstream reports kTLS installed and trusted. The exchange stays on the buffered path so the
+// downstream socket's in-place encryption is not bypassed.
+TEST_P(TcpProxySpliceTest, SpliceNotEngagedWhenDownstreamUserspaceTls) {
+  setup(1);
+  raiseEventUpstreamConnected(0);
+
+  wireSocket(filter_callbacks_.connection_, down_socket_, down_io_, down_socket_ptr_, down_fds_[1]);
+  wireSocket(*upstream_connections_.at(0), up_socket_, up_io_, up_socket_ptr_, up_fds_[1]);
+
+  // Upstream is splice-eligible (kTLS installed + trusted), but the downstream sink exposes a
+  // non-null ssl(): a userspace-TLS socket.
+  auto ssl_info = std::make_shared<NiceMock<Ssl::MockConnectionInfo>>();
+  ON_CALL(filter_callbacks_.connection_, ssl()).WillByDefault(Return(ssl_info));
+  ON_CALL(*upstream_connections_.at(0), aboveHighWatermark()).WillByDefault(Return(false));
+  Network::KtlsBytestreamInfo ktls_info{/*installed=*/true, up_fds_[1], /*trusted_peer=*/true};
+  ON_CALL(*upstream_connections_.at(0), ktlsBytestreamInfo())
+      .WillByDefault(
+          testing::Return(makeOptRefFromPtr<const Network::KtlsBytestreamInfo>(&ktls_info)));
+
+  // No splice: the upstream chunk is relayed downstream through write() and the pump never arms.
+  Buffer::OwnedImpl response("world");
+  EXPECT_CALL(filter_callbacks_.connection_, write(BufferEqual(&response), _));
+  upstream_callbacks_->onUpstreamData(response, false);
+  EXPECT_EQ(0U, config_->stats().splice_pump_engaged_total_.value());
 }
 
 // Test nothing bad happens if an invalid factory is configured.

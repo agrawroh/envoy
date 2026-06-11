@@ -180,11 +180,11 @@ public:
 
   /**
    * Re-point this upstream's read callbacks at `callbacks`. Used by the Phase-2 warm connection
-   * pool (see source/common/tcp_proxy/UPSTREAM_POOL_DESIGN.md): a pooled raw-TCP upstream outlives
+   * pool: a pooled raw-TCP upstream outlives
    * the Filter that minted it, so when a new Filter checks it out the connection's upstream-data
-   * callbacks must be rebound to the new Filter's UpstreamCallbacks -- otherwise an upstream byte
+   * callbacks must be rebound to the new Filter's UpstreamCallbacks. Otherwise an upstream byte
    * would be delivered to the destroyed original Filter (use-after-free). Default no-op for
-   * tunneled/ HTTP upstreams, which are never pooled.
+   * tunneled/HTTP upstreams, which are never pooled.
    */
   virtual void rebindUpstreamCallbacks(Tcp::ConnectionPool::UpstreamCallbacks&) {}
 

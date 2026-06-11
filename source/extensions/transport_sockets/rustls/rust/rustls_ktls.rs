@@ -67,7 +67,8 @@ struct JsonConfig {
   /// When true together with enable_ktls, disables kTLS for the RX direction. Defaults to false.
   #[serde(default)]
   disable_ktls_rx: bool,
-  /// SNI hostname for upstream client connections. If not specified, defaults to "localhost".
+  /// SNI hostname for upstream client connections. Required on the upstream side; an empty or
+  /// missing value is rejected at config load (`new_upstream`).
   #[serde(default)]
   sni: Option<String>,
   /// Minimum acceptable TLS protocol version. Defaults to TLS_AUTO (rustls safe default range).
@@ -289,6 +290,10 @@ impl RustlsFactoryConfig {
               .to_string(),
           );
         }
+        // rustls 0.23 defaults apply: the CRL is checked for the end-entity (client) certificate
+        // only, and a certificate whose issuer is not covered by any supplied CRL is treated as
+        // not-revoked (UnknownStatusPolicy::Allow). This is revocation checking, not full-chain
+        // hard-fail revocation.
         verifier_builder = verifier_builder.with_crls(crls);
       }
       let verifier = verifier_builder
@@ -362,6 +367,10 @@ impl RustlsFactoryConfig {
             .to_string(),
         );
       }
+      // rustls 0.23 defaults apply: the CRL is checked for the end-entity (server) certificate
+      // only, and a certificate whose issuer is not covered by any supplied CRL is treated as
+      // not-revoked (UnknownStatusPolicy::Allow). This is revocation checking, not full-chain
+      // hard-fail revocation.
       let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
         .with_crls(crls)
         .build()
@@ -578,6 +587,12 @@ impl RustlsTransportSocket {
   fn ensure_connection(&mut self) -> Result<(), String> {
     if self.conn.is_some() {
       return Ok(());
+    }
+    // Belt-and-suspenders: never build a connection after a prior config failure (e.g. a rejected
+    // per-connection SNI override). Building one would hand back the factory-default authority and
+    // mis-handshake. Callers also gate on `self.failure` before reaching here.
+    if !self.failure.is_empty() {
+      return Err(self.failure.clone());
     }
     // Prefer the per-connection SNI override (e.g. auto_sni) over the factory default. The same
     // shared `ClientConfig` is used either way, so only the `ServerName` varies per connection.
@@ -1207,6 +1222,16 @@ impl TransportSocket<EnvoyTransportSocketImpl> for RustlsTransportSocket {
   }
 
   fn on_connected(&mut self, envoy: &mut EnvoyTransportSocketImpl) {
+    // A prior config failure (e.g. a rejected per-connection SNI override) must fail closed.
+    // Without this guard we would build a connection with the factory-default SNI and handshake
+    // against the wrong authority. The connection terminates on the next I/O via the failure check.
+    if !self.failure.is_empty() {
+      envoy_log_error!(
+        "rustls: refusing to connect, prior config failure: {}",
+        self.failure
+      );
+      return;
+    }
     if let Err(e) = self.ensure_connection() {
       self.failure = e.clone();
       envoy_log_error!("rustls: failed to create TLS connection: {e}");
@@ -1873,7 +1898,9 @@ mod linux_ktls {
                 cipher_type: TLS_CIPHER_AES_GCM_128,
               },
               iv: iv_part,
-              key: kb.try_into().unwrap(),
+              key: kb
+                .try_into()
+                .map_err(|_| format!("AES-128-GCM key length {} != {AES_GCM_128_KEY}", kb.len()))?,
               salt,
               rec_seq: seq.to_be_bytes(),
             };
@@ -1893,7 +1920,9 @@ mod linux_ktls {
                 cipher_type: TLS_CIPHER_AES_GCM_256,
               },
               iv: iv_part,
-              key: kb.try_into().unwrap(),
+              key: kb
+                .try_into()
+                .map_err(|_| format!("AES-256-GCM key length {} != {AES_GCM_256_KEY}", kb.len()))?,
               salt,
               rec_seq: seq.to_be_bytes(),
             };
@@ -1925,7 +1954,9 @@ mod linux_ktls {
             cipher_type: TLS_CIPHER_AES_GCM_256,
           },
           iv: iv_part,
-          key: kb.try_into().unwrap(),
+          key: kb
+            .try_into()
+            .map_err(|_| format!("AES-256-GCM key length {} != {AES_GCM_256_KEY}", kb.len()))?,
           salt,
           rec_seq: seq.to_be_bytes(),
         };
@@ -1957,8 +1988,18 @@ mod linux_ktls {
             version,
             cipher_type: TLS_CIPHER_CHACHA20_POLY1305,
           },
-          iv: iv_bytes.try_into().unwrap(),
-          key: kb.try_into().unwrap(),
+          iv: iv_bytes.try_into().map_err(|_| {
+            format!(
+              "ChaCha20-Poly1305 IV length {} != {CHACHA20_IV}",
+              iv_bytes.len()
+            )
+          })?,
+          key: kb.try_into().map_err(|_| {
+            format!(
+              "ChaCha20-Poly1305 key length {} != {CHACHA20_KEY}",
+              kb.len()
+            )
+          })?,
           salt: [],
           rec_seq: seq.to_be_bytes(),
         };
@@ -2552,6 +2593,35 @@ mod tests {
   }
 
   #[test]
+  fn rejected_server_name_override_fails_closed_builds_nothing() {
+    // A rejected per-connection override must fail closed: neither `on_connected` nor
+    // `ensure_connection` may fall back to the factory-default SNI and build a handshake. Calling
+    // `on_connected` directly would pull the Envoy I/O ABI callbacks into this pure-Rust test
+    // binary (it links no C++ ABI impls to satisfy them), so we assert the two guards that actually
+    // prevent the mis-handshake: (1) `ensure_connection` refuses to build a connection while
+    // `failure` is set (the belt-and-suspenders guard `on_connected` returns before reaching), and
+    // (2) no TLS bytes are queued (the write backlog only ever grows in `drain_outgoing_tls`, which
+    // both guards short-circuit before). `invalid_server_name_override_fails_clean` above covers the
+    // failure field; this covers the no-connection / no-bytes consequence.
+    let mut s = make_client_socket_default_sni();
+    let mut envoy = EnvoyTransportSocketImpl::new(std::ptr::null_mut());
+    s.on_set_server_name_override(&mut envoy, "not a valid sni!!");
+    assert!(!s.failure.is_empty(), "override must have failed");
+    assert!(
+      s.ensure_connection().is_err(),
+      "ensure_connection must refuse to build while failure is set"
+    );
+    assert!(
+      s.conn.is_none(),
+      "no ClientConnection must be built after a rejected SNI override"
+    );
+    assert!(
+      s.tls_write_backlog.is_empty(),
+      "no TLS bytes must be queued after a rejected SNI override"
+    );
+  }
+
+  #[test]
   fn errno_name_uses_libc_constants() {
     #[cfg(target_os = "linux")]
     {
@@ -2659,7 +2729,7 @@ mod tests {
     assert_eq!(s.tls_record_header_seen, 0);
   }
 
-  // -- Backpressure properties on the write path -----------------------------------------------
+  // Backpressure properties on the write path.
 
   #[test]
   fn write_backlog_limit_is_at_least_one_record() {
@@ -2936,6 +3006,286 @@ tnY4u9DRKVqDzKPVPzz8BXzdJicwWlqVdO2I+w==\n\
         "error must explain the missing CRL blocks: {err}"
       ),
     }
+  }
+
+  // Leaf certificate (and its key) revoked by `TEST_CRL_PEM`: CN `Test Server`, SAN
+  // `server1.example.com`, issued by the Test CA in `TEST_CA_PEM`, serial 0x3A...0565. From
+  // test/common/tls/test_data/san_dns_cert.pem + san_dns_key.pem.
+  const SAN_DNS_REVOKED_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIEHDCCAwSgAwIBAgIUOrNwiIu6GAcd0b6vdOeMYT5JBWUwDQYJKoZIhvcNAQEL\n\
+BQAwdjELMAkGA1UEBhMCVVMxEzARBgNVBAgMCkNhbGlmb3JuaWExFjAUBgNVBAcM\n\
+DVNhbiBGcmFuY2lzY28xDTALBgNVBAoMBEx5ZnQxGTAXBgNVBAsMEEx5ZnQgRW5n\n\
+aW5lZXJpbmcxEDAOBgNVBAMMB1Rlc3QgQ0EwHhcNMjQwODIxMTkxNDA0WhcNMjYw\n\
+ODIxMTkxNDA0WjB6MQswCQYDVQQGEwJVUzETMBEGA1UECAwKQ2FsaWZvcm5pYTEW\n\
+MBQGA1UEBwwNU2FuIEZyYW5jaXNjbzENMAsGA1UECgwETHlmdDEZMBcGA1UECwwQ\n\
+THlmdCBFbmdpbmVlcmluZzEUMBIGA1UEAwwLVGVzdCBTZXJ2ZXIwggEiMA0GCSqG\n\
+SIb3DQEBAQUAA4IBDwAwggEKAoIBAQDOZFedQ1i8YddmDdIbuEdEfV9x/sANeT1p\n\
+/F6WysC0Tg0K077VS0ahZlQbHZ1N8DmfE07ESPI0RNEdSCPRVywm61POqKolVmPp\n\
+3OLLDPZ+Qfj8B0m1de/NmjeImTovL5+xJXJnPRmDKLwOHfixCwapRpmW235WjXHR\n\
+9hfORLsY7w43MgcwYLkgQFA6pcCePHXZqdg0bcGCvr2j+ygnOXqFgjHdLCbvSeIu\n\
+eWBF7cOt8BP/Ly7Rl0tNAG5Lt2tjIzyKpa5sGK1BF82yJ8FZGreNmIioyiEz7RFa\n\
+8WYuMXvSnRRbqVaqyUzVJAZxBThpcavNnv2R4+eNto3aJIq8GeNnAgMBAAGjgZ0w\n\
+gZowDAYDVR0TAQH/BAIwADALBgNVHQ8EBAMCBeAwHQYDVR0lBBYwFAYIKwYBBQUH\n\
+AwIGCCsGAQUFBwMBMB4GA1UdEQQXMBWCE3NlcnZlcjEuZXhhbXBsZS5jb20wHQYD\n\
+VR0OBBYEFDrvbzgz3ksTLd/OhVsk5W4U4Q/0MB8GA1UdIwQYMBaAFA+gzyW9WBd+\n\
+CB52mGXJQ68fT4VWMA0GCSqGSIb3DQEBCwUAA4IBAQAPbpQehGZiDc2qJrHE0hSW\n\
+xQo0GI2rCfTyz6pyFP5KBSYx+uz8V7dMuFd3Kswl/Ca/X/CF5N54Q1COkU1qveWi\n\
+1tgj5tYNEOpPFmkb5QD/umybPHngPvtYItqOO5PJBBSaAbzniCwbwTE5S2esNifk\n\
+pl6mFPczSMYSPywXcypRmsn0t1gk73AOLa+9l55s3EZFUpD0E55OBLerlyZxcqaz\n\
+TbUezpAo9wEf6eVq/FYBwrX0dS9iH+GW4vqAjZ3pgfUF3z2hh45sdKHojvjNNdHh\n\
+/y+x7s2rk1+zsQu0szoQXyV9AAO8lclijpCwRtYlstC4rrLb6qNPq6Bip2krdM0J\n\
+-----END CERTIFICATE-----\n";
+
+  const SAN_DNS_REVOKED_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDOZFedQ1i8Yddm\n\
+DdIbuEdEfV9x/sANeT1p/F6WysC0Tg0K077VS0ahZlQbHZ1N8DmfE07ESPI0RNEd\n\
+SCPRVywm61POqKolVmPp3OLLDPZ+Qfj8B0m1de/NmjeImTovL5+xJXJnPRmDKLwO\n\
+HfixCwapRpmW235WjXHR9hfORLsY7w43MgcwYLkgQFA6pcCePHXZqdg0bcGCvr2j\n\
++ygnOXqFgjHdLCbvSeIueWBF7cOt8BP/Ly7Rl0tNAG5Lt2tjIzyKpa5sGK1BF82y\n\
+J8FZGreNmIioyiEz7RFa8WYuMXvSnRRbqVaqyUzVJAZxBThpcavNnv2R4+eNto3a\n\
+JIq8GeNnAgMBAAECggEAPSFFPgQbfThxhv2i9KjhGu0TXv04PwVg5kpkbb9B0mWn\n\
+wUQ0KpKwKc/YK2vbEqGLP42Fb+e3LToQwd6DFVb/ccuTuAsG0iZDU5oj5kZBn+XE\n\
+bElwUHnM/BWoSyIvNJijcOGJgAB91PY0tO21oiKE55BMn30Fb3dXdfuw01xSGjDz\n\
+WpFOwJphA1vlEGoZO41ftjAc5lcVUohZOuBPYp1gI9jXYSFiWjabVIH1PsLMByOQ\n\
+VILzcNBsEC/zFyklMAbIH1YZnDzz4onR5uE6GSk+PpPos/zcyGvOcoIOKl8H9qQd\n\
+KTz9Xp5tWJRw9vtd6z3LGTYvEFMIamhVLmkr3dk4QQKBgQD6MDW+2R05sDlRJ9y2\n\
+SvpPEipBEutyxB4Naym1MRpEIkrX+G5gYWORoLrb/E3ZllKyEX5ILM8Z5NBPiCLd\n\
+dW4EYK86Doe36SnBaIkB5YPu2Q/vbLMATK2O6NuCQChbVhfnDJUUIH8LaqAeQzAo\n\
+xs8fq5vi90856vNVsiuNXF53hwKBgQDTL7B4sNMIPouxRVxVQMzCELWioA1KmGl8\n\
+H/Nun5iTSKDvOeODscXMT+Zm13O/z6NMRarIO/0iAhHtosBSdbUBpDq7ScoWwaOH\n\
+GhZhTr/SKeUmqyETWucOg/Zcd1ZksBy6PEiff0fKLf8bFKa35eZKrcQPS2+Yjg9j\n\
+RbvzPrhtIQKBgClFaKhJ8otAqcPceolLxwziJzxC3bo55ec6xU+RgQ66RXRpE/Qs\n\
+PJuaUxjU/xakuJGNVzKaybMwzrg/8dhsdbCdLmq6WOMawHuaPfelH+V3wyww1zp2\n\
+a68GdKeA4+dlRV4k8ja2wZ5lgXJcjQY8/Y/w5C9FsrkQLAH3+T1BfofjAoGAIozw\n\
+0C4NuJGTBSOV4ZTCaxWUwdBxnDynNVl82CJgMeh1++16nXceJzkDNtwU4dK0oqvb\n\
+LvsxhLjV+gzgbh03ydb2jOGboHF5sYbBFpZtp5KXHOZueN4sYyGP0rzrc3mkmYt3\n\
+TjDiq98ul12fkQKZ1KntI5tx3IGRXupvv3IJdkECgYAtxsGX+n5gviC5boajLQIA\n\
+P1n08bmHchANFFZFHjzFLP+Iy/+obhm4U10IjChLbFJll+p1wp4tsqBFoda6hmEh\n\
+FArmTsOEz/pa82mtuAnCJZUSx2v7ZWKKtgp+7aplslh6GsfRFT+w4qj/iiPrDqQG\n\
+06/z3yVGc+C2Ey/IClZX5A==\n\
+-----END PRIVATE KEY-----\n";
+
+  // A control leaf (and its key) NOT in the CRL: same Test CA issuer, same SAN
+  // `server1.example.com`, serial 0x3A...0566. From test/common/tls/test_data/san_dns2_cert.pem +
+  // san_dns2_key.pem. Used to prove the only difference that fails the handshake below is the
+  // revocation status.
+  const SAN_DNS_VALID_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIEHDCCAwSgAwIBAgIUOrNwiIu6GAcd0b6vdOeMYT5JBWYwDQYJKoZIhvcNAQEL\n\
+BQAwdjELMAkGA1UEBhMCVVMxEzARBgNVBAgMCkNhbGlmb3JuaWExFjAUBgNVBAcM\n\
+DVNhbiBGcmFuY2lzY28xDTALBgNVBAoMBEx5ZnQxGTAXBgNVBAsMEEx5ZnQgRW5n\n\
+aW5lZXJpbmcxEDAOBgNVBAMMB1Rlc3QgQ0EwHhcNMjQwODIxMTkxNDA0WhcNMjYw\n\
+ODIxMTkxNDA0WjB6MQswCQYDVQQGEwJVUzETMBEGA1UECAwKQ2FsaWZvcm5pYTEW\n\
+MBQGA1UEBwwNU2FuIEZyYW5jaXNjbzENMAsGA1UECgwETHlmdDEZMBcGA1UECwwQ\n\
+THlmdCBFbmdpbmVlcmluZzEUMBIGA1UEAwwLVGVzdCBTZXJ2ZXIwggEiMA0GCSqG\n\
+SIb3DQEBAQUAA4IBDwAwggEKAoIBAQCqK6bTU0hUif0kMYsPxmLbIZC9EA7y6GsC\n\
+TKykILShmoqAIvgsipj1utX/BCI9wJeJ6T4Y0sITnqpVhW/goUC8uGmFkCxc1ImS\n\
+unE2RH/O3jAG0QuXLnH9qP65PMEpQvjglXC1W4cxOuOuNcfUII2yn38zFuGfOkpq\n\
+6jgd5zrIIy0GGxFwnMIvK6lh2q163cVVgev4/6jXvwxEl/ddDGQdljH2FRa2TyVy\n\
++DdmXJvQ53aUZVp3PbjGNo5ZDw/PAeBfHzJBMGqyMHmdJQ1LdatDkR6xHyY1UDKp\n\
+PqRYy15QSKoo1tQvGs826C7J9era+VWcGkyALY/WrmKgcYr2XnuPAgMBAAGjgZ0w\n\
+gZowDAYDVR0TAQH/BAIwADALBgNVHQ8EBAMCBeAwHQYDVR0lBBYwFAYIKwYBBQUH\n\
+AwIGCCsGAQUFBwMBMB4GA1UdEQQXMBWCE3NlcnZlcjEuZXhhbXBsZS5jb20wHQYD\n\
+VR0OBBYEFAQ4pydcSpRHpZwXSY7X/oAX11cvMB8GA1UdIwQYMBaAFA+gzyW9WBd+\n\
+CB52mGXJQ68fT4VWMA0GCSqGSIb3DQEBCwUAA4IBAQB9HU4WZX+zdLuo9tTSlMPv\n\
+uB1GtIgENxDP8Xr2ip1ytJIroNrZDU6KhypYoBQFUSTeGaynwyrsmGCcjS4kN+fh\n\
+b6DX1O+VWJL4I4wtwleK4RayYyN2OSw+0gqoZ+RtwZhbuboL8zOvGJLR4TalDPnp\n\
+wMPCfVpT8a+VOIUsW7zCM9MbPw/h6uOCyNMqZb22Qawmdb3khT9AfBqXQQTRwg3X\n\
+7q5DWg5vOUi8VUs9d+LhpFeNWeDp13DfwuVsMt0sYHVFcqqzzPq0MzYqeq3WEhnB\n\
+j8DgZSgBnkk70/vKtaCTjgYt40Hkefuw6O5O1/qAfEEJGKYff18EcRHwtsD9kFeY\n\
+-----END CERTIFICATE-----\n";
+
+  const SAN_DNS_VALID_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCqK6bTU0hUif0k\n\
+MYsPxmLbIZC9EA7y6GsCTKykILShmoqAIvgsipj1utX/BCI9wJeJ6T4Y0sITnqpV\n\
+hW/goUC8uGmFkCxc1ImSunE2RH/O3jAG0QuXLnH9qP65PMEpQvjglXC1W4cxOuOu\n\
+NcfUII2yn38zFuGfOkpq6jgd5zrIIy0GGxFwnMIvK6lh2q163cVVgev4/6jXvwxE\n\
+l/ddDGQdljH2FRa2TyVy+DdmXJvQ53aUZVp3PbjGNo5ZDw/PAeBfHzJBMGqyMHmd\n\
+JQ1LdatDkR6xHyY1UDKpPqRYy15QSKoo1tQvGs826C7J9era+VWcGkyALY/WrmKg\n\
+cYr2XnuPAgMBAAECggEALsw4Ya9qmc0k75osWxc8wnSVoFjVM5oVK5m4dJ6F7ldY\n\
+tWpog59N9239Qdd6Ly9SvVuGdz8mnkypHUHIBady7TNt2YxPluvgNZjOX5Uw7MwP\n\
+uyAsJtRgBtk9y+VYXaeMV/7g8w8Lu88tJBCoNr8JGNFiIsOtIqPeKU7mRdr8QGNw\n\
+5tSgFoyG7jG+1nbEGJUHzK+SAqOLT5MYt2Z0sPHifwIYbwVe7IohRndxVWXsxwtq\n\
+C5SwZqeg1PUl4trt+T91nHfzA6B0+/EaFHWWnyFZHTD1sY9eLbTiatj5g/GtkOJt\n\
+tYRS2m5+dlbp872f0vUwcoe93D7J9d54jVFozjAGSQKBgQDiRj6dKJ9IPScnmNhv\n\
+ODYqkFr3Ui4STfAeI/FQofMoK0WWXzz6CBwhvzK0OTrXPZjXDkI+spbs6gzGQ7ND\n\
+0HBcdgzd4FoZzjB2S7E9aZySAwL9RWXbnucacAGVQI4jW2KSLMt2OtQD9AAd0gIG\n\
+pDkb6Lyxj6iqu93nq58O69qhDQKBgQDAhpjYD/XmFb7V5hNvtskQXqLZEHmUj/BO\n\
+PUxTiCs103vPbrTNLnm5l1Mk4LI04zAndP8hO1rE64vn0LaBqXc2Gf8lsgyjTAeK\n\
+cp+lCFPKOi0we+McouUfcWyb6j5fo0SgqCs8Vi4mxC/HTAS3G5Booof4blC8EvQR\n\
+2WUKV9vQCwKBgQCS+J1i5yfOfCoahiTO2OwV6X2sdyyFpyn36dCsVwThanngmiu5\n\
+G9tp8A63ERUvCUtlJFXS850kdUGm5gJiYdkZtXPWCgt8B3li3PdatGaGUH54k8L9\n\
+S9FAUtA0aaHpRUpZN89QFBXyG2KX+/hk5/ZQMnOdwXoEq9IO0GKYBooTYQKBgQCV\n\
+5bYHM5YPCItG2xXy+uvdNPGx86PVyaQeJpfQycpq5DgXr2hSAIeBupJfuhrGFsUd\n\
+U3h5FU981rBdUyFmHt3UX7VKUjCIy99rKgemZK9oWpdokmynlSSzsIoRcvYRXHtI\n\
+YucW2TqhsEpK76MUNf/fl/wprypo5JDnfM2wmetpNQKBgHtj1R7rHUsAye0yiLqq\n\
+VeSNcjs69KsVPC3rZrhxCx/768EYreYa3XfL20RgQwsSGt65OPnz7QIgVE5a0Ckr\n\
+vxfh3L18KtAPTPko9kh7/BGoROc8R85Jt95tmNB0QsCwaHvpmQukX5Q2CXRZVaOJ\n\
+dgzdR551cxWkFZopfrOy7Mlr\n\
+-----END PRIVATE KEY-----\n";
+
+  // Ensures the ring crypto provider is installed for the in-process handshake tests below.
+  // Idempotent: the SDK's `program_init` may already have installed it, in which case the second
+  // `install_default` returns Err, which is fine.
+  fn ensure_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+  }
+
+  // Builds a real upstream rustls `ClientConnection` from `new_upstream`, trusting the Test CA and
+  // configured with the CRL, requesting the leaf's SAN (`server1.example.com`).
+  fn revocation_client(crl: Option<String>) -> ClientConnection {
+    let cfg = JsonConfig {
+      cert_chain: String::new(),
+      private_key: String::new(),
+      trusted_ca: Some(TEST_CA_PEM.to_string()),
+      alpn_protocols: None,
+      enable_ktls: false,
+      disable_ktls_rx: false,
+      sni: Some("server1.example.com".to_string()),
+      tls_minimum_protocol_version: TlsVersion::Auto,
+      tls_maximum_protocol_version: TlsVersion::Auto,
+      crl,
+    };
+    let factory = RustlsFactoryConfig::new_upstream(cfg).expect("upstream config builds");
+    let (cfg, sn) = match factory.endpoint {
+      EndpointKind::Upstream { cfg, server_name } => (cfg, server_name),
+      EndpointKind::Downstream(_) => panic!("expected an upstream endpoint"),
+    };
+    ClientConnection::new(cfg, sn).expect("client connection builds")
+  }
+
+  // Builds a test rustls `ServerConnection` that presents `cert_pem` / `key_pem`. No client auth.
+  fn test_server(cert_pem: &str, key_pem: &str) -> ServerConnection {
+    let certs = parse_cert_chain(cert_pem.as_bytes()).expect("server cert parses");
+    let key = parse_private_key(key_pem.as_bytes()).expect("server key parses");
+    let server_cfg = ServerConfig::builder()
+      .with_no_client_auth()
+      .with_single_cert(certs, key)
+      .expect("server config builds");
+    ServerConnection::new(Arc::new(server_cfg)).expect("server connection builds")
+  }
+
+  // Pumps a rustls client/server handshake in memory until both sides finish or one errors,
+  // returning the first `process_new_packets` error (the client side observes a rejected server
+  // certificate here). Bounded so a stalled handshake can't loop forever.
+  fn drive_handshake(
+    client: &mut ClientConnection,
+    server: &mut ServerConnection,
+  ) -> Option<String> {
+    for _ in 0..32 {
+      let mut c2s = Vec::new();
+      client.write_tls(&mut c2s).expect("client write_tls");
+      if !c2s.is_empty() {
+        server
+          .read_tls(&mut Cursor::new(&c2s))
+          .expect("server read_tls");
+        if let Err(e) = server.process_new_packets() {
+          return Some(e.to_string());
+        }
+      }
+      let mut s2c = Vec::new();
+      server.write_tls(&mut s2c).expect("server write_tls");
+      if !s2c.is_empty() {
+        client
+          .read_tls(&mut Cursor::new(&s2c))
+          .expect("client read_tls");
+        if let Err(e) = client.process_new_packets() {
+          return Some(e.to_string());
+        }
+      }
+      if !client.is_handshaking() && !server.is_handshaking() {
+        return None;
+      }
+      if c2s.is_empty() && s2c.is_empty() {
+        break;
+      }
+    }
+    None
+  }
+
+  // Wire-level: a revoked server certificate must fail the upstream handshake. Drives a real rustls
+  // handshake between the upstream client (Test CA trust + the CRL that revokes the leaf) and a
+  // server presenting the revoked leaf, asserting `process_new_packets` reports the certificate as
+  // revoked.
+  //
+  // NOTE on fixture coupling: the leaf and the Test CA in test/common/tls/test_data expire on
+  // 2026-08-21. While valid, rustls fails this handshake on revocation; the control test below
+  // (same CA, same SAN, non-revoked serial) succeeding is what isolates revocation as the cause.
+  // Once the fixtures expire, the control test starts failing first (self-announcing), at which
+  // point both fixtures need regenerating.
+  #[test]
+  fn upstream_revoked_server_cert_fails_handshake() {
+    ensure_crypto_provider();
+    let mut client = revocation_client(Some(TEST_CRL_PEM.to_string()));
+    let mut server = test_server(SAN_DNS_REVOKED_CERT_PEM, SAN_DNS_REVOKED_KEY_PEM);
+    let err = drive_handshake(&mut client, &mut server)
+      .expect("handshake against a revoked server certificate must fail");
+    assert!(
+      err.to_lowercase().contains("revoked"),
+      "handshake must fail specifically because the certificate is revoked: {err}"
+    );
+  }
+
+  // Control for the test above: the same upstream client (Test CA trust + CRL) completes the
+  // handshake against a non-revoked leaf with the same SAN, proving the chain / SNI / time / version
+  // all line up and the only thing that fails the revoked case is the revocation status.
+  #[test]
+  fn upstream_non_revoked_server_cert_completes_handshake() {
+    ensure_crypto_provider();
+    let mut client = revocation_client(Some(TEST_CRL_PEM.to_string()));
+    let mut server = test_server(SAN_DNS_VALID_CERT_PEM, SAN_DNS_VALID_KEY_PEM);
+    let err = drive_handshake(&mut client, &mut server);
+    assert!(
+      err.is_none(),
+      "non-revoked server certificate must complete the handshake, got: {err:?}"
+    );
+    assert!(
+      !client.is_handshaking(),
+      "client handshake must be complete"
+    );
+    assert!(
+      !server.is_handshaking(),
+      "server handshake must be complete"
+    );
+  }
+
+  // A sub-minimum TLS version peer must be refused. The upstream client requires TLS 1.3; a server
+  // pinned to TLS 1.2 only shares no protocol version, so the handshake fails rather than silently
+  // downgrading.
+  #[test]
+  fn upstream_sub_minimum_tls_version_peer_is_refused() {
+    ensure_crypto_provider();
+    let cfg = JsonConfig {
+      cert_chain: String::new(),
+      private_key: String::new(),
+      trusted_ca: Some(TEST_CA_PEM.to_string()),
+      alpn_protocols: None,
+      enable_ktls: false,
+      disable_ktls_rx: false,
+      sni: Some("server1.example.com".to_string()),
+      tls_minimum_protocol_version: TlsVersion::Tls13,
+      tls_maximum_protocol_version: TlsVersion::Tls13,
+      crl: None,
+    };
+    let factory = RustlsFactoryConfig::new_upstream(cfg).expect("upstream config builds");
+    let (cfg, sn) = match factory.endpoint {
+      EndpointKind::Upstream { cfg, server_name } => (cfg, server_name),
+      EndpointKind::Downstream(_) => panic!("expected an upstream endpoint"),
+    };
+    let mut client = ClientConnection::new(cfg, sn).expect("client connection builds");
+    // Server pinned to TLS 1.2 only.
+    let certs = parse_cert_chain(SAN_DNS_VALID_CERT_PEM.as_bytes()).expect("server cert parses");
+    let key = parse_private_key(SAN_DNS_VALID_KEY_PEM.as_bytes()).expect("server key parses");
+    let server_cfg = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+      .with_no_client_auth()
+      .with_single_cert(certs, key)
+      .expect("server config builds");
+    let mut server = ServerConnection::new(Arc::new(server_cfg)).expect("server connection builds");
+    let err = drive_handshake(&mut client, &mut server)
+      .expect("a TLS-1.2-only peer must be refused by a TLS-1.3-min client");
+    assert!(
+      client.is_handshaking() || !err.is_empty(),
+      "handshake must not complete against a sub-minimum-version peer: {err}"
+    );
   }
 
   #[test]

@@ -52,11 +52,11 @@ enum TlsVersion {
 //     once at config load and is not refreshed.
 //
 //   **Authorization / observability gap**: ``Network::Connection::ssl()`` returns ``nullptr``
-//   for this transport socket. Filters and access-log formatters that consume TLS metadata —
-//   notably ``envoy.filters.http.rbac`` / ``envoy.filters.network.rbac`` (the
+//   for this transport socket. Filters and access-log formatters that consume TLS metadata
+//   (notably ``envoy.filters.http.rbac`` / ``envoy.filters.network.rbac`` (the
 //   ``AuthenticatedMatcher`` and URI/DNS-SAN principal matchers), ``envoy.filters.http.ext_authz``
 //   (peer-cert subject/SAN propagation), and access-log operators ``%DOWNSTREAM_TLS_VERSION%``
-//   / ``%DOWNSTREAM_TLS_CIPHER%`` / ``%DOWNSTREAM_PEER_CERT*%`` / ``%UPSTREAM_TLS_*%`` — will
+//   / ``%DOWNSTREAM_TLS_CIPHER%`` / ``%DOWNSTREAM_PEER_CERT*%`` / ``%UPSTREAM_TLS_*%``) will
 //   behave as if the connection were plaintext. **Do not route through this socket from a
 //   listener whose filter chain depends on TLS-derived principals or audit fields** until the
 //   ``Ssl::ConnectionInfo`` plumbing lands.
@@ -130,7 +130,9 @@ message RustlsUpstreamTlsContext {
   // PEM file, and may contain multiple concatenated CRLs. The trust store is always present
   // (``trusted_ca`` or the bundled ``webpki`` roots), so a CRL is always meaningful here. The CRL
   // is read once at config-load time and is not refreshed, so a rotated CRL requires a config
-  // update.
+  // update. Revocation is checked for the end-entity (server) certificate only, and a certificate
+  // whose issuer is not covered by any supplied CRL is treated as not-revoked (the ``rustls``
+  // default unknown-status policy).
   string crl = 10;
 }
 
@@ -214,6 +216,8 @@ message RustlsDownstreamTlsContext {
   // during mTLS verification. Can be inline PEM content or a filesystem path to a PEM file, and
   // may contain multiple concatenated CRLs. Only meaningful when ``trusted_ca`` is set (client
   // certificates are verified). The CRL is read once at config-load time and is not refreshed,
-  // so a rotated CRL requires a config update.
+  // so a rotated CRL requires a config update. Revocation is checked for the end-entity (client)
+  // certificate only, and a certificate whose issuer is not covered by any supplied CRL is treated
+  // as not-revoked (the ``rustls`` default unknown-status policy).
   string crl = 9;
 }

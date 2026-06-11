@@ -234,8 +234,9 @@ Config::Config(const envoy::extensions::filters::network::tcp_proxy::v3::TcpProx
     return drain_manager;
   });
 
-  // Fail-closed gate for the Phase-2 warm upstream connection pool (UPSTREAM_POOL_DESIGN.md). The
-  // slot is only populated -- and therefore the pool only ever consulted -- when this reloadable
+  // Fail-closed gate for the Phase-2 warm upstream connection pool (reuses already-handshaked,
+  // kTLS-installed upstreams across high-churn request boundaries). The slot is only populated (and
+  // therefore the pool only ever consulted) when this reloadable
   // feature is enabled; it defaults OFF so the filter stays strictly 1:1. (The eventual home for
   // this switch is a typed proto field on the TcpProxy config; the runtime feature is the
   // intermediate, ship-dark control while the path is validated.)
@@ -887,14 +888,27 @@ bool Filter::maybeTunnel(Upstream::ThreadLocalCluster& cluster) {
     // Track attempted hosts for access logging
     getStreamInfo().upstreamInfo()->addUpstreamHostAttempted(host);
 
-    // Phase-2 warm connection pool (buffered relay path only; see UPSTREAM_POOL_DESIGN.md). Only
-    // raw-TCP (non-tunneling) upstreams are poolable -- HTTP/tunneling upstreams frame their own
+    // Phase-2 warm connection pool (buffered relay path only). Only
+    // raw-TCP (non-tunneling) upstreams are poolable. HTTP/tunneling upstreams frame their own
     // bodies and expose no spliceable/pooled socket. When the l4_connection_pool feature is on and
     // the chosen host has an address, arm the per-Filter frame tracker for this host and try to
     // adopt a warm, already-handshaked connection instead of opening a fresh one.
     if (!config_->tunnelingConfigHelper().has_value() && config_->upstreamPool().has_value() &&
         host->address() != nullptr) {
-      pool_host_key_ = std::string(host->address()->asStringView());
+      // Fold the cluster name and the effective per-connection SNI override into the key alongside
+      // the IP:port. A connection handshaked for SNI A (or for a different cluster) at the same
+      // address must never be checked out for SNI B: reusing it would send the wrong certificate's
+      // session to the new peer. transport_socket_options_ is already set for this connection
+      // (establishUpstreamConnection populated it before this call); serverNameOverride() is empty
+      // when no override applies. NUL separators keep the segments unambiguous.
+      const std::string& cluster_name = route_ ? route_->clusterName() : EMPTY_STRING;
+      absl::string_view sni =
+          (transport_socket_options_ != nullptr &&
+           transport_socket_options_->serverNameOverride().has_value())
+              ? absl::string_view(transport_socket_options_->serverNameOverride().value())
+              : absl::string_view{};
+      pool_host_key_ = absl::StrCat(cluster_name, absl::string_view("\0", 1), sni,
+                                    absl::string_view("\0", 1), host->address()->asStringView());
       pool_eligible_ = true;
       frame_tracker_ = std::make_unique<HttpFrameTracker>();
       if (tryCheckoutPooledUpstream(pool_host_key_, host)) {
@@ -1146,7 +1160,7 @@ Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
   // Phase-2 pool routing. On a fresh, pool-eligible connection, observe the request framing up
   // front so this exchange can be routed by method and size before we decide whether to splice. The
   // frame tracker is a pure observer (it does not drain `data`), so a splice chosen below still
-  // takes the same bytes -- preserving the large-upload first-chunk splice. This is the only
+  // takes the same bytes, preserving the large-upload first-chunk splice. This is the only
   // request-direction feed on the still-undecided pool path; the buffered write below re-feeds only
   // once the route is decided, so every request byte is framed exactly once.
   bool request_framed_here = false;
@@ -1172,16 +1186,17 @@ Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
       OptRef<const Network::KtlsBytestreamInfo> info = up->ktlsBytestreamInfo();
       const bool ktls_ready = info.has_value() && info->installed && info->trusted_peer;
       // Engage the upload splice once kTLS is installed and ordering is safe: the first chunk is
-      // trivially safe (nothing written yet); a later chunk -- a PUT body after buffered request
-      // headers -- is safe once those small headers have flushed, which maybeEngageSplice gates via
+      // trivially safe (nothing written yet); a later chunk (a PUT body after buffered request
+      // headers) is safe once those small headers have flushed, which maybeEngageSplice gates via
       // the upstream high-watermark.
       if (ktls_ready && (!upstream_write_started_ || !up->aboveHighWatermark()) &&
           maybeEngageSplice(data, /*from_upstream=*/false)) {
         return Network::FilterStatus::StopIteration;
       }
       // A PUT body that beat the kTLS install: hold it and poll until kTLS installs, then splice
-      // it. Only LATER chunks are held (upstream_write_started_ -- the request headers already went
-      // out on the buffered path), so a GET, which sends only the request and no body, is never
+      // it. Only LATER chunks are held (upstream_write_started_ is true, i.e. the request headers
+      // already went out on the buffered path), so a GET, which sends only the request and no body,
+      // is never
       // held and its latency is unchanged. Only a kTLS-capable upstream still installing (info
       // present, not installed) is held, so non-kTLS/mock upstreams stay on the buffered path. This
       // recovers the large-PUT in-kernel splice without the GET cost of deferring the first chunk.
@@ -1216,14 +1231,6 @@ Network::FilterStatus Filter::onData(Buffer::Instance& data, bool end_stream) {
     getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(data.length());
     upstream_->encodeData(data, end_stream);
     upstream_write_started_ = true;
-    // TEMP-DIAG: on the buffered pool path, did the upload back up past the upstream write
-    // high-watermark (H2 signal -- a stuck kTLS sendmsg whose writable re-arm was clobbered)?
-    if (route_buffered_for_pool_ || adopted_from_pool_) {
-      OptRef<Network::Connection> up = upstream_->upstreamConnection();
-      if (up.has_value() && up->aboveHighWatermark()) {
-        config_->stats().pool_upload_above_hwm_total_.inc();
-      }
-    }
     resetIdleTimer(); // TODO(ggreenway) PERF: do we need to reset timer on both send and receive?
   } else if (receive_before_connect_) {
     // Buffer data received before upstream connection exists.
@@ -1447,12 +1454,7 @@ void Filter::onUpstreamData(Buffer::Instance& data, bool end_stream) {
       // path below handles it.
     }
   }
-  // TEMP-DIAG funnel: first response chunk read on a buffered pool exchange.
-  if (pool_eligible_ && !pool_response_started_ && data.length() > 0) {
-    pool_response_started_ = true;
-    config_->stats().pool_response_started_total_.inc();
-  }
-  // An upstream half-close (end_stream) means the peer is tearing the connection down -- it is not
+  // An upstream half-close (end_stream) means the peer is tearing the connection down. It is not
   // reusable, so it must not be pooled. The pool's check-in MSG_PEEK clean-check would also catch a
   // FIN'd socket, but drop the tracker up front to skip the wasted check-in attempt.
   if (end_stream && frame_tracker_ != nullptr) {
@@ -1502,6 +1504,22 @@ bool Filter::maybeEngageSplice(Buffer::Instance& data, bool from_upstream) {
   const os_fd_t down_fd = down.getSocket()->ioHandle().fdDoNotUse();
   const os_fd_t up_fd = up->getSocket()->ioHandle().fdDoNotUse();
   if (down_fd == INVALID_SOCKET || up_fd == INVALID_SOCKET) {
+    return false;
+  }
+  // Downstream-sink safety gate (mirrors SpliceCoordinator::sinkLegIsRawOrKtls). The L4 pump relays
+  // raw bytes in BOTH directions, so the downstream leg must be plaintext (raw_buffer) or installed
+  // kTLS, never userspace TLS. A non-null ssl() means a userspace-TLS socket (e.g. BoringSSL
+  // `tls`); a rustls socket reports ssl()==nullptr but is only safe once kTLS is actually
+  // installed. Without this gate, decrypted upstream plaintext would be spliced onto a
+  // userspace-TLS downstream (cleartext on the wire) and the downstream's ciphertext relayed up as
+  // the upload body.
+  if (down.ssl() != nullptr) {
+    ENVOY_CONN_LOG(debug, "L4 splice skip: downstream sink is userspace TLS (ssl present)", down);
+    return false;
+  }
+  if (OptRef<const Network::KtlsBytestreamInfo> down_ktls = down.ktlsBytestreamInfo();
+      down_ktls.has_value() && !down_ktls->installed) {
+    ENVOY_CONN_LOG(debug, "L4 splice skip: downstream sink kTLS not yet installed", down);
     return false;
   }
   // Do not engage while the upstream write buffer is backed up. The pump relays the request and
@@ -1593,9 +1611,9 @@ bool Filter::tryCheckoutPooledUpstream(absl::string_view host_key,
   }
 
   // Adopt the warm connection. It already finished its TLS handshake and kTLS install on a previous
-  // exchange, so this request pays neither cost. Re-point its read callbacks at THIS Filter -- the
-  // connection outlived the Filter that minted it, and its callbacks still pointed at that (now
-  // destroyed) object -- and re-enable reads, which were disabled at check-in to keep idle bytes
+  // exchange, so this request pays neither cost. Re-point its read callbacks at THIS Filter (the
+  // connection outlived the Filter that minted it, and its callbacks still pointed at that now
+  // destroyed object) and re-enable reads, which were disabled at check-in to keep idle bytes
   // from being delivered to the dead Filter.
   upstream->rebindUpstreamCallbacks(*upstream_callbacks_);
   OptRef<Network::Connection> conn = upstream->upstreamConnection();
@@ -1617,7 +1635,6 @@ bool Filter::tryCheckoutPooledUpstream(absl::string_view host_key,
   }
   upstream_info.setUpstreamSslConnection(upstream_->getUpstreamConnectionSslInfo());
 
-  config_->stats().pool_checkout_hit_total_.inc(); // TEMP-DIAG funnel.
   ENVOY_CONN_LOG(debug, "tcp_proxy: adopted warm pooled upstream for {}",
                  read_callbacks_->connection(), host_key);
   // Drive the same post-connect path the fresh-connection callback uses: flush any early data,
@@ -1638,6 +1655,11 @@ constexpr uint64_t kPoolMaxUploadBytes = 1024 * 1024;
 } // namespace
 
 bool Filter::splicePermitted() const {
+  // L4 splice kill-switch. Defaults off so the filter ships dark on the buffered relay; gating here
+  // covers every engage site (onData upload and onUpstreamData download) in one place.
+  if (!Runtime::runtimeFeatureEnabled("envoy.reloadable_features.tcp_proxy_l4_ktls_splice")) {
+    return false;
+  }
   // An adopted warm connection must stay on the buffered path so it remains returnable to the pool.
   if (adopted_from_pool_) {
     return false;
@@ -1658,7 +1680,7 @@ void Filter::maybePickPoolRoute() {
     return;
   }
   // Decide only once the request line + headers are in (method and Content-Length known). While the
-  // headers are still arriving, stay undecided -- splicePermitted() holds the splice off meanwhile,
+  // headers are still arriving, stay undecided. splicePermitted() holds the splice off meanwhile,
   // so a small upload is never spliced before its size can be read.
   if (!frame_tracker_->requestHeadersParsed()) {
     return;
@@ -1672,7 +1694,6 @@ void Filter::maybePickPoolRoute() {
     // Keep this exchange on the buffered, returnable path. The frame tracker keeps observing it;
     // when it reaches ExchangeComplete the connection checks back into the warm pool.
     route_buffered_for_pool_ = true;
-    config_->stats().pool_buffered_routed_total_.inc(); // TEMP-DIAG funnel.
     ENVOY_CONN_LOG(debug, "tcp_proxy: routing {}-byte {} upload to buffered pool path",
                    read_callbacks_->connection(), upload_bytes, method);
     return;
@@ -1690,9 +1711,9 @@ void Filter::maybePickPoolRoute() {
 
 void Filter::feedFrameTracker(const Buffer::Instance& data, bool from_upstream) {
   // The buffered relay is the only poolable path: a spliced connection's fd is hijacked by the pump
-  // and can never be returned (see UPSTREAM_POOL_DESIGN.md "Coexistence"). So once a splice
-  // engages, abandon framing/pooling for this connection. Likewise skip when the pool path was
-  // never armed.
+  // and can never be returned (a connection is EITHER spliced OR pooled, never both). So once a
+  // splice engages, abandon framing/pooling for this connection. Likewise skip when the pool path
+  // was never armed.
   if (!pool_eligible_ || frame_tracker_ == nullptr) {
     return;
   }
@@ -1735,20 +1756,16 @@ void Filter::feedFrameTracker(const Buffer::Instance& data, bool from_upstream) 
     return;
   }
   if (verdict == HttpFrameTracker::Verdict::ExchangeComplete) {
-    config_->stats().pool_exchange_completed_total_.inc();      // TEMP-DIAG funnel.
-    const uint32_t code = frame_tracker_->responseStatusCode(); // TEMP-DIAG: 2xx vs error.
-    if (code >= 200 && code < 300) {
-      config_->stats().pool_resp_2xx_total_.inc();
-    } else {
-      config_->stats().pool_resp_non2xx_total_.inc();
-      ENVOY_CONN_LOG(debug, "tcp_proxy: pool exchange got non-2xx response {}",
-                     read_callbacks_->connection(), code);
-    }
     maybeCheckinPooledUpstream();
   }
 }
 
 void Filter::maybeCheckinPooledUpstream() {
+  // Known limitation (the pool path is flag-gated and ships dark): the model is one request per
+  // downstream connection. Once upstream_ is checked in here, this Filter has no upstream; a
+  // keep-alive client that sent a second request on the same downstream connection would find no
+  // upstream and stall. A downstream-keep-alive re-checkout path is intentionally deferred rather
+  // than built now.
   if (!pool_eligible_ || checked_in_to_pool_ || upstream_ == nullptr || frame_tracker_ == nullptr) {
     return;
   }
@@ -1776,7 +1793,7 @@ void Filter::maybeCheckinPooledUpstream() {
   }
 
   // Transfer ownership to the pool. Null upstream_ FIRST (release the unique_ptr) so ~Filter does
-  // not close the connection -- the pool now owns the close. This is the ownership invariant the
+  // not close the connection (the pool now owns the close). This is the ownership invariant the
   // design calls out: mis-release is a double-close / UAF.
   checked_in_to_pool_ = true;
   disableIdleTimer();
@@ -1836,7 +1853,7 @@ void Filter::onKtlsEngageRetry() {
     }
   }
   // Exhausted (kTLS never installed) or the connection closed: flush the held body on the normal
-  // path so the upload still completes -- no worse than before -- and re-enable downstream reads.
+  // path so the upload still completes (no worse than before) and re-enable downstream reads.
   if (upstream_ != nullptr && deferred_upload_buffer_.length() > 0) {
     getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(deferred_upload_buffer_.length());
     upstream_->encodeData(deferred_upload_buffer_, /*end_stream=*/false);
@@ -1992,7 +2009,7 @@ void Filter::onUpstreamConnection() {
     // warm pool. addBytesSentCallback is append-only (a callback is removed only when it returns
     // false), and a pooled upstream connection outlives the Filter that minted it, so a connection
     // reused N times would accumulate N stale callbacks each bound to a destroyed Filter's
-    // upstream_callbacks_ -- an unbounded leak and a use-after-free hazard. The idle timer is still
+    // upstream_callbacks_, an unbounded leak and a use-after-free hazard. The idle timer is still
     // reset on every onData/onUpstreamData, so the pool path only loses the bytes-flushed timer
     // refinement.
     if (upstream_ && !pool_eligible_) {

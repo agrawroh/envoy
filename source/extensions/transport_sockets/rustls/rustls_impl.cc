@@ -50,7 +50,7 @@ createRustlsConfig(bool is_upstream, const Protobuf::Message& validated_proto,
 
 } // namespace
 
-// -- RustlsUpstreamTransportSocketFactory -------------------------------------
+// RustlsUpstreamTransportSocketFactory.
 
 RustlsUpstreamTransportSocketFactory::RustlsUpstreamTransportSocketFactory(
     DynamicModuleTransportSocketConfigSharedPtr config, std::string default_sni,
@@ -121,14 +121,14 @@ void RustlsUpstreamTransportSocketFactory::hashKey(
   Network::CommonUpstreamTransportSocketFactory::hashKey(key, options);
 }
 
-// -- RustlsDownstreamTransportSocketFactory -----------------------------------
+// RustlsDownstreamTransportSocketFactory.
 
 Network::TransportSocketPtr
 RustlsDownstreamTransportSocketFactory::createDownstreamTransportSocket() const {
   return std::make_unique<DynamicModules::DynamicModuleTransportSocket>(config_);
 }
 
-// -- Config factories ---------------------------------------------------------
+// Config factories.
 
 ProtobufTypes::MessagePtr RustlsUpstreamTransportSocketConfigFactory::createEmptyConfigProto() {
   return std::make_unique<

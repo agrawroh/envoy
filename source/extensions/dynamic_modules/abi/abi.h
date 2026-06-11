@@ -12332,8 +12332,10 @@ bool envoy_dynamic_module_on_transport_socket_ktls_state(
  * server name (SNI) override for the transport socket. The host calls it once after
  * envoy_dynamic_module_on_transport_socket_new and before
  * envoy_dynamic_module_on_transport_socket_on_connected when the connection carries an override
- * (e.g. a cluster with auto_sni). This hook is optional: a module that does not export it simply
- * does not receive the override and continues to use its configured default server name.
+ * (e.g. a cluster with auto_sni). It is also called before
+ * envoy_dynamic_module_on_transport_socket_set_callbacks. This hook is optional: a module that does
+ * not export it simply does not receive the override and continues to use its configured default
+ * server name.
  *
  * @param transport_socket_envoy_ptr is the pointer to the Envoy transport socket object.
  * @param transport_socket_module_ptr is the pointer to the in-module transport socket.
