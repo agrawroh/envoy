@@ -290,10 +290,11 @@ impl RustlsFactoryConfig {
               .to_string(),
           );
         }
-        // rustls 0.23 defaults apply: the CRL is checked for the end-entity (client) certificate
-        // only, and a certificate whose issuer is not covered by any supplied CRL is treated as
-        // not-revoked (UnknownStatusPolicy::Allow). This is revocation checking, not full-chain
-        // hard-fail revocation.
+        // The verifier keeps rustls 0.23's strict builder defaults: revocation is checked across
+        // the full client certificate chain (RevocationCheckDepth::Chain), and a certificate whose
+        // revocation status is unknown (its issuer is not covered by any supplied CRL) is rejected
+        // (UnknownStatusPolicy::Deny). We deliberately do not call only_check_end_entity_revocation
+        // or allow_unknown_revocation_status, which would weaken this.
         verifier_builder = verifier_builder.with_crls(crls);
       }
       let verifier = verifier_builder
@@ -367,10 +368,11 @@ impl RustlsFactoryConfig {
             .to_string(),
         );
       }
-      // rustls 0.23 defaults apply: the CRL is checked for the end-entity (server) certificate
-      // only, and a certificate whose issuer is not covered by any supplied CRL is treated as
-      // not-revoked (UnknownStatusPolicy::Allow). This is revocation checking, not full-chain
-      // hard-fail revocation.
+      // The verifier keeps rustls 0.23's strict builder defaults: revocation is checked across the
+      // full server certificate chain (RevocationCheckDepth::Chain), and a certificate whose
+      // revocation status is unknown (its issuer is not covered by any supplied CRL) is rejected
+      // (UnknownStatusPolicy::Deny). We deliberately do not call only_check_end_entity_revocation
+      // or allow_unknown_revocation_status, which would weaken this.
       let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
         .with_crls(crls)
         .build()

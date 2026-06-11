@@ -126,8 +126,9 @@ void UpstreamPool::checkin(absl::string_view host_key, GenericUpstreamPtr upstre
   // Rebind the connection's read callbacks to the pool-owned idle sink so an upstream byte or close
   // event arriving while the connection sits idle (after the checking-in Filter is destroyed,
   // before the next checkout rebinds) is handled safely instead of dereferencing the dead Filter.
-  // The sink closes the connection on any such event; the next checkout's clean-check then discards
-  // it.
+  // The sink only logs the event; it never closes the connection or touches pools_ (closing from
+  // the callback could corrupt the pool mid-iteration). Disposal is deferred to the next checkout's
+  // clean-check, which discards a connection that saw such an event.
   upstream->rebindUpstreamCallbacks(idle_callbacks_);
 
   Entry entry;

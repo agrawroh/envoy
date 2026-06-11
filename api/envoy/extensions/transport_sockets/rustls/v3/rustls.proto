@@ -130,9 +130,9 @@ message RustlsUpstreamTlsContext {
   // PEM file, and may contain multiple concatenated CRLs. The trust store is always present
   // (``trusted_ca`` or the bundled ``webpki`` roots), so a CRL is always meaningful here. The CRL
   // is read once at config-load time and is not refreshed, so a rotated CRL requires a config
-  // update. Revocation is checked for the end-entity (server) certificate only, and a certificate
-  // whose issuer is not covered by any supplied CRL is treated as not-revoked (the ``rustls``
-  // default unknown-status policy).
+  // update. Revocation is checked across the full server certificate chain, and a certificate whose
+  // revocation status is unknown (its issuer is not covered by any supplied CRL) is rejected (the
+  // ``rustls`` strict default unknown-status policy).
   string crl = 10;
 }
 
@@ -216,8 +216,8 @@ message RustlsDownstreamTlsContext {
   // during mTLS verification. Can be inline PEM content or a filesystem path to a PEM file, and
   // may contain multiple concatenated CRLs. Only meaningful when ``trusted_ca`` is set (client
   // certificates are verified). The CRL is read once at config-load time and is not refreshed,
-  // so a rotated CRL requires a config update. Revocation is checked for the end-entity (client)
-  // certificate only, and a certificate whose issuer is not covered by any supplied CRL is treated
-  // as not-revoked (the ``rustls`` default unknown-status policy).
+  // so a rotated CRL requires a config update. Revocation is checked across the full client
+  // certificate chain, and a certificate whose revocation status is unknown (its issuer is not
+  // covered by any supplied CRL) is rejected (the ``rustls`` strict default unknown-status policy).
   string crl = 9;
 }

@@ -60,8 +60,8 @@ bool splitHeaderBlock(absl::string_view header_block, absl::string_view& first_l
       return false;
     }
     absl::string_view name = line.substr(0, colon);
-    // RFC 9112 §5.1: no whitespace is allowed between the field name and the colon. Reject it --
-    // it is the "Foo : bar" smuggling primitive that some parsers treat as "Foo" and others as
+    // RFC 9112 §5.1: no whitespace is allowed between the field name and the colon. Reject it; it
+    // is the "Foo : bar" smuggling primitive that some parsers treat as "Foo" and others as
     // "Foo ".
     if (name.back() == ' ' || name.back() == '\t') {
       return false;

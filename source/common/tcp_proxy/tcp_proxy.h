@@ -109,14 +109,20 @@ struct OnDemandStats {
 class Drainer;
 class UpstreamDrainManager;
 
-// Derives the Phase-2 warm-connection-pool checkout/checkin key from the cluster name, the
-// effective per-connection SNI override, and the upstream "ip:port" address, NUL-separated. SNI and
-// cluster are folded in so a connection handshaked for one SNI (or cluster) at an address is never
-// checked out for another at that same address (which would send the wrong certificate's session to
-// the new peer). `sni` is empty when no serverNameOverride applies. Free function so the exact byte
-// layout is directly unit-testable. The NUL separators are part of the contract; reusing the bytes
-// for a different SNI must produce a different key.
-std::string poolHostKey(absl::string_view cluster, absl::string_view sni, absl::string_view addr);
+// Derives the Phase-2 warm-connection-pool checkout/checkin key from the cluster name, the upstream
+// "ip:port" address, and the FULL per-connection transport-socket trust identity (not just SNI).
+// The upstream-TLS TRUST decision depends on the whole TransportSocketOptions: the server-name
+// (SNI) override, the verify-SAN list the peer cert is validated against, the ALPN override and
+// fallback, and any shared filter-state objects. All of these are folded in (using the same fields
+// and order as Network::CommonUpstreamTransportSocketFactory::hashKey) so a connection handshaked
+// under one trust identity (or for a different cluster) at an address is never checked out for a
+// request needing a different one at that same address (which could validate against the wrong SAN
+// list or present the wrong certificate / protocol). `options` may be null when no override
+// applies. Free function so the exact byte layout is directly unit-testable. The NUL separators and
+// the length-prefixed options blob are part of the contract; differing trust identity must produce
+// a different key.
+std::string poolHostKey(absl::string_view cluster, absl::string_view addr,
+                        const Network::TransportSocketOptionsConstSharedPtr& options);
 
 /**
  * Route is an individual resolved route for a connection.
@@ -824,6 +830,11 @@ protected:
   // is destroyed first (avoids a use-after-free from a deferred completion).
   Event::SchedulableCallbackPtr splice_complete_schedulable_;
   Network::ConnectionEvent splice_complete_event_{Network::ConnectionEvent::LocalClose};
+  // True once an engaged splice removed the downstream ConnectionImpl FileEvent (as it did the
+  // upstream's). The upstream is force-closed NoFlush at teardown for this reason; the detached
+  // downstream outlives teardown and is closed on the upstream-close path, which must also close it
+  // NoFlush so it never re-arms the removed FileEvent on the write/flush path.
+  bool downstream_splice_detached_{false};
   // The connection pool used to set up |upstream_|.
   // This will be non-null from when an upstream connection is attempted until
   // it either succeeds or fails.

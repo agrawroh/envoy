@@ -456,6 +456,42 @@ TEST_P(TcpProxySpliceTest, SpliceEngagesOnRealSocketsWhenKtlsInstalled) {
   EXPECT_EQ(0U, response.length()); // drained into the pump
 }
 
+// LAT-1: tearing down an engaged splice closes the detached downstream sink NoFlush, not
+// FlushWrite. Engage removes the downstream ConnectionImpl FileEvent (the pump owns the fd), so a
+// FlushWrite close on the upstream-close teardown path could re-arm a null file_event_ on the
+// write/flush path. This pins the NoFlush contract for both legs (the upstream is already
+// force-closed NoFlush by tearDownSplice; the downstream sink must match).
+TEST_P(TcpProxySpliceTest, EngagedSpliceTeardownClosesDownstreamNoFlush) {
+  setup(1);
+  raiseEventUpstreamConnected(0);
+
+  wireSocket(filter_callbacks_.connection_, down_socket_, down_io_, down_socket_ptr_, down_fds_[1]);
+  wireSocket(*upstream_connections_.at(0), up_socket_, up_io_, up_socket_ptr_, up_fds_[1]);
+
+  ON_CALL(filter_callbacks_.connection_, ssl()).WillByDefault(Return(nullptr));
+  ON_CALL(*upstream_connections_.at(0), aboveHighWatermark()).WillByDefault(Return(false));
+  Network::KtlsBytestreamInfo ktls_info{/*installed=*/true, up_fds_[1], /*trusted_peer=*/true};
+  ON_CALL(*upstream_connections_.at(0), ktlsBytestreamInfo())
+      .WillByDefault(
+          testing::Return(makeOptRefFromPtr<const Network::KtlsBytestreamInfo>(&ktls_info)));
+  EXPECT_CALL(filter_callbacks_.connection_.dispatcher_, createFileEvent_(_, _, _, _))
+      .Times(2)
+      .WillRepeatedly(Invoke([](os_fd_t, Event::FileReadyCb, Event::FileTriggerType, uint32_t) {
+        return new NiceMock<Event::MockFileEvent>();
+      }));
+
+  // Engage the download splice; this detaches the downstream sink's FileEvent.
+  Buffer::OwnedImpl response("world");
+  upstream_callbacks_->onUpstreamData(response, false);
+  ASSERT_EQ(1U, config_->stats().splice_pump_engaged_total_.value());
+
+  // The upstream closing tears the splice down. Both the force-closed upstream and the detached
+  // downstream sink must close NoFlush so neither re-arms its removed FileEvent.
+  EXPECT_CALL(*upstream_connections_.at(0), close(Network::ConnectionCloseType::NoFlush));
+  EXPECT_CALL(filter_callbacks_.connection_, close(Network::ConnectionCloseType::NoFlush));
+  upstream_callbacks_->onEvent(Network::ConnectionEvent::RemoteClose);
+}
+
 // SEC-1: a userspace-TLS downstream sink (ssl() != nullptr) is NEVER spliced even though the
 // upstream reports kTLS installed and trusted. The exchange stays on the buffered path so the
 // downstream socket's in-place encryption is not bypassed.
@@ -562,32 +598,75 @@ TEST_P(TcpProxySpliceTest, SpliceNotEngagedOnUploadWhenDownstreamUserspaceTls) {
   EXPECT_EQ(0U, config_->stats().splice_pump_engaged_total_.value());
 }
 
+// Helper: build TransportSocketOptions for a given SNI override and verify-SAN list. Either may be
+// empty. Returns null when both are empty (the no-override case the production call site passes).
+Network::TransportSocketOptionsConstSharedPtr
+poolKeyOptions(absl::string_view sni, std::vector<std::string> verify_san_list = {},
+               std::vector<std::string> alpn = {}) {
+  if (sni.empty() && verify_san_list.empty() && alpn.empty()) {
+    return nullptr;
+  }
+  return std::make_shared<Network::TransportSocketOptionsImpl>(sni, std::move(verify_san_list),
+                                                               std::move(alpn));
+}
+
 // G1, SEC-2: the warm-pool checkout/checkin key folds in the per-connection SNI override, so a
 // connection handshaked for SNI A at an address is never checked out for SNI B at that same
 // address (which would send the wrong certificate's session to the new peer).
 TEST(TcpProxyPoolHostKeyTest, SniIsPartOfTheKey) {
   // Two distinct SNI overrides at the SAME cluster and address yield DIFFERENT keys.
-  const std::string key_a = poolHostKey("cluster", "sni-a.example.com", "10.0.0.1:443");
-  const std::string key_b = poolHostKey("cluster", "sni-b.example.com", "10.0.0.1:443");
+  const std::string key_a =
+      poolHostKey("cluster", "10.0.0.1:443", poolKeyOptions("sni-a.example.com"));
+  const std::string key_b =
+      poolHostKey("cluster", "10.0.0.1:443", poolKeyOptions("sni-b.example.com"));
   EXPECT_NE(key_a, key_b);
 
   // Same SNI, same cluster, same address is the same key (a warm connection is reusable).
-  EXPECT_EQ(key_a, poolHostKey("cluster", "sni-a.example.com", "10.0.0.1:443"));
+  EXPECT_EQ(key_a, poolHostKey("cluster", "10.0.0.1:443", poolKeyOptions("sni-a.example.com")));
 
   // A different cluster at the same SNI and address is also a different key.
-  EXPECT_NE(key_a, poolHostKey("other", "sni-a.example.com", "10.0.0.1:443"));
+  EXPECT_NE(key_a, poolHostKey("other", "10.0.0.1:443", poolKeyOptions("sni-a.example.com")));
 }
 
-// The no-override path yields the cluster + NUL + NUL + addr form (an empty SNI segment), and is
-// distinct from any non-empty-SNI key at the same cluster and address.
+// G1, SEC-2: the key captures the FULL upstream-TLS trust identity, not just SNI. Two connections
+// with the SAME SNI but a DIFFERENT verify-SAN list validate the peer certificate against different
+// SANs, so they are NOT interchangeable and must hash to different keys (no cross-trust reuse).
+TEST(TcpProxyPoolHostKeyTest, VerifySanListIsPartOfTheKey) {
+  const std::string addr = "10.0.0.1:443";
+  // Identical SNI, differing verify-SAN list -> different keys.
+  const std::string key_san_a =
+      poolHostKey("cluster", addr, poolKeyOptions("sni.example.com", {"spiffe://a"}));
+  const std::string key_san_b =
+      poolHostKey("cluster", addr, poolKeyOptions("sni.example.com", {"spiffe://b"}));
+  EXPECT_NE(key_san_a, key_san_b);
+
+  // A verify-SAN list present vs. absent (same SNI) is also a different trust identity.
+  EXPECT_NE(key_san_a, poolHostKey("cluster", addr, poolKeyOptions("sni.example.com")));
+
+  // Identical options (same SNI AND same verify-SAN list) yield a stable, reusable key.
+  EXPECT_EQ(key_san_a,
+            poolHostKey("cluster", addr, poolKeyOptions("sni.example.com", {"spiffe://a"})));
+
+  // The ALPN override is also folded in: same SNI + same verify-SAN, differing ALPN -> different.
+  EXPECT_NE(poolHostKey("cluster", addr, poolKeyOptions("sni.example.com", {"spiffe://a"}, {"h2"})),
+            poolHostKey("cluster", addr,
+                        poolKeyOptions("sni.example.com", {"spiffe://a"}, {"http/1.1"})));
+}
+
+// The no-override path (null options) yields the cluster + NUL + addr + NUL + empty-options form,
+// and is distinct from any key carrying a real trust identity at the same cluster and address.
 TEST(TcpProxyPoolHostKeyTest, NoOverrideKeyForm) {
   const std::string addr = "10.0.0.1:443";
+  // With null options the options-identity blob is empty: zero length prefix and no payload bytes.
+  const uint64_t zero_len = 0;
   const std::string expected =
-      absl::StrCat("cluster", absl::string_view("\0", 1), absl::string_view("\0", 1), addr);
-  EXPECT_EQ(expected, poolHostKey("cluster", "", addr));
+      absl::StrCat("cluster", absl::string_view("\0", 1), addr, absl::string_view("\0", 1),
+                   absl::string_view(reinterpret_cast<const char*>(&zero_len), sizeof(zero_len)));
+  EXPECT_EQ(expected, poolHostKey("cluster", addr, nullptr));
 
-  // The empty-SNI key must not collide with a real SNI's key at the same cluster + address.
-  EXPECT_NE(poolHostKey("cluster", "", addr), poolHostKey("cluster", "sni-a.example.com", addr));
+  // The no-override key must not collide with a real SNI's key at the same cluster + address.
+  EXPECT_NE(poolHostKey("cluster", addr, nullptr),
+            poolHostKey("cluster", addr, poolKeyOptions("sni-a.example.com")));
 }
 
 // Test nothing bad happens if an invalid factory is configured.

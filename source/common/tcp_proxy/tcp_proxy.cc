@@ -5,6 +5,7 @@
 #include <string>
 
 #include "envoy/buffer/buffer.h"
+#include "envoy/common/hashable.h"
 #include "envoy/config/accesslog/v3/accesslog.pb.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/event/timer.h"
@@ -23,6 +24,7 @@
 #include "source/common/common/enum_to_int.h"
 #include "source/common/common/fmt.h"
 #include "source/common/common/macros.h"
+#include "source/common/common/scalar_to_byte_vector.h"
 #include "source/common/common/utility.h"
 #include "source/common/config/metadata.h"
 #include "source/common/config/utility.h"
@@ -50,11 +52,54 @@ namespace TcpProxy {
 // Type alias for UpstreamConnectMode to simplify usage throughout this file.
 using UpstreamConnectMode = envoy::extensions::filters::network::tcp_proxy::v3::UpstreamConnectMode;
 
-std::string poolHostKey(absl::string_view cluster, absl::string_view sni, absl::string_view addr) {
-  // NUL separators keep the three segments unambiguous (no SNI or cluster name contains a NUL), so
-  // (cluster, sni, addr) maps to a distinct key and a connection handshaked for one SNI is never
-  // checked out for another at the same address.
-  return absl::StrCat(cluster, absl::string_view("\0", 1), sni, absl::string_view("\0", 1), addr);
+std::string poolHostKey(absl::string_view cluster, absl::string_view addr,
+                        const Network::TransportSocketOptionsConstSharedPtr& options) {
+  // The pool key must be a faithful proxy for the connection's upstream-TLS trust identity, not
+  // just its SNI. The TLS TRUST decision depends on the full transport-socket options: the
+  // server-name (SNI) override, the verify-SAN list the peer cert is validated against, the ALPN
+  // override and fallback, and any shared filter-state objects. Two connections that differ in any
+  // of these are NOT interchangeable (reusing one for the other could validate against the wrong
+  // SAN list or present the wrong protocol), so they must hash to different keys. We fold the same
+  // fields, in the same order, that Network::CommonUpstreamTransportSocketFactory::hashKey folds
+  // (source/common/network/transport_socket_options_impl.cc), so the pool key tracks Envoy's own
+  // transport-socket cache identity.
+  //
+  // Layout: cluster, NUL, addr, NUL, then the length-prefixed options-identity bytes. The cluster
+  // and address are plain byte segments (neither contains a NUL); the options identity is a vector
+  // of fixed-width scalars built with pushScalarToByteVector. We length-prefix the options bytes so
+  // the boundary between addr and the options blob stays unambiguous and the whole key remains a
+  // stable, collision-resistant std::string the pool uses verbatim.
+  std::vector<uint8_t> options_identity;
+  if (options != nullptr) {
+    const auto& server_name_override = options->serverNameOverride();
+    if (server_name_override.has_value()) {
+      pushScalarToByteVector(StringUtil::CaseInsensitiveHash()(server_name_override.value()),
+                             options_identity);
+    }
+    for (const auto& san : options->verifySubjectAltNameListOverride()) {
+      pushScalarToByteVector(StringUtil::CaseInsensitiveHash()(san), options_identity);
+    }
+    for (const auto& protocol : options->applicationProtocolListOverride()) {
+      pushScalarToByteVector(StringUtil::CaseInsensitiveHash()(protocol), options_identity);
+    }
+    for (const auto& protocol : options->applicationProtocolFallback()) {
+      pushScalarToByteVector(StringUtil::CaseInsensitiveHash()(protocol), options_identity);
+    }
+    for (const auto& object : options->downstreamSharedFilterStateObjects()) {
+      if (const auto* hashable = dynamic_cast<const Hashable*>(object.data_.get());
+          hashable != nullptr) {
+        if (const auto hash = hashable->hash(); hash.has_value()) {
+          pushScalarToByteVector(hash.value(), options_identity);
+        }
+      }
+    }
+  }
+  const uint64_t options_len = options_identity.size();
+  return absl::StrCat(
+      cluster, absl::string_view("\0", 1), addr, absl::string_view("\0", 1),
+      absl::string_view(reinterpret_cast<const char*>(&options_len), sizeof(options_len)),
+      absl::string_view(reinterpret_cast<const char*>(options_identity.data()),
+                        options_identity.size()));
 }
 
 const std::string& PerConnectionCluster::key() {
@@ -902,19 +947,17 @@ bool Filter::maybeTunnel(Upstream::ThreadLocalCluster& cluster) {
     // adopt a warm, already-handshaked connection instead of opening a fresh one.
     if (!config_->tunnelingConfigHelper().has_value() && config_->upstreamPool().has_value() &&
         host->address() != nullptr) {
-      // Fold the cluster name and the effective per-connection SNI override into the key alongside
-      // the IP:port. A connection handshaked for SNI A (or for a different cluster) at the same
-      // address must never be checked out for SNI B: reusing it would send the wrong certificate's
-      // session to the new peer. transport_socket_options_ is already set for this connection
-      // (establishUpstreamConnection populated it before this call); serverNameOverride() is empty
-      // when no override applies. NUL separators keep the segments unambiguous.
+      // Fold the cluster name and the full per-connection transport-socket trust identity into the
+      // key alongside the IP:port. The TLS TRUST decision depends on more than SNI: the verify-SAN
+      // list, the ALPN override and fallback, and shared filter-state objects all change which peer
+      // certificate / protocol is acceptable. A connection handshaked under one trust identity (or
+      // for a different cluster) at the same address must never be checked out for another, so the
+      // key folds all of those fields. transport_socket_options_ is already set for this connection
+      // (establishUpstreamConnection populated it before this call) and is null when no override
+      // applies. NUL separators keep the cluster/addr segments unambiguous.
       const std::string& cluster_name = route_ ? route_->clusterName() : EMPTY_STRING;
-      absl::string_view sni =
-          (transport_socket_options_ != nullptr &&
-           transport_socket_options_->serverNameOverride().has_value())
-              ? absl::string_view(transport_socket_options_->serverNameOverride().value())
-              : absl::string_view{};
-      pool_host_key_ = poolHostKey(cluster_name, sni, host->address()->asStringView());
+      pool_host_key_ =
+          poolHostKey(cluster_name, host->address()->asStringView(), transport_socket_options_);
       pool_eligible_ = true;
       frame_tracker_ = std::make_unique<HttpFrameTracker>();
       if (tryCheckoutPooledUpstream(pool_host_key_, host)) {
@@ -1574,11 +1617,13 @@ bool Filter::maybeEngageSplice(Buffer::Instance& data, bool from_upstream) {
   // Commit. Consume the chunk the pump now owns, then remove both ConnectionImpl FileEvents so the
   // pump is the only FileEvent on each fd. Removing rather than disabling matters because a
   // disabled second registration drops the next connection's edges after fd reuse and wedges its
-  // handshake. Nulling file_event_ is safe because tearDownSplice closes with NoFlush and never
-  // enters the write path that would touch it.
+  // handshake. Nulling file_event_ is safe because both legs are closed NoFlush, which never enters
+  // the write path that would re-arm the removed event: tearDownSplice closes the upstream NoFlush,
+  // and downstream_splice_detached_ makes the upstream-close path close the downstream NoFlush too.
   data.drain(data.length());
   down.getSocket()->ioHandle().resetFileEvents();
   up->getSocket()->ioHandle().resetFileEvents();
+  downstream_splice_detached_ = true;
   splice_pump_ = std::move(pump);
   splice_pump_->arm();
   config_->stats().splice_pump_active_.inc();
@@ -1939,6 +1984,12 @@ void Filter::onUpstreamEvent(Network::ConnectionEvent event) {
                          read_callbacks_->connection());
           getStreamInfo().setResponseFlag(StreamInfo::CoreResponseFlag::UpstreamRemoteReset);
           read_callbacks_->connection().close(Network::ConnectionCloseType::AbortReset);
+        } else if (downstream_splice_detached_) {
+          // A spliced downstream had its ConnectionImpl FileEvent removed at engage and never
+          // reinstalled, so a FlushWrite close could re-arm a null file_event_ (ENVOY_BUG) if a
+          // write were pending. The splice bypassed the userspace write buffer, so nothing is
+          // buffered to flush; close NoFlush, matching how tearDownSplice closes the upstream.
+          read_callbacks_->connection().close(Network::ConnectionCloseType::NoFlush);
         } else {
           read_callbacks_->connection().close(Network::ConnectionCloseType::FlushWrite);
         }
