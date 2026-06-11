@@ -486,14 +486,23 @@ void SpliceCoordinator::finalize() {
 
   if (completion_status_ != TcpProxy::SpliceCompletion::BoundsReached) {
     // A truncated or failed splice cannot be recovered: part of the body has already left for the
-    // sink socket. Do NOT re-arm the borrowed legs (a pending peer-close would dispatch into the
-    // still-active, soon-dead stream). Re-enable the source read (upload may have read-disabled it)
-    // so teardown is not blocked, then force-close the upstream NoFlush, mirroring the proven L4
-    // tearDownSplice. The upstream close drives the codec reset, which propagates through the
-    // router to reset the downstream stream too, so neither connection is reused.
+    // sink socket. The upstream is force-closed NoFlush (never reused), mirroring the proven L4
+    // tearDownSplice; its close drives the codec reset, which propagates through the router to reset
+    // the downstream stream too. Re-enable the source read (upload may have read-disabled it) so
+    // teardown is not blocked.
     incSpliceCounter("truncated");
     ENVOY_LOG(debug, "kTLS body-splice aborted before the Content-Length boundary, resetting");
     maybeReadEnableSource();
+    // engage() detached both legs' file events. maybeReadEnableSource() reinstalls the upload's
+    // source leg (the downstream); a download's downstream is the SINK and is still detached. The
+    // upstream close below cascades the codec reset into the downstream connection and calls
+    // enableFileEvents() on it, which is a null-file_event_ ENVOY_BUG on a detached leg. Reinstall
+    // the download sink first, exactly as the success path does before delivering end-stream. The
+    // upstream is intentionally left detached and force-closed, never re-armed for reuse.
+    if (direction_ == Direction::Download && legs_detached_ && down.has_value() &&
+        down->state() == Network::Connection::State::Open) {
+      down->reinstallFileEvents();
+    }
     if (up.has_value() && up->state() == Network::Connection::State::Open) {
       up->close(Network::ConnectionCloseType::NoFlush);
     }
@@ -587,6 +596,14 @@ void SpliceCoordinator::reset() {
   }
   splice_pump_.reset();
   maybeReadEnableSource();
+  // As in finalize()'s truncation branch: a download's downstream sink is still detached here and
+  // the upstream NoFlush close below cascades the codec reset into it, so reinstall it to avoid a
+  // null-file_event_ ENVOY_BUG. An upload's downstream is the source, already reinstalled by
+  // maybeReadEnableSource() above; the direction_ guard keeps this from a double reinstall.
+  if (direction_ == Direction::Download && legs_detached_ && downstream_connection_.has_value() &&
+      downstream_connection_->state() == Network::Connection::State::Open) {
+    downstream_connection_->reinstallFileEvents();
+  }
   if (upstream_connection_.has_value() &&
       upstream_connection_->state() == Network::Connection::State::Open) {
     // The NoFlush close runs the codec reset cascade inline, which re-enters

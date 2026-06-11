@@ -266,61 +266,70 @@ TEST_P(KtlsSpliceIntegrationTest, UploadAboveThresholdEngagesSplice) {
   EXPECT_EQ(0, truncated == nullptr ? 0 : truncated->value());
 }
 
-// Truncation: a download whose upstream advertises a Content-Length, then sends fewer body bytes
-// than promised and closes the connection mid-body. The downstream must observe a reset /
-// incomplete response rather than a clean, complete 200, so a peer that disappears mid-body can
-// never be mistaken for a fully delivered body.
+// Engaged-download truncation (the real proof of the finalize()/reset() crash fix). A GET whose
+// upstream advertises a Content-Length >= the 64 KiB floor, so the L7 download splice ENGAGES over
+// the fake-kTLS upstream and detaches both legs' file events to hand the fds to the in-kernel pump.
+// The upstream then sends FEWER body bytes than the advertised Content-Length and closes mid-body.
+// The pump sees the upstream EOF before reaching the u2d bound and completes Closed (a truncation),
+// which drives finalize() into its non-BoundsReached branch.
 //
-// SCOPE (read before changing). The strongest version of this test would drive the truncation on an
-// ENGAGED splice (Content-Length >= the 64 KiB floor) and assert the truncated counter. That path
-// cannot be exercised end-to-end here today: once engage() commits it detaches both legs'
-// ConnectionImpl file events so the in-kernel SplicePump owns the fds, and finalize()'s truncation
-// branch force-closes the borrowed upstream WITHOUT first reinstalling the downstream (sink) leg's
-// file event. The force-close cascade (ConnectionImpl::closeInternal) then calls enableFileEvents()
-// on that still-detached downstream leg and trips the "Null file_event_" ENVOY_BUG
-// (source/common/network/io_socket_handle_impl.cc), which aborts the process in a debug build.
-// That is a real defect in the engaged-splice teardown (SpliceCoordinator::finalize / reset), which
-// this test does not own; the engaged-path truncated/completed accounting is covered with mocks by
-// SpliceCoordinatorTest.CompleteTruncated and CompleteErrorRoutesToTruncation in
-// test/common/router/splice_coordinator_test.cc, where the mock upstream close is a no-op and so
-// does not run the cascade.
+// That branch force-closes the borrowed upstream NoFlush, and the close cascade
+// (ConnectionImpl::closeInternal) re-enters the still-detached downstream (sink) leg and calls
+// enableFileEvents() on it. The crash fix reinstalls that download sink's file event first; without
+// it the cascade hit a null file_event_ and tripped the "Null file_event_" ENVOY_BUG
+// (source/common/network/io_socket_handle_impl.cc), aborting the process in a debug build. So the
+// load-bearing assertion of this test is simply that the process does NOT abort: reaching the end
+// of the test at all proves the engaged-truncation teardown is crash-free.
 //
-// To stay deterministic and crash-free while still pinning the customer-visible truncation
-// contract, this drives a SUB-threshold body so the splice never arms (no leg is ever detached) and
-// the buffered path carries the bytes. The assertions therefore are: the splice did not engage, and
-// the truncated response is surfaced downstream as a reset / incomplete rather than a clean 200.
-TEST_P(KtlsSpliceIntegrationTest, DownloadTruncationSurfacesIncompleteResponse) {
+// The customer-visible contract is also pinned: the downstream must see a reset / incomplete
+// response, never a clean 200 with the full body, so a peer that vanishes mid-body can never be
+// mistaken for a fully delivered body. The splice must have engaged (engaged Ge(1)), and the
+// truncation must be accounted (truncated Ge(1)).
+TEST_P(KtlsSpliceIntegrationTest, EngagedDownloadTruncationDoesNotCrash) {
   initializeWithFakeKtlsUpstream();
   codec_client_ = makeHttpConnection(lookupPort("http"));
   auto response = codec_client_->makeHeaderOnlyRequest(Http::TestRequestHeaderMapImpl{
       {":method", "GET"}, {":path", "/download"}, {":scheme", "http"}, {":authority", "host"}});
 
-  // Below the 64 KiB floor, so the splice stays disarmed and the bytes flow through the buffered
-  // path; the truncation handling under test is the codec/router path, not the splice.
-  constexpr uint64_t content_length = MinSpliceBodyBytes - 1;
+  // At/above the 64 KiB floor so the download splice arms and engages. The pump owns the fds once
+  // engage() commits, which is the state the crash fix protects on teardown.
+  constexpr uint64_t content_length = 128 * 1024;
   waitForNextUpstreamRequest();
   upstream_request_->encodeHeaders(
       Http::TestResponseHeaderMapImpl{{":status", "200"},
                                       {"content-length", absl::StrCat(content_length)}},
       false);
+  // Wait for the headers to reach the client, which guarantees the upstream-headers read (and so
+  // the scheduled engage()) has unwound on the server before the body is sent. This is what lets
+  // the splice engage before any body arrives, exactly as runDownload documents.
   response->waitForHeaders();
 
-  // Send strictly fewer bytes than the advertised Content-Length, then close the upstream so the
-  // body is cut mid-transfer.
+  // The splice has engaged by now (it commits from the scheduled callback after the headers read).
+  // Confirm it before driving the truncation so a regression that silently kept the buffered path
+  // is caught here rather than being mistaken for a passing truncation test.
+  test_server_->waitForCounter("cluster.cluster_0.http1_ktls_splice.engaged", testing::Ge(1));
+
+  // Send strictly fewer bytes than the advertised Content-Length (end_stream=false), then close the
+  // upstream connection so the body is cut mid-transfer. The pump sees EOF before the bound.
   const std::string partial = makeBody(content_length / 2);
   Buffer::OwnedImpl partial_data(partial);
   upstream_request_->encodeData(partial_data, false);
   RELEASE_ASSERT(fake_upstream_connection_->close(), "failed to close upstream");
 
-  // The downstream stream is reset / left incomplete: no clean end-of-stream with the full body.
+  // The downstream stream is reset / left incomplete: no clean end-of-stream with the full body. If
+  // the teardown had aborted on the detached-sink ENVOY_BUG, the process would have crashed before
+  // reaching this point.
   ASSERT_TRUE(response->waitForAnyTermination());
   EXPECT_FALSE(response->complete());
 
-  // The splice never armed for a sub-threshold body, so its engaged counter is absent (lazily
-  // created on first engage) or zero.
-  const Stats::CounterSharedPtr engaged =
-      test_server_->counter("cluster.cluster_0.http1_ktls_splice.engaged");
-  EXPECT_EQ(0, engaged == nullptr ? 0 : engaged->value());
+  // The splice engaged, then the mid-body close was accounted as a truncation (engaged, then
+  // exactly one of completed XOR truncated, ticks once per splice decision).
+  test_server_->waitForCounter("cluster.cluster_0.http1_ktls_splice.truncated", testing::Ge(1));
+  EXPECT_GE(test_server_->counter("cluster.cluster_0.http1_ktls_splice.engaged")->value(), 1);
+  EXPECT_EQ(0,
+            test_server_->counter("cluster.cluster_0.http1_ktls_splice.completed") == nullptr
+                ? 0
+                : test_server_->counter("cluster.cluster_0.http1_ktls_splice.completed")->value());
 }
 
 } // namespace

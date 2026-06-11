@@ -1039,7 +1039,14 @@ TEST_F(SpliceCoordinatorTest, CompleteUploadBoundsReached) {
   EXPECT_EQ(0, counter("truncated"));
 }
 
-// #53 complete-truncated (Closed)
+// #53 complete-truncated (Closed). A download truncation force-closes the upstream NoFlush and
+// never re-arms it for reuse, but it MUST reinstall the downstream (sink) file event first.
+// engage() detached both legs, and the upstream NoFlush close cascades the codec reset into the
+// downstream connection, which calls enableFileEvents() on it: on a still-detached leg that is the
+// "Null file_event_" ENVOY_BUG (a debug abort, the crash the fix addresses). The InSequence pins
+// the reinstall BEFORE the close, which is the ordering that keeps the cascade from hitting a null
+// file event. The upstream is the one leg deliberately left detached (it is force-closed, not
+// reused), so its reinstall stays Times(0).
 TEST_F(SpliceCoordinatorTest, CompleteTruncated) {
   initialize();
   ASSERT_TRUE(armDownload());
@@ -1048,10 +1055,14 @@ TEST_F(SpliceCoordinatorTest, CompleteTruncated) {
   ASSERT_TRUE(coord_->engaged());
 
   completion_cb_(TcpProxy::SpliceCompletion::Closed);
-  // Truncation force-closes the upstream NoFlush and does NOT re-arm the legs.
-  EXPECT_CALL(upstream_conn_, close(Network::ConnectionCloseType::NoFlush));
+  {
+    InSequence seq;
+    // The download sink leg is reinstalled before the upstream close cascade can reach it.
+    EXPECT_CALL(downstream_conn_, reinstallFileEvents());
+    EXPECT_CALL(upstream_conn_, close(Network::ConnectionCloseType::NoFlush));
+  }
+  // The upstream is force-closed and never re-armed for reuse.
   EXPECT_CALL(upstream_conn_, reinstallFileEvents()).Times(0);
-  EXPECT_CALL(downstream_conn_, reinstallFileEvents()).Times(0);
   fireFinalize();
   EXPECT_EQ(1, counter("engaged"));
   EXPECT_EQ(1, counter("truncated"));
@@ -1060,7 +1071,8 @@ TEST_F(SpliceCoordinatorTest, CompleteTruncated) {
 
 // #53b complete-truncated-upstream-already-closed: on the truncation path an upstream that is
 // already Closed is not force-closed again, mirroring the BoundsReached leg-closed skip in
-// FinalizeLegClosedSkipRearm. The truncation is still counted.
+// FinalizeLegClosedSkipRearm. The downstream sink is still reinstalled (its guard keys off the
+// downstream being Open, independent of the upstream state). The truncation is still counted.
 TEST_F(SpliceCoordinatorTest, CompleteTruncatedUpstreamAlreadyClosed) {
   initialize();
   ASSERT_TRUE(armDownload());
@@ -1071,6 +1083,8 @@ TEST_F(SpliceCoordinatorTest, CompleteTruncatedUpstreamAlreadyClosed) {
   completion_cb_(TcpProxy::SpliceCompletion::Closed);
   upstream_conn_.state_ = Network::Connection::State::Closed;
   EXPECT_CALL(upstream_conn_, close(_)).Times(0);
+  // The downstream is still Open, so it is reinstalled even though the upstream close is skipped.
+  EXPECT_CALL(downstream_conn_, reinstallFileEvents());
   fireFinalize();
   EXPECT_EQ(1, counter("truncated"));
 }
@@ -1113,7 +1127,11 @@ TEST_F(SpliceCoordinatorTest, CompleteFinalizeDeferred) {
 // G. RESET / re-entrancy
 // ----------------------------------------------------------------------------------------------
 
-// #56 reset-while-engaged
+// #56 reset-while-engaged. An engaged download torn down mid-transfer via reset() reinstalls the
+// downstream (sink) file event BEFORE the upstream NoFlush close, then force-closes the upstream.
+// Same crash-fix rationale as CompleteTruncated: engage() detached both legs, and the upstream
+// close cascade calls enableFileEvents() on the downstream, which is the "Null file_event_"
+// ENVOY_BUG on a detached leg. The InSequence pins the reinstall ahead of the close.
 TEST_F(SpliceCoordinatorTest, ResetWhileEngaged) {
   initialize();
   ASSERT_TRUE(armDownload());
@@ -1121,12 +1139,55 @@ TEST_F(SpliceCoordinatorTest, ResetWhileEngaged) {
   fireEngage();
   ASSERT_TRUE(coord_->engaged());
 
-  EXPECT_CALL(upstream_conn_, close(Network::ConnectionCloseType::NoFlush));
+  {
+    InSequence seq;
+    EXPECT_CALL(downstream_conn_, reinstallFileEvents());
+    EXPECT_CALL(upstream_conn_, close(Network::ConnectionCloseType::NoFlush));
+  }
   coord_->reset();
   EXPECT_FALSE(coord_->engaged());
   EXPECT_EQ(1, counter("truncated"));
   // The latch is set before the close so a re-entrant onResetStream is a no-op.
   EXPECT_TRUE(onResetStreamInProgress());
+}
+
+// #56b reset-download-reinstalls-sink-before-close (LOAD-BEARING crash-fix proof for reset()).
+// This is the unit-level proof that reset()'s download branch reinstalls the detached downstream
+// SINK leg before the upstream is force-closed. The close() stub re-enters reset()'s cascade
+// expectations indirectly: here we record, at the moment the upstream close fires, whether the
+// downstream reinstall has already happened. The mock close() is a no-op (it does not run the real
+// ConnectionImpl cascade), so this asserts the ORDERING the production cascade depends on, the
+// thing that, if reversed, aborts a debug build with "Null file_event_". The upload variant is
+// covered by CompleteErrorRoutesToTruncation (its source leg is reinstalled via
+// maybeReadEnableSource, not this download-only branch), so this case is download-specific by
+// design.
+TEST_F(SpliceCoordinatorTest, ResetDownloadReinstallsSinkBeforeUpstreamClose) {
+  initialize();
+  ASSERT_TRUE(armDownload());
+  coord_->scheduleEngage();
+  fireEngage();
+  ASSERT_TRUE(coord_->engaged());
+
+  bool sink_reinstalled = false;
+  bool reinstalled_before_close = false;
+  ON_CALL(downstream_conn_, reinstallFileEvents()).WillByDefault(Invoke([&]() {
+    sink_reinstalled = true;
+  }));
+  // At the instant the upstream is force-closed, the sink reinstall must already have run,
+  // otherwise the real close cascade would call enableFileEvents() on a null file_event_.
+  ON_CALL(upstream_conn_, close(Network::ConnectionCloseType::NoFlush)).WillByDefault(Invoke([&]() {
+    reinstalled_before_close = sink_reinstalled;
+  }));
+  EXPECT_CALL(downstream_conn_, reinstallFileEvents()).Times(1);
+  EXPECT_CALL(upstream_conn_, close(Network::ConnectionCloseType::NoFlush)).Times(1);
+  // The upstream is force-closed, never re-armed.
+  EXPECT_CALL(upstream_conn_, reinstallFileEvents()).Times(0);
+
+  coord_->reset();
+
+  EXPECT_TRUE(sink_reinstalled);
+  EXPECT_TRUE(reinstalled_before_close);
+  EXPECT_EQ(1, counter("truncated"));
 }
 
 // #57 reset-double-free-guard (LOAD-BEARING).
@@ -1194,6 +1255,9 @@ TEST_F(SpliceCoordinatorTest, ResetIdempotent) {
   ASSERT_TRUE(coord_->engaged());
 
   EXPECT_CALL(upstream_conn_, close(Network::ConnectionCloseType::NoFlush)).Times(1);
+  // The download sink is reinstalled exactly once: the first reset clears the connection refs, so
+  // the second reset's reinstall guard is false.
+  EXPECT_CALL(downstream_conn_, reinstallFileEvents()).Times(1);
   coord_->reset();
   coord_->reset(); // second reset is a no-op: no second close, no second truncated
   EXPECT_EQ(1, counter("truncated"));
