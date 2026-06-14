@@ -90,6 +90,19 @@ int64_t monotonicTimeToNanos(const absl::optional<MonotonicTime>& time,
   return std::chrono::duration_cast<std::chrono::nanoseconds>(time.value() - start_time).count();
 }
 
+// Resolve a dynamic metadata value by filter name and dotted key path. Returns an unset value
+// when the path is absent.
+const Protobuf::Value&
+dynamicMetadataValue(const StreamInfo::StreamInfo& stream_info,
+                     envoy_dynamic_module_type_module_buffer filter_name,
+                     envoy_dynamic_module_type_module_buffer path) {
+  std::string filter_name_str(filter_name.ptr, filter_name.length);
+  std::string path_str(path.ptr, path.length);
+  std::vector<std::string> path_parts = absl::StrSplit(path_str, '.');
+  const auto& metadata = stream_info.dynamicMetadata();
+  return Envoy::Config::Metadata::metadataValue(&metadata, filter_name_str, path_parts);
+}
+
 } // namespace
 
 extern "C" {
@@ -799,26 +812,39 @@ bool envoy_dynamic_module_callback_access_logger_get_dynamic_metadata(
     envoy_dynamic_module_type_module_buffer filter_name,
     envoy_dynamic_module_type_module_buffer path, envoy_dynamic_module_type_envoy_buffer* result) {
   auto* logger = static_cast<ThreadLocalLogger*>(logger_envoy_ptr);
-  std::string filter_name_str(filter_name.ptr, filter_name.length);
-  std::string path_str(path.ptr, path.length);
-  std::vector<std::string> path_parts = absl::StrSplit(path_str, '.');
-
-  const auto& metadata = logger->stream_info_->dynamicMetadata();
-  const auto& value =
-      Envoy::Config::Metadata::metadataValue(&metadata, filter_name_str, path_parts);
-
-  if (value.kind_case() == Protobuf::Value::KIND_NOT_SET) {
-    return false;
-  }
-
-  // Note: Currently only string values are supported. Complex types would require serialization
-  // to a buffer, but the ABI uses zero-copy pointers to Envoy memory.
+  // String values are returned zero-copy here. Numbers and bools have dedicated typed accessors.
+  const auto& value = dynamicMetadataValue(*logger->stream_info_, filter_name, path);
   if (value.kind_case() == Protobuf::Value::kStringValue) {
     const auto& str = value.string_value();
     *result = {const_cast<char*>(str.data()), str.size()};
     return true;
   }
+  return false;
+}
 
+bool envoy_dynamic_module_callback_access_logger_get_dynamic_metadata_number(
+    envoy_dynamic_module_type_access_logger_envoy_ptr logger_envoy_ptr,
+    envoy_dynamic_module_type_module_buffer filter_name,
+    envoy_dynamic_module_type_module_buffer path, double* result) {
+  auto* logger = static_cast<ThreadLocalLogger*>(logger_envoy_ptr);
+  const auto& value = dynamicMetadataValue(*logger->stream_info_, filter_name, path);
+  if (value.kind_case() == Protobuf::Value::kNumberValue) {
+    *result = value.number_value();
+    return true;
+  }
+  return false;
+}
+
+bool envoy_dynamic_module_callback_access_logger_get_dynamic_metadata_bool(
+    envoy_dynamic_module_type_access_logger_envoy_ptr logger_envoy_ptr,
+    envoy_dynamic_module_type_module_buffer filter_name,
+    envoy_dynamic_module_type_module_buffer path, bool* result) {
+  auto* logger = static_cast<ThreadLocalLogger*>(logger_envoy_ptr);
+  const auto& value = dynamicMetadataValue(*logger->stream_info_, filter_name, path);
+  if (value.kind_case() == Protobuf::Value::kBoolValue) {
+    *result = value.bool_value();
+    return true;
+  }
   return false;
 }
 
