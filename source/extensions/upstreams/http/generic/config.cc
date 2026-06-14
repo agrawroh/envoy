@@ -3,6 +3,7 @@
 #include "source/extensions/upstreams/http/http/upstream_request.h"
 #include "source/extensions/upstreams/http/tcp/upstream_request.h"
 #include "source/extensions/upstreams/http/udp/upstream_request.h"
+#include "source/extensions/upstreams/http/web_transport/upstream_request.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -29,6 +30,10 @@ Router::GenericConnPoolPtr GenericGenericConnPoolFactory::createGenericConnPool(
     return (conn_pool->valid() ? std::move(conn_pool) : nullptr);
   case UpstreamProtocol::UDP:
     conn_pool = std::make_unique<Upstreams::Http::Udp::UdpConnPool>(host);
+    return (conn_pool->valid() ? std::move(conn_pool) : nullptr);
+  case UpstreamProtocol::WEBTRANSPORT:
+    conn_pool = std::make_unique<Upstreams::Http::WebTransport::WebTransportConnPool>(
+        host, thread_local_cluster, priority, downstream_protocol, ctx);
     return (conn_pool->valid() ? std::move(conn_pool) : nullptr);
   }
 

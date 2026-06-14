@@ -1,0 +1,165 @@
+#include "source/extensions/upstreams/http/web_transport/web_transport_relay.h"
+
+#include <algorithm>
+#include <array>
+
+namespace Envoy {
+namespace Extensions {
+namespace Upstreams {
+namespace Http {
+namespace WebTransport {
+
+namespace {
+// Matches the QUICHE default stream read budget. Reads larger than this are split across pumps.
+constexpr size_t MaxStreamReadSize = 16 * 1024;
+// Error code relayed to a peer when its counterpart stream is gone.
+constexpr uint32_t StreamGoneErrorCode = 0;
+} // namespace
+
+WebTransportStreamRelay::WebTransportStreamRelay(WebTransportRelay& owner,
+                                                 Envoy::Http::WebTransportStream& incoming,
+                                                 Envoy::Http::WebTransportStream& mirror)
+    : owner_(owner), incoming_(incoming), mirror_(mirror), incoming_end_(*this, true),
+      mirror_end_(*this, false) {
+  incoming_.setWebTransportStreamCallbacks(&incoming_end_);
+  mirror_.setWebTransportStreamCallbacks(&mirror_end_);
+  // Drain anything already buffered on the incoming stream.
+  pump(true);
+}
+
+WebTransportStreamRelay::~WebTransportStreamRelay() {
+  incoming_.setWebTransportStreamCallbacks(nullptr);
+  mirror_.setWebTransportStreamCallbacks(nullptr);
+}
+
+void WebTransportStreamRelay::notifyActivity() { owner_.signalActivity(); }
+
+void WebTransportStreamRelay::pump(bool from_incoming) {
+  Envoy::Http::WebTransportStream& source = stream(from_incoming);
+  Envoy::Http::WebTransportStream& destination = stream(!from_incoming);
+  std::string& pending = from_incoming ? incoming_pending_ : mirror_pending_;
+  bool& pending_fin = from_incoming ? incoming_pending_fin_ : mirror_pending_fin_;
+  bool& done = from_incoming ? incoming_done_ : mirror_done_;
+  if (done) {
+    return;
+  }
+
+  // Flush bytes held from an earlier blocked write before reading more.
+  if (!pending.empty()) {
+    if (!destination.canWriteWebTransportStream() ||
+        !destination.writeWebTransportStream(pending, pending_fin)) {
+      return;
+    }
+    pending.clear();
+    if (pending_fin) {
+      done = true;
+      return;
+    }
+  }
+
+  // Read only while the destination can write. QUICHE accepts a write in full once it reports it
+  // can write, so the held bytes above are a defensive fallback the normal path does not reach.
+  std::array<char, MaxStreamReadSize> buffer;
+  while (destination.canWriteWebTransportStream()) {
+    Envoy::Http::WebTransportStreamReadResult result =
+        source.readWebTransportStream(absl::MakeSpan(buffer));
+    if (result.bytes_read == 0 && !result.end_stream) {
+      return;
+    }
+    absl::string_view data(buffer.data(), result.bytes_read);
+    if (!destination.writeWebTransportStream(data, result.end_stream)) {
+      // Hold the bytes and the end flag until the destination can write again.
+      pending.assign(data.data(), data.size());
+      pending_fin = result.end_stream;
+      return;
+    }
+    if (result.end_stream) {
+      done = true;
+      return;
+    }
+  }
+}
+
+void WebTransportStreamRelay::onReset(bool on_incoming, uint32_t error_code) {
+  stream(!on_incoming).resetWebTransportStream(error_code);
+  // A reset tears down both directions, so the pair is finished and the owner can reclaim it.
+  incoming_done_ = true;
+  mirror_done_ = true;
+}
+
+void WebTransportStreamRelay::onStopSending(bool on_incoming, uint32_t error_code) {
+  stream(!on_incoming).stopSendingWebTransportStream(error_code);
+}
+
+WebTransportRelay::WebTransportRelay(Envoy::Http::WebTransportSession& downstream,
+                                     Envoy::Http::WebTransportSession& upstream,
+                                     Callbacks& callbacks)
+    : callbacks_(callbacks), downstream_side_(*this, Direction::Downstream),
+      upstream_side_(*this, Direction::Upstream), downstream_(&downstream), upstream_(&upstream) {
+  downstream_->setWebTransportSessionCallbacks(&downstream_side_);
+  upstream_->setWebTransportSessionCallbacks(&upstream_side_);
+  ENVOY_LOG(debug, "WebTransport relay established");
+}
+
+WebTransportRelay::~WebTransportRelay() {
+  if (downstream_ != nullptr) {
+    downstream_->setWebTransportSessionCallbacks(nullptr);
+  }
+  if (upstream_ != nullptr) {
+    upstream_->setWebTransportSessionCallbacks(nullptr);
+  }
+}
+
+void WebTransportRelay::forwardDatagram(Direction from, absl::string_view datagram) {
+  Envoy::Http::WebTransportSession* peer = from == Direction::Downstream ? upstream_ : downstream_;
+  if (peer != nullptr) {
+    peer->sendWebTransportDatagram(datagram);
+    callbacks_.onDatagramRelayed();
+  }
+}
+
+void WebTransportRelay::relayStream(Direction from, Envoy::Http::WebTransportStream& incoming,
+                                    bool bidirectional) {
+  // Reclaim finished relays so a peer that opens and closes streams cannot grow the list without
+  // bound. Safe here because this runs from a session incoming-stream callback, not from inside a
+  // relayed stream's own callback.
+  stream_relays_.erase(std::remove_if(stream_relays_.begin(), stream_relays_.end(),
+                                      [](const auto& relay) { return relay->finished(); }),
+                       stream_relays_.end());
+  Envoy::Http::WebTransportSession* peer = from == Direction::Downstream ? upstream_ : downstream_;
+  if (peer == nullptr || !peer->canOpenWebTransportStream(bidirectional)) {
+    // The peer session is gone or cannot open a stream now, so reject this one.
+    incoming.resetWebTransportStream(StreamGoneErrorCode);
+    return;
+  }
+  Envoy::Http::WebTransportStream* mirror = peer->openWebTransportStream(bidirectional);
+  if (mirror == nullptr) {
+    incoming.resetWebTransportStream(StreamGoneErrorCode);
+    return;
+  }
+  stream_relays_.push_back(std::make_unique<WebTransportStreamRelay>(*this, incoming, *mirror));
+  signalActivity();
+}
+
+void WebTransportRelay::onSessionClosed(Direction which) {
+  // Tear down the stream relays now, while the closing session's stream adapters are still alive,
+  // so the per-stream End callbacks detach cleanly.
+  stream_relays_.clear();
+  Envoy::Http::WebTransportSession*& closed = session(which);
+  if (closed != nullptr) {
+    // Detach so a late event cannot reach the relay after the session closes, and drop the pointer
+    // so the relay stops forwarding to it.
+    closed->setWebTransportSessionCallbacks(nullptr);
+    closed = nullptr;
+  }
+  if (!notified_) {
+    notified_ = true;
+    callbacks_.onRelayClosed();
+  }
+}
+
+} // namespace WebTransport
+} // namespace Http
+} // namespace Upstreams
+} // namespace Extensions
+} // namespace Envoy

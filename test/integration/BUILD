@@ -2837,6 +2837,7 @@ envoy_cc_test(
     ],
     deps = envoy_select_enable_http3([
         ":quic_http_integration_test_lib",
+        "//envoy/http:web_transport_interface",
         "//source/extensions/filters/http/web_transport:config",
     ]),
 )

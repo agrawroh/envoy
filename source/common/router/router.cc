@@ -998,6 +998,9 @@ GenericConnPoolPtr Filter::createConnPool(Upstream::ThreadLocalCluster& cluster,
     auto method = downstream_headers_->getMethodValue();
     if (Http::HeaderUtility::isConnectUdpRequest(*downstream_headers_)) {
       upstream_protocol = UpstreamProtocol::UDP;
+    } else if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.web_transport") &&
+               Http::HeaderUtility::isWebTransportConnectRequest(*downstream_headers_)) {
+      upstream_protocol = UpstreamProtocol::WEBTRANSPORT;
     } else if (method == Http::Headers::get().MethodValues.Connect ||
                (route_entry_->connectConfig()->allow_post() &&
                 method == Http::Headers::get().MethodValues.Post)) {

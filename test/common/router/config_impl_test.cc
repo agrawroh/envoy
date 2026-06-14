@@ -10547,6 +10547,26 @@ virtual_hosts:
   EXPECT_EQ(creation_status_.message(), "Non-CONNECT upgrade type Websocket has ConnectConfig");
 }
 
+TEST_F(RouteConfigurationV2, WebTransportConnectConfig) {
+  const std::string yaml = R"EOF(
+virtual_hosts:
+  - name: webtransport
+    domains: [idle.lyft.com]
+    routes:
+      - match:
+          connect_matcher: {}
+        route:
+          cluster: some-cluster
+          upgrade_configs:
+            - upgrade_type: webtransport
+              connect_config: {}
+  )EOF";
+  factory_context_.cluster_manager_.initializeClusters({"some-cluster"}, {});
+  TestConfigImpl give_me_a_name(parseRouteConfigurationFromYaml(yaml), factory_context_, true,
+                                creation_status_);
+  EXPECT_TRUE(creation_status_.ok());
+}
+
 TEST_F(RouteConfigurationV2, ConnectProxy) {
   const std::string yaml = R"EOF(
 virtual_hosts:

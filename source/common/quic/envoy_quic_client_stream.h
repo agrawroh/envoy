@@ -16,6 +16,8 @@
 namespace Envoy {
 namespace Quic {
 
+class EnvoyQuicClientWebTransportSession;
+
 // This class is a quic stream and also a request encoder.
 class EnvoyQuicClientStream : public quic::QuicSpdyClientStream,
                               public EnvoyQuicStream,
@@ -25,6 +27,8 @@ public:
   EnvoyQuicClientStream(quic::QuicStreamId id, quic::QuicSpdyClientSession* client_session,
                         quic::StreamType type, Http::Http3::CodecStats& stats,
                         const envoy::config::core::v3::Http3ProtocolOptions& http3_options);
+  // Defined out of line so the WebTransport session unique_ptr sees a complete type.
+  ~EnvoyQuicClientStream() override;
 
   void setResponseDecoder(Http::ResponseDecoder& decoder);
 
@@ -32,6 +36,7 @@ public:
   Http::Http1StreamEncoderOptionsOptRef http1StreamEncoderOptions() override {
     return absl::nullopt;
   }
+  OptRef<Http::WebTransportSession> webTransport() override;
 
   // Http::RequestEncoder
   Http::Status encodeHeaders(const Http::RequestHeaderMap& headers, bool end_stream) override;
@@ -109,6 +114,10 @@ private:
   Http::ResponseDecoderHandlePtr response_decoder_handle_;
   Http::ResponseDecoder* response_decoder_{nullptr};
   bool decoded_1xx_{false};
+  // Lazily created when the upstream requests the WebTransport session for a WebTransport CONNECT.
+  // This derived-class member destructs before the base-class QUICHE session that owns the visitor,
+  // so the destructor can safely detach the visitor.
+  std::unique_ptr<EnvoyQuicClientWebTransportSession> web_transport_session_;
 
   // When an HTTP Upgrade is requested, this contains the protocol upgrade type, e.g. "websocket".
   // It will be empty, when no such request is active.

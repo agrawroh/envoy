@@ -167,6 +167,16 @@ public:
     return inner_encoder_->http1StreamEncoderOptions();
   }
 
+  OptRef<WebTransportSession> webTransport() override {
+    ASSERT(inner_encoder_);
+    return inner_encoder_->webTransport();
+  }
+
+  void setWebTransportConnectReadyCallback(std::function<void()> callback) override {
+    ASSERT(inner_encoder_);
+    inner_encoder_->setWebTransportConnectReadyCallback(std::move(callback));
+  }
+
 protected:
   RequestEncoderWrapper(RequestEncoder* inner) : inner_encoder_(inner) {}
 

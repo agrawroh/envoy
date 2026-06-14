@@ -118,6 +118,9 @@ public:
   Http::Http1StreamEncoderOptionsOptRef http1StreamEncoderOptions() {
     return encoder_.http1StreamEncoderOptions();
   }
+  // Returns the WebTransport session for a WebTransport CONNECT, or nullopt otherwise. Lets a test
+  // act as a WebTransport server by claiming the session before encoding the 200.
+  OptRef<Http::WebTransportSession> webTransport() { return encoder_.webTransport(); }
   void
   sendLocalReply(Http::Code code, absl::string_view body,
                  const std::function<void(Http::ResponseHeaderMap& headers)>& /*modify_headers*/,

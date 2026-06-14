@@ -8,10 +8,13 @@
 namespace Envoy {
 namespace Quic {
 
-// Stats for WebTransport over HTTP/3 sessions. These live in their own webtransport sub-scope, a
-// peer of the http3 codec scope. sessions_total counts accepted sessions, sessions_rejected counts
-// sessions refused by the per-connection limit, and sessions_unclaimed counts negotiated `CONNECTs`
-// that reached a 2xx with no filter to terminate them. @see stats_macros.h
+// Stats for WebTransport over HTTP/3 sessions. These live in their own webtransport sub-scope. On a
+// terminating listener they live under the listener scope and count sessions ending here and
+// datagrams to and from the client. On a proxying cluster they live under the cluster scope and
+// count relayed sessions and datagrams forwarded each way. sessions_total counts accepted or
+// relayed sessions, sessions_rejected counts sessions refused by the per-connection limit or by the
+// relay, and sessions_unclaimed counts negotiated `CONNECTs` that reached a 2xx with no filter to
+// terminate them. @see stats_macros.h
 #define ALL_WEB_TRANSPORT_STATS(COUNTER, GAUGE)                                                    \
   COUNTER(sessions_total)                                                                          \
   COUNTER(sessions_rejected)                                                                       \

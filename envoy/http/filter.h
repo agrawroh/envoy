@@ -277,6 +277,10 @@ public:
   // response data from the upstream stream once it is established.
   virtual void
   setUpstreamToDownstream(Router::UpstreamToDownstream& upstream_to_downstream_interface) PURE;
+
+  // Reset the downstream stream idle timer when a relayed WebTransport session sees activity, so a
+  // busy proxied session is not reaped. The default is a no-op for non-WebTransport streams.
+  virtual void onWebTransportActivity() {}
 };
 
 /**

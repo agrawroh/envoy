@@ -79,6 +79,12 @@ public:
     const Http::ConnectionPool::Instance::StreamOptions& upstreamStreamOptions() const override {
       return filter_.callbacks_->upstreamCallbacks()->upstreamStreamOptions();
     }
+    OptRef<Http::WebTransportSession> webTransport() override {
+      return filter_.callbacks_->webTransport();
+    }
+    void onWebTransportActivity() override {
+      filter_.callbacks_->upstreamCallbacks()->onWebTransportActivity();
+    }
 
   private:
     void maybeEndDecode(bool end_stream);
