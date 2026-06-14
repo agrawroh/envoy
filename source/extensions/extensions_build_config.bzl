@@ -227,6 +227,7 @@ EXTENSIONS = {
     "envoy.filters.http.sse_to_metadata":               "//source/extensions/filters/http/sse_to_metadata:config",
     "envoy.filters.http.header_mutation":               "//source/extensions/filters/http/header_mutation:config",
     "envoy.filters.http.transform":                     "//source/extensions/filters/http/transform:config",
+    "envoy.filters.http.web_transport":                 "//source/extensions/filters/http/web_transport:config",
 
     #
     # Listener filters

@@ -267,20 +267,32 @@ public:
     quic_connection_ = connection.get();
     ASSERT(quic_connection_persistent_info_ != nullptr);
     OptRef<Http::HttpServerPropertiesCache> cache;
-    auto session = std::make_unique<EnvoyQuicClientSession>(
+    quic::QuicServerId server_id{
+        (host.empty() ? transport_socket_factory_->clientContextConfig()->serverNameIndication()
+                      : host),
+        static_cast<uint16_t>(port)};
+    return makeClientSession(persistent_info, std::move(connection), wrapper, migration_helper,
+                             server_id, cache);
+  }
+
+  // Creates the client session. Overridable so a test can substitute a session subclass, for
+  // example one that advertises WebTransport support.
+  virtual std::unique_ptr<EnvoyQuicClientSession>
+  makeClientSession(PersistentQuicInfoImpl& persistent_info,
+                    std::unique_ptr<EnvoyQuicClientConnection> connection,
+                    quic::QuicForceBlockablePacketWriter* wrapper,
+                    EnvoyQuicClientConnection::EnvoyQuicMigrationHelper* migration_helper,
+                    const quic::QuicServerId& server_id,
+                    OptRef<Http::HttpServerPropertiesCache> cache) {
+    return std::make_unique<EnvoyQuicClientSession>(
         persistent_info.quic_config_, supported_versions_, std::move(connection), wrapper,
-        migration_helper, migration_config_,
-        quic::QuicServerId{
-            (host.empty() ? transport_socket_factory_->clientContextConfig()->serverNameIndication()
-                          : host),
-            static_cast<uint16_t>(port)},
+        migration_helper, migration_config_, server_id,
         transport_socket_factory_->getCryptoConfig(), *dispatcher_,
         // Use smaller window than the default one to have test coverage of client codec buffer
         // exceeding high watermark.
         /*send_buffer_limit=*/2 * Http2::Utility::OptionsLimits::MIN_INITIAL_STREAM_WINDOW_SIZE,
         persistent_info.crypto_stream_factory_, quic_stat_names_, cache, *stats_store_.rootScope(),
         nullptr, *transport_socket_factory_);
-    return session;
   }
 
   IntegrationCodecClientPtr makeRawHttpConnection(

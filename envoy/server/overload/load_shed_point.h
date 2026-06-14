@@ -55,6 +55,10 @@ public:
   // which will eventually drain the HPPT/3 connection.
   const std::string H3ServerGoAwayOnDispatch =
       "envoy.load_shed_points.http3_server_go_away_on_dispatch";
+
+  // Envoy will refuse a new WebTransport session on an HTTP/3 connection when it is under pressure.
+  const std::string WebTransportAcceptSession =
+      "envoy.load_shed_points.web_transport_accept_session";
 };
 
 using LoadShedPointName = ConstSingleton<LoadShedPointNameValues>;

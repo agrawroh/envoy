@@ -14,6 +14,8 @@
 namespace Envoy {
 namespace Quic {
 
+class EnvoyQuicWebTransportSession;
+
 // This class is a quic stream and also a response encoder.
 class EnvoyQuicServerStream : public quic::QuicSpdyServerStreamBase,
                               public EnvoyQuicStream,
@@ -25,6 +27,8 @@ public:
                         const envoy::config::core::v3::Http3ProtocolOptions& http3_options,
                         envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
                             headers_with_underscores_action);
+  // Defined out of line so the WebTransport session unique_ptr sees a complete type.
+  ~EnvoyQuicServerStream() override;
 
   void setRequestDecoder(Http::RequestDecoder& decoder) override {
     request_decoder_ = decoder.getRequestDecoderHandle();
@@ -34,10 +38,12 @@ public:
   // Http::StreamEncoder
   void encode1xxHeaders(const Http::ResponseHeaderMap& headers) override;
   void encodeHeaders(const Http::ResponseHeaderMap& headers, bool end_stream) override;
+  void encodeData(Buffer::Instance& data, bool end_stream) override;
   void encodeTrailers(const Http::ResponseTrailerMap& trailers) override;
   Http::Http1StreamEncoderOptionsOptRef http1StreamEncoderOptions() override {
     return absl::nullopt;
   }
+  OptRef<Http::WebTransportSession> webTransport() override;
   bool streamErrorOnInvalidHttpMessage() const override {
     return http3_options_.override_stream_error_on_invalid_http_message().value();
   }
@@ -124,6 +130,14 @@ private:
 #endif
 
   Http::RequestDecoderHandlePtr request_decoder_;
+  // Lazily created when a filter requests the WebTransport session for a WebTransport CONNECT. This
+  // derived-class member destructs before the base-class QUICHE session that owns the visitor, so
+  // the destructor can safely detach the visitor.
+  std::unique_ptr<EnvoyQuicWebTransportSession> web_transport_session_;
+  // Whether this stream reserved a slot against the connection WebTransport session cap.
+  bool web_transport_session_reserved_{false};
+  // Set when a non-2xx response rejects a WebTransport CONNECT, so the response body is dropped.
+  bool web_transport_reject_{false};
   envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
       headers_with_underscores_action_;
 

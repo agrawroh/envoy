@@ -37,6 +37,13 @@ public:
   Http::Status encodeHeaders(const Http::RequestHeaderMap& headers, bool end_stream) override;
   void encodeTrailers(const Http::RequestTrailerMap& trailers) override;
   void enableTcpTunneling() override {}
+  void setWebTransportConnectReadyCallback(std::function<void()> callback) override {
+    web_transport_connect_ready_cb_ = std::move(callback);
+  }
+
+  // Replays a WebTransport CONNECT that was buffered until the peer SETTINGS arrived. Called by the
+  // session from OnSettingsFrame.
+  void onWebTransportSettingsReceived();
 
   // Http::Stream
   void resetStream(Http::StreamResetReason reason) override;
@@ -106,6 +113,16 @@ private:
   // When an HTTP Upgrade is requested, this contains the protocol upgrade type, e.g. "websocket".
   // It will be empty, when no such request is active.
   std::string upgrade_protocol_;
+
+  // A WebTransport CONNECT buffered until the peer SETTINGS arrive, replayed from
+  // onWebTransportSettingsReceived. Null when no CONNECT is waiting.
+  Http::RequestHeaderMapPtr deferred_web_transport_connect_headers_;
+  bool deferred_web_transport_connect_end_stream_{false};
+  // True while replaying a buffered CONNECT, so it stays a WebTransport CONNECT across a runtime
+  // guard flip.
+  bool replaying_web_transport_connect_{false};
+  // Invoked once the WebTransport CONNECT has been written so the proxy can set up relaying.
+  std::function<void()> web_transport_connect_ready_cb_;
 };
 
 } // namespace Quic

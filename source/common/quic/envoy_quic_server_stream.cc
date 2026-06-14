@@ -13,9 +13,11 @@
 #include "source/common/http/utility.h"
 #include "source/common/quic/envoy_quic_server_session.h"
 #include "source/common/quic/envoy_quic_utils.h"
+#include "source/common/quic/envoy_quic_web_transport_session.h"
 #include "source/common/quic/quic_stats_gatherer.h"
 #include "source/common/runtime/runtime_features.h"
 
+#include "absl/strings/match.h"
 #include "quiche/common/http/http_header_block.h"
 #include "quiche/quic/core/http/quic_header_list.h"
 #include "quiche/quic/core/quic_session.h"
@@ -52,6 +54,8 @@ EnvoyQuicServerStream::EnvoyQuicServerStream(
   }
 }
 
+EnvoyQuicServerStream::~EnvoyQuicServerStream() = default;
+
 void EnvoyQuicServerStream::encode1xxHeaders(const Http::ResponseHeaderMap& headers) {
   ASSERT(Http::HeaderUtility::isSpecial1xx(headers));
   encodeHeaders(headers, false);
@@ -82,13 +86,39 @@ void EnvoyQuicServerStream::encodeHeaders(const Http::ResponseHeaderMap& headers
   // This is counting not serialized bytes in the send buffer.
   local_end_stream_ = end_stream;
   SendBufferMonitor::ScopedWatermarkBufferUpdater updater(this, this);
+  size_t bytes_sent = 0;
   {
     IncrementalBytesSentTracker tracker(*this, *mutableBytesMeter(), true);
     quiche::HttpHeaderBlock header_block = envoyHeadersToHttp2HeaderBlock(*header_map);
     addDecompressedHeaderBytesSent(header_block);
-    size_t bytes_sent = WriteHeaders(std::move(header_block), end_stream, nullptr);
+    bytes_sent = WriteHeaders(std::move(header_block), end_stream, nullptr);
     stats_gatherer_->addBytesSent(bytes_sent, end_stream);
     ENVOY_BUG(bytes_sent != 0, "Failed to encode headers.");
+  }
+
+  // Handle the final response to a negotiated WebTransport CONNECT. web_transport() is non-null
+  // only for such a stream, and an interim 1xx is not the final response so it falls through.
+  if (bytes_sent != 0 && web_transport() != nullptr && !end_stream &&
+      !absl::StartsWith(headers.getStatusValue(), "1")) {
+    const bool is_2xx = absl::StartsWith(headers.getStatusValue(), "2");
+    if (is_2xx && web_transport_session_ != nullptr && web_transport_session_->claimed()) {
+      // A filter claimed the session and accepted it with a 2xx.
+      web_transport_session_->accept();
+    } else if (is_2xx) {
+      // A 2xx reached a negotiated CONNECT that no filter claimed (opted-in route with no
+      // WebTransport filter). Reset rather than leave a half-open session.
+      static_cast<EnvoyQuicServerSession*>(session())
+          ->webTransportStats()
+          .sessions_unclaimed_.inc();
+      // Reset() runs OnClose() synchronously and destroys this stream, so return before touching
+      // any member.
+      Reset(quic::QUIC_STREAM_CANCELLED);
+      return;
+    } else {
+      // A non-2xx rejects the session. The response must be body-less because the client capsule
+      // parser would reject a payload.
+      web_transport_reject_ = true;
+    }
   }
 
   if (local_end_stream_) {
@@ -97,6 +127,39 @@ void EnvoyQuicServerStream::encodeHeaders(const Http::ResponseHeaderMap& headers
     }
     onLocalEndStream();
   }
+}
+
+OptRef<Http::WebTransportSession> EnvoyQuicServerStream::webTransport() {
+  // QUICHE only mints the session for a negotiated WebTransport CONNECT.
+  if (web_transport() == nullptr) {
+    return {};
+  }
+  if (web_transport_session_ == nullptr) {
+    auto& connection = *static_cast<EnvoyQuicServerSession*>(session());
+    // Refuse the session when over the per-connection cap or when the connection is shedding load.
+    const bool rejected =
+        connection.webTransportSessionLimitReached() || connection.webTransportSheddingLoad();
+    if (rejected) {
+      connection.webTransportStats().sessions_rejected_.inc();
+    } else {
+      // Reserve a slot against the per-connection cap now, in lockstep with the limit check, and
+      // release it when the stream closes.
+      connection.onWebTransportSessionOpened();
+      web_transport_session_reserved_ = true;
+    }
+    web_transport_session_ = std::make_unique<EnvoyQuicWebTransportSession>(
+        web_transport(), connection.webTransportStats(), rejected,
+        connection.maxWebTransportStreamsPerSession());
+  }
+  return *web_transport_session_;
+}
+
+void EnvoyQuicServerStream::encodeData(Buffer::Instance& data, bool end_stream) {
+  if (web_transport_reject_) {
+    // A WebTransport CONNECT reject is body-less. Drop the body but keep the stream end.
+    data.drain(data.length());
+  }
+  EnvoyQuicStream::encodeData(data, end_stream);
 }
 
 void EnvoyQuicServerStream::encodeTrailers(const Http::ResponseTrailerMap& trailers) {
@@ -218,8 +281,10 @@ void EnvoyQuicServerStream::OnInitialHeadersComplete(bool fin, size_t frame_len,
 #endif
 
 #ifdef ENVOY_ENABLE_HTTP_DATAGRAMS
-  if (Http::HeaderUtility::isCapsuleProtocol(*headers) ||
-      Http::HeaderUtility::isConnectUdpRequest(*headers)) {
+  // A WebTransport CONNECT already has QUICHE registered as the stream datagram visitor, so skip
+  // capsule setup to avoid a double registration even if the request carries a capsule header.
+  if (web_transport() == nullptr && (Http::HeaderUtility::isCapsuleProtocol(*headers) ||
+                                     Http::HeaderUtility::isConnectUdpRequest(*headers))) {
     useCapsuleProtocol();
     // HTTP/3 Datagrams sent over CONNECT-UDP are already congestion controlled, so make it bypass
     // the default Datagram queue.
@@ -439,6 +504,10 @@ void EnvoyQuicServerStream::CloseWriteSide() {
 }
 
 void EnvoyQuicServerStream::OnClose() {
+  if (web_transport_session_reserved_) {
+    web_transport_session_reserved_ = false;
+    static_cast<EnvoyQuicServerSession*>(session())->onWebTransportSessionClosed();
+  }
   destroy();
   quic::QuicSpdyServerStreamBase::OnClose();
   if (isDoingWatermarkAccounting()) {

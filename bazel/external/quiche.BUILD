@@ -5504,6 +5504,7 @@ envoy_cc_library(
     ],
     copts = quiche_copts,
     repository = "@envoy",
+    visibility = ["//visibility:public"],
     deps = [
         ":common_http_http_header_block_lib",
         ":quiche_common_callbacks",
@@ -5512,6 +5513,32 @@ envoy_cc_library(
         ":quiche_common_quiche_vectorized_io_utils_lib",
         ":quiche_common_status_utils",
         ":quiche_common_structured_headers_lib",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/time",
+        "@abseil-cpp//absl/types:span",
+    ],
+)
+
+envoy_quic_cc_test_library(
+    name = "quiche_web_transport_test_tools_lib",
+    srcs = ["quiche/web_transport/complete_buffer_visitor.cc"],
+    hdrs = [
+        "quiche/quic/tools/web_transport_test_visitors.h",
+        "quiche/web_transport/complete_buffer_visitor.h",
+        "quiche/web_transport/stream_helpers.h",
+        "quiche/web_transport/test_tools/mock_web_transport.h",
+    ],
+    deps = [
+        ":quic_core_web_transport_interface_lib",
+        ":quic_platform_base",
+        ":quiche_common_buffer_allocator_lib",
+        ":quiche_common_callbacks",
+        ":quiche_common_circular_deque_lib",
+        ":quiche_common_mem_slice",
+        ":quiche_common_platform_export",
+        ":quiche_common_platform_test",
+        ":quiche_web_transport_web_transport_lib",
+        "@abseil-cpp//absl/status",
         "@abseil-cpp//absl/strings",
         "@abseil-cpp//absl/time",
         "@abseil-cpp//absl/types:span",

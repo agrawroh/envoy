@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 
@@ -144,6 +145,14 @@ public:
    * Enable TCP Tunneling.
    */
   virtual void enableTcpTunneling() PURE;
+
+  /**
+   * Register a callback invoked once the WebTransport extended CONNECT has been written. An HTTP/3
+   * upstream that has not yet received the peer SETTINGS defers the CONNECT until they arrive, so
+   * the callback may run asynchronously. Once it runs, webTransport() reflects whether the upstream
+   * negotiated WebTransport. Defaulted so only the HTTP/3 stream overrides it.
+   */
+  virtual void setWebTransportConnectReadyCallback(std::function<void()>) {}
 };
 
 /**

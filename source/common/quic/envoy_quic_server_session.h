@@ -11,6 +11,7 @@
 #include "source/common/quic/quic_filter_manager_connection_impl.h"
 #include "source/common/quic/quic_stat_names.h"
 #include "source/common/quic/send_buffer_monitor.h"
+#include "source/common/quic/web_transport_stats.h"
 
 #include "quiche/quic/core/http/quic_server_session_base.h"
 #include "quiche/quic/core/quic_crypto_server_stream.h"
@@ -92,6 +93,16 @@ public:
     should_send_go_away_on_dispatch_ = should_send_go_away_on_dispatch;
   }
 
+  void setWebTransportAcceptLoadShedPoint(Server::LoadShedPoint* web_transport_accept) {
+    web_transport_accept_load_shed_point_ = web_transport_accept;
+  }
+
+  // Whether the connection is shedding load, so a new WebTransport session should be refused.
+  bool webTransportSheddingLoad() {
+    return web_transport_accept_load_shed_point_ != nullptr &&
+           web_transport_accept_load_shed_point_->shouldShedLoad();
+  }
+
   // quic::QuicSession
   void OnConnectionClosed(const quic::QuicConnectionCloseFrame& frame,
                           quic::ConnectionCloseSource source) override;
@@ -131,6 +142,23 @@ public:
 
   using quic::QuicSession::PerformActionOnActiveStreams;
 
+  // WebTransport stats for this connection, in the webtransport sub-scope.
+  WebTransportStats& webTransportStats() {
+    return WebTransportStats::atomicGet(web_transport_stats_, stats_scope_);
+  }
+
+  // Per-connection WebTransport session accounting. A new session is refused once the active count
+  // reaches the cap.
+  bool webTransportSessionLimitReached() const {
+    return active_web_transport_sessions_ >= max_web_transport_sessions_;
+  }
+  void onWebTransportSessionOpened() { ++active_web_transport_sessions_; }
+  void onWebTransportSessionClosed() { --active_web_transport_sessions_; }
+  // Per-session WebTransport stream cap. Zero means no Envoy level limit.
+  uint32_t maxWebTransportStreamsPerSession() const {
+    return max_web_transport_streams_per_session_;
+  }
+
 protected:
   // quic::QuicServerSessionBase
   std::unique_ptr<quic::QuicCryptoServerStreamBase>
@@ -144,6 +172,14 @@ protected:
   quic::QuicSpdyStream* CreateOutgoingBidirectionalStream() override;
 
   quic::HttpDatagramSupport LocalHttpDatagramSupport() override { return http_datagram_support_; }
+
+  // quic::QuicSpdySession
+  // Advertises WebTransport only when it is latched on in setHttp3Options(). Flag flips apply to
+  // new connections only.
+  quic::WebTransportHttp3VersionSet LocallySupportedWebTransportVersions() const override {
+    return web_transport_enabled_ ? quic::kDefaultSupportedWebTransportVersions
+                                  : quic::WebTransportHttp3VersionSet();
+  }
 
   // QuicFilterManagerConnectionImpl
   bool hasDataToWrite() override;
@@ -173,10 +209,20 @@ private:
   absl::optional<ConnectionMapPosition> position_;
   QuicConnectionStats& connection_stats_;
   quic::HttpDatagramSupport http_datagram_support_ = quic::HttpDatagramSupport::kNone;
+  // Whether to advertise WebTransport support, latched once in setHttp3Options().
+  bool web_transport_enabled_ = false;
+  // Maximum concurrent WebTransport sessions per connection, latched in setHttp3Options().
+  uint32_t max_web_transport_sessions_ = 16;
+  // Maximum concurrent WebTransport streams per session, latched in setHttp3Options(). Zero means
+  // no Envoy level limit.
+  uint32_t max_web_transport_streams_per_session_ = 0;
+  uint32_t active_web_transport_sessions_ = 0;
+  WebTransportStats::AtomicPtr web_transport_stats_;
   std::unique_ptr<quic::QuicConnectionDebugVisitor> debug_visitor_;
   // Load shed points for H3 GoAway
   Server::LoadShedPoint* should_send_go_away_and_close_on_dispatch_ = nullptr;
   Server::LoadShedPoint* should_send_go_away_on_dispatch_ = nullptr;
+  Server::LoadShedPoint* web_transport_accept_load_shed_point_ = nullptr;
   Http::SessionIdleListInterface* session_idle_list_;
   bool h3_go_away_sent_ = false;
   bool on_connection_closed_called_ = false;
