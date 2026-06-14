@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.http.web_transport.v3;
+
+import "xds/annotations/v3/status.proto";
+
+import "udpa/annotations/status.proto";
+
+option java_package = "io.envoyproxy.envoy.extensions.filters.http.web_transport.v3";
+option java_outer_classname = "WebTransportProto";
+option java_multiple_files = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/web_transport/v3;web_transportv3";
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
+option (xds.annotations.v3.file_status).work_in_progress = true;
+
+// [#protodoc-title: WebTransport]
+// WebTransport filter :ref:`configuration overview <config_http_filters_web_transport>`.
+// [#extension: envoy.filters.http.web_transport]
+
+// Terminates WebTransport over HTTP/3 sessions and echoes received datagrams back to the client.
+// When the client offers ``subprotocols`` in the ``wt-available-protocols`` request header, the
+// reference handler selects the most preferred offer and returns it in the ``wt-protocol`` response
+// header. This is a reference handler for the WebTransport termination path and takes no
+// configuration.
+message WebTransport {
+}

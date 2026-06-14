@@ -16,6 +16,7 @@
 #include "source/common/quic/envoy_quic_server_connection.h"
 #include "source/common/quic/envoy_quic_server_stream.h"
 #include "source/common/quic/quic_filter_manager_connection_impl.h"
+#include "source/common/runtime/runtime_features.h"
 
 #include "absl/types/optional.h"
 #include "quiche/quic/core/quic_config.h"
@@ -119,6 +120,13 @@ quic::QuicSpdyStream* EnvoyQuicServerSession::CreateIncomingStream(quic::QuicStr
 }
 
 quic::QuicSpdyStream* EnvoyQuicServerSession::CreateOutgoingBidirectionalStream() {
+  // WebTransport may try to open a server initiated stream to mirror an upstream one. Envoy does
+  // not create server initiated WebTransport streams yet, so report failure rather than crash, and
+  // the relay resets the stream it could not mirror. Other server initiated streams remain
+  // disallowed.
+  if (web_transport_enabled_) {
+    return nullptr;
+  }
   IS_ENVOY_BUG("Unexpected disallowed server initiated stream");
   return nullptr;
 }
@@ -216,6 +224,18 @@ void EnvoyQuicServerSession::setHttp3Options(
           quic::QuicTime::Delta::FromMilliseconds(memory_reduction_timeout_ms));
     }
   }
+  // Latch before set_allow_extended_connect(). Only enable when the listener opts in and extended
+  // CONNECT and HTTP/3 datagrams are both on, because QUICHE forbids disabling extended CONNECT
+  // once WebTransport is negotiated.
+  web_transport_enabled_ =
+      Runtime::runtimeFeatureEnabled("envoy.reloadable_features.web_transport") &&
+      http3_options_->web_transport_options().enabled() &&
+      http3_options_->allow_extended_connect() &&
+      LocalHttpDatagramSupport() != quic::HttpDatagramSupport::kNone;
+  max_web_transport_sessions_ =
+      PROTOBUF_GET_WRAPPED_OR_DEFAULT(http3_options_->web_transport_options(), max_sessions, 16);
+  max_web_transport_streams_per_session_ = PROTOBUF_GET_WRAPPED_OR_DEFAULT(
+      http3_options_->web_transport_options(), max_streams_per_session, 0);
   set_allow_extended_connect(http3_options_->allow_extended_connect());
   if (http3_options_->disable_qpack()) {
     DisableHuffmanEncoding();
