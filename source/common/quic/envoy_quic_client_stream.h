@@ -16,6 +16,8 @@
 namespace Envoy {
 namespace Quic {
 
+class EnvoyQuicClientWebTransportSession;
+
 // This class is a quic stream and also a request encoder.
 class EnvoyQuicClientStream : public quic::QuicSpdyClientStream,
                               public EnvoyQuicStream,
@@ -25,6 +27,8 @@ public:
   EnvoyQuicClientStream(quic::QuicStreamId id, quic::QuicSpdyClientSession* client_session,
                         quic::StreamType type, Http::Http3::CodecStats& stats,
                         const envoy::config::core::v3::Http3ProtocolOptions& http3_options);
+  // Defined out of line so the WebTransport session unique_ptr sees a complete type.
+  ~EnvoyQuicClientStream() override;
 
   void setResponseDecoder(Http::ResponseDecoder& decoder);
 
@@ -32,11 +36,19 @@ public:
   Http::Http1StreamEncoderOptionsOptRef http1StreamEncoderOptions() override {
     return absl::nullopt;
   }
+  OptRef<Http::WebTransportSession> webTransport() override;
 
   // Http::RequestEncoder
   Http::Status encodeHeaders(const Http::RequestHeaderMap& headers, bool end_stream) override;
   void encodeTrailers(const Http::RequestTrailerMap& trailers) override;
   void enableTcpTunneling() override {}
+  void setWebTransportConnectReadyCallback(std::function<void()> callback) override {
+    web_transport_connect_ready_cb_ = std::move(callback);
+  }
+
+  // Replays a WebTransport CONNECT that was buffered until the peer SETTINGS arrived. Called by the
+  // session from OnSettingsFrame.
+  void onWebTransportSettingsReceived();
 
   // Http::Stream
   void resetStream(Http::StreamResetReason reason) override;
@@ -102,10 +114,24 @@ private:
   Http::ResponseDecoderHandlePtr response_decoder_handle_;
   Http::ResponseDecoder* response_decoder_{nullptr};
   bool decoded_1xx_{false};
+  // Lazily created when the upstream requests the WebTransport session for a WebTransport CONNECT.
+  // This derived-class member destructs before the base-class QUICHE session that owns the visitor,
+  // so the destructor can safely detach the visitor.
+  std::unique_ptr<EnvoyQuicClientWebTransportSession> web_transport_session_;
 
   // When an HTTP Upgrade is requested, this contains the protocol upgrade type, e.g. "websocket".
   // It will be empty, when no such request is active.
   std::string upgrade_protocol_;
+
+  // A WebTransport CONNECT buffered until the peer SETTINGS arrive, replayed from
+  // onWebTransportSettingsReceived. Null when no CONNECT is waiting.
+  Http::RequestHeaderMapPtr deferred_web_transport_connect_headers_;
+  bool deferred_web_transport_connect_end_stream_{false};
+  // True while replaying a buffered CONNECT, so it stays a WebTransport CONNECT across a runtime
+  // guard flip.
+  bool replaying_web_transport_connect_{false};
+  // Invoked once the WebTransport CONNECT has been written so the proxy can set up relaying.
+  std::function<void()> web_transport_connect_ready_cb_;
 };
 
 } // namespace Quic

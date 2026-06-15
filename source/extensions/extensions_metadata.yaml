@@ -758,6 +758,13 @@ envoy.filters.http.wasm:
   status_upstream: alpha
   type_urls:
   - envoy.extensions.filters.http.wasm.v3.Wasm
+envoy.filters.http.web_transport:
+  categories:
+  - envoy.filters.http
+  security_posture: unknown
+  status: alpha
+  type_urls:
+  - envoy.extensions.filters.http.web_transport.v3.WebTransport
 envoy.filters.http.stateful_session:
   categories:
   - envoy.filters.http

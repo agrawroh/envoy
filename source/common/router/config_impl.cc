@@ -704,7 +704,9 @@ RouteEntryImplBase::RouteEntryImplBase(const CommonVirtualHostSharedPtr& vhost,
       if (absl::EqualsIgnoreCase(upgrade_config.upgrade_type(),
                                  Http::Headers::get().MethodValues.Connect) ||
           absl::EqualsIgnoreCase(upgrade_config.upgrade_type(),
-                                 Http::Headers::get().UpgradeValues.ConnectUdp)) {
+                                 Http::Headers::get().UpgradeValues.ConnectUdp) ||
+          absl::EqualsIgnoreCase(upgrade_config.upgrade_type(),
+                                 Http::Headers::get().ProtocolValues.WebTransport)) {
         connect_config_ = std::make_unique<ConnectConfig>(upgrade_config.connect_config());
       } else {
         creation_status = absl::InvalidArgumentError(absl::StrCat(

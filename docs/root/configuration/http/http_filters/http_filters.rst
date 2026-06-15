@@ -76,3 +76,4 @@ HTTP filters
   upstream_codec_filter
   wasm_filter
   transform_filter
+  web_transport_filter

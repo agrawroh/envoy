@@ -47,6 +47,13 @@ TEST_F(GenericGenericConnPoolFactoryTest, CreateValidUdpConnPool) {
                                              *message_));
 }
 
+TEST_F(GenericGenericConnPoolFactoryTest, CreateValidWebTransportConnPool) {
+  EXPECT_TRUE(
+      factory_.createGenericConnPool(nullptr, thread_local_cluster_,
+                                     Router::GenericConnPoolFactory::UpstreamProtocol::WEBTRANSPORT,
+                                     priority_, Envoy::Http::Protocol::Http3, nullptr, *message_));
+}
+
 TEST_F(GenericGenericConnPoolFactoryTest, InvalidConnPool) {
   // Passes an invalid UpstreamProtocol and check a nullptr is returned.
   EXPECT_FALSE(factory_.createGenericConnPool(
