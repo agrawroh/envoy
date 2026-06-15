@@ -737,6 +737,45 @@ TEST_P(EnvoyQuicClientSessionTest, DisableQpack) {
   EXPECT_EQ(envoy_quic_session_->qpack_maximum_dynamic_table_capacity(), 0);
 }
 
+// WebTransport is advertised only when the runtime flag is enabled, the cluster opts in, and
+// HTTP/3 datagrams are compiled in. The server drives extended CONNECT on the client.
+TEST_P(EnvoyQuicClientSessionTest, WebTransportEnabledWhenConfigured) {
+#ifndef ENVOY_ENABLE_HTTP_DATAGRAMS
+  GTEST_SKIP() << "WebTransport requires HTTP/3 datagram support.";
+#endif
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "true"}});
+
+  envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.mutable_web_transport_options()->set_enabled(true);
+  envoy_quic_session_->setHttp3Options(http3_options);
+
+  EXPECT_TRUE(envoy_quic_session_->LocallySupportedWebTransportVersions().Any());
+}
+
+// WebTransport stays off when the runtime flag is disabled, even with the cluster opted in.
+TEST_P(EnvoyQuicClientSessionTest, WebTransportDisabledWithoutRuntimeFlag) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "false"}});
+
+  envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.mutable_web_transport_options()->set_enabled(true);
+  envoy_quic_session_->setHttp3Options(http3_options);
+
+  EXPECT_FALSE(envoy_quic_session_->LocallySupportedWebTransportVersions().Any());
+}
+
+// WebTransport stays off when the cluster does not opt in, even with the runtime flag on.
+TEST_P(EnvoyQuicClientSessionTest, WebTransportDisabledWithoutClusterOptIn) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "true"}});
+
+  envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  envoy_quic_session_->setHttp3Options(http3_options);
+
+  EXPECT_FALSE(envoy_quic_session_->LocallySupportedWebTransportVersions().Any());
+}
+
 class MockOsSysCallsImpl : public Api::OsSysCallsImpl {
 public:
   MOCK_METHOD(Api::SysCallSizeResult, recvmsg, (os_fd_t socket, msghdr* msg, int flags),

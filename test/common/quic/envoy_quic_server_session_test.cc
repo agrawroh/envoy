@@ -24,11 +24,13 @@
 #include "test/test_common/global.h"
 #include "test/test_common/logging.h"
 #include "test/test_common/simulated_time_system.h"
+#include "test/test_common/test_runtime.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "quiche/quic/core/crypto/null_encrypter.h"
 #include "quiche/quic/core/deterministic_connection_id_generator.h"
+#include "quiche/quic/core/http/http_constants.h"
 #include "quiche/quic/core/quic_crypto_server_stream.h"
 #include "quiche/quic/core/quic_error_codes.h"
 #include "quiche/quic/core/quic_utils.h"
@@ -61,6 +63,7 @@ public:
   }
 
   using EnvoyQuicServerSession::GetCryptoStream;
+  using EnvoyQuicServerSession::LocallySupportedWebTransportVersions;
 };
 
 class ProofSourceDetailsSetter {
@@ -1203,6 +1206,140 @@ TEST_F(EnvoyQuicServerSessionTest, DisableQpack) {
   EXPECT_EQ(envoy_quic_session_.qpack_maximum_dynamic_table_capacity(), 0);
 
   installReadFilter();
+}
+
+// WebTransport is advertised only when the runtime flag is enabled, the listener opts in, extended
+// CONNECT is allowed, and HTTP/3 datagrams are compiled in.
+TEST_F(EnvoyQuicServerSessionTest, WebTransportEnabledWhenConfigured) {
+#ifndef ENVOY_ENABLE_HTTP_DATAGRAMS
+  GTEST_SKIP() << "WebTransport requires HTTP/3 datagram support.";
+#endif
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "true"}});
+
+  envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.mutable_web_transport_options()->set_enabled(true);
+  http3_options.set_allow_extended_connect(true);
+  envoy_quic_session_.setHttp3Options(http3_options);
+
+  EXPECT_TRUE(envoy_quic_session_.LocallySupportedWebTransportVersions().Any());
+
+  installReadFilter();
+}
+
+// WebTransport stays off when the runtime flag is disabled, even with the listener opted in and
+// extended CONNECT allowed.
+TEST_F(EnvoyQuicServerSessionTest, WebTransportDisabledWithoutRuntimeFlag) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "false"}});
+
+  envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.mutable_web_transport_options()->set_enabled(true);
+  http3_options.set_allow_extended_connect(true);
+  envoy_quic_session_.setHttp3Options(http3_options);
+
+  EXPECT_FALSE(envoy_quic_session_.LocallySupportedWebTransportVersions().Any());
+
+  installReadFilter();
+}
+
+// WebTransport stays off when the listener does not opt in, even with the runtime flag on and
+// extended CONNECT allowed.
+TEST_F(EnvoyQuicServerSessionTest, WebTransportDisabledWithoutListenerOptIn) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "true"}});
+
+  envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.set_allow_extended_connect(true);
+  envoy_quic_session_.setHttp3Options(http3_options);
+
+  EXPECT_FALSE(envoy_quic_session_.LocallySupportedWebTransportVersions().Any());
+
+  installReadFilter();
+}
+
+// WebTransport requires extended CONNECT. Without it negotiation stays off and the QUICHE
+// set_allow_extended_connect() invariant is never tripped.
+TEST_F(EnvoyQuicServerSessionTest, WebTransportDisabledWithoutExtendedConnect) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "true"}});
+
+  envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.mutable_web_transport_options()->set_enabled(true);
+  http3_options.set_allow_extended_connect(false);
+  envoy_quic_session_.setHttp3Options(http3_options);
+
+  EXPECT_FALSE(envoy_quic_session_.LocallySupportedWebTransportVersions().Any());
+
+  installReadFilter();
+}
+
+// The per-connection WebTransport session limit is reached when the cap is full and frees a slot
+// when a session closes.
+TEST_F(EnvoyQuicServerSessionTest, WebTransportSessionLimit) {
+  installReadFilter();
+  EXPECT_FALSE(envoy_quic_session_.webTransportSessionLimitReached());
+  for (uint32_t i = 0; i < 16; ++i) {
+    envoy_quic_session_.onWebTransportSessionOpened();
+  }
+  EXPECT_TRUE(envoy_quic_session_.webTransportSessionLimitReached());
+  envoy_quic_session_.onWebTransportSessionClosed();
+  EXPECT_FALSE(envoy_quic_session_.webTransportSessionLimitReached());
+}
+
+// The per-connection WebTransport session limit honors the configured max_sessions value.
+TEST_F(EnvoyQuicServerSessionTest, WebTransportConfiguredSessionLimit) {
+  installReadFilter();
+  envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.mutable_web_transport_options()->mutable_max_sessions()->set_value(2);
+  envoy_quic_session_.setHttp3Options(http3_options);
+
+  EXPECT_FALSE(envoy_quic_session_.webTransportSessionLimitReached());
+  envoy_quic_session_.onWebTransportSessionOpened();
+  envoy_quic_session_.onWebTransportSessionOpened();
+  EXPECT_TRUE(envoy_quic_session_.webTransportSessionLimitReached());
+}
+
+// A new WebTransport session is refused when the accept load shed point is shedding load.
+TEST_F(EnvoyQuicServerSessionTest, WebTransportSheddingLoad) {
+  installReadFilter();
+  EXPECT_FALSE(envoy_quic_session_.webTransportSheddingLoad());
+
+  NiceMock<Server::MockLoadShedPoint> shed_point;
+  envoy_quic_session_.setWebTransportAcceptLoadShedPoint(&shed_point);
+  EXPECT_CALL(shed_point, shouldShedLoad()).WillOnce(testing::Return(true));
+  EXPECT_TRUE(envoy_quic_session_.webTransportSheddingLoad());
+  EXPECT_CALL(shed_point, shouldShedLoad()).WillOnce(testing::Return(false));
+  EXPECT_FALSE(envoy_quic_session_.webTransportSheddingLoad());
+}
+
+// An incoming WebTransport unidirectional stream is a QUICHE-internal stream, not an
+// EnvoyQuicStream. The connection watermark callbacks must skip it instead of dereferencing a null
+// cast result.
+TEST_F(EnvoyQuicServerSessionTest, WatermarkCallbacksSkipWebTransportStreams) {
+#ifndef ENVOY_ENABLE_HTTP_DATAGRAMS
+  GTEST_SKIP() << "WebTransport requires HTTP/3 datagram support.";
+#endif
+  installReadFilter();
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.web_transport", "true"}});
+  envoy::config::core::v3::Http3ProtocolOptions http3_options;
+  http3_options.mutable_web_transport_options()->set_enabled(true);
+  http3_options.set_allow_extended_connect(true);
+  envoy_quic_session_.setHttp3Options(http3_options);
+
+  // Feed an incoming WebTransport unidirectional stream so QUICHE creates and activates a
+  // WebTransportHttp3UnidirectionalStream.
+  quic::QuicStreamId stream_id = 2u;
+  char type[2];
+  quic::QuicDataWriter writer(sizeof(type), type);
+  ASSERT_TRUE(writer.WriteVarInt62(quic::kWebTransportUnidirectionalStream));
+  quic::QuicStreamFrame stream_frame(stream_id, false, 0, absl::string_view(type, writer.length()));
+  envoy_quic_session_.OnStreamFrame(stream_frame);
+
+  // The watermark fan-out iterates every active stream. It must not crash on the non-Envoy stream.
+  http_connection_->onUnderlyingConnectionAboveWriteBufferHighWatermark();
+  http_connection_->onUnderlyingConnectionBelowWriteBufferLowWatermark();
 }
 
 TEST_F(EnvoyQuicServerSessionTest, ConnectionFlowControlForStreamsEnabledByDefault) {

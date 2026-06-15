@@ -1,0 +1,177 @@
+#include "envoy/http/web_transport.h"
+
+#include "source/extensions/filters/http/web_transport/web_transport_filter.h"
+
+#include "test/mocks/http/mocks.h"
+
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
+
+namespace Envoy {
+namespace Extensions {
+namespace HttpFilters {
+namespace WebTransport {
+namespace {
+
+using testing::_;
+using testing::Invoke;
+using testing::Return;
+using testing::SaveArg;
+
+class MockWebTransportSession : public Http::WebTransportSession {
+public:
+  MOCK_METHOD(bool, sessionLimitExceeded, (), (const, override));
+  MOCK_METHOD(void, setWebTransportSessionCallbacks, (Http::WebTransportSessionCallbacks*),
+              (override));
+  MOCK_METHOD(void, sendWebTransportDatagram, (absl::string_view), (override));
+  MOCK_METHOD(bool, canOpenWebTransportStream, (bool), (const, override));
+  MOCK_METHOD(Http::WebTransportStream*, openWebTransportStream, (bool), (override));
+};
+
+class WebTransportFilterTest : public testing::Test {
+public:
+  WebTransportFilterTest() { filter_.setDecoderFilterCallbacks(decoder_callbacks_); }
+
+  WebTransportFilter filter_;
+  testing::NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks_;
+  testing::NiceMock<MockWebTransportSession> session_;
+};
+
+// A WebTransport CONNECT is accepted with a 200 and the filter registers as the session consumer.
+TEST_F(WebTransportFilterTest, AcceptsWebTransportConnect) {
+  EXPECT_CALL(decoder_callbacks_, webTransport())
+      .WillOnce(Return(OptRef<Http::WebTransportSession>(session_)));
+  Http::WebTransportSessionCallbacks* registered = nullptr;
+  EXPECT_CALL(session_, setWebTransportSessionCallbacks(_)).WillOnce(SaveArg<0>(&registered));
+  EXPECT_CALL(decoder_callbacks_, encodeHeaders_(Http::HttpStatusIs(200), false));
+
+  Http::TestRequestHeaderMapImpl headers{
+      {":method", "CONNECT"}, {":protocol", "webtransport"}, {":authority", "example.com"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, filter_.decodeHeaders(headers, false));
+  EXPECT_EQ(registered, &filter_);
+}
+
+// The filter selects the client's most preferred offered `subprotocol` and returns it in the
+// wt-protocol response header as a structured field string.
+TEST_F(WebTransportFilterTest, SelectsFirstOfferedSubprotocol) {
+  EXPECT_CALL(decoder_callbacks_, webTransport())
+      .WillOnce(Return(OptRef<Http::WebTransportSession>(session_)));
+  std::string selected;
+  EXPECT_CALL(decoder_callbacks_, encodeHeaders_(Http::HttpStatusIs(200), false))
+      .WillOnce(Invoke([&selected](Http::ResponseHeaderMap& headers, bool) {
+        const auto value = headers.get(Http::LowerCaseString("wt-protocol"));
+        if (!value.empty()) {
+          selected = std::string(value[0]->value().getStringView());
+        }
+      }));
+
+  Http::TestRequestHeaderMapImpl headers{{":method", "CONNECT"},
+                                         {":protocol", "webtransport"},
+                                         {":authority", "example.com"},
+                                         {"wt-available-protocols", "\"chat\", \"echo\""}};
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, filter_.decodeHeaders(headers, false));
+  EXPECT_EQ("\"chat\"", selected);
+}
+
+// A CONNECT that offers no `subprotocols` gets a 200 with no wt-protocol header.
+TEST_F(WebTransportFilterTest, NoSubprotocolWhenNoneOffered) {
+  EXPECT_CALL(decoder_callbacks_, webTransport())
+      .WillOnce(Return(OptRef<Http::WebTransportSession>(session_)));
+  bool has_selection = true;
+  EXPECT_CALL(decoder_callbacks_, encodeHeaders_(Http::HttpStatusIs(200), false))
+      .WillOnce(Invoke([&has_selection](Http::ResponseHeaderMap& headers, bool) {
+        has_selection = !headers.get(Http::LowerCaseString("wt-protocol")).empty();
+      }));
+
+  Http::TestRequestHeaderMapImpl headers{
+      {":method", "CONNECT"}, {":protocol", "webtransport"}, {":authority", "example.com"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, filter_.decodeHeaders(headers, false));
+  EXPECT_FALSE(has_selection);
+}
+
+// A malformed offer is ignored, the handshake still completes with a 200 and no selection.
+TEST_F(WebTransportFilterTest, MalformedSubprotocolOfferIgnored) {
+  EXPECT_CALL(decoder_callbacks_, webTransport())
+      .WillOnce(Return(OptRef<Http::WebTransportSession>(session_)));
+  bool has_selection = true;
+  EXPECT_CALL(decoder_callbacks_, encodeHeaders_(Http::HttpStatusIs(200), false))
+      .WillOnce(Invoke([&has_selection](Http::ResponseHeaderMap& headers, bool) {
+        has_selection = !headers.get(Http::LowerCaseString("wt-protocol")).empty();
+      }));
+
+  // An sf-list of an integer is not a list of strings, so parsing rejects it.
+  Http::TestRequestHeaderMapImpl headers{{":method", "CONNECT"},
+                                         {":protocol", "webtransport"},
+                                         {":authority", "example.com"},
+                                         {"wt-available-protocols", "42"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, filter_.decodeHeaders(headers, false));
+  EXPECT_FALSE(has_selection);
+}
+
+// A WebTransport CONNECT over the connection session limit is rejected with a 429 and the filter
+// does not claim the session.
+TEST_F(WebTransportFilterTest, RejectsOverSessionLimit) {
+  EXPECT_CALL(decoder_callbacks_, webTransport())
+      .WillOnce(Return(OptRef<Http::WebTransportSession>(session_)));
+  EXPECT_CALL(session_, sessionLimitExceeded()).WillOnce(Return(true));
+  EXPECT_CALL(session_, setWebTransportSessionCallbacks(_)).Times(0);
+  EXPECT_CALL(decoder_callbacks_, encodeHeaders_(Http::HttpStatusIs(429), true));
+
+  Http::TestRequestHeaderMapImpl headers{
+      {":method", "CONNECT"}, {":protocol", "webtransport"}, {":authority", "example.com"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, filter_.decodeHeaders(headers, false));
+}
+
+// Received datagrams are echoed back on the session.
+TEST_F(WebTransportFilterTest, EchoesDatagram) {
+  EXPECT_CALL(decoder_callbacks_, webTransport())
+      .WillOnce(Return(OptRef<Http::WebTransportSession>(session_)));
+  Http::TestRequestHeaderMapImpl headers{
+      {":method", "CONNECT"}, {":protocol", "webtransport"}, {":authority", "example.com"}};
+  filter_.decodeHeaders(headers, false);
+
+  // Each datagram echoes back and resets the stream idle timer.
+  EXPECT_CALL(decoder_callbacks_, resetIdleTimer());
+  EXPECT_CALL(session_, sendWebTransportDatagram(absl::string_view("ping")));
+  filter_.onWebTransportDatagram("ping");
+
+  // After the session closes the filter stops echoing and stops resetting the idle timer.
+  filter_.onWebTransportSessionClosed();
+  EXPECT_CALL(session_, sendWebTransportDatagram(_)).Times(0);
+  EXPECT_CALL(decoder_callbacks_, resetIdleTimer()).Times(0);
+  filter_.onWebTransportDatagram("late");
+}
+
+// Destroying the filter detaches it from the session so no stale callbacks fire.
+TEST_F(WebTransportFilterTest, DetachesOnDestroy) {
+  EXPECT_CALL(decoder_callbacks_, webTransport())
+      .WillOnce(Return(OptRef<Http::WebTransportSession>(session_)));
+  Http::TestRequestHeaderMapImpl headers{
+      {":method", "CONNECT"}, {":protocol", "webtransport"}, {":authority", "example.com"}};
+  filter_.decodeHeaders(headers, false);
+
+  EXPECT_CALL(session_, setWebTransportSessionCallbacks(nullptr));
+  filter_.onDestroy();
+}
+
+// Destroying a filter that never claimed a session does nothing.
+TEST_F(WebTransportFilterTest, DestroyWithoutSessionIsNoOp) {
+  EXPECT_CALL(session_, setWebTransportSessionCallbacks(_)).Times(0);
+  filter_.onDestroy();
+}
+
+// A request that is not a WebTransport session passes through untouched.
+TEST_F(WebTransportFilterTest, PassesThroughNonWebTransport) {
+  EXPECT_CALL(decoder_callbacks_, webTransport())
+      .WillOnce(Return(OptRef<Http::WebTransportSession>{}));
+  EXPECT_CALL(decoder_callbacks_, encodeHeaders_(_, _)).Times(0);
+
+  Http::TestRequestHeaderMapImpl headers{{":method", "GET"}, {":path", "/"}};
+  EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_.decodeHeaders(headers, true));
+}
+
+} // namespace
+} // namespace WebTransport
+} // namespace HttpFilters
+} // namespace Extensions
+} // namespace Envoy

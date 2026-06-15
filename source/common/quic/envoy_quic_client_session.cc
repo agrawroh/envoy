@@ -12,6 +12,7 @@
 #include "source/common/quic/quic_filter_manager_connection_impl.h"
 #include "source/common/quic/quic_network_connectivity_observer_impl.h"
 #include "source/common/quic/scone_state.h"
+#include "source/common/runtime/runtime_features.h"
 
 #include "quiche/quic/core/quic_bandwidth.h"
 
@@ -255,6 +256,13 @@ std::unique_ptr<quic::QuicCryptoClientStreamBase> EnvoyQuicClientSession::Create
 void EnvoyQuicClientSession::setHttp3Options(
     const envoy::config::core::v3::Http3ProtocolOptions& http3_options) {
   QuicFilterManagerConnectionImpl::setHttp3Options(http3_options);
+  // Latch before any early return. The client advertises WebTransport in its SETTINGS only when the
+  // cluster opts in and HTTP/3 datagrams are on. QUICHE enables extended CONNECT on the client once
+  // the server's SETTINGS arrive. Flag flips apply to new connections only.
+  web_transport_enabled_ =
+      Runtime::runtimeFeatureEnabled("envoy.reloadable_features.web_transport") &&
+      http3_options_->web_transport_options().enabled() &&
+      LocalHttpDatagramSupport() != quic::HttpDatagramSupport::kNone;
   if (http3_options_->disable_qpack()) {
     DisableHuffmanEncoding();
     DisableCookieCrumbling();
@@ -319,6 +327,38 @@ void EnvoyQuicClientSession::OnServerPreferredAddressAvailable(
 std::vector<std::string> EnvoyQuicClientSession::GetAlpnsToOffer() const {
   return configured_alpns_.empty() ? quic::QuicSpdyClientSession::GetAlpnsToOffer()
                                    : configured_alpns_;
+}
+
+bool EnvoyQuicClientSession::OnSettingsFrame(const quic::SettingsFrame& frame) {
+  const bool result = quic::QuicSpdyClientSession::OnSettingsFrame(frame);
+  if (!result) {
+    return false;
+  }
+  // SETTINGS have been received, so SupportsWebTransport() is now definitive. Replay any buffered
+  // WebTransport `CONNECTs`. Move the set out first so a stream that registers during replay does
+  // not mutate the container being iterated, and re-resolve each id so a stream that closed
+  // meanwhile is skipped.
+  absl::flat_hash_set<quic::QuicStreamId> waiting =
+      std::move(streams_waiting_for_web_transport_settings_);
+  streams_waiting_for_web_transport_settings_.clear();
+  for (quic::QuicStreamId id : waiting) {
+    quic::QuicSpdyStream* stream = GetOrCreateSpdyDataStream(id);
+    if (stream == nullptr) {
+      continue;
+    }
+    static_cast<EnvoyQuicClientStream*>(stream)->onWebTransportSettingsReceived();
+  }
+  return true;
+}
+
+void EnvoyQuicClientSession::registerStreamWaitingForWebTransportSettings(
+    EnvoyQuicClientStream& stream) {
+  streams_waiting_for_web_transport_settings_.insert(stream.id());
+}
+
+void EnvoyQuicClientSession::unregisterStreamWaitingForWebTransportSettings(
+    EnvoyQuicClientStream& stream) {
+  streams_waiting_for_web_transport_settings_.erase(stream.id());
 }
 
 void EnvoyQuicClientSession::OnConfigNegotiated() {

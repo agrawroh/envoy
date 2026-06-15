@@ -34,20 +34,28 @@ QuicHttpServerConnectionImpl::QuicHttpServerConnectionImpl(
       overload_manager.getLoadShedPoint(
           Server::LoadShedPointName::get().H3ServerGoAwayAndCloseOnDispatch),
       overload_manager.getLoadShedPoint(Server::LoadShedPointName::get().H3ServerGoAwayOnDispatch));
+  quic_session.setWebTransportAcceptLoadShedPoint(overload_manager.getLoadShedPoint(
+      Server::LoadShedPointName::get().WebTransportAcceptSession));
 }
 
 void QuicHttpServerConnectionImpl::onUnderlyingConnectionAboveWriteBufferHighWatermark() {
   quic_server_session_.PerformActionOnActiveStreams([](quic::QuicStream* quic_stream) {
-    ENVOY_LOG(debug, "runHighWatermarkCallbacks on stream {}", quic_stream->id());
-    quicStreamToEnvoyStream(quic_stream)->runHighWatermarkCallbacks();
+    // WebTransport data streams are not EnvoyQuicStreams and have no Envoy watermark callbacks, so
+    // skip them. QUICHE manages their flow control.
+    if (EnvoyQuicStream* stream = quicStreamToEnvoyStream(quic_stream)) {
+      ENVOY_LOG(debug, "runHighWatermarkCallbacks on stream {}", quic_stream->id());
+      stream->runHighWatermarkCallbacks();
+    }
     return true;
   });
 }
 
 void QuicHttpServerConnectionImpl::onUnderlyingConnectionBelowWriteBufferLowWatermark() {
   quic_server_session_.PerformActionOnActiveStreams([](quic::QuicStream* quic_stream) {
-    ENVOY_LOG(debug, "runLowWatermarkCallbacks on stream {}", quic_stream->id());
-    quicStreamToEnvoyStream(quic_stream)->runLowWatermarkCallbacks();
+    if (EnvoyQuicStream* stream = quicStreamToEnvoyStream(quic_stream)) {
+      ENVOY_LOG(debug, "runLowWatermarkCallbacks on stream {}", quic_stream->id());
+      stream->runLowWatermarkCallbacks();
+    }
     return true;
   });
 }
