@@ -365,6 +365,7 @@ TEST(NullTracerTest, BasicFunctionality) {
   span_ptr->injectContext(trace_context, upstream_context);
   span_ptr->log(SystemTime(), "fake_event");
   span_ptr->useLocalDecision();
+  span_ptr->disableLocalDecision();
 
   EXPECT_NE(nullptr, span_ptr->spawnChild(config, "foo", SystemTime()));
 }
