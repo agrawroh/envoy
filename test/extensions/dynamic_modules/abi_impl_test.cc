@@ -1186,6 +1186,10 @@ WEAK_STUB(NetworkSetDynamicMetadataBool,
 WEAK_STUB(NetworkGetDynamicMetadataBool,
           envoy_dynamic_module_callback_network_get_dynamic_metadata_bool(nullptr, {nullptr, 0},
                                                                           {nullptr, 0}, nullptr))
+WEAK_STUB(NetworkSetDynamicMetadataStringBatch,
+          envoy_dynamic_module_callback_network_set_dynamic_metadata_string_batch(nullptr,
+                                                                                  {nullptr, 0},
+                                                                                  nullptr, 0))
 
 WEAK_STUB(ListenerFilterGetAddressType,
           envoy_dynamic_module_callback_listener_filter_get_address_type(nullptr))
@@ -1196,6 +1200,9 @@ WEAK_STUB(ListenerFilterGetDynamicMetadataNumber,
 WEAK_STUB(ListenerFilterSetDynamicMetadataNumber,
           envoy_dynamic_module_callback_listener_filter_set_dynamic_metadata_number(
               nullptr, {nullptr, 0}, {nullptr, 0}, 0))
+WEAK_STUB(ListenerFilterSetDynamicMetadataStringBatch,
+          envoy_dynamic_module_callback_listener_filter_set_dynamic_metadata_string_batch(
+              nullptr, {nullptr, 0}, nullptr, 0))
 
 WEAK_STUB(HttpAddDynamicMetadataListNumber,
           envoy_dynamic_module_callback_http_add_dynamic_metadata_list_number(nullptr, {nullptr, 0},
