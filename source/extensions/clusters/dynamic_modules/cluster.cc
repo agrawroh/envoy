@@ -36,6 +36,9 @@ struct DynamicModuleThreadAwareLoadBalancer : public Upstream::ThreadAwareLoadBa
       return std::make_unique<DynamicModuleLoadBalancer>(handle_, params.priority_set);
     }
 
+    // The module LB applies host churn incrementally, so don't rebuild the worker LB on host change.
+    bool recreateOnHostChange() const override { return false; }
+
     DynamicModuleClusterHandleSharedPtr handle_;
   };
 
