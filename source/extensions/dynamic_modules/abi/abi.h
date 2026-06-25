@@ -8936,6 +8936,18 @@ void envoy_dynamic_module_callback_cluster_pre_init_complete(
     envoy_dynamic_module_type_cluster_envoy_ptr cluster_envoy_ptr);
 
 /**
+ * envoy_dynamic_module_callback_cluster_use_persistent_host_map selects the persistent
+ * cross-priority host map backing for this cluster, trading the per-update O(N) copy for O(delta)
+ * updates. The module may call this during envoy_dynamic_module_on_cluster_init, before the cluster
+ * discovers any hosts.
+ *
+ * @param cluster_envoy_ptr is the pointer to the Envoy cluster.
+ * @param use_persistent_host_map whether to use the persistent backing.
+ */
+void envoy_dynamic_module_callback_cluster_use_persistent_host_map(
+    envoy_dynamic_module_type_cluster_envoy_ptr cluster_envoy_ptr, bool use_persistent_host_map);
+
+/**
  * envoy_dynamic_module_callback_cluster_lb_get_healthy_host_count returns the number of healthy
  * hosts at the given priority level in the cluster's host set.
  *

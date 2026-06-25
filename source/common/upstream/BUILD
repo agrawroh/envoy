@@ -428,6 +428,7 @@ envoy_cc_library(
         "//source/common/runtime:runtime_lib",
         "//source/common/stats:stats_matcher_lib",
         "//source/server:transport_socket_config_lib",
+        "@immer",
     ],
 )
 
@@ -502,6 +503,7 @@ envoy_cc_library(
         "//source/extensions/upstreams/http:config",
         "//source/extensions/upstreams/tcp:config",
         "//source/server:transport_socket_config_lib",
+        "@abseil-cpp//absl/functional:function_ref",
         "@abseil-cpp//absl/synchronization",
         "@envoy_api//envoy/config/cluster/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",

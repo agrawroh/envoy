@@ -546,6 +546,12 @@ REPOSITORY_LOCATIONS_SPEC = dict(
         sha256 = "e2da4f41bae8869f8dee56f4c104e699e7de3a483b5e451fda8e76fbcc66c59a",
         urls = ["https://github.com/Maratyszcza/FP16/archive/{version}.zip"],
     ),
+    immer = dict(
+        version = "0.8.1",
+        strip_prefix = "immer-{version}",
+        sha256 = "de8411c84830864604bb685dc8f2e3c0dbdc40b95b2f6726092f7dcc85e75209",
+        urls = ["https://github.com/arximboldi/immer/archive/v{version}.tar.gz"],
+    ),
     simdutf = dict(
         # NOTE: Update together with v8 and proxy_wasm_cpp_host.
         version = "8.1.0",

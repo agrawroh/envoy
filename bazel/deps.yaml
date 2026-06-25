@@ -938,6 +938,16 @@ fp16:
   extensions:
   - envoy.wasm.runtime.v8
 
+immer:
+  project_name: "immer"
+  project_desc: "Header-only library of persistent and immutable data structures for C++"
+  project_url: "https://github.com/arximboldi/immer"
+  release_date: "2023-01-08"
+  use_category:
+  - other
+  license: "BSL-1.0"
+  license_url: "https://github.com/arximboldi/immer/blob/v{version}/LICENSE"
+
 googleurl:
   project_name: "Chrome URL parsing library"
   project_desc: "Chrome URL parsing library"

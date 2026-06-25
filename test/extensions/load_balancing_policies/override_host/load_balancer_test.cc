@@ -164,7 +164,8 @@ protected:
         host_map->insert({host->address()->asString(), host});
       }
     }
-    thread_local_priority_set_.cross_priority_host_map_ = host_map;
+    thread_local_priority_set_.cross_priority_host_map_ =
+        Envoy::Upstream::makeFlatHostLookupTable(host_map);
   }
 
   Locality makeLocality(absl::string_view region, absl::string_view zone) {
