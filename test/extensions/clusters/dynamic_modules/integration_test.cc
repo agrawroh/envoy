@@ -126,6 +126,22 @@ TEST_P(DynamicModuleClusterIntegrationTest, AsyncHostSelection) {
   EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
+// Verifies that repeated requests through an asynchronous cluster all succeed. Each request runs a
+// fresh async host selection on the worker load balancer, so the per-selection state must be
+// registered and taken cleanly on every pass rather than leaking or clobbering across requests.
+TEST_P(DynamicModuleClusterIntegrationTest, AsyncHostSelectionMultipleRequests) {
+  initializeWithDecCluster("async_host_selection");
+  codec_client_ = makeHttpConnection(makeClientConnection(lookupPort("http")));
+
+  for (int i = 0; i < 3; ++i) {
+    auto response =
+        sendRequestAndWaitForResponse(default_request_headers_, 0, default_response_headers_, 0);
+    EXPECT_TRUE(upstream_request_->complete());
+    EXPECT_TRUE(response->complete());
+    EXPECT_EQ("200", response->headers().getStatusValue());
+  }
+}
+
 // Verifies that a cluster can use the scheduler to add hosts after initialization.
 TEST_P(DynamicModuleClusterIntegrationTest, SchedulerHostUpdate) {
   initializeWithDecCluster("scheduler_host_update");

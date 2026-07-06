@@ -787,18 +787,22 @@ DynamicModuleLoadBalancer::chooseHost(Upstream::LoadBalancerContext* context) {
     return {nullptr};
   }
 
-  // Pre-capture the worker dispatcher and prepare the cancellation flag before calling into the
-  // module. The module's choose_host may spawn a background thread that calls
-  // async_host_selection_complete, which reads these fields. Setting them beforehand establishes
-  // a happens-before relationship via the thread::spawn synchronization in the module.
   const auto* connection = context != nullptr ? context->downstreamConnection() : nullptr;
-  active_async_dispatcher_ = connection != nullptr ? &connection->dispatcher() : nullptr;
+  Event::Dispatcher* dispatcher = connection != nullptr ? &connection->dispatcher() : nullptr;
   // Capture the worker dispatcher for worker timer creation. Sticky: keep any previously captured
   // dispatcher when this call has no connection, since the worker dispatcher is stable.
-  if (active_async_dispatcher_ != nullptr) {
-    worker_dispatcher_ = active_async_dispatcher_;
+  if (dispatcher != nullptr) {
+    worker_dispatcher_ = dispatcher;
   }
-  active_async_cancelled_ = std::make_shared<std::atomic<bool>>(false);
+  // Register the selection state before calling into the module. The module's choose_host may spawn
+  // a background thread that calls async_host_selection_complete before choose_host returns, and
+  // that completion looks the state up by context. Registering first means the entry is present
+  // when it does, and the module's thread::spawn establishes the happens-before for the read.
+  auto cancelled = std::make_shared<std::atomic<bool>>(false);
+  {
+    absl::MutexLock lock(&async_selections_lock_);
+    active_async_selections_[context] = AsyncSelectionState{cancelled, dispatcher};
+  }
 
   envoy_dynamic_module_type_cluster_host_envoy_ptr host_ptr = nullptr;
   envoy_dynamic_module_type_cluster_lb_async_handle_module_ptr async_handle = nullptr;
@@ -806,17 +810,18 @@ DynamicModuleLoadBalancer::chooseHost(Upstream::LoadBalancerContext* context) {
                                                           &async_handle);
 
   if (async_handle != nullptr) {
-    // Async pending: the module will call the completion callback later.
+    // Async pending: the module will call the completion callback later. Hand it the same flag so
+    // cancel() and the completion share one atomic. A completion that already ran on a spawned
+    // thread has taken the entry, so a cancel after that is a harmless no-op.
     auto cancelable = std::make_unique<DynamicModuleAsyncHostSelectionHandle>(
-        async_handle, in_module_lb_,
-        handle_->cluster_->config()->on_cluster_lb_cancel_host_selection_, active_async_cancelled_);
+        this, context, async_handle, in_module_lb_,
+        handle_->cluster_->config()->on_cluster_lb_cancel_host_selection_, std::move(cancelled));
     return Upstream::HostSelectionResponse{nullptr, std::move(cancelable)};
   }
 
-  // Synchronous result or no host. Clear the async state.
-  active_async_dispatcher_ = nullptr;
-  active_async_cancelled_ = nullptr;
-
+  // Synchronous result or no host. The module will not complete this selection, so drop the entry
+  // registered above unless a spawned thread already took it.
+  eraseAsyncSelection(context);
   if (host_ptr == nullptr) {
     return {nullptr};
   }
@@ -824,6 +829,23 @@ DynamicModuleLoadBalancer::chooseHost(Upstream::LoadBalancerContext* context) {
   // Look up the host shared pointer from the raw pointer.
   auto host = handle_->cluster_->findHost(host_ptr);
   return {host};
+}
+
+std::optional<DynamicModuleLoadBalancer::AsyncSelectionState>
+DynamicModuleLoadBalancer::takeAsyncSelection(const void* context) const {
+  absl::MutexLock lock(&async_selections_lock_);
+  auto it = active_async_selections_.find(context);
+  if (it == active_async_selections_.end()) {
+    return std::nullopt;
+  }
+  AsyncSelectionState state = std::move(it->second);
+  active_async_selections_.erase(it);
+  return state;
+}
+
+void DynamicModuleLoadBalancer::eraseAsyncSelection(const void* context) const {
+  absl::MutexLock lock(&async_selections_lock_);
+  active_async_selections_.erase(context);
 }
 
 DynamicModuleAsyncHostSelectionHandle::~DynamicModuleAsyncHostSelectionHandle() {
@@ -837,6 +859,11 @@ DynamicModuleAsyncHostSelectionHandle::~DynamicModuleAsyncHostSelectionHandle() 
 
 void DynamicModuleAsyncHostSelectionHandle::cancel() {
   cancelled_->store(true, std::memory_order_release);
+  // Drop the selection's map entry so a cancelled-without-completion selection does not retain it.
+  // lb_ may already be gone, so reach it through the liveness-checked registry rather than
+  // dereferencing it directly.
+  DynamicModuleLoadBalancer::withActiveInstance(
+      lb_, [this](const DynamicModuleLoadBalancer& lb) { lb.eraseAsyncSelection(context_); });
 }
 
 const Upstream::PrioritySet& DynamicModuleLoadBalancer::prioritySet() const {

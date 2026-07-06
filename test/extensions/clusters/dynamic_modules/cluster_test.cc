@@ -2630,7 +2630,10 @@ TEST_F(DynamicModuleClusterTest, AsyncHostSelectionHandleCancel) {
   auto* dummy_lb = reinterpret_cast<envoy_dynamic_module_type_cluster_lb_module_ptr>(0xBEEF);
 
   auto cancelled = std::make_shared<std::atomic<bool>>(false);
-  DynamicModuleAsyncHostSelectionHandle handle(dummy_async_handle, dummy_lb, nullptr, cancelled);
+  // A null Envoy-side lb pointer is never found in the active-instance registry, so cancel() only
+  // flips the flag and does not touch any selection map.
+  DynamicModuleAsyncHostSelectionHandle handle(nullptr, nullptr, dummy_async_handle, dummy_lb,
+                                               nullptr, cancelled);
   handle.cancel();
   EXPECT_TRUE(cancelled->load());
 }
@@ -2642,14 +2645,16 @@ TEST_F(DynamicModuleClusterTest, AsyncHostSelectionHandleCancelNullFn) {
   auto* dummy_lb = reinterpret_cast<envoy_dynamic_module_type_cluster_lb_module_ptr>(0xBEEF);
 
   auto cancelled = std::make_shared<std::atomic<bool>>(false);
-  DynamicModuleAsyncHostSelectionHandle handle(dummy_async_handle, dummy_lb, nullptr, cancelled);
+  DynamicModuleAsyncHostSelectionHandle handle(nullptr, nullptr, dummy_async_handle, dummy_lb,
+                                               nullptr, cancelled);
   // Should not crash with nullptr cancel function.
   handle.cancel();
 }
 
-// Test async host selection complete callback with a valid host.
+// Test async host selection complete callback with a valid host. chooseHost registers the
+// selection so the completion finds its state keyed by context.
 TEST_F(DynamicModuleClusterTest, AsyncHostSelectionCompleteWithHost) {
-  auto result = createCluster(makeYamlConfig("cluster_no_op"));
+  auto result = createCluster(makeYamlConfig("cluster_async_host_selection"));
   ASSERT_TRUE(result.ok());
   auto& [cluster, lb] = result.value();
 
@@ -2676,13 +2681,15 @@ TEST_F(DynamicModuleClusterTest, AsyncHostSelectionCompleteWithHost) {
   auto* lb_envoy_ptr = static_cast<void*>(lb_instance.get());
   auto* context_ptr = static_cast<void*>(&context);
 
+  auto response = lb_instance->chooseHost(&context);
+  ASSERT_NE(nullptr, response.cancelable);
   envoy_dynamic_module_callback_cluster_lb_async_host_selection_complete(
       lb_envoy_ptr, context_ptr, raw_host_ptr, {"resolved", 8});
 }
 
 // Test async host selection complete callback with null host.
 TEST_F(DynamicModuleClusterTest, AsyncHostSelectionCompleteNullHost) {
-  auto result = createCluster(makeYamlConfig("cluster_no_op"));
+  auto result = createCluster(makeYamlConfig("cluster_async_host_selection"));
   ASSERT_TRUE(result.ok());
   auto& [cluster, lb] = result.value();
 
@@ -2700,13 +2707,15 @@ TEST_F(DynamicModuleClusterTest, AsyncHostSelectionCompleteNullHost) {
   auto* lb_envoy_ptr = static_cast<void*>(lb_instance.get());
   auto* context_ptr = static_cast<void*>(&context);
 
+  auto response = lb_instance->chooseHost(&context);
+  ASSERT_NE(nullptr, response.cancelable);
   envoy_dynamic_module_callback_cluster_lb_async_host_selection_complete(
       lb_envoy_ptr, context_ptr, nullptr, {"dns_failure", 11});
 }
 
 // Test async host selection complete callback with empty details.
 TEST_F(DynamicModuleClusterTest, AsyncHostSelectionCompleteEmptyDetails) {
-  auto result = createCluster(makeYamlConfig("cluster_no_op"));
+  auto result = createCluster(makeYamlConfig("cluster_async_host_selection"));
   ASSERT_TRUE(result.ok());
   auto& [cluster, lb] = result.value();
 
@@ -2724,6 +2733,8 @@ TEST_F(DynamicModuleClusterTest, AsyncHostSelectionCompleteEmptyDetails) {
   auto* lb_envoy_ptr = static_cast<void*>(lb_instance.get());
   auto* context_ptr = static_cast<void*>(&context);
 
+  auto response = lb_instance->chooseHost(&context);
+  ASSERT_NE(nullptr, response.cancelable);
   envoy_dynamic_module_callback_cluster_lb_async_host_selection_complete(lb_envoy_ptr, context_ptr,
                                                                          nullptr, {nullptr, 0});
 }
@@ -2766,6 +2777,205 @@ TEST_F(DynamicModuleClusterTest, AsyncHostSelectionCompleteRegistersFreshInstanc
   bool found = DynamicModuleLoadBalancer::withActiveInstance(
       second.get(), [](const DynamicModuleLoadBalancer&) {});
   EXPECT_TRUE(found);
+}
+
+// Two concurrent async selections on one worker load balancer. Cancelling the first must suppress
+// only the first selection's completion, and the second selection's completion must still fire.
+// The cluster_async_host_selection module returns an async handle from every choose_host, so each
+// chooseHost registers its own per-selection state keyed by context.
+TEST_F(DynamicModuleClusterTest, AsyncHostSelectionCancelFirstDoesNotSuppressSecond) {
+  auto result = createCluster(makeYamlConfig("cluster_async_host_selection"));
+  ASSERT_TRUE(result.ok()) << result.status().message();
+  auto& [cluster, lb] = result.value();
+  auto& module_cluster = dynamic_cast<DynamicModuleCluster&>(*cluster);
+
+  std::vector<Upstream::HostSharedPtr> hosts;
+  ASSERT_TRUE(addSimpleHosts(module_cluster, {"127.0.0.1:8080"}, {1}, hosts));
+  auto* raw_host_ptr = const_cast<Upstream::Host*>(hosts[0].get());
+
+  auto handle = std::make_shared<DynamicModuleClusterHandle>(
+      std::dynamic_pointer_cast<DynamicModuleCluster>(cluster));
+  auto lb_instance = std::make_unique<DynamicModuleLoadBalancer>(handle, cluster->prioritySet());
+  auto* lb_envoy_ptr = static_cast<void*>(lb_instance.get());
+
+  // Two distinct contexts stand in for two concurrent streams on the same worker.
+  NiceMock<Upstream::MockLoadBalancerContext> context_a;
+  NiceMock<Upstream::MockLoadBalancerContext> context_b;
+  EXPECT_CALL(context_a, onAsyncHostSelection(_, _)).Times(0);
+  EXPECT_CALL(context_b, onAsyncHostSelection(_, _))
+      .WillOnce([&raw_host_ptr](Upstream::HostConstSharedPtr&& host, std::string&&) {
+        EXPECT_EQ(host.get(), raw_host_ptr);
+      });
+
+  auto response_a = lb_instance->chooseHost(&context_a);
+  ASSERT_NE(nullptr, response_a.cancelable);
+  auto response_b = lb_instance->chooseHost(&context_b);
+  ASSERT_NE(nullptr, response_b.cancelable);
+
+  // Cancel the first selection, then complete both. The first must be dropped, the second
+  // delivered.
+  response_a.cancelable->cancel();
+  envoy_dynamic_module_callback_cluster_lb_async_host_selection_complete(
+      lb_envoy_ptr, static_cast<void*>(&context_a), raw_host_ptr, {"first", 5});
+  envoy_dynamic_module_callback_cluster_lb_async_host_selection_complete(
+      lb_envoy_ptr, static_cast<void*>(&context_b), raw_host_ptr, {"second", 6});
+}
+
+// Completing the same selection twice delivers exactly once. The first completion takes the
+// per-selection entry, so the second finds nothing and is a no-op rather than a second delivery.
+TEST_F(DynamicModuleClusterTest, AsyncHostSelectionCompleteTwiceDeliversOnce) {
+  auto result = createCluster(makeYamlConfig("cluster_async_host_selection"));
+  ASSERT_TRUE(result.ok()) << result.status().message();
+  auto& [cluster, lb] = result.value();
+
+  auto handle = std::make_shared<DynamicModuleClusterHandle>(
+      std::dynamic_pointer_cast<DynamicModuleCluster>(cluster));
+  auto lb_instance = std::make_unique<DynamicModuleLoadBalancer>(handle, cluster->prioritySet());
+  auto* lb_envoy_ptr = static_cast<void*>(lb_instance.get());
+
+  NiceMock<Upstream::MockLoadBalancerContext> context;
+  EXPECT_CALL(context, onAsyncHostSelection(_, _)).Times(1);
+
+  auto response = lb_instance->chooseHost(&context);
+  ASSERT_NE(nullptr, response.cancelable);
+
+  envoy_dynamic_module_callback_cluster_lb_async_host_selection_complete(
+      lb_envoy_ptr, static_cast<void*>(&context), nullptr, {"once", 4});
+  envoy_dynamic_module_callback_cluster_lb_async_host_selection_complete(
+      lb_envoy_ptr, static_cast<void*>(&context), nullptr, {"twice", 5});
+}
+
+// Cancelling a selection whose completion never arrives does not deliver, and does not affect a
+// later selection reusing the same context address.
+TEST_F(DynamicModuleClusterTest, AsyncHostSelectionCancelThenReuseContext) {
+  auto result = createCluster(makeYamlConfig("cluster_async_host_selection"));
+  ASSERT_TRUE(result.ok()) << result.status().message();
+  auto& [cluster, lb] = result.value();
+
+  auto handle = std::make_shared<DynamicModuleClusterHandle>(
+      std::dynamic_pointer_cast<DynamicModuleCluster>(cluster));
+  auto lb_instance = std::make_unique<DynamicModuleLoadBalancer>(handle, cluster->prioritySet());
+  auto* lb_envoy_ptr = static_cast<void*>(lb_instance.get());
+
+  NiceMock<Upstream::MockLoadBalancerContext> context;
+  EXPECT_CALL(context, onAsyncHostSelection(_, _)).Times(1);
+
+  // First selection is cancelled before completing. cancel() then reset() mirrors the router.
+  auto response_first = lb_instance->chooseHost(&context);
+  ASSERT_NE(nullptr, response_first.cancelable);
+  response_first.cancelable->cancel();
+  response_first.cancelable.reset();
+
+  // A second selection reuses the same context address and completes normally. It registers fresh
+  // state with a fresh flag, so the earlier cancel does not suppress it.
+  auto response_second = lb_instance->chooseHost(&context);
+  ASSERT_NE(nullptr, response_second.cancelable);
+  envoy_dynamic_module_callback_cluster_lb_async_host_selection_complete(
+      lb_envoy_ptr, static_cast<void*>(&context), nullptr, {"second", 6});
+}
+
+// When the selection has a downstream connection, the completion posts to that connection's
+// worker dispatcher and re-checks cancellation there. A cancel that lands after the completion is
+// posted but before the posted callback runs must still suppress delivery.
+TEST_F(DynamicModuleClusterTest, AsyncHostSelectionPostedCompletionCancelledBeforeDispatch) {
+  auto result = createCluster(makeYamlConfig("cluster_async_host_selection"));
+  ASSERT_TRUE(result.ok()) << result.status().message();
+  auto& [cluster, lb] = result.value();
+
+  auto handle = std::make_shared<DynamicModuleClusterHandle>(
+      std::dynamic_pointer_cast<DynamicModuleCluster>(cluster));
+  auto lb_instance = std::make_unique<DynamicModuleLoadBalancer>(handle, cluster->prioritySet());
+  auto* lb_envoy_ptr = static_cast<void*>(lb_instance.get());
+
+  // A downstream connection makes chooseHost capture the connection's dispatcher, so the completion
+  // takes the posted path rather than the inline path.
+  NiceMock<Upstream::MockLoadBalancerContext> context;
+  NiceMock<Network::MockConnection> downstream_connection;
+  ON_CALL(context, downstreamConnection()).WillByDefault(Return(&downstream_connection));
+
+  Event::PostCb captured_cb;
+  bool captured = false;
+  ON_CALL(downstream_connection.dispatcher_, post(_))
+      .WillByDefault(testing::Invoke([&](Event::PostCb cb) {
+        captured_cb = std::move(cb);
+        captured = true;
+      }));
+
+  EXPECT_CALL(context, onAsyncHostSelection(_, _)).Times(0);
+
+  auto response = lb_instance->chooseHost(&context);
+  ASSERT_NE(nullptr, response.cancelable);
+
+  // The completion posts to the worker dispatcher rather than delivering inline.
+  envoy_dynamic_module_callback_cluster_lb_async_host_selection_complete(
+      lb_envoy_ptr, static_cast<void*>(&context), nullptr, {"posted", 6});
+  ASSERT_TRUE(captured);
+
+  // Cancel after the post, then run the posted callback. The worker-thread re-check drops it.
+  response.cancelable->cancel();
+  captured_cb();
+}
+
+// The posted completion delivers when the selection is not cancelled before the callback runs.
+TEST_F(DynamicModuleClusterTest, AsyncHostSelectionPostedCompletionDelivers) {
+  auto result = createCluster(makeYamlConfig("cluster_async_host_selection"));
+  ASSERT_TRUE(result.ok()) << result.status().message();
+  auto& [cluster, lb] = result.value();
+
+  auto handle = std::make_shared<DynamicModuleClusterHandle>(
+      std::dynamic_pointer_cast<DynamicModuleCluster>(cluster));
+  auto lb_instance = std::make_unique<DynamicModuleLoadBalancer>(handle, cluster->prioritySet());
+  auto* lb_envoy_ptr = static_cast<void*>(lb_instance.get());
+
+  NiceMock<Upstream::MockLoadBalancerContext> context;
+  NiceMock<Network::MockConnection> downstream_connection;
+  ON_CALL(context, downstreamConnection()).WillByDefault(Return(&downstream_connection));
+
+  Event::PostCb captured_cb;
+  bool captured = false;
+  ON_CALL(downstream_connection.dispatcher_, post(_))
+      .WillByDefault(testing::Invoke([&](Event::PostCb cb) {
+        captured_cb = std::move(cb);
+        captured = true;
+      }));
+
+  EXPECT_CALL(context, onAsyncHostSelection(_, _))
+      .WillOnce([](Upstream::HostConstSharedPtr&& host, std::string&& details) {
+        EXPECT_EQ(host, nullptr);
+        EXPECT_EQ(details, "posted");
+      });
+
+  auto response = lb_instance->chooseHost(&context);
+  ASSERT_NE(nullptr, response.cancelable);
+
+  envoy_dynamic_module_callback_cluster_lb_async_host_selection_complete(
+      lb_envoy_ptr, static_cast<void*>(&context), nullptr, {"posted", 6});
+  ASSERT_TRUE(captured);
+  captured_cb();
+}
+
+// Cancelling a selection erases its map entry, so a completion that races in afterwards for the
+// same context is dropped rather than delivered.
+TEST_F(DynamicModuleClusterTest, AsyncHostSelectionCancelDropsLateCompletion) {
+  auto result = createCluster(makeYamlConfig("cluster_async_host_selection"));
+  ASSERT_TRUE(result.ok()) << result.status().message();
+  auto& [cluster, lb] = result.value();
+
+  auto handle = std::make_shared<DynamicModuleClusterHandle>(
+      std::dynamic_pointer_cast<DynamicModuleCluster>(cluster));
+  auto lb_instance = std::make_unique<DynamicModuleLoadBalancer>(handle, cluster->prioritySet());
+  auto* lb_envoy_ptr = static_cast<void*>(lb_instance.get());
+
+  NiceMock<Upstream::MockLoadBalancerContext> context;
+  EXPECT_CALL(context, onAsyncHostSelection(_, _)).Times(0);
+
+  auto response = lb_instance->chooseHost(&context);
+  ASSERT_NE(nullptr, response.cancelable);
+  response.cancelable->cancel();
+
+  // A late completion for the cancelled selection must not deliver.
+  envoy_dynamic_module_callback_cluster_lb_async_host_selection_complete(
+      lb_envoy_ptr, static_cast<void*>(&context), nullptr, {"late", 4});
 }
 
 // =============================================================================

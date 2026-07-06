@@ -167,6 +167,8 @@ test_program(name = "formatter_config_new_fail")
 
 test_program(name = "cluster_no_op")
 
+test_program(name = "cluster_async_host_selection")
+
 test_program(name = "cluster_run_on_all_workers")
 
 test_program(name = "cluster_config_new_fail")

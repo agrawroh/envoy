@@ -1336,26 +1336,30 @@ void envoy_dynamic_module_callback_cluster_lb_async_host_selection_complete(
   }
 
   // The module may invoke this callback on any thread and race the load balancer destructor.
-  // Validate the raw pointer against the live registry and snapshot the state we need under the
-  // registry lock.
-  std::shared_ptr<std::atomic<bool>> cancelled;
-  Envoy::Event::Dispatcher* dispatcher = nullptr;
+  // Validate the raw pointer against the live registry and take this selection's state under the
+  // registry lock, keyed by the context the module round-trips so a later choose_host cannot have
+  // clobbered it.
+  std::optional<DynamicModuleLoadBalancer::AsyncSelectionState> state;
   DynamicModuleClusterHandleSharedPtr handle;
-  const bool found = DynamicModuleLoadBalancer::withActiveInstance(
-      lb_raw, [&](const DynamicModuleLoadBalancer& lb) {
-        cancelled = lb.activeAsyncCancelled();
-        dispatcher = lb.activeAsyncDispatcher();
-        handle = lb.handle();
-      });
-  if (!found) {
+  DynamicModuleLoadBalancer::withActiveInstance(lb_raw, [&](const DynamicModuleLoadBalancer& lb) {
+    state = lb.takeAsyncSelection(context_envoy_ptr);
+    handle = lb.handle();
+  });
+  // Drop the event if the load balancer is gone or no live selection is registered for this
+  // context. The latter covers a duplicate completion and a completion after cancellation.
+  if (!state.has_value()) {
     return;
   }
 
+  std::shared_ptr<std::atomic<bool>> cancelled = std::move(state->cancelled);
+  Envoy::Event::Dispatcher* dispatcher = state->dispatcher;
   if (dispatcher != nullptr) {
-    // Post to the worker thread. The handle keeps the cluster alive until the callback runs.
+    // Post to the worker thread. The handle keeps the cluster alive until the callback runs. The
+    // cancellation flag is re-checked on the worker thread because the router may cancel between
+    // this post and its execution.
     dispatcher->post([context_envoy_ptr, host, details_str = std::move(details_str),
                       cancelled = std::move(cancelled), handle = std::move(handle)]() {
-      if (cancelled != nullptr && cancelled->load(std::memory_order_acquire)) {
+      if (cancelled->load(std::memory_order_acquire)) {
         return;
       }
       auto* context = getContext(context_envoy_ptr);
@@ -1367,6 +1371,9 @@ void envoy_dynamic_module_callback_cluster_lb_async_host_selection_complete(
     });
   } else {
     // No worker dispatcher. Complete inline on the calling thread.
+    if (cancelled->load(std::memory_order_acquire)) {
+      return;
+    }
     auto* context = getContext(context_envoy_ptr);
     Envoy::Upstream::HostConstSharedPtr host_shared;
     if (host != nullptr) {
