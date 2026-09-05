@@ -91,6 +91,26 @@ public:
 
 namespace {
 
+// The rendered name of a tagged stat depends on the tag extraction config, so tests locate a
+// module-defined stat by the name fragment the module chose rather than by guessing the full name.
+uint64_t findCounterValueBySubstring(Stats::Store& store, absl::string_view fragment) {
+  for (const auto& counter : store.counters()) {
+    if (absl::StrContains(counter->name(), fragment)) {
+      return counter->value();
+    }
+  }
+  return 0;
+}
+
+uint64_t findGaugeValueBySubstring(Stats::Store& store, absl::string_view fragment) {
+  for (const auto& gauge : store.gauges()) {
+    if (absl::StrContains(gauge->name(), fragment)) {
+      return gauge->value();
+    }
+  }
+  return 0;
+}
+
 class DynamicModuleClusterTest : public testing::Test {
 public:
   DynamicModuleClusterTest() {
@@ -1832,6 +1852,122 @@ TEST_F(DynamicModuleClusterTest, MetricsDefineAndIncrementCounter) {
   auto inc_result = envoy_dynamic_module_callback_cluster_config_increment_counter(
       config, counter_id, nullptr, 0, 5);
   EXPECT_EQ(inc_result, envoy_dynamic_module_type_metrics_result_Success);
+}
+
+// A resolved handle records against the same stat the id-plus-labels path writes, and records
+// without resolving the label tuple again.
+TEST_F(DynamicModuleClusterTest, MetricsResolveAndRecordByHandle) {
+  auto result = createCluster(makeYamlConfig("cluster_no_op"));
+  ASSERT_OK(result);
+
+  auto cluster = std::dynamic_pointer_cast<DynamicModuleCluster>(result->first);
+  auto* config = cluster->config().get();
+  unfreezeStatCreation(*config);
+
+  envoy_dynamic_module_type_module_buffer label_name = {const_cast<char*>("outcome"),
+                                                        strlen("outcome")};
+  envoy_dynamic_module_type_module_buffer label_value = {const_cast<char*>("resolved"),
+                                                         strlen("resolved")};
+
+  // Counter vec.
+  size_t counter_id = 0;
+  envoy_dynamic_module_type_module_buffer counter_name = {const_cast<char*>("handle_counter"),
+                                                          strlen("handle_counter")};
+  ASSERT_EQ(envoy_dynamic_module_type_metrics_result_Success,
+            envoy_dynamic_module_callback_cluster_config_define_counter(
+                config, counter_name, &label_name, 1, &counter_id));
+  envoy_dynamic_module_type_cluster_metric_counter_envoy_ptr counter = nullptr;
+  EXPECT_EQ(envoy_dynamic_module_type_metrics_result_Success,
+            envoy_dynamic_module_callback_cluster_config_resolve_counter_vec(
+                config, counter_id, &label_value, 1, &counter));
+  ASSERT_NE(nullptr, counter);
+  envoy_dynamic_module_callback_cluster_metric_counter_add(counter, 5);
+  // The id path writes the same child, so the two add up on one stat.
+  EXPECT_EQ(envoy_dynamic_module_type_metrics_result_Success,
+            envoy_dynamic_module_callback_cluster_config_increment_counter(config, counter_id,
+                                                                           &label_value, 1, 3));
+  EXPECT_EQ(8, findCounterValueBySubstring(server_context_.store_, "handle_counter"));
+
+  // Resolving the same tuple again yields the same child, which is what makes a cached handle
+  // equivalent to the id path rather than a second stat.
+  envoy_dynamic_module_type_cluster_metric_counter_envoy_ptr counter_again = nullptr;
+  EXPECT_EQ(envoy_dynamic_module_type_metrics_result_Success,
+            envoy_dynamic_module_callback_cluster_config_resolve_counter_vec(
+                config, counter_id, &label_value, 1, &counter_again));
+  EXPECT_EQ(counter, counter_again);
+
+  // Gauge vec.
+  size_t gauge_id = 0;
+  envoy_dynamic_module_type_module_buffer gauge_name = {const_cast<char*>("handle_gauge"),
+                                                        strlen("handle_gauge")};
+  ASSERT_EQ(envoy_dynamic_module_type_metrics_result_Success,
+            envoy_dynamic_module_callback_cluster_config_define_gauge(config, gauge_name,
+                                                                      &label_name, 1, &gauge_id));
+  envoy_dynamic_module_type_cluster_metric_gauge_envoy_ptr gauge = nullptr;
+  EXPECT_EQ(envoy_dynamic_module_type_metrics_result_Success,
+            envoy_dynamic_module_callback_cluster_config_resolve_gauge_vec(
+                config, gauge_id, &label_value, 1, &gauge));
+  ASSERT_NE(nullptr, gauge);
+  envoy_dynamic_module_callback_cluster_metric_gauge_set(gauge, 10);
+  envoy_dynamic_module_callback_cluster_metric_gauge_add(gauge, 5);
+  envoy_dynamic_module_callback_cluster_metric_gauge_sub(gauge, 3);
+  EXPECT_EQ(12, findGaugeValueBySubstring(server_context_.store_, "handle_gauge"));
+
+  // Histogram vec. The value is not readable from an isolated store, so this asserts the call
+  // succeeds and the handle is non-null.
+  size_t histogram_id = 0;
+  envoy_dynamic_module_type_module_buffer histogram_name = {const_cast<char*>("handle_histogram"),
+                                                            strlen("handle_histogram")};
+  ASSERT_EQ(envoy_dynamic_module_type_metrics_result_Success,
+            envoy_dynamic_module_callback_cluster_config_define_histogram(
+                config, histogram_name, &label_name, 1, &histogram_id));
+  envoy_dynamic_module_type_cluster_metric_histogram_envoy_ptr histogram = nullptr;
+  EXPECT_EQ(envoy_dynamic_module_type_metrics_result_Success,
+            envoy_dynamic_module_callback_cluster_config_resolve_histogram_vec(
+                config, histogram_id, &label_value, 1, &histogram));
+  ASSERT_NE(nullptr, histogram);
+  envoy_dynamic_module_callback_cluster_metric_histogram_record(histogram, 42);
+}
+
+// Resolution rejects an unknown id and a label count that does not match the definition, and the
+// record callbacks ignore a null handle rather than dereferencing it.
+TEST_F(DynamicModuleClusterTest, MetricsResolveRejectsBadInputAndIgnoresNullHandles) {
+  auto result = createCluster(makeYamlConfig("cluster_no_op"));
+  ASSERT_OK(result);
+
+  auto cluster = std::dynamic_pointer_cast<DynamicModuleCluster>(result->first);
+  auto* config = cluster->config().get();
+  unfreezeStatCreation(*config);
+
+  envoy_dynamic_module_type_module_buffer label_name = {const_cast<char*>("outcome"),
+                                                        strlen("outcome")};
+  envoy_dynamic_module_type_module_buffer label_value = {const_cast<char*>("resolved"),
+                                                         strlen("resolved")};
+  size_t counter_id = 0;
+  envoy_dynamic_module_type_module_buffer counter_name = {const_cast<char*>("arity_counter"),
+                                                          strlen("arity_counter")};
+  ASSERT_EQ(envoy_dynamic_module_type_metrics_result_Success,
+            envoy_dynamic_module_callback_cluster_config_define_counter(
+                config, counter_name, &label_name, 1, &counter_id));
+
+  envoy_dynamic_module_type_cluster_metric_counter_envoy_ptr counter = nullptr;
+  // Unknown id.
+  EXPECT_EQ(envoy_dynamic_module_type_metrics_result_MetricNotFound,
+            envoy_dynamic_module_callback_cluster_config_resolve_counter_vec(
+                config, 999, &label_value, 1, &counter));
+  EXPECT_EQ(nullptr, counter);
+  // Wrong label count for a counter that declares one label.
+  EXPECT_EQ(envoy_dynamic_module_type_metrics_result_InvalidLabels,
+            envoy_dynamic_module_callback_cluster_config_resolve_counter_vec(config, counter_id,
+                                                                             nullptr, 0, &counter));
+  EXPECT_EQ(nullptr, counter);
+
+  // A null handle is ignored on every record path.
+  envoy_dynamic_module_callback_cluster_metric_counter_add(nullptr, 1);
+  envoy_dynamic_module_callback_cluster_metric_gauge_set(nullptr, 1);
+  envoy_dynamic_module_callback_cluster_metric_gauge_add(nullptr, 1);
+  envoy_dynamic_module_callback_cluster_metric_gauge_sub(nullptr, 1);
+  envoy_dynamic_module_callback_cluster_metric_histogram_record(nullptr, 1);
 }
 
 // Test defining and using a scalar gauge via the ABI callbacks.
