@@ -93,6 +93,14 @@ public:
                                        absl::string_view filter_name, absl::string_view key,
                                        double value);
 
+  // Set several string values in dynamic metadata under one filter namespace, resolving the
+  // namespace and merging once. An empty array is a no-op and does not create the namespace. Within
+  // one call a later entry overwrites an earlier entry with the same key.
+  static void
+  setDynamicMetadataStringBatch(StreamInfo::StreamInfo& stream_info, absl::string_view filter_name,
+                                const envoy_dynamic_module_type_module_key_value_pair* entries,
+                                size_t entries_size);
+
   // Set a string value in filter state. When life_span is set, it is passed to setData.
   static bool
   setFilterStateBytes(StreamInfo::StreamInfo& stream_info, absl::string_view key,

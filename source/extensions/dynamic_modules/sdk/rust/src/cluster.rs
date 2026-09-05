@@ -347,6 +347,21 @@ pub trait ClusterLbContext {
   /// Returns `true` if the value was set, `false` if the request has no stream info.
   fn set_dynamic_metadata_string(&self, namespace: &str, key: &str, value: &str) -> bool;
 
+  /// Sets several string values on the request's dynamic metadata under one `namespace` in a single
+  /// ABI crossing, resolving the namespace and merging once.
+  ///
+  /// A cluster that writes a per-request selection record pays the single-key setter once per field.
+  /// This is the same result for one crossing. Existing entries with the same key are overwritten,
+  /// and within one call a later entry overwrites an earlier entry with the same key. An empty slice
+  /// is a no-op and does not create the namespace.
+  ///
+  /// Returns `true` if the values were set, `false` if the request has no stream info.
+  fn set_dynamic_metadata_string_batch<'a>(
+    &self,
+    namespace: &'a str,
+    entries: &'a [(&'a str, &'a str)],
+  ) -> bool;
+
   /// Creates a per-worker timer on this request's worker dispatcher.
   ///
   /// The worker dispatcher is captured on this load balancer for the duration of host selection,
@@ -2444,6 +2459,30 @@ impl ClusterLbContext for ClusterLbContextRef<'_> {
     }
   }
 
+  fn set_dynamic_metadata_string_batch(&self, namespace: &str, entries: &[(&str, &str)]) -> bool {
+    // `pairs` borrows the key and value bytes of `entries`, which outlive this call. Envoy copies
+    // them into the metadata Struct synchronously, so the pointers never dangle. An empty `entries`
+    // yields an empty Vec paired with a zero length the callback treats as a no-op.
+    let mut pairs: Vec<abi::envoy_dynamic_module_type_module_key_value_pair> =
+      Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+      pairs.push(abi::envoy_dynamic_module_type_module_key_value_pair {
+        key_ptr: key.as_ptr() as *const _,
+        key_length: key.len(),
+        value_ptr: value.as_ptr() as *const _,
+        value_length: value.len(),
+      });
+    }
+    unsafe {
+      abi::envoy_dynamic_module_callback_cluster_lb_context_set_dynamic_metadata_string_batch(
+        self.raw_context,
+        str_to_module_buffer(namespace),
+        pairs.as_ptr(),
+        pairs.len(),
+      )
+    }
+  }
+
   fn worker_timer_new(&self) -> Option<Box<dyn EnvoyClusterWorkerTimer>> {
     let raw_ptr =
       unsafe { abi::envoy_dynamic_module_callback_cluster_worker_timer_new(self.raw_lb) };
@@ -2930,6 +2969,34 @@ pub unsafe extern "C" fn envoy_dynamic_module_on_cluster_http_callout_done(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  // Drives the real wrapper against the stub in `lib_test.rs` so the flattening of the
+  // `(&str, &str)` slice into the ABI pair array is checked, not just mocked away.
+  #[test]
+  fn set_dynamic_metadata_string_batch_flattens_entries_in_order() {
+    let context = ClusterLbContextRef::new(0x1 as _, std::ptr::null_mut());
+
+    assert!(context.set_dynamic_metadata_string_batch(
+      "dec",
+      &[("l1_decision", "resolved"), ("l2_selector", "dicer")],
+    ));
+    assert_eq!(
+      *crate::mod_test::MOCK_CLUSTER_LB_CONTEXT_METADATA_BATCH
+        .lock()
+        .unwrap(),
+      vec![
+        ("l1_decision".to_owned(), "resolved".to_owned()),
+        ("l2_selector".to_owned(), "dicer".to_owned()),
+      ]
+    );
+
+    // An empty slice still crosses once and is a no-op on the Envoy side.
+    assert!(context.set_dynamic_metadata_string_batch("dec", &[]));
+    assert!(crate::mod_test::MOCK_CLUSTER_LB_CONTEXT_METADATA_BATCH
+      .lock()
+      .unwrap()
+      .is_empty());
+  }
 
   #[test]
   fn add_hosts_with_hostnames_dispatches_and_validates_lengths() {
