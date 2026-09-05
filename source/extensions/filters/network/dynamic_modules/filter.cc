@@ -69,10 +69,18 @@ void DynamicModuleNetworkFilter::initializeReadFilterCallbacks(
   // Publish the worker dispatcher for cross-thread `commit()`; see `dispatcher()`.
   cached_dispatcher_.store(&callbacks.connection().dispatcher(), std::memory_order_release);
 
+  // Parse into a local and only publish a value that parsed. `absl::SimpleAtoi` leaves its output
+  // unspecified when it fails, and neither failure arm here returns, so writing the member directly
+  // would leave the index indeterminate on a malformed dispatcher name. The module keys per-worker
+  // state on `workerIndex()`, so a defined fallback matters more than a precise one.
   const std::string& worker_name = callbacks.connection().dispatcher().name();
   auto pos = worker_name.find_first_of('_');
   ENVOY_BUG(pos != std::string::npos, "worker name is not in expected format worker_{index}");
-  if (!absl::SimpleAtoi(worker_name.substr(pos + 1), &worker_index_)) {
+  uint32_t parsed_worker_index = 0;
+  if (pos != std::string::npos &&
+      absl::SimpleAtoi(worker_name.substr(pos + 1), &parsed_worker_index)) {
+    worker_index_ = parsed_worker_index;
+  } else {
     IS_ENVOY_BUG("failed to parse worker index from name");
   }
 

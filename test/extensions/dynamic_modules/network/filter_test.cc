@@ -314,6 +314,53 @@ TEST(DynamicModuleNetworkFilterConfigTest, StopIterationStatus) {
 }
 
 // -----------------------------------------------------------------------------
+// Worker index tests
+// -----------------------------------------------------------------------------
+
+// A well formed dispatcher name yields its index.
+TEST_F(DynamicModuleNetworkFilterTest, WorkerIndexParsedFromDispatcherName) {
+  NiceMock<Event::MockDispatcher> worker_dispatcher{"worker_7"};
+  NiceMock<Network::MockReadFilterCallbacks> read_callbacks;
+  NiceMock<Network::MockConnection> connection;
+  ON_CALL(connection, dispatcher()).WillByDefault(testing::ReturnRef(worker_dispatcher));
+  ON_CALL(read_callbacks, connection()).WillByDefault(testing::ReturnRef(connection));
+
+  auto filter = std::make_shared<DynamicModuleNetworkFilter>(filter_config_);
+  filter->initializeReadFilterCallbacks(read_callbacks);
+  EXPECT_EQ(7, filter->workerIndex());
+}
+
+// A dispatcher name the parser cannot read leaves a defined index instead of an indeterminate one.
+// Neither failure arm returns, and `absl::SimpleAtoi` leaves its output unspecified on failure, so
+// the index must not be written from a failed parse. The module keys per-worker state on it.
+TEST_F(DynamicModuleNetworkFilterTest, WorkerIndexDefaultsToZeroOnUnparsableDispatcherName) {
+  NiceMock<Event::MockDispatcher> worker_dispatcher{"worker_not_a_number"};
+  NiceMock<Network::MockReadFilterCallbacks> read_callbacks;
+  NiceMock<Network::MockConnection> connection;
+  ON_CALL(connection, dispatcher()).WillByDefault(testing::ReturnRef(worker_dispatcher));
+  ON_CALL(read_callbacks, connection()).WillByDefault(testing::ReturnRef(connection));
+
+  auto filter = std::make_shared<DynamicModuleNetworkFilter>(filter_config_);
+  EXPECT_ENVOY_BUG(filter->initializeReadFilterCallbacks(read_callbacks),
+                   "failed to parse worker index from name");
+  EXPECT_EQ(0, filter->workerIndex());
+}
+
+// A name with no separator at all trips the format check and still leaves a defined index.
+TEST_F(DynamicModuleNetworkFilterTest, WorkerIndexDefaultsToZeroOnNameWithNoSeparator) {
+  NiceMock<Event::MockDispatcher> worker_dispatcher{"noseparator"};
+  NiceMock<Network::MockReadFilterCallbacks> read_callbacks;
+  NiceMock<Network::MockConnection> connection;
+  ON_CALL(connection, dispatcher()).WillByDefault(testing::ReturnRef(worker_dispatcher));
+  ON_CALL(read_callbacks, connection()).WillByDefault(testing::ReturnRef(connection));
+
+  auto filter = std::make_shared<DynamicModuleNetworkFilter>(filter_config_);
+  EXPECT_ENVOY_BUG(filter->initializeReadFilterCallbacks(read_callbacks),
+                   "worker name is not in expected format");
+  EXPECT_EQ(0, filter->workerIndex());
+}
+
+// -----------------------------------------------------------------------------
 // Metrics Tests
 // -----------------------------------------------------------------------------
 
