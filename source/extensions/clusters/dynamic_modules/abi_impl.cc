@@ -312,6 +312,31 @@ envoy_dynamic_module_callback_cluster_lb_get_healthy_host(
   return const_cast<Envoy::Upstream::Host*>(healthy_hosts[index].get());
 }
 
+bool envoy_dynamic_module_callback_cluster_lb_get_healthy_hosts(
+    envoy_dynamic_module_type_cluster_lb_envoy_ptr lb_envoy_ptr, uint32_t priority,
+    envoy_dynamic_module_type_cluster_host_envoy_ptr* hosts, size_t hosts_capacity,
+    size_t* hosts_size_out) {
+  *hosts_size_out = 0;
+  if (lb_envoy_ptr == nullptr) {
+    return false;
+  }
+  const auto& host_sets = getLb(lb_envoy_ptr)->prioritySet().hostSetsPerPriority();
+  if (priority >= host_sets.size()) {
+    return false;
+  }
+  const auto& healthy_hosts = host_sets[priority]->healthyHosts();
+  *hosts_size_out = healthy_hosts.size();
+  // Leave the buffer untouched when it cannot hold the whole partition, so the caller retries with
+  // a larger one instead of acting on a partial view of the healthy set.
+  if (healthy_hosts.size() > hosts_capacity) {
+    return false;
+  }
+  for (size_t i = 0; i < healthy_hosts.size(); i++) {
+    hosts[i] = const_cast<Envoy::Upstream::Host*>(healthy_hosts[i].get());
+  }
+  return true;
+}
+
 // =============================================================================
 // Cluster LB Host Information Callbacks
 // =============================================================================

@@ -4732,6 +4732,31 @@ pub extern "C" fn envoy_dynamic_module_callback_cluster_lb_get_healthy_host(
   std::ptr::null_mut()
 }
 
+/// Reports two healthy hosts at priority 0 and no such priority otherwise, so the SDK wrapper's
+/// size-then-fill handshake and its not-found arm are both exercised.
+#[no_mangle]
+pub extern "C" fn envoy_dynamic_module_callback_cluster_lb_get_healthy_hosts(
+  _lb_envoy_ptr: abi::envoy_dynamic_module_type_cluster_lb_envoy_ptr,
+  priority: u32,
+  hosts: *mut abi::envoy_dynamic_module_type_cluster_host_envoy_ptr,
+  hosts_capacity: usize,
+  hosts_size_out: *mut usize,
+) -> bool {
+  const HOSTS: [usize; 2] = [0xAB, 0xCD];
+  unsafe { *hosts_size_out = 0 };
+  if priority != 0 {
+    return false;
+  }
+  unsafe { *hosts_size_out = HOSTS.len() };
+  if hosts_capacity < HOSTS.len() {
+    return false;
+  }
+  for (i, addr) in HOSTS.iter().enumerate() {
+    unsafe { *hosts.add(i) = *addr as abi::envoy_dynamic_module_type_cluster_host_envoy_ptr };
+  }
+  true
+}
+
 #[no_mangle]
 pub extern "C" fn envoy_dynamic_module_callback_cluster_lb_get_cluster_name(
   _lb_envoy_ptr: abi::envoy_dynamic_module_type_cluster_lb_envoy_ptr,

@@ -824,6 +824,42 @@ TEST_F(DynamicModuleClusterTest, LbAbiCallbacks) {
   EXPECT_EQ(nullptr, envoy_dynamic_module_callback_cluster_lb_get_healthy_host(dm_lb, 0, 2));
   // Invalid priority.
   EXPECT_EQ(nullptr, envoy_dynamic_module_callback_cluster_lb_get_healthy_host(dm_lb, 99, 0));
+
+  // The bulk getter reports the size for a zero capacity probe and writes nothing.
+  size_t healthy_size = 12345;
+  EXPECT_FALSE(envoy_dynamic_module_callback_cluster_lb_get_healthy_hosts(dm_lb, 0, nullptr, 0,
+                                                                          &healthy_size));
+  EXPECT_EQ(2, healthy_size);
+
+  // A buffer that is one short writes nothing, so a caller cannot act on a partial healthy set.
+  envoy_dynamic_module_type_cluster_host_envoy_ptr too_small[1] = {nullptr};
+  healthy_size = 0;
+  EXPECT_FALSE(envoy_dynamic_module_callback_cluster_lb_get_healthy_hosts(dm_lb, 0, too_small, 1,
+                                                                          &healthy_size));
+  EXPECT_EQ(2, healthy_size);
+  EXPECT_EQ(nullptr, too_small[0]);
+
+  // A large enough buffer is filled in the indexed accessor's order.
+  envoy_dynamic_module_type_cluster_host_envoy_ptr filled[4] = {nullptr, nullptr, nullptr, nullptr};
+  healthy_size = 0;
+  EXPECT_TRUE(envoy_dynamic_module_callback_cluster_lb_get_healthy_hosts(dm_lb, 0, filled, 4,
+                                                                         &healthy_size));
+  EXPECT_EQ(2, healthy_size);
+  EXPECT_EQ(hosts[0].get(), filled[0]);
+  EXPECT_EQ(hosts[1].get(), filled[1]);
+  EXPECT_EQ(nullptr, filled[2]);
+
+  // An unknown priority level reports zero and fails, distinguishing it from an empty partition.
+  healthy_size = 12345;
+  EXPECT_FALSE(envoy_dynamic_module_callback_cluster_lb_get_healthy_hosts(dm_lb, 99, filled, 4,
+                                                                          &healthy_size));
+  EXPECT_EQ(0, healthy_size);
+
+  // A null load balancer pointer is rejected rather than dereferenced.
+  healthy_size = 12345;
+  EXPECT_FALSE(envoy_dynamic_module_callback_cluster_lb_get_healthy_hosts(nullptr, 0, filled, 4,
+                                                                          &healthy_size));
+  EXPECT_EQ(0, healthy_size);
 }
 
 // Test the LB host information ABI callbacks.
