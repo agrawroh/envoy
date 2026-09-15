@@ -1,3 +1,6 @@
+#include "envoy/config/bootstrap/v3/bootstrap.pb.h"
+#include "envoy/extensions/transport_sockets/tls/v3/tls.pb.h"
+
 #include "test/integration/http_integration.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/logging.h"
@@ -375,6 +378,171 @@ TEST_P(DynamicModulesBootstrapAwsSigningIntegrationTest, SignedCalloutGatingInit
   EXPECT_LOG_CONTAINS(
       "info", "Bootstrap signed callout test completed successfully!",
       initializeWithBootstrapExtension(testDataDir("rust"), "bootstrap_signed_callout_test"));
+}
+
+// Every resource kind is served from the manager that owns it, so one bootstrap covering all four
+// checks each accessor against config the test controls.
+TEST_P(DynamicModulesBootstrapIntegrationTest, ActiveResources) {
+  const std::string sds_yaml =
+      fmt::format(R"EOF(
+resources:
+- "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret
+  name: secret_0
+  tls_certificate:
+    certificate_chain: {{ filename: "{}" }}
+    private_key: {{ filename: "{}" }}
+)EOF",
+                  TestEnvironment::runfilesPath("test/config/integration/certs/servercert.pem"),
+                  TestEnvironment::runfilesPath("test/config/integration/certs/serverkey.pem"));
+  const std::string sds_path =
+      TestEnvironment::writeStringToFileForTest("active_resources_sds.yaml", sds_yaml);
+
+  config_helper_.addConfigModifier([&sds_path](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    // Name the listener's filter chain so it is reported, since an unnamed chain has nothing to
+    // report it by.
+    bootstrap.mutable_static_resources()->mutable_listeners(0)->mutable_filter_chains(0)->set_name(
+        "chain_0");
+
+    // Give the upstream cluster a transport socket match, which is where match names come from.
+    auto* match =
+        bootstrap.mutable_static_resources()->mutable_clusters(0)->add_transport_socket_matches();
+    match->set_name("match_0");
+    match->mutable_transport_socket()->set_name("envoy.transport_sockets.raw_buffer");
+
+    // Serve the listener's certificate over SDS so a dynamic secret provider exists.
+    envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext tls_context;
+    auto* secret_config =
+        tls_context.mutable_common_tls_context()->add_tls_certificate_sds_secret_configs();
+    secret_config->set_name("secret_0");
+    auto* config_source = secret_config->mutable_sds_config();
+    config_source->mutable_path_config_source()->set_path(sds_path);
+    config_source->set_resource_api_version(envoy::config::core::v3::ApiVersion::V3);
+    auto* transport_socket = bootstrap.mutable_static_resources()
+                                 ->mutable_listeners(0)
+                                 ->mutable_filter_chains(0)
+                                 ->mutable_transport_socket();
+    transport_socket->set_name("envoy.transport_sockets.tls");
+    ASSERT_TRUE(transport_socket->mutable_typed_config()->PackFrom(tls_context));
+  });
+  initializeWithBootstrapExtension(testDataDir("rust"), "bootstrap_active_resources_test");
+
+  BufferingStreamDecoderPtr response = IntegrationUtil::makeSingleRequest(
+      lookupPort("admin"), "GET", "/active_resources", "", Http::CodecType::HTTP1, version_);
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  // The whole set is asserted, not just membership. The base bootstrap contributes one listener and
+  // one cluster, the admin listener is held by the connection handler rather than the listener
+  // manager, and the base bootstrap's static secret is not a dynamic one.
+  EXPECT_EQ("filter_chains=[chain_0] clusters=[cluster_0] transport_socket_matches=[match_0] "
+            "secrets=[secret_0]",
+            response->body());
+}
+
+// A chain delivered as a standalone FilterChain resource lives in the process-wide FCDS manager
+// rather than the listener's inline chains, and is still reported through the listener whose
+// matcher routes to it.
+TEST_P(DynamicModulesBootstrapIntegrationTest, ActiveResourcesFcds) {
+  const std::string fcds_yaml = R"EOF(
+resources:
+- "@type": type.googleapis.com/envoy.config.listener.v3.FilterChain
+  name: fcds_chain
+  filters:
+  - name: envoy.filters.network.http_connection_manager
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+      stat_prefix: fcds
+      route_config:
+        name: fcds_route
+        virtual_hosts:
+        - name: fcds_vhost
+          domains: ["*"]
+          routes:
+          - match: {prefix: "/"}
+            route: {cluster: cluster_0}
+      http_filters:
+      - name: envoy.filters.http.router
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+)EOF";
+  const std::string fcds_path =
+      TestEnvironment::writeStringToFileForTest("active_resources_fcds.yaml", fcds_yaml);
+
+  config_helper_.addConfigModifier(
+      [&fcds_path](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+        auto* listener = bootstrap.mutable_static_resources()->mutable_listeners(0);
+        // Drop the inline chain, point fcds_config at the file, and route every connection to the
+        // FCDS-delivered chain.
+        listener->mutable_filter_chains()->Clear();
+        auto* config_source = listener->mutable_fcds_config()->mutable_config_source();
+        config_source->mutable_path_config_source()->set_path(fcds_path);
+        config_source->set_resource_api_version(envoy::config::core::v3::ApiVersion::V3);
+        TestUtility::loadFromYaml(R"EOF(
+      on_no_match:
+        action:
+          name: filter-chain-name
+          typed_config:
+            "@type": type.googleapis.com/google.protobuf.StringValue
+            value: fcds_chain
+    )EOF",
+                                  *listener->mutable_filter_chain_matcher());
+      });
+  initializeWithBootstrapExtension(testDataDir("rust"), "bootstrap_active_resources_test");
+
+  BufferingStreamDecoderPtr response = IntegrationUtil::makeSingleRequest(
+      lookupPort("admin"), "GET", "/active_resources", "", Http::CodecType::HTTP1, version_);
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  EXPECT_THAT(response->body(), testing::HasSubstr("filter_chains=[fcds_chain]"));
+}
+
+// The accessors read live manager state, so a resource that comes and goes is reported and then
+// dropped. A file-based CDS cluster drives the churn.
+TEST_P(DynamicModulesBootstrapIntegrationTest, ActiveResourcesTrackClusterChurn) {
+  const std::string cds_with_cluster = R"EOF(
+resources:
+- "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
+  name: cluster_dyn
+  connect_timeout: 0.25s
+  type: STATIC
+  load_assignment:
+    cluster_name: cluster_dyn
+    endpoints: []
+)EOF";
+  const std::string cds_path =
+      TestEnvironment::writeStringToFileForTest("active_resources_cds.yaml", cds_with_cluster);
+  config_helper_.addConfigModifier([&cds_path](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    auto* cds = bootstrap.mutable_dynamic_resources()->mutable_cds_config();
+    cds->mutable_path_config_source()->set_path(cds_path);
+    cds->set_resource_api_version(envoy::config::core::v3::ApiVersion::V3);
+  });
+  initializeWithBootstrapExtension(testDataDir("rust"), "bootstrap_active_resources_test");
+
+  auto cluster_names = [this]() {
+    BufferingStreamDecoderPtr response = IntegrationUtil::makeSingleRequest(
+        lookupPort("admin"), "GET", "/active_resources", "", Http::CodecType::HTTP1, version_);
+    EXPECT_EQ("200", response->headers().getStatusValue());
+    return response->body();
+  };
+  EXPECT_THAT(cluster_names(), testing::HasSubstr("clusters=[cluster_0,cluster_dyn]"));
+
+  // Replace the CDS file atomically and wait for the cluster manager to apply the change, so each
+  // check is deterministic rather than timing dependent. Each wait is relative to the value before
+  // the rename, since the static cluster already contributes to these counters.
+  const uint64_t removed_before = test_server_->counter("cluster_manager.cluster_removed")->value();
+  TestEnvironment::renameFile(
+      TestEnvironment::writeStringToFileForTest("active_resources_cds_empty.yaml", "resources: []"),
+      cds_path);
+  test_server_->waitForCounter("cluster_manager.cluster_removed", testing::Ge(removed_before + 1));
+  // The static cluster survives an empty CDS push, since CDS only removes what it added.
+  EXPECT_THAT(cluster_names(), testing::HasSubstr("clusters=[cluster_0]"));
+
+  // Re-adding it is reported too, so the accessor tracks churn in both directions.
+  const uint64_t added_before = test_server_->counter("cluster_manager.cluster_added")->value();
+  TestEnvironment::renameFile(TestEnvironment::writeStringToFileForTest(
+                                  "active_resources_cds_readd.yaml", cds_with_cluster),
+                              cds_path);
+  test_server_->waitForCounter("cluster_manager.cluster_added", testing::Ge(added_before + 1));
+  EXPECT_THAT(cluster_names(), testing::HasSubstr("clusters=[cluster_0,cluster_dyn]"));
 }
 
 } // namespace DynamicModules

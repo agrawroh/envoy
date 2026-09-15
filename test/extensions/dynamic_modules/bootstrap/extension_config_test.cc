@@ -309,6 +309,44 @@ TEST_F(ExtensionConfigTest, ClusterAccessRequiresServerInitialized) {
   EXPECT_TRUE(config->enableClusterLifecycle());
 }
 
+// Resource enumeration reaches the listener, cluster and secret managers, none of which exist until
+// the server is initialized, so it emits nothing until then rather than dereferencing a null
+// manager.
+TEST_F(ExtensionConfigTest, ActiveResourceNamesRequireServerInitialized) {
+  auto dynamic_module =
+      Extensions::DynamicModules::newDynamicModule(testDataDir() + "/libbootstrap_no_op.so", false);
+  ASSERT_OK(dynamic_module);
+  auto config_or = newDynamicModuleBootstrapExtensionConfig(
+      "test", "config", DefaultMetricsNamespace, std::move(dynamic_module.value()), dispatcher_,
+      context_, context_.store_);
+  ASSERT_OK(config_or);
+  auto config = config_or.value();
+
+  std::vector<std::string> names;
+  auto collect = [&names](absl::string_view name) { names.emplace_back(name); };
+  for (const auto kind :
+       {envoy_dynamic_module_type_bootstrap_active_resource_kind_FilterChain,
+        envoy_dynamic_module_type_bootstrap_active_resource_kind_Cluster,
+        envoy_dynamic_module_type_bootstrap_active_resource_kind_Secret,
+        envoy_dynamic_module_type_bootstrap_active_resource_kind_TransportSocketMatch}) {
+    config->forEachActiveResourceName(kind, collect);
+  }
+  EXPECT_THAT(names, testing::IsEmpty());
+
+  // Once initialized every kind is served from its manager. The mock managers hold nothing, so the
+  // result stays empty while now exercising each accessor.
+  testing::NiceMock<Server::MockListenerManager> listener_manager;
+  config->setListenerManager(listener_manager);
+  for (const auto kind :
+       {envoy_dynamic_module_type_bootstrap_active_resource_kind_FilterChain,
+        envoy_dynamic_module_type_bootstrap_active_resource_kind_Cluster,
+        envoy_dynamic_module_type_bootstrap_active_resource_kind_Secret,
+        envoy_dynamic_module_type_bootstrap_active_resource_kind_TransportSocketMatch}) {
+    config->forEachActiveResourceName(kind, collect);
+  }
+  EXPECT_THAT(names, testing::IsEmpty());
+}
+
 } // namespace DynamicModules
 } // namespace Bootstrap
 } // namespace Extensions

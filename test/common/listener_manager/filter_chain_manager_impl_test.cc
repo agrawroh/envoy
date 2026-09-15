@@ -169,6 +169,22 @@ public:
   std::shared_ptr<Network::MockFilterChain> build_out_fallback_filter_chain_{
       std::make_shared<Network::MockFilterChain>()};
 
+  // A config source the FCDS subscription machinery accepts.
+  static envoy::config::core::v3::ConfigSource fcdsConfigSource() {
+    envoy::config::core::v3::ConfigSource config_source;
+    auto* api_config_source = config_source.mutable_api_config_source();
+    api_config_source->set_api_type(envoy::config::core::v3::ApiConfigSource::GRPC);
+    api_config_source->set_transport_api_version(envoy::config::core::v3::ApiVersion::V3);
+    return config_source;
+  }
+
+  std::vector<std::string> filterChainNames() {
+    std::vector<std::string> names;
+    filter_chain_manager_->forEachFilterChainName(
+        [&names](absl::string_view name) { names.emplace_back(name); });
+    return names;
+  }
+
   NiceMock<MockFilterChainFactoryBuilder> filter_chain_factory_builder_;
   NiceMock<Server::Configuration::MockFactoryContext> parent_context_;
   std::vector<Network::Address::InstanceConstSharedPtr> addresses_;
@@ -394,12 +410,7 @@ TEST_P(FilterChainManagerImplTest, FcdsSharedFilterChainManagerBasic) {
   auto fcds_shared_manager = std::make_shared<FcdsSharedFilterChainManager>(
       parent_context_.server_factory_context_, listener_component_factory);
 
-  envoy::config::core::v3::ConfigSource config_source;
-  config_source.mutable_api_config_source()->set_api_type(
-      envoy::config::core::v3::ApiConfigSource::GRPC);
-  config_source.mutable_api_config_source()->set_transport_api_version(
-      envoy::config::core::v3::ApiVersion::V3);
-
+  const envoy::config::core::v3::ConfigSource config_source = fcdsConfigSource();
   std::string filter_chain_name = "dynamic_chain";
 
   Config::SubscriptionCallbacks* fcds_callbacks = nullptr;
@@ -474,6 +485,84 @@ TEST_P(FilterChainManagerImplTest, FcdsSharedFilterChainManagerBasic) {
   EXPECT_TRUE(active_chain_v2->addedViaApi());
 
   handle.reset();
+}
+
+// A named inline chain is reported, and a chain that carries no name is skipped because there is
+// nothing to report it by.
+TEST_P(FilterChainManagerImplTest, ForEachFilterChainNameInline) {
+  auto chain = std::make_shared<Network::MockFilterChain>();
+  EXPECT_CALL(*chain, name()).WillRepeatedly(Return("foo"));
+  EXPECT_CALL(filter_chain_factory_builder_, buildFilterChain(_, _, _)).WillOnce(Return(chain));
+  addSingleFilterChainHelper(filter_chain_template_);
+  EXPECT_THAT(filterChainNames(), testing::ElementsAre("foo"));
+
+  EXPECT_CALL(*chain, name()).WillRepeatedly(Return(""));
+  EXPECT_THAT(filterChainNames(), testing::IsEmpty());
+}
+
+// An FCDS chain the matcher references is reported only while its subscription holds a committed
+// chain, which is the same state findFilterChain() needs to route to it.
+TEST_P(FilterChainManagerImplTest, ForEachFilterChainNameFcds) {
+  NiceMock<MockListenerComponentFactory> listener_component_factory;
+  auto fcds_shared_manager = std::make_shared<FcdsSharedFilterChainManager>(
+      parent_context_.server_factory_context_, listener_component_factory);
+
+  Config::SubscriptionCallbacks* fcds_callbacks = nullptr;
+  auto subscription = std::make_unique<NiceMock<Config::MockSubscription>>();
+  EXPECT_CALL(parent_context_.server_factory_context_.cluster_manager_.subscription_factory_,
+              subscriptionFromConfigSource(_, _, _, _, _, _))
+      .WillOnce(Invoke(
+          [&fcds_callbacks, &subscription](
+              const envoy::config::core::v3::ConfigSource&, absl::string_view, Stats::Scope&,
+              Config::SubscriptionCallbacks& callbacks, Config::OpaqueResourceDecoderSharedPtr,
+              const Config::SubscriptionOptions&) -> absl::StatusOr<Config::SubscriptionPtr> {
+            fcds_callbacks = &callbacks;
+            return std::move(subscription);
+          }));
+
+  // The matcher falls back to a chain name that is not configured inline, so building it subscribes
+  // to FCDS for that name.
+  xds::type::matcher::v3::Matcher matcher;
+  TestUtility::loadFromYaml(R"EOF(
+     on_no_match:
+       action:
+         name: filter-chain-name
+         typed_config:
+           "@type": type.googleapis.com/google.protobuf.StringValue
+           value: fcds_chain
+  )EOF",
+                            matcher);
+  auto inline_chain = std::make_shared<Network::MockFilterChain>();
+  EXPECT_CALL(*inline_chain, name()).WillRepeatedly(Return("foo"));
+  EXPECT_CALL(filter_chain_factory_builder_, buildFilterChain(_, _, _))
+      .WillOnce(Return(inline_chain));
+  EXPECT_OK(filter_chain_manager_->addFilterChains(
+      &matcher,
+      std::vector<const envoy::config::listener::v3::FilterChain*>{&filter_chain_template_},
+      nullptr, filter_chain_factory_builder_, *filter_chain_manager_, fcds_shared_manager,
+      fcdsConfigSource(), dummy_fcds_callbacks_));
+
+  Init::ExpectableWatcherImpl init_watcher;
+  EXPECT_CALL(init_watcher, ready());
+  init_manager_.initialize(init_watcher);
+  ASSERT_NE(fcds_callbacks, nullptr);
+
+  // Subscribed but not committed, so only the inline chain is reported.
+  EXPECT_THAT(filterChainNames(), testing::ElementsAre("foo"));
+
+  envoy::config::listener::v3::FilterChain fcds_chain;
+  fcds_chain.set_name("fcds_chain");
+  EXPECT_CALL(listener_component_factory, createNetworkFilterFactoryList(_, _))
+      .WillOnce(Return(Filter::NetworkFilterFactoriesList{}));
+  Protobuf::RepeatedPtrField<std::string> removed_resources;
+  EXPECT_OK(fcds_callbacks->onConfigUpdate(TestUtility::decodeResources({fcds_chain}).refvec_,
+                                           removed_resources, "v1"));
+  EXPECT_THAT(filterChainNames(), testing::UnorderedElementsAre("foo", "fcds_chain"));
+
+  // Removed upstream, so the chain stops being routable and stops being reported.
+  *removed_resources.Add() = "fcds_chain";
+  EXPECT_OK(fcds_callbacks->onConfigUpdate({}, removed_resources, "v2"));
+  EXPECT_THAT(filterChainNames(), testing::ElementsAre("foo"));
 }
 
 TEST_P(FilterChainManagerImplTest, FcdsNoMatcherFails) {

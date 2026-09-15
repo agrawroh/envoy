@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <string>
 
 #include "envoy/event/dispatcher.h"
@@ -168,6 +169,18 @@ public:
   void onListenerAddOrUpdate(absl::string_view listener_name,
                              const Network::ListenerConfig& listener_config) override;
   void onListenerRemoval(const std::string& listener_name) override;
+
+  /**
+   * Invokes `callback` for the name of each active resource of a single kind, letting the module
+   * reconcile its own view against what Envoy has committed. A no-op before the server is
+   * initialized, since the managers holding the resources are not reachable until then. Main thread
+   * only.
+   *
+   * @param kind selects which kind of active resource to enumerate.
+   * @param callback functor that is provided one name at a time, valid for that call only.
+   */
+  void forEachActiveResourceName(envoy_dynamic_module_type_bootstrap_active_resource_kind kind,
+                                 std::function<void(absl::string_view)> callback);
 
   // The corresponding in-module configuration.
   envoy_dynamic_module_type_bootstrap_extension_config_module_ptr in_module_config_ = nullptr;

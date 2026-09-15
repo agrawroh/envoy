@@ -159,6 +159,16 @@ GenericSecretConfigProviderSharedPtr SecretManagerImpl::findOrCreateGenericSecre
                                                 init_manager, true);
 }
 
+void SecretManagerImpl::forEachActiveTlsCertificateName(
+    std::function<void(absl::string_view)> callback) const {
+  for (const auto& provider : certificate_providers_.allSecretProviders()) {
+    // A provider whose secret has not been delivered yet is warming, not active.
+    if (provider->secret() != nullptr) {
+      callback(provider->secretData().resource_name_);
+    }
+  }
+}
+
 ProtobufTypes::MessagePtr
 SecretManagerImpl::dumpSecretConfigs(const Matchers::StringMatcher& name_matcher) {
   auto config_dump = std::make_unique<envoy::admin::v3::SecretsConfigDump>();

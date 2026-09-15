@@ -80,7 +80,9 @@ public:
       auto handle_or_error = fcds_manager->subscribe(
           context.fcds_config_source_, name, context.fcds_callbacks_, context.init_manager_);
       THROW_IF_NOT_OK(handle_or_error.status());
-      return std::make_shared<DynamicFilterChainAction>(std::move(handle_or_error).value());
+      auto handle = std::move(handle_or_error).value();
+      context.fcds_handles_.push_back(handle);
+      return std::make_shared<DynamicFilterChainAction>(std::move(handle));
     }
     return std::make_shared<NoopFilterChainAction>();
   }
@@ -348,6 +350,7 @@ absl::Status FilterChainManagerImpl::maybeConstructMatcher(
         .fcds_callbacks_ = fcds_callbacks,
         .fcds_config_source_ = fcds_config_source,
         .init_manager_ = init_manager_,
+        .fcds_handles_ = fcds_handles_,
     };
     // MatchTreeFactory::create doesn't have an exception-free variant.
     TRY_NEEDS_AUDIT {
@@ -613,6 +616,23 @@ makeCidrListEntry(const std::string& cidr, const T& data, absl::Status& creation
 }
 
 }; // namespace
+
+void FilterChainManagerImpl::forEachFilterChainName(
+    std::function<void(absl::string_view)> callback) const {
+  for (const auto& proto_and_chain : fc_contexts_) {
+    const absl::string_view name = proto_and_chain.second->name();
+    if (!name.empty()) {
+      callback(name);
+    }
+  }
+  // An FCDS chain is reported once its subscription has committed, which is the same test
+  // findFilterChain() uses to route to it, so a name is only reported while it is routable.
+  for (const auto& handle : fcds_handles_) {
+    if (handle->filterChain() != nullptr) {
+      callback(handle->filterChainName());
+    }
+  }
+}
 
 const Network::FilterChain*
 FilterChainManagerImpl::findFilterChain(const Network::ConnectionSocket& socket,
@@ -1052,6 +1072,8 @@ public:
   const Network::FilterChain* filterChain() override {
     return shared_manager_->findThreadLocalFilterChain(filter_chain_name_);
   }
+
+  absl::string_view filterChainName() const override { return filter_chain_name_; }
 
   ~FcdsSubscriptionHandleImpl() override {
     shared_manager_->unsubscribe(filter_chain_name_, *this);

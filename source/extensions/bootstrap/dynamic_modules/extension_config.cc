@@ -114,6 +114,43 @@ void DynamicModuleBootstrapExtensionConfig::onListenerRemoval(const std::string&
   }
 }
 
+void DynamicModuleBootstrapExtensionConfig::forEachActiveResourceName(
+    envoy_dynamic_module_type_bootstrap_active_resource_kind kind,
+    std::function<void(absl::string_view)> callback) {
+  // setListenerManager() hands over the listener manager as the server finishes initializing, which
+  // is also when the cluster and secret managers become reachable.
+  if (listener_manager_ == nullptr) {
+    return;
+  }
+  switch (kind) {
+  case envoy_dynamic_module_type_bootstrap_active_resource_kind_FilterChain:
+    for (Network::ListenerConfig& listener :
+         listener_manager_->listeners(Server::ListenerManager::ListenerState::ACTIVE)) {
+      listener.filterChainManager().forEachFilterChainName(callback);
+    }
+    break;
+  case envoy_dynamic_module_type_bootstrap_active_resource_kind_Cluster: {
+    const Upstream::ClusterManager::ClusterInfoMaps clusters = context_.clusterManager().clusters();
+    for (const auto& cluster_entry : clusters.active_clusters_) {
+      callback(cluster_entry.first);
+    }
+    break;
+  }
+  case envoy_dynamic_module_type_bootstrap_active_resource_kind_TransportSocketMatch: {
+    // Matches are configured per cluster and the ABI carries names only, so a match several
+    // clusters share is reported once per cluster that configures it.
+    const Upstream::ClusterManager::ClusterInfoMaps clusters = context_.clusterManager().clusters();
+    for (const auto& cluster_entry : clusters.active_clusters_) {
+      cluster_entry.second.get().info()->transportSocketMatcher().forEachMatchName(callback);
+    }
+    break;
+  }
+  case envoy_dynamic_module_type_bootstrap_active_resource_kind_Secret:
+    context_.secretManager().forEachActiveTlsCertificateName(callback);
+    break;
+  }
+}
+
 void DynamicModuleBootstrapExtensionConfig::onScheduled(uint64_t event_id) {
   if (in_module_config_ != nullptr && on_bootstrap_extension_config_scheduled_ != nullptr) {
     on_bootstrap_extension_config_scheduled_(thisAsVoidPtr(), in_module_config_, event_id);

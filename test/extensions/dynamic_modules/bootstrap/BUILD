@@ -121,6 +121,7 @@ envoy_cc_dyn_module_test(
     data = [
         "//test/config/integration/certs",
         "//test/extensions/dynamic_modules/test_data/c:bootstrap_no_op",
+        "//test/extensions/dynamic_modules/test_data/rust:bootstrap_active_resources_test",
         "//test/extensions/dynamic_modules/test_data/rust:bootstrap_admin_handler_test",
         "//test/extensions/dynamic_modules/test_data/rust:bootstrap_cluster_lifecycle_test",
         "//test/extensions/dynamic_modules/test_data/rust:bootstrap_file_watcher_test",
@@ -143,5 +144,7 @@ envoy_cc_dyn_module_test(
         "//test/test_common:environment_lib",
         "//test/test_common:logging_lib",
         "//test/test_common:utility_lib",
+        "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/transport_sockets/tls/v3:pkg_cc_proto",
     ],
 )

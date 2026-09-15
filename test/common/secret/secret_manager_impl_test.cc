@@ -58,6 +58,13 @@ protected:
 
   void setupSecretProviderContext() {}
 
+  static std::vector<std::string> activeTlsCertificateSecretNames(const SecretManager& manager) {
+    std::vector<std::string> names;
+    manager.forEachActiveTlsCertificateName(
+        [&names](absl::string_view name) { names.emplace_back(name); });
+    return names;
+  }
+
   Api::ApiPtr api_;
   testing::NiceMock<Server::MockConfigTracker> config_tracker_;
   Event::SimulatedTimeSystem time_system_;
@@ -401,6 +408,51 @@ tls_certificate:
   const std::string key_pem = "{{ test_rundir }}/test/common/tls/test_data/selfsigned_key.pem";
   EXPECT_EQ(TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(key_pem)),
             tls_config.privateKey());
+}
+
+// A dynamic TLS certificate secret is reported only once its material has been delivered, since a
+// provider that is still warming has nothing to hand a TLS context.
+TEST_F(SecretManagerImplTest, ForEachActiveTlsCertificateSecretName) {
+  Server::MockInstance server;
+  SecretManagerPtr secret_manager(new SecretManagerImpl(config_tracker_));
+
+  NiceMock<Server::Configuration::MockTransportSocketFactoryContext> secret_context;
+  envoy::config::core::v3::ConfigSource config_source;
+  NiceMock<LocalInfo::MockLocalInfo> local_info;
+  NiceMock<Init::MockManager> init_manager;
+  NiceMock<Init::ExpectableWatcherImpl> init_watcher;
+  Init::TargetHandlePtr init_target_handle;
+  EXPECT_CALL(init_manager, add(_))
+      .WillOnce(Invoke([&init_target_handle](const Init::Target& target) {
+        init_target_handle = target.createHandle("test");
+      }));
+  EXPECT_CALL(secret_context.server_context_, mainThreadDispatcher())
+      .WillRepeatedly(ReturnRef(*dispatcher_));
+  EXPECT_CALL(secret_context.server_context_, localInfo()).WillOnce(ReturnRef(local_info));
+  EXPECT_CALL(secret_context.server_context_, api()).WillRepeatedly(ReturnRef(*api_));
+
+  auto secret_provider = secret_manager->findOrCreateTlsCertificateProvider(
+      config_source, "abc.com", secret_context.server_context_, init_manager, true);
+  EXPECT_THAT(activeTlsCertificateSecretNames(*secret_manager), testing::IsEmpty());
+
+  const std::string yaml = R"EOF(
+name: "abc.com"
+tls_certificate:
+  certificate_chain:
+    filename: "{{ test_rundir }}/test/common/tls/test_data/selfsigned_cert.pem"
+  private_key:
+    filename: "{{ test_rundir }}/test/common/tls/test_data/selfsigned_key.pem"
+)EOF";
+  envoy::extensions::transport_sockets::tls::v3::Secret typed_secret;
+  TestUtility::loadFromYaml(TestEnvironment::substitute(yaml), typed_secret);
+  init_target_handle->initialize(init_watcher);
+  EXPECT_OK(secret_context.server_context_.cluster_manager_.subscription_factory_.callbacks_
+                ->onConfigUpdate(TestUtility::decodeResources({typed_secret}).refvec_, ""));
+  EXPECT_THAT(activeTlsCertificateSecretNames(*secret_manager), testing::ElementsAre("abc.com"));
+
+  // The provider is unregistered when its last user goes away, so the name stops being reported.
+  secret_provider.reset();
+  EXPECT_THAT(activeTlsCertificateSecretNames(*secret_manager), testing::IsEmpty());
 }
 
 TEST_F(SecretManagerImplTest, SdsDynamicGenericSecret) {

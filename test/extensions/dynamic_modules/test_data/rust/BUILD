@@ -55,6 +55,8 @@ test_program(name = "bootstrap_signed_callout_test")
 
 test_program(name = "bootstrap_file_watcher_test")
 
+test_program(name = "bootstrap_active_resources_test")
+
 test_program(name = "bootstrap_admin_handler_test")
 
 test_program(name = "bootstrap_cluster_lifecycle_test")

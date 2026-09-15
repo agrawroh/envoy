@@ -191,6 +191,16 @@ void envoy_dynamic_module_callback_bootstrap_extension_iterate_gauges(
                            });
 }
 
+void envoy_dynamic_module_callback_bootstrap_extension_get_active_resource_names(
+    envoy_dynamic_module_type_bootstrap_extension_config_envoy_ptr extension_config_envoy_ptr,
+    envoy_dynamic_module_type_bootstrap_active_resource_kind kind,
+    envoy_dynamic_module_type_bootstrap_active_resource_name_fn name_fn, void* user_data) {
+  auto* config = static_cast<DynamicModuleBootstrapExtensionConfig*>(extension_config_envoy_ptr);
+  config->forEachActiveResourceName(kind, [name_fn, user_data](absl::string_view name) {
+    name_fn({name.data(), name.size()}, user_data);
+  });
+}
+
 // -------------------- Stats Definition and Update Callbacks --------------------
 
 } // extern "C"

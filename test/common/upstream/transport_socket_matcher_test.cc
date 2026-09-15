@@ -112,6 +112,12 @@ public:
                    .value();
   }
 
+  std::vector<std::string> matchNames() {
+    std::vector<std::string> names;
+    matcher_->forEachMatchName([&names](absl::string_view name) { names.emplace_back(name); });
+    return names;
+  }
+
   void validate(const envoy::config::core::v3::Metadata* endpoint_metadata,
                 const envoy::config::core::v3::Metadata* locality_metadata,
                 const std::string& expected) {
@@ -324,6 +330,32 @@ filter_metadata:
   auto& factory_raw = matcher_->resolve(&endpoint_metadata2, nullptr).factory_;
   const auto& foo_raw = dynamic_cast<const FakeTransportSocketFactory&>(factory_raw);
   EXPECT_EQ("raw_id", foo_raw.id());
+
+  EXPECT_THAT(matchNames(), testing::UnorderedElementsAre("tls", "raw"));
+}
+
+// Every configured match is reported by name, whether selection is metadata based (matches_) or
+// matcher based (transport_sockets_by_name_). The two are mutually exclusive, so no name repeats.
+TEST_F(TransportSocketMatcherTest, ForEachMatchName) {
+  init({R"EOF(
+name: "sidecar_socket"
+match:
+  sidecar: "true"
+transport_socket:
+  name: "foo"
+  typed_config:
+    "@type": type.googleapis.com/envoy.config.core.v3.Node
+    id: "sidecar")EOF",
+        R"EOF(
+name: "http_socket"
+match:
+  protocol: "http"
+transport_socket:
+  name: "foo"
+  typed_config:
+    "@type": type.googleapis.com/envoy.config.core.v3.Node
+    id: "http")EOF"});
+  EXPECT_THAT(matchNames(), testing::UnorderedElementsAre("sidecar_socket", "http_socket"));
 }
 
 TEST_F(TransportSocketMatcherTest, MultipleMatchFirstWin) {

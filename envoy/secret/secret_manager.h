@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -172,6 +173,14 @@ public:
                                     const std::string& config_name,
                                     Server::Configuration::ServerFactoryContext& server_context,
                                     OptRef<Init::Manager> init_manager) PURE;
+
+  /**
+   * Invoke a callback for the name of each dynamic (SDS) TLS certificate secret whose material has
+   * been delivered. Secrets that are still warming are skipped, and a name is only valid for the
+   * duration of its callback.
+   * @param callback functor that is provided one secret name at a time.
+   */
+  virtual void forEachActiveTlsCertificateName(std::function<void(absl::string_view)>) const PURE;
 };
 
 using SecretManagerPtr = std::unique_ptr<SecretManager>;

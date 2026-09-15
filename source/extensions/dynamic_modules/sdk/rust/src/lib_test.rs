@@ -2876,6 +2876,33 @@ pub extern "C" fn envoy_dynamic_module_callback_bootstrap_extension_iterate_gaug
 }
 
 #[no_mangle]
+pub extern "C" fn envoy_dynamic_module_callback_bootstrap_extension_get_active_resource_names(
+  _config_envoy_ptr: abi::envoy_dynamic_module_type_bootstrap_extension_config_envoy_ptr,
+  kind: abi::envoy_dynamic_module_type_bootstrap_active_resource_kind,
+  name_fn: abi::envoy_dynamic_module_type_bootstrap_active_resource_name_fn,
+  user_data: *mut std::os::raw::c_void,
+) {
+  // Emit the kind's own name twice so a test can check both the enum mapping and that every
+  // emitted name is collected rather than deduplicated.
+  use abi::envoy_dynamic_module_type_bootstrap_active_resource_kind as AbiKind;
+  let name: &str = match kind {
+    AbiKind::FilterChain => "filter_chain",
+    AbiKind::Cluster => "cluster",
+    AbiKind::TransportSocketMatch => "transport_socket_match",
+    AbiKind::Secret => "secret",
+  };
+  let buffer = abi::envoy_dynamic_module_type_envoy_buffer {
+    ptr: name.as_ptr() as *const _,
+    length: name.len(),
+  };
+  let name_fn = name_fn.unwrap();
+  unsafe {
+    name_fn(buffer, user_data);
+    name_fn(buffer, user_data);
+  }
+}
+
+#[no_mangle]
 pub extern "C" fn envoy_dynamic_module_callback_bootstrap_extension_config_define_counter(
   _config_envoy_ptr: abi::envoy_dynamic_module_type_bootstrap_extension_config_envoy_ptr,
   _name: abi::envoy_dynamic_module_type_module_buffer,
@@ -6979,6 +7006,20 @@ fn test_bootstrap_extension_listener_lifecycle_default_noop() {
   unsafe {
     envoy_dynamic_module_on_bootstrap_extension_config_destroy(config_ptr);
   }
+}
+
+#[test]
+fn test_bootstrap_extension_active_resource_names() {
+  let envoy_config = bootstrap::EnvoyBootstrapExtensionConfigImpl::new(std::ptr::null_mut());
+  let names = |kind| envoy_config.active_resource_names(kind);
+
+  // Each kind reaches the callback as its own ABI value, and every emitted name is collected rather
+  // than deduplicated.
+  assert_eq!(names(ActiveResourceKind::FilterChain), ["filter_chain"; 2]);
+  assert_eq!(names(ActiveResourceKind::Cluster), ["cluster"; 2]);
+  assert_eq!(names(ActiveResourceKind::Secret), ["secret"; 2]);
+  let matches = names(ActiveResourceKind::TransportSocketMatch);
+  assert_eq!(matches, ["transport_socket_match"; 2]);
 }
 
 // =============================================================================

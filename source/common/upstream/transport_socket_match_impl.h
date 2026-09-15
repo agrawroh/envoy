@@ -85,6 +85,16 @@ public:
 
   bool usesFilterState() const override { return uses_filter_state_; }
 
+  void forEachMatchName(std::function<void(absl::string_view)> callback) const override {
+    for (const auto& match : matches_) {
+      callback(match.name);
+    }
+    // Matcher-based selection keeps its transport sockets keyed by name instead.
+    for (const auto& [name, factory] : transport_sockets_by_name_) {
+      callback(name);
+    }
+  }
+
 protected:
   TransportSocketMatcherImpl(
       const Protobuf::RepeatedPtrField<envoy::config::cluster::v3::Cluster::TransportSocketMatch>&

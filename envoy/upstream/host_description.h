@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -403,6 +404,13 @@ public:
    *         transport socket resolution must be done per-connection with transport_socket_options.
    */
   virtual bool usesFilterState() const PURE;
+
+  /**
+   * Invoke a callback for the name of each transport socket match configured on this matcher. A
+   * name is only valid for the duration of its callback.
+   * @param callback functor that is provided one match name at a time.
+   */
+  virtual void forEachMatchName(std::function<void(absl::string_view)>) const PURE;
 };
 
 using TransportSocketMatcherPtr = std::unique_ptr<TransportSocketMatcher>;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 
 #include "envoy/access_log/access_log.h"
@@ -704,6 +705,14 @@ public:
    */
   virtual const FilterChain* findFilterChain(const ConnectionSocket& socket,
                                              const StreamInfo::StreamInfo& info) const PURE;
+
+  /**
+   * Invoke a callback for the name of each filter chain this manager can route to. Chains with no
+   * name are skipped, and a name is only valid for the duration of its callback. The default is a
+   * no-op for managers that do not index chains by name.
+   * @param callback functor that is provided one filter chain name at a time.
+   */
+  virtual void forEachFilterChainName(std::function<void(absl::string_view)>) const {}
 };
 
 /**

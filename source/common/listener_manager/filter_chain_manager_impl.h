@@ -106,6 +106,9 @@ struct FilterChainActionFactoryContext {
   FcdsClientCallbacks& fcds_callbacks_;
   const envoy::config::core::v3::ConfigSource& fcds_config_source_;
   Init::Manager& init_manager_;
+  // Every FCDS subscription handle created while building the matcher is recorded here, so the
+  // owning manager knows which FCDS chains the matcher can route to.
+  std::vector<FcdsSubscriptionHandleSharedPtr>& fcds_handles_;
 };
 
 using FilterChainsByMatcher = absl::node_hash_map<envoy::config::listener::v3::FilterChainMatch,
@@ -217,6 +220,7 @@ public:
   // Network::FilterChainManager
   const Network::FilterChain* findFilterChain(const Network::ConnectionSocket& socket,
                                               const StreamInfo::StreamInfo& info) const override;
+  void forEachFilterChainName(std::function<void(absl::string_view)> callback) const override;
 
   // Add all filter chains into this manager. During the lifetime of FilterChainManagerImpl this
   // should be called at most once.
@@ -421,6 +425,10 @@ private:
   // Index filter chains by name, used by the matcher actions.
   FilterChainsByName filter_chains_by_name_;
 
+  // One subscription handle per FCDS chain matcher_ references, so forEachFilterChainName() reports
+  // the FCDS chains this listener can route to rather than every chain FCDS has delivered.
+  std::vector<FcdsSubscriptionHandleSharedPtr> fcds_handles_;
+
   // Used to hint listener which filter chains it should drain.
   mutable std::vector<Network::DrainableFilterChainSharedPtr> draining_filter_chains_;
 };
@@ -464,6 +472,8 @@ public:
   virtual ~FcdsSubscriptionHandle() = default;
   virtual const Network::FilterChain* filterChain() PURE;
   virtual FcdsClientCallbacks& callbacks() PURE;
+  // Name of the FCDS filter chain this handle subscribes to.
+  virtual absl::string_view filterChainName() const PURE;
 };
 using FcdsSubscriptionHandleSharedPtr = std::shared_ptr<FcdsSubscriptionHandle>;
 
