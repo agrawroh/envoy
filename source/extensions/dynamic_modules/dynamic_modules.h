@@ -44,18 +44,30 @@ public:
    * Get a function pointer from the dynamic module with a specific type.
    * @param T the function pointer type to cast the symbol to.
    * @param symbol_ref the symbol to look up.
-   * @return the symbol if found, otherwise nullptr.
+   * @return the symbol, or an error if the module does not export it.
    */
   template <typename T>
   absl::StatusOr<T> getFunctionPointer(const absl::string_view symbol_ref) const {
-    static_assert(std::is_pointer<T>::value &&
-                      std::is_function<typename std::remove_pointer<T>::type>::value,
-                  "T must be a function pointer type");
-    auto symbol = getSymbol(symbol_ref);
+    T symbol = getOptionalFunctionPointer<T>(symbol_ref);
     if (symbol == nullptr) {
       return absl::InvalidArgumentError("Failed to resolve symbol " + std::string(symbol_ref));
     }
-    return reinterpret_cast<T>(symbol);
+    return symbol;
+  }
+
+  /**
+   * Get an optional function pointer from the dynamic module. An event hook added after a module
+   * was built is not exported by that module, so per the ABI compatibility policy in abi/abi.h
+   * every newly added hook must be resolved this way rather than as a load failure.
+   * @param T the function pointer type to cast the symbol to.
+   * @param symbol_ref the symbol to look up.
+   * @return the symbol, or nullptr if the module does not export it.
+   */
+  template <typename T> T getOptionalFunctionPointer(const absl::string_view symbol_ref) const {
+    static_assert(std::is_pointer<T>::value &&
+                      std::is_function<typename std::remove_pointer<T>::type>::value,
+                  "T must be a function pointer type");
+    return reinterpret_cast<T>(getSymbol(symbol_ref));
   }
 
 private:

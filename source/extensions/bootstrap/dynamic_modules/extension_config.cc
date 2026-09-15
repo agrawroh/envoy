@@ -114,6 +114,42 @@ void DynamicModuleBootstrapExtensionConfig::onListenerRemoval(const std::string&
   }
 }
 
+bool DynamicModuleBootstrapExtensionConfig::enableSecretLifecycle() {
+  if (secret_lifecycle_enabled_) {
+    return false;
+  }
+  if (!server_initialized_) {
+    ENVOY_LOG(error, "cannot enable secret lifecycle before server is initialized");
+    return false;
+  }
+  secret_lifecycle_enabled_ = true;
+  // The SecretManager replays the providers that already exist, so this also subscribes to the
+  // secrets that are active already. Every callback below runs on the main thread, and the handles
+  // holding them are members, so `this` outlives every invocation.
+  secret_provider_created_handle_ =
+      context_.secretManager().addTlsCertificateProviderCreatedCallback(
+          [this](const std::string& secret_name, Secret::TlsCertificateConfigProvider& provider) {
+            // addUpdateCallback fires immediately when the secret is already present and again on
+            // every rotation. addRemoveCallback fires when the resource is explicitly removed.
+            secret_callback_handles_.push_back(provider.addUpdateCallback([this, secret_name]() {
+              notifySecretEvent(on_bootstrap_extension_secret_add_or_update_, secret_name);
+              return absl::OkStatus();
+            }));
+            secret_callback_handles_.push_back(provider.addRemoveCallback([this, secret_name]() {
+              notifySecretEvent(on_bootstrap_extension_secret_removal_, secret_name);
+              return absl::OkStatus();
+            }));
+          });
+  return true;
+}
+
+void DynamicModuleBootstrapExtensionConfig::notifySecretEvent(
+    OnBootstrapExtensionSecretEventType hook, const std::string& secret_name) {
+  if (in_module_config_ != nullptr && hook != nullptr) {
+    hook(thisAsVoidPtr(), in_module_config_, {secret_name.data(), secret_name.size()});
+  }
+}
+
 void DynamicModuleBootstrapExtensionConfig::forEachActiveResourceName(
     envoy_dynamic_module_type_bootstrap_active_resource_kind kind,
     std::function<void(absl::string_view)> callback) {
@@ -423,6 +459,13 @@ newDynamicModuleBootstrapExtensionConfig(
   config->on_bootstrap_extension_cluster_removal_ = on_cluster_removal.value();
   config->on_bootstrap_extension_listener_add_or_update_ = on_listener_add_or_update.value();
   config->on_bootstrap_extension_listener_removal_ = on_listener_removal.value();
+  // Newly added hooks are resolved optionally so a module built before they existed keeps loading.
+  config->on_bootstrap_extension_secret_add_or_update_ =
+      config->dynamic_module_->getOptionalFunctionPointer<OnBootstrapExtensionSecretEventType>(
+          "envoy_dynamic_module_on_bootstrap_extension_secret_add_or_update");
+  config->on_bootstrap_extension_secret_removal_ =
+      config->dynamic_module_->getOptionalFunctionPointer<OnBootstrapExtensionSecretEventType>(
+          "envoy_dynamic_module_on_bootstrap_extension_secret_removal");
 
   config->stat_creation_frozen_ = true;
 

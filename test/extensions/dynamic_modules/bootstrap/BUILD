@@ -130,6 +130,7 @@ envoy_cc_dyn_module_test(
         "//test/extensions/dynamic_modules/test_data/rust:bootstrap_init_target_test",
         "//test/extensions/dynamic_modules/test_data/rust:bootstrap_integration_test",
         "//test/extensions/dynamic_modules/test_data/rust:bootstrap_listener_lifecycle_test",
+        "//test/extensions/dynamic_modules/test_data/rust:bootstrap_secret_lifecycle_test",
         "//test/extensions/dynamic_modules/test_data/rust:bootstrap_shared_data_test",
         "//test/extensions/dynamic_modules/test_data/rust:bootstrap_signed_callout_test",
         "//test/extensions/dynamic_modules/test_data/rust:bootstrap_stats_test",

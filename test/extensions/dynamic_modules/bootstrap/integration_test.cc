@@ -545,6 +545,47 @@ resources:
   EXPECT_THAT(cluster_names(), testing::HasSubstr("clusters=[cluster_0,cluster_dyn]"));
 }
 
+// Serving the listener's certificate over SDS creates a dynamic secret provider that is active by
+// the time the module enables secret lifecycle, so enabling replays it and the module observes
+// on_secret_add_or_update with the secret name.
+TEST_P(DynamicModulesBootstrapIntegrationTest, SecretLifecycleRust) {
+  const std::string sds_yaml =
+      fmt::format(R"EOF(
+resources:
+- "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret
+  name: secret_0
+  tls_certificate:
+    certificate_chain: {{ filename: "{}" }}
+    private_key: {{ filename: "{}" }}
+)EOF",
+                  TestEnvironment::runfilesPath("test/config/integration/certs/servercert.pem"),
+                  TestEnvironment::runfilesPath("test/config/integration/certs/serverkey.pem"));
+  const std::string sds_path =
+      TestEnvironment::writeStringToFileForTest("secret_lifecycle_sds.yaml", sds_yaml);
+
+  config_helper_.addConfigModifier([&sds_path](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext tls_context;
+    auto* secret_config =
+        tls_context.mutable_common_tls_context()->add_tls_certificate_sds_secret_configs();
+    secret_config->set_name("secret_0");
+    auto* config_source = secret_config->mutable_sds_config();
+    config_source->mutable_path_config_source()->set_path(sds_path);
+    config_source->set_resource_api_version(envoy::config::core::v3::ApiVersion::V3);
+    auto* transport_socket = bootstrap.mutable_static_resources()
+                                 ->mutable_listeners(0)
+                                 ->mutable_filter_chains(0)
+                                 ->mutable_transport_socket();
+    transport_socket->set_name("envoy.transport_sockets.tls");
+    ASSERT_TRUE(transport_socket->mutable_typed_config()->PackFrom(tls_context));
+  });
+
+  EXPECT_LOG_CONTAINS_ALL_OF(
+      Envoy::ExpectedLogMessages({{"info", "Bootstrap secret lifecycle test: server initialized"},
+                                  {"info", "Secret lifecycle enabled: true"},
+                                  {"info", "Secret added or updated: secret_0"}}),
+      initializeWithBootstrapExtension(testDataDir("rust"), "bootstrap_secret_lifecycle_test"));
+}
+
 } // namespace DynamicModules
 } // namespace Bootstrap
 } // namespace Extensions

@@ -46,6 +46,8 @@ public:
                bool warm));
   MOCK_METHOD(void, forEachActiveTlsCertificateName, (std::function<void(absl::string_view)>),
               (const));
+  MOCK_METHOD(Common::CallbackHandlePtr, addTlsCertificateProviderCreatedCallback,
+              (std::function<void(const std::string&, TlsCertificateConfigProvider&)>));
   MOCK_METHOD(CertificateValidationContextConfigProviderSharedPtr,
               findOrCreateCertificateValidationContextProvider,
               (const envoy::config::core::v3::ConfigSource& config_source,

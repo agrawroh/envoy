@@ -169,6 +169,17 @@ void SecretManagerImpl::forEachActiveTlsCertificateName(
   }
 }
 
+Common::CallbackHandlePtr SecretManagerImpl::addTlsCertificateProviderCreatedCallback(
+    std::function<void(const std::string& name, TlsCertificateConfigProvider& provider)> callback) {
+  // Replay the providers that already exist so an observer sees every provider rather than only the
+  // ones created after it registered. allSecretProviders() returns a snapshot of locked providers,
+  // so a callback that subscribes cannot invalidate this iteration.
+  for (const auto& provider : certificate_providers_.allSecretProviders()) {
+    callback(provider->secretData().resource_name_, *provider);
+  }
+  return certificate_providers_.provider_created_callbacks_.add(std::move(callback));
+}
+
 ProtobufTypes::MessagePtr
 SecretManagerImpl::dumpSecretConfigs(const Matchers::StringMatcher& name_matcher) {
   auto config_dump = std::make_unique<envoy::admin::v3::SecretsConfigDump>();

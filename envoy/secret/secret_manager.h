@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 
+#include "envoy/common/callback.h"
 #include "envoy/common/optref.h"
 #include "envoy/common/pure.h"
 #include "envoy/config/core/v3/config_source.pb.h"
@@ -181,6 +182,19 @@ public:
    * @param callback functor that is provided one secret name at a time.
    */
   virtual void forEachActiveTlsCertificateName(std::function<void(absl::string_view)>) const PURE;
+
+  /**
+   * Registers a callback invoked with the config name and provider each time a dynamic TLS
+   * certificate secret provider is created, and once per provider that already exists so an
+   * observer sees the ones that predate it. Observers hook the provider's own update and remove
+   * callbacks to learn when its secret becomes active or is removed. Called and invoked on the main
+   * thread.
+   * @param callback functor that is provided one newly created provider at a time.
+   * @return a handle whose destruction removes the callback.
+   */
+  ABSL_MUST_USE_RESULT virtual Common::CallbackHandlePtr addTlsCertificateProviderCreatedCallback(
+      std::function<void(const std::string& name, TlsCertificateConfigProvider& provider)> callback)
+      PURE;
 };
 
 using SecretManagerPtr = std::unique_ptr<SecretManager>;

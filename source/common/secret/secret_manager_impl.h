@@ -8,6 +8,7 @@
 #include "envoy/ssl/certificate_validation_context_config.h"
 #include "envoy/ssl/tls_certificate_config.h"
 
+#include "source/common/common/callback_impl.h"
 #include "source/common/common/logger.h"
 #include "source/common/secret/sds_api.h"
 
@@ -76,6 +77,10 @@ public:
   void
   forEachActiveTlsCertificateName(std::function<void(absl::string_view)> callback) const override;
 
+  Common::CallbackHandlePtr addTlsCertificateProviderCreatedCallback(
+      std::function<void(const std::string& name, TlsCertificateConfigProvider& provider)> callback)
+      override;
+
 private:
   ProtobufTypes::MessagePtr dumpSecretConfigs(const Matchers::StringMatcher& name_matcher);
 
@@ -103,6 +108,7 @@ private:
         secret_provider = SecretType::create(server_context, sds_config_source, config_name,
                                              unregister_secret_provider, warm);
         dynamic_secret_providers_[map_key] = secret_provider;
+        provider_created_callbacks_.runCallbacks(config_name, *secret_provider);
       }
       // It is important to add the init target to the manager regardless the secret provider is new
       // or existing. Different clusters / listeners can share same secret so they have to be marked
@@ -136,6 +142,11 @@ private:
       }
       return providers;
     }
+
+    // Invoked with (config name, provider) each time a new dynamic provider is created, so an
+    // observer can hook the provider's own update and remove callbacks. Only wired up for the TLS
+    // certificate providers today.
+    Common::CallbackManager<void, const std::string&, SecretType&> provider_created_callbacks_;
 
   private:
     // Removes dynamic secret provider which has been deleted.

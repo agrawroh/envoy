@@ -47,6 +47,9 @@ TEST_F(ExtensionConfigTest, LoadOK) {
   EXPECT_NE(config.value()->on_bootstrap_extension_http_callout_done_, nullptr);
   EXPECT_NE(config.value()->on_bootstrap_extension_timer_fired_, nullptr);
   EXPECT_NE(config.value()->on_bootstrap_extension_admin_request_, nullptr);
+  // The secret hooks are resolved optionally, so a module that does not export them still loads.
+  EXPECT_EQ(config.value()->on_bootstrap_extension_secret_add_or_update_, nullptr);
+  EXPECT_EQ(config.value()->on_bootstrap_extension_secret_removal_, nullptr);
 }
 
 TEST_F(ExtensionConfigTest, ConfigNewFail) {
@@ -345,6 +348,28 @@ TEST_F(ExtensionConfigTest, ActiveResourceNamesRequireServerInitialized) {
     config->forEachActiveResourceName(kind, collect);
   }
   EXPECT_THAT(names, testing::IsEmpty());
+}
+
+// Secret lifecycle reaches the SecretManager, which is not available until the server is
+// initialized, and registering twice would leak a second set of subscriptions.
+TEST_F(ExtensionConfigTest, EnableSecretLifecycleRequiresServerInitialized) {
+  auto dynamic_module =
+      Extensions::DynamicModules::newDynamicModule(testDataDir() + "/libbootstrap_no_op.so", false);
+  ASSERT_OK(dynamic_module);
+  auto config_or = newDynamicModuleBootstrapExtensionConfig(
+      "test", "config", DefaultMetricsNamespace, std::move(dynamic_module.value()), dispatcher_,
+      context_, context_.store_);
+  ASSERT_OK(config_or);
+  auto config = config_or.value();
+
+  EXPECT_FALSE(config->enableSecretLifecycle());
+
+  // After initialization it registers once, and a second call is refused rather than registering a
+  // duplicate set of subscriptions.
+  testing::NiceMock<Server::MockListenerManager> listener_manager;
+  config->setListenerManager(listener_manager);
+  EXPECT_TRUE(config->enableSecretLifecycle());
+  EXPECT_FALSE(config->enableSecretLifecycle());
 }
 
 } // namespace DynamicModules

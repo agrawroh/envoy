@@ -3,9 +3,11 @@
 #include <functional>
 #include <string>
 
+#include "envoy/common/callback.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/filesystem/watcher.h"
 #include "envoy/http/async_client.h"
+#include "envoy/secret/secret_provider.h"
 #include "envoy/server/factory_context.h"
 #include "envoy/server/listener_manager.h"
 #include "envoy/stats/scope.h"
@@ -61,6 +63,9 @@ using OnBootstrapExtensionListenerAddOrUpdateType =
     decltype(&envoy_dynamic_module_on_bootstrap_extension_listener_add_or_update);
 using OnBootstrapExtensionListenerRemovalType =
     decltype(&envoy_dynamic_module_on_bootstrap_extension_listener_removal);
+// Both secret lifecycle hooks carry the same arguments, so one type serves both.
+using OnBootstrapExtensionSecretEventType =
+    decltype(&envoy_dynamic_module_on_bootstrap_extension_secret_add_or_update);
 
 class DynamicModuleBootstrapExtension;
 
@@ -171,6 +176,20 @@ public:
   void onListenerRemoval(const std::string& listener_name) override;
 
   /**
+   * Enables secret lifecycle event notifications. When enabled the module receives
+   * on_bootstrap_extension_secret_add_or_update when a dynamic TLS certificate secret becomes
+   * active or is rotated, and on_bootstrap_extension_secret_removal when one is removed. Secrets
+   * are independent xDS resources, so these fire without any cluster or listener being re-pushed.
+   *
+   * Secrets that are already active are replayed before this returns, so a module that enables late
+   * still observes them. This must be called on the main thread after the server is initialized,
+   * since the SecretManager is not reachable before that point.
+   *
+   * @return true if the callbacks were successfully registered, false if already registered.
+   */
+  bool enableSecretLifecycle();
+
+  /**
    * Invokes `callback` for the name of each active resource of a single kind, letting the module
    * reconcile its own view against what Envoy has committed. A no-op before the server is
    * initialized, since the managers holding the resources are not reachable until then. Main thread
@@ -207,6 +226,9 @@ public:
   OnBootstrapExtensionListenerAddOrUpdateType on_bootstrap_extension_listener_add_or_update_ =
       nullptr;
   OnBootstrapExtensionListenerRemovalType on_bootstrap_extension_listener_removal_ = nullptr;
+  // Resolved optionally, so these stay null for a module built before the hooks existed.
+  OnBootstrapExtensionSecretEventType on_bootstrap_extension_secret_add_or_update_ = nullptr;
+  OnBootstrapExtensionSecretEventType on_bootstrap_extension_secret_removal_ = nullptr;
 
   // The dynamic module.
   Extensions::DynamicModules::DynamicModulePtr dynamic_module_;
@@ -251,6 +273,9 @@ public:
   std::string admin_response_body_;
 
 private:
+  // Notifies the module of a secret lifecycle event when it exports `hook`.
+  void notifySecretEvent(OnBootstrapExtensionSecretEventType hook, const std::string& secret_name);
+
   /**
    * This implementation of the AsyncClient::Callbacks is used to handle the response from the HTTP
    * callout from the parent bootstrap extension config.
@@ -308,6 +333,14 @@ private:
   // Handle for the shutdown lifecycle callback that cleans up listener_update_callbacks_handle_.
   Server::ServerLifecycleNotifier::HandlePtr listener_lifecycle_shutdown_handle_;
   bool listener_lifecycle_enabled_ = false;
+
+  // Secret lifecycle subscription handles, one for the SecretManager and two per provider. They are
+  // members so they are released with this config, which is what keeps the callbacks below from
+  // running against a destroyed config. No shutdown hook is needed because a CallbackHandle whose
+  // manager died first deregisters itself safely.
+  Common::CallbackHandlePtr secret_provider_created_handle_;
+  std::vector<Common::CallbackHandlePtr> secret_callback_handles_;
+  bool secret_lifecycle_enabled_ = false;
 };
 
 using DynamicModuleBootstrapExtensionConfigSharedPtr =
