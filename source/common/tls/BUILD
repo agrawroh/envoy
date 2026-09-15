@@ -168,6 +168,27 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "pem_cache_lib",
+    srcs = ["pem_cache.cc"],
+    hdrs = ["pem_cache.h"],
+    external_deps = ["ssl"],
+    # TLS is core functionality.
+    visibility = ["//visibility:public"],
+    deps = [
+        ":utility_lib",
+        "//envoy/singleton:instance_interface",
+        "//envoy/singleton:manager_interface",
+        "//source/common/common:assert_lib",
+        "//source/common/common:fmt_lib",
+        "//source/common/common:thread_lib",
+        "@abseil-cpp//absl/algorithm:container",
+        "@abseil-cpp//absl/container:flat_hash_map",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/strings",
+    ],
+)
+
+envoy_cc_library(
     name = "context_lib",
     srcs = [
         "client_context_impl.cc",
@@ -205,6 +226,7 @@ envoy_cc_library(
         "//source/common/runtime:runtime_features_lib",
         "//source/common/stats:symbol_table_lib",
         "//source/common/stats:utility_lib",
+        ":pem_cache_lib",
         "//source/common/tls/cert_validator:cert_validator_lib",
         "//source/common/tls/private_key:private_key_manager_lib",
         "@abseil-cpp//absl/container:flat_hash_map",

@@ -216,6 +216,21 @@ TEST_P(SslIntegrationTest, RouterRequestAndResponseWithBodyNoBuffer) {
   checkStats();
 }
 
+// Sharing parsed certificate material across contexts must not change what is served on the wire.
+// The listener carries two certificates so both a shared entry and a distinct one are exercised,
+// and the handshake plus a full request and response is the assertion.
+TEST_P(SslIntegrationTest, RouterRequestAndResponseWithSharedParsedCertificates) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.cache_parsed_tls_certificates", "true"}});
+  server_ecdsa_cert_ = true;
+
+  ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+    return makeSslClientConnection({});
+  };
+  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+  checkStats();
+}
+
 TEST_P(SslIntegrationTest, RouterRequestAndResponseWithBodyNoBufferHttp2) {
   setDownstreamProtocol(Http::CodecType::HTTP2);
   config_helper_.setClientCodec(envoy::extensions::filters::network::http_connection_manager::v3::
