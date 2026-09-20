@@ -683,6 +683,25 @@ shadow_mode: {}
                                testing::Ge(1));
 }
 
+// A filter that clears the route cache makes Envoy resolve the route again, which re-enters the
+// module so that a decision taken from state an earlier filter produced takes effect.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, ReEntersModuleOnRouteCacheClear) {
+  config_helper_.prependFilter(R"EOF(
+name: clear-route-cache
+typed_config:
+  "@type": type.googleapis.com/test.integration.filters.ClearRouteCacheFilterConfig
+)EOF");
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "override"}, {"x-cluster", "canary"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  // The module ran once while the route was first resolved and again for the refresh.
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.decision_override",
+                               testing::Ge(2));
+  test_server_->waitForCounter("cluster.canary.upstream_rq_200", testing::Ge(1));
+}
+
 // A decision that stops the chain skips the specifiers configured after it, which the second
 // specifier of the chain reports through its own statistics.
 TEST_P(DynamicModuleRouteSpecifierIntegrationTest, StopsChain) {

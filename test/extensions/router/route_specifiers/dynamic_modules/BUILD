@@ -20,6 +20,7 @@ envoy_extension_cc_dyn_module_test(
         "//test/extensions/dynamic_modules/test_data/c:route_specifier_missing_config_new",
         "//test/extensions/dynamic_modules/test_data/c:route_specifier_missing_on_route",
         "//test/extensions/dynamic_modules/test_data/c:route_specifier_no_op",
+        "//test/extensions/dynamic_modules/test_data/c:route_specifier_select_template",
         "//test/extensions/dynamic_modules/test_data/c:route_specifier_unknown_decision",
     ],
     extension_names = ["envoy.router.route_specifiers.dynamic_modules"],
@@ -50,6 +51,7 @@ envoy_extension_cc_dyn_module_test(
     deps = [
         "//source/extensions/router/route_specifiers/dynamic_modules:config",
         "//test/integration:http_integration_lib",
+        "//test/integration/filters:clear_route_cache_filter_lib",
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/extensions/router/route_specifiers/dynamic_modules/v3:pkg_cc_proto",
     ],

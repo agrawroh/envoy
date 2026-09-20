@@ -285,6 +285,43 @@ TEST_F(DynamicModuleRouteSpecifierTest, AcceptsAllowlists) {
   EXPECT_TRUE(config.ok());
 }
 
+// A virtual host that configures no routes at all is routed entirely by the module, which is how a
+// module owns the routing of a virtual host once shadow mode has validated it.
+TEST_F(DynamicModuleRouteSpecifierTest, RoutesVirtualHostWithoutRoutes) {
+  envoy::config::route::v3::RouteConfiguration proto_config;
+  TestUtility::loadFromYaml(R"EOF(
+name: test_route_config
+virtual_hosts:
+- name: test_vhost
+  domains: ["*"]
+  route_specifiers:
+  - name: envoy.router.route_specifiers.dynamic_modules
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.router.route_specifiers.dynamic_modules.v3.DynamicModuleRouteSpecifier
+      dynamic_module_config:
+        name: route_specifier_select_template
+        do_not_close: true
+      specifier_name: test_route_specifier
+      stat_prefix: test
+      failure_policy: NO_ROUTE
+      route_templates:
+      - template_id: only
+        route:
+          match: {prefix: "/"}
+          route: {cluster: module_cluster}
+)EOF",
+                            proto_config);
+  const auto config = Envoy::Router::ConfigImpl::create(
+      proto_config, context_, creation_status_visitor_, init_manager_, false);
+  ASSERT_TRUE(config.ok());
+
+  const auto route = config.value()->route(requestHeaders(), stream_info_, 0);
+  ASSERT_NE(nullptr, route.route);
+  ASSERT_NE(nullptr, route.route->routeEntry());
+  EXPECT_EQ("module_cluster", route.route->routeEntry()->clusterName());
+  EXPECT_EQ("test_vhost", route.route->virtualHost().name());
+}
+
 TEST_F(DynamicModuleRouteSpecifierTest, ConfigDestroyRunsOnTeardown) {
   using GetConfigDestroyCountFuncType = int (*)(void);
   auto module = Extensions::DynamicModules::newDynamicModule(
