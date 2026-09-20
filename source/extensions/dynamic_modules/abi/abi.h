@@ -16717,6 +16717,40 @@ bool envoy_dynamic_module_callback_route_specifier_get_cluster_host_count(
 // ------------------- Route Specifier Callbacks - Input Route -----------------
 
 /**
+ * envoy_dynamic_module_type_route_specifier_input_route holds the properties of the route that
+ * route matching resolved that are free to read, so that a module can take all of them in one call
+ * instead of one call each.
+ *
+ * A property the kind of the route does not carry is zeroed: cluster_name and timeout_ms for a
+ * route that answers the request directly, response_code for a route entry. The buffers point at
+ * storage Envoy owns which is valid for the duration of the event hook.
+ */
+typedef struct envoy_dynamic_module_type_route_specifier_input_route {
+  envoy_dynamic_module_type_route_specifier_route_kind kind;
+  envoy_dynamic_module_type_envoy_buffer name;
+  envoy_dynamic_module_type_envoy_buffer virtual_host_name;
+  envoy_dynamic_module_type_envoy_buffer cluster_name;
+  uint64_t timeout_ms;
+  uint32_t response_code;
+} envoy_dynamic_module_type_route_specifier_input_route;
+
+/**
+ * envoy_dynamic_module_callback_route_specifier_get_input_route is called by the module to get the
+ * properties of the route that route matching resolved that are free to read, in one call.
+ *
+ * Prefer this over the individual getters when the module reads more than one of them, for example
+ * to compare the route of the module with the one it replaces. The properties that are not free to
+ * read, such as the redirect location and the route metadata, have no bulk form.
+ *
+ * @param context_envoy_ptr is the pointer to the route decision context.
+ * @param result is where the properties are stored. It is only written when this returns true.
+ * @return true if a route was resolved for the request, false otherwise.
+ */
+bool envoy_dynamic_module_callback_route_specifier_get_input_route(
+    envoy_dynamic_module_type_route_specifier_context_envoy_ptr context_envoy_ptr,
+    envoy_dynamic_module_type_route_specifier_input_route* result);
+
+/**
  * envoy_dynamic_module_callback_route_specifier_get_input_route_kind returns the kind of the route
  * that route matching, and any route specifier that ran before this one, resolved for the request.
  *

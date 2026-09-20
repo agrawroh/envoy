@@ -497,6 +497,7 @@ TEST_P(DynamicModuleRouteSpecifierIntegrationTest, ReadsRequestAndRouteState) {
       {"attribute-string", "HTTP/1.1"},
       {"attribute-bool", "false"},
       {"route-kind", "RouteEntry"},
+      {"route-bulk", "RouteEntry//integration/cluster_0"},
       {"virtual-host-name", "integration"},
       {"route-cluster-name", "cluster_0"},
       {"cluster-host-count", "1/1/0"},

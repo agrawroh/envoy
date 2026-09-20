@@ -31,6 +31,27 @@ option (udpa.annotations.file_status).package_version_status = ACTIVE;
 // <config_http_route_specifiers_dynamic_modules>` for more details.
 // [#extension: envoy.router.route_specifiers.dynamic_modules]
 
+// What Envoy does when the decision of the module cannot be honored.
+//
+// This covers a module that reports an error, which is what the SDK does when the module panics, a
+// decision that selects no template or an unknown one, a template whose ``match`` does not hold for
+// the request, an override of a route that route matching did not resolve, route entry overrides
+// recorded for a direct response, and route metadata a typed metadata factory rejects.
+enum FailurePolicy {
+  // Must be set explicitly unless the specifier runs in shadow mode.
+  FAILURE_POLICY_UNSPECIFIED = 0;
+
+  // Use the route the specifier was given, unchanged, and carry on with the chain. This keeps the
+  // routing of the route table the module replaces in effect while it is being rolled out. If the
+  // specifier was given no route, the request has no route.
+  PASS_THROUGH = 1;
+
+  // Use no route, so the request is handled as if nothing had matched, and end the chain. Prefer
+  // this once the module owns the routing of the virtual host, so that a failure never falls back
+  // to the routes that are left.
+  NO_ROUTE = 2;
+}
+
 // A named route the module may select for a request.
 //
 // A template is built and validated once, when the specifier is configured, so an invalid template
@@ -183,27 +204,6 @@ message ShadowMode {
   // authorization and rate limit filters of the listener. The filters the module disables or
   // enables for a request are always compared.
   repeated string filter_names = 2 [(validate.rules).repeated = {items {string {min_len: 1}}}];
-}
-
-// What Envoy does when the decision of the module cannot be honored.
-//
-// This covers a module that reports an error, which is what the SDK does when the module panics, a
-// decision that selects no template or an unknown one, a template whose ``match`` does not hold for
-// the request, an override of a route that route matching did not resolve, route entry overrides
-// recorded for a direct response, and route metadata a typed metadata factory rejects.
-enum FailurePolicy {
-  // Must be set explicitly unless the specifier runs in shadow mode.
-  FAILURE_POLICY_UNSPECIFIED = 0;
-
-  // Use the route the specifier was given, unchanged, and carry on with the chain. This keeps the
-  // routing of the route table the module replaces in effect while it is being rolled out. If the
-  // specifier was given no route, the request has no route.
-  PASS_THROUGH = 1;
-
-  // Use no route, so the request is handled as if nothing had matched, and end the chain. Prefer
-  // this once the module owns the routing of the virtual host, so that a failure never falls back
-  // to the routes that are left.
-  NO_ROUTE = 2;
 }
 
 // Configuration for the dynamic modules route specifier.

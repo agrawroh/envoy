@@ -649,13 +649,15 @@ Envoy::Router::OnRouteResult DynamicModuleRouteSpecifier::onRoute(
   }
 
   RouteSpecifierContext context{*config_, route, headers, stream_info, random};
-  const MonotonicTime module_start = config_->timeSource().monotonicTime();
   const ModuleDecision decision =
       config_->on_route_(config_->in_module_config_, static_cast<void*>(&context));
+  // Reading the clock is the most expensive thing this method does that is not the module itself,
+  // so the start of the specifier doubles as the start of the module. Only the runtime fraction
+  // check and the context construction sit between the two, which is why on_route_duration is
+  // measured from there rather than read again.
+  const MonotonicTime module_end = config_->timeSource().monotonicTime();
   config_->stats().on_route_duration_.recordValue(
-      std::chrono::duration_cast<std::chrono::microseconds>(config_->timeSource().monotonicTime() -
-                                                            module_start)
-          .count());
+      std::chrono::duration_cast<std::chrono::microseconds>(module_end - start).count());
 
   const bool shadow = config_->shadow().has_value();
   // Resolving the decision moves the recorded overrides onto the route it produces, so the filter

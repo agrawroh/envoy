@@ -540,6 +540,29 @@ bool envoy_dynamic_module_callback_route_specifier_get_cluster_host_count(
 
 // --------------------------------- Input route -------------------------------
 
+bool envoy_dynamic_module_callback_route_specifier_get_input_route(
+    envoy_dynamic_module_type_route_specifier_context_envoy_ptr context_envoy_ptr,
+    envoy_dynamic_module_type_route_specifier_input_route* result) {
+  const auto& route = routeSpecifierContext(context_envoy_ptr)->input_route;
+  if (route == nullptr) {
+    return false;
+  }
+  *result = {};
+  const auto* entry = route->routeEntry();
+  result->kind = entry != nullptr
+                     ? envoy_dynamic_module_type_route_specifier_route_kind_RouteEntry
+                     : envoy_dynamic_module_type_route_specifier_route_kind_DirectResponse;
+  setEnvoyBuffer(&result->name, route->routeName());
+  setEnvoyBuffer(&result->virtual_host_name, route->virtualHost().name());
+  if (entry != nullptr) {
+    setEnvoyBuffer(&result->cluster_name, entry->clusterName());
+    result->timeout_ms = static_cast<uint64_t>(entry->timeout().count());
+  } else {
+    result->response_code = static_cast<uint32_t>(route->directResponseEntry()->responseCode());
+  }
+  return true;
+}
+
 envoy_dynamic_module_type_route_specifier_route_kind
 envoy_dynamic_module_callback_route_specifier_get_input_route_kind(
     envoy_dynamic_module_type_route_specifier_context_envoy_ptr context_envoy_ptr) {

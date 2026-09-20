@@ -226,6 +226,26 @@ fn duration_to_millis(duration: Duration) -> u64 {
   u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// The properties of the route that route matching resolved that are free to read.
+///
+/// A property the kind of the route does not carry is absent: `cluster_name` and `timeout` for a
+/// route that answers the request directly, `response_code` for a route entry.
+#[derive(Debug)]
+pub struct InputRoute<'a> {
+  /// The kind of the route.
+  pub kind: RouteKind,
+  /// The name of the route.
+  pub name: EnvoyBuffer<'a>,
+  /// The name of the virtual host the route belongs to.
+  pub virtual_host_name: EnvoyBuffer<'a>,
+  /// The upstream cluster of the route.
+  pub cluster_name: Option<EnvoyBuffer<'a>>,
+  /// The route timeout.
+  pub timeout: Option<Duration>,
+  /// The status code the route answers the request with.
+  pub response_code: Option<u32>,
+}
+
 /// Context for a single route decision.
 ///
 /// It provides read access to the request, to the stream info and to the route that route matching
@@ -503,6 +523,59 @@ impl RouteSpecifierContext {
     } else {
       None
     }
+  }
+
+  /// Get the properties of the route that route matching resolved that are free to read, in one
+  /// call.
+  ///
+  /// Prefer this over the individual getters when more than one of them is read. Returns `None`
+  /// when no route was resolved for the request.
+  pub fn input_route(&self) -> Option<InputRoute<'_>> {
+    let mut result = abi::envoy_dynamic_module_type_route_specifier_input_route {
+      kind: abi::envoy_dynamic_module_type_route_specifier_route_kind::None,
+      name: abi::envoy_dynamic_module_type_envoy_buffer {
+        ptr: ptr::null_mut(),
+        length: 0,
+      },
+      virtual_host_name: abi::envoy_dynamic_module_type_envoy_buffer {
+        ptr: ptr::null_mut(),
+        length: 0,
+      },
+      cluster_name: abi::envoy_dynamic_module_type_envoy_buffer {
+        ptr: ptr::null_mut(),
+        length: 0,
+      },
+      timeout_ms: 0,
+      response_code: 0,
+    };
+    if !unsafe {
+      abi::envoy_dynamic_module_callback_route_specifier_get_input_route(
+        self.envoy_ptr,
+        &mut result,
+      )
+    } {
+      return None;
+    }
+    let kind = RouteKind::from_abi(result.kind);
+    let is_route_entry = kind == RouteKind::RouteEntry;
+    Some(InputRoute {
+      kind,
+      name: unsafe { EnvoyBuffer::new_from_raw(result.name.ptr as *const u8, result.name.length) },
+      virtual_host_name: unsafe {
+        EnvoyBuffer::new_from_raw(
+          result.virtual_host_name.ptr as *const u8,
+          result.virtual_host_name.length,
+        )
+      },
+      cluster_name: is_route_entry.then(|| unsafe {
+        EnvoyBuffer::new_from_raw(
+          result.cluster_name.ptr as *const u8,
+          result.cluster_name.length,
+        )
+      }),
+      timeout: is_route_entry.then(|| Duration::from_millis(result.timeout_ms)),
+      response_code: (!is_route_entry).then_some(result.response_code),
+    })
   }
 
   /// Get the kind of the route that route matching resolved for the request.

@@ -11181,6 +11181,29 @@ pub extern "C" fn envoy_dynamic_module_callback_route_specifier_get_cluster_host
 }
 
 #[no_mangle]
+pub extern "C" fn envoy_dynamic_module_callback_route_specifier_get_input_route(
+  _context_envoy_ptr: abi::envoy_dynamic_module_type_route_specifier_context_envoy_ptr,
+  result: *mut abi::envoy_dynamic_module_type_route_specifier_input_route,
+) -> bool {
+  if !STUB_ROUTE_STATE_PRESENT.load(std::sync::atomic::Ordering::SeqCst) {
+    return false;
+  }
+  let buffer = |value: &'static str| abi::envoy_dynamic_module_type_envoy_buffer {
+    ptr: value.as_ptr() as *const _,
+    length: value.len(),
+  };
+  unsafe {
+    (*result).kind = abi::envoy_dynamic_module_type_route_specifier_route_kind::RouteEntry;
+    (*result).name = buffer(STUB_SPECIFIER_ROUTE_NAME);
+    (*result).virtual_host_name = buffer(STUB_ROUTE_VALUE);
+    (*result).cluster_name = buffer(STUB_ROUTE_VALUE);
+    (*result).timeout_ms = 1500;
+    (*result).response_code = 0;
+  }
+  true
+}
+
+#[no_mangle]
 pub extern "C" fn envoy_dynamic_module_callback_route_specifier_get_input_route_kind(
   _context_envoy_ptr: abi::envoy_dynamic_module_type_route_specifier_context_envoy_ptr,
 ) -> abi::envoy_dynamic_module_type_route_specifier_route_kind {
@@ -11889,6 +11912,31 @@ fn test_route_specifier_context_reads_request_state() {
   assert!(ctx.get_dynamic_metadata_bool("filter", "key").is_none());
   assert!(ctx.get_filter_state_bytes("key").is_none());
   assert!(ctx.get_cluster_host_count("cluster", 0).is_none());
+  STUB_ROUTE_STATE_PRESENT.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[test]
+fn test_route_specifier_context_reads_input_route_in_one_call() {
+  let ctx = unsafe { route_specifier::RouteSpecifierContext::new(std::ptr::null_mut()) };
+  STUB_ROUTE_STATE_PRESENT.store(true, std::sync::atomic::Ordering::SeqCst);
+
+  let input = ctx.input_route().unwrap();
+  assert_eq!(route_specifier::RouteKind::RouteEntry, input.kind);
+  assert_eq!(STUB_SPECIFIER_ROUTE_NAME.as_bytes(), input.name.as_slice());
+  assert_eq!(
+    STUB_ROUTE_VALUE.as_bytes(),
+    input.virtual_host_name.as_slice()
+  );
+  assert_eq!(
+    STUB_ROUTE_VALUE.as_bytes(),
+    input.cluster_name.unwrap().as_slice()
+  );
+  assert_eq!(Some(std::time::Duration::from_millis(1500)), input.timeout);
+  // A route entry carries no status code of its own.
+  assert_eq!(None, input.response_code);
+
+  STUB_ROUTE_STATE_PRESENT.store(false, std::sync::atomic::Ordering::SeqCst);
+  assert!(ctx.input_route().is_none());
   STUB_ROUTE_STATE_PRESENT.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 

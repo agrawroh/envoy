@@ -184,6 +184,22 @@ fn read_echoed_value(ctx: &RouteSpecifierContext, name: &[u8]) -> String {
         |counts| format!("{}/{}/{}", counts.total, counts.healthy, counts.degraded),
       )
     },
+    // Reads every free property of the resolved route in one call rather than one call each.
+    b"route-bulk" => ctx.input_route().map_or_else(
+      || ABSENT.to_owned(),
+      |route| {
+        format!(
+          "{:?}/{}/{}/{}",
+          route.kind,
+          String::from_utf8_lossy(route.name.as_slice()),
+          String::from_utf8_lossy(route.virtual_host_name.as_slice()),
+          route.cluster_name.map_or_else(
+            || ABSENT.to_owned(),
+            |name| String::from_utf8_lossy(name.as_slice()).into_owned()
+          )
+        )
+      },
+    ),
     b"route-kind" => format!("{:?}", ctx.input_route_kind()),
     b"route-name" => buffer_to_string_or_absent(ctx.input_route_name()),
     b"virtual-host-name" => buffer_to_string_or_absent(ctx.input_route_virtual_host_name()),
