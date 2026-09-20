@@ -1,0 +1,768 @@
+#include "envoy/extensions/router/route_specifiers/dynamic_modules/v3/dynamic_modules.pb.h"
+
+#include "test/integration/http_integration.h"
+#include "test/test_common/utility.h"
+
+#include "absl/strings/str_cat.h"
+#include "gtest/gtest.h"
+
+namespace Envoy {
+namespace Extensions {
+namespace RouteSpecifiers {
+namespace DynamicModules {
+namespace {
+
+using DynamicModuleRouteSpecifierProto =
+    envoy::extensions::router::route_specifiers::dynamic_modules::v3::DynamicModuleRouteSpecifier;
+
+class DynamicModuleRouteSpecifierIntegrationTest
+    : public testing::TestWithParam<Network::Address::IpVersion>,
+      public HttpIntegrationTest {
+public:
+  DynamicModuleRouteSpecifierIntegrationTest()
+      : HttpIntegrationTest(Http::CodecType::HTTP1, GetParam()) {
+    autonomous_upstream_ = true;
+    TestEnvironment::setEnvVar(
+        "ENVOY_DYNAMIC_MODULES_SEARCH_PATH",
+        TestEnvironment::substitute(
+            "{{ test_rundir }}/test/extensions/dynamic_modules/test_data/rust"),
+        1);
+  }
+
+  // Configures the virtual host to run the route specifier. The extra configuration is appended to
+  // the specifier configuration so that a test can add what it needs. A second specifier is
+  // appended to the chain only when a test asks for it, since it decides the request too.
+  void setupTest(const std::string& extra_specifier_yaml = "",
+                 bool chain_second_specifier = false) {
+    config_helper_.addConfigModifier(
+        [extra_specifier_yaml, chain_second_specifier](
+            envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+                hcm) {
+          const std::string specifier_yaml = R"EOF(
+dynamic_module_config:
+  name: route_specifier_integration_test
+specifier_name: test_route_specifier
+stat_prefix: test
+failure_policy: PASS_THROUGH
+route_templates:
+- template_id: canary
+  route:
+    match: {prefix: "/"}
+    route:
+      cluster: canary
+      timeout: 7s
+- template_id: direct
+  route:
+    match: {prefix: "/"}
+    direct_response:
+      status: 204
+- template_id: redirect
+  route:
+    match: {prefix: "/"}
+    redirect:
+      host_redirect: redirected.example.com
+- template_id: unmatched
+  route:
+    match: {prefix: "/never"}
+    route: {cluster: canary}
+- template_id: hedged
+  route:
+    match: {prefix: "/"}
+    route:
+      cluster: canary
+      hedge_policy: {hedge_on_per_try_timeout: true}
+- template_id: redirect_found
+  route:
+    match: {prefix: "/"}
+    redirect:
+      host_redirect: redirected.example.com
+      response_code: FOUND
+- template_id: direct_body
+  route:
+    name: template_direct
+    match: {prefix: "/"}
+    direct_response:
+      status: 204
+      body: {inline_string: "template"}
+route_action_overrides:
+  slow:
+    retry_policy:
+      retry_on: 5xx
+      num_retries: 3
+  mirrored:
+    request_mirror_policies:
+    - cluster: canary
+  hashed:
+    hash_policy:
+    - header: {header_name: x-hash}
+  matched:
+    metadata_match:
+      filter_metadata:
+        envoy.lb:
+          version: canary
+)EOF" + extra_specifier_yaml;
+          DynamicModuleRouteSpecifierProto specifier_config;
+          TestUtility::loadFromYaml(specifier_yaml, specifier_config);
+
+          auto* virtual_host = hcm.mutable_route_config()->mutable_virtual_hosts(0);
+          auto* specifier = virtual_host->add_route_specifiers();
+          specifier->set_name("envoy.router.route_specifiers.dynamic_modules");
+          std::ignore = specifier->mutable_typed_config()->PackFrom(specifier_config);
+
+          if (!chain_second_specifier) {
+            return;
+          }
+          DynamicModuleRouteSpecifierProto second_config = specifier_config;
+          second_config.set_stat_prefix("second");
+          auto* second = virtual_host->add_route_specifiers();
+          second->set_name("envoy.router.route_specifiers.dynamic_modules");
+          std::ignore = second->mutable_typed_config()->PackFrom(second_config);
+        });
+    // Routes that answer the request directly, so that a shadow comparison has two routes of the
+    // same kind to compare.
+    config_helper_.addConfigModifier(
+        [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+               hcm) {
+          auto* virtual_host = hcm.mutable_route_config()->mutable_virtual_hosts(0);
+          auto* redirect = virtual_host->add_routes();
+          TestUtility::loadFromYaml(R"EOF(
+match: {prefix: "/redirect"}
+redirect: {host_redirect: original.example.com}
+)EOF",
+                                    *redirect);
+          auto* direct = virtual_host->add_routes();
+          TestUtility::loadFromYaml(R"EOF(
+name: matched_direct
+match: {prefix: "/direct"}
+direct_response:
+  status: 204
+  body: {inline_string: "route"}
+)EOF",
+                                    *direct);
+          // Envoy matches routes in order, so the catch all route moves to the end.
+          auto* routes = virtual_host->mutable_routes();
+          routes->SwapElements(0, 1);
+          routes->SwapElements(1, 2);
+        });
+    // The template clusters must exist, since a template names one that no route does.
+    config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+      auto* cluster = bootstrap.mutable_static_resources()->add_clusters();
+      cluster->MergeFrom(bootstrap.static_resources().clusters(0));
+      cluster->set_name("canary");
+    });
+    setUpstreamCount(2);
+    HttpIntegrationTest::initialize();
+  }
+
+  Http::TestRequestHeaderMapImpl
+  requestHeaders(const std::vector<std::pair<std::string, std::string>>& extra_headers = {}) {
+    Http::TestRequestHeaderMapImpl headers{
+        {":method", "GET"}, {":path", "/"}, {":scheme", "http"}, {":authority", "example.com"}};
+    for (const auto& [key, value] : extra_headers) {
+      // A pseudo header replaces the default, while a normal header is appended so that a test can
+      // send the same key twice.
+      if (absl::StartsWith(key, ":")) {
+        headers.setCopy(Http::LowerCaseString(key), value);
+      } else {
+        headers.addCopy(Http::LowerCaseString(key), value);
+      }
+    }
+    return headers;
+  }
+
+  std::string header(const Http::ResponseHeaderMap& headers, absl::string_view key) {
+    const auto values = headers.get(Http::LowerCaseString(key));
+    return values.empty() ? "" : std::string(values[0]->value().getStringView());
+  }
+
+  IntegrationStreamDecoderPtr
+  sendRequest(const std::vector<std::pair<std::string, std::string>>& extra_headers) {
+    auto response = codec_client_->makeHeaderOnlyRequest(requestHeaders(extra_headers));
+    EXPECT_TRUE(response->waitForEndStream());
+    EXPECT_TRUE(response->complete());
+    return response;
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, DynamicModuleRouteSpecifierIntegrationTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+
+// Without a decision from the module the route that matching resolved stays in effect.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, PassThrough) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.decision_pass_through",
+                               testing::Ge(1));
+}
+
+// The module defines metrics at configuration time and records them on each decision.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, RecordsDecisionMetrics) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "select-template"}, {"x-template", "canary"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+
+  test_server_->waitForCounter("dynamicmodulescustom.decisions_total", testing::Ge(1));
+  test_server_->waitForCounter("dynamicmodulescustom.decisions_by_template.template.canary",
+                               testing::Ge(1));
+}
+
+// A selected template is evaluated against the request like a configured route, so its action
+// decides where the request goes.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, SelectsTemplate) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "select-template"},
+                               {"x-template", "canary"},
+                               {"x-echo", "route-cluster-name"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  EXPECT_EQ("canary", header(response->headers(), "x-echo-result"));
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.decision_select_template",
+                               testing::Ge(1));
+}
+
+// A template whose action answers the request directly is served without an upstream.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, SelectsDirectResponseTemplate) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "select-template"}, {"x-template", "direct"}});
+  EXPECT_EQ("204", response->headers().getStatusValue());
+}
+
+// A template whose action redirects answers with the location it builds.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, SelectsRedirectTemplate) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "select-template"}, {"x-template", "redirect"}});
+  EXPECT_EQ("301", response->headers().getStatusValue());
+  EXPECT_EQ("http://redirected.example.com/", header(response->headers(), "location"));
+}
+
+// A template whose match does not hold for the request cannot be used, so the failure policy
+// applies. PASS_THROUGH keeps the route that matching resolved.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, TemplateMatchFailedPassesThrough) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "select-template"}, {"x-template", "unmatched"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.failure_template_match_failed",
+                               testing::Ge(1));
+}
+
+// A decision that selects no template cannot be honored either.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, TemplateNotSelectedPassesThrough) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "select-template"}, {"x-template", "unknown"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.failure_template_not_selected",
+                               testing::Ge(1));
+}
+
+// A module that reports an error is handled by the failure policy rather than by the decision.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, ModuleErrorPassesThrough) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "error"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.failure_module_error",
+                               testing::Ge(1));
+}
+
+// NO_ROUTE makes a failure drop the route rather than fall back to the route table.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, ModuleErrorFailsClosed) {
+  setupTest(R"EOF(
+failure_policy: NO_ROUTE
+)EOF");
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "error"}});
+  EXPECT_EQ("404", response->headers().getStatusValue());
+}
+
+// A module can drop the route of a request outright.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, NoRoute) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "no-route"}});
+  EXPECT_EQ("404", response->headers().getStatusValue());
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.decision_no_route",
+                               testing::Ge(1));
+}
+
+// An override replaces the cluster of the route that matching resolved, so the request is served
+// by the cluster the module named.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, OverridesCluster) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest(
+      {{"x-decision", "override"}, {"x-cluster", "canary"}, {"x-echo", "route-cluster-name"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  // The echo reads the route matching resolved, which is the one the override replaces.
+  EXPECT_EQ("cluster_0", header(response->headers(), "x-echo-result"));
+  test_server_->waitForCounter("cluster.canary.upstream_rq_200", testing::Ge(1));
+  EXPECT_EQ(0, test_server_->counter("cluster.cluster_0.upstream_rq_200")->value());
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.decision_override",
+                               testing::Ge(1));
+}
+
+// A cluster name the allowlist rejects is ignored, so the cluster of the route that matching
+// resolved stays in effect.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, RejectsClusterOutsideAllowlist) {
+  setupTest(R"EOF(
+allowed_cluster_names:
+- exact: canary
+)EOF");
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "override"}, {"x-cluster", "denied"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  test_server_->waitForCounter("cluster.cluster_0.upstream_rq_200", testing::Ge(1));
+  EXPECT_EQ(0, test_server_->counter("cluster.canary.upstream_rq_200")->value());
+}
+
+// A filter name the allowlist rejects is ignored, so the module cannot disable a filter the
+// operator did not list.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, RejectsFilterOutsideAllowlist) {
+  setupTest(R"EOF(
+allowed_filter_names:
+- exact: envoy.filters.http.allowed
+shadow_mode:
+  compare_fields: [FILTER_DISABLED]
+)EOF");
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response =
+      sendRequest({{"x-decision", "override"}, {"x-filter-disabled", "envoy.filters.http.denied"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.shadow_match", testing::Ge(1));
+  EXPECT_EQ(0, test_server_
+                   ->counter("route_specifier.dynamic_modules.test.shadow_mismatch_filter_disabled")
+                   ->value());
+}
+
+// A module that disables an allowed filter differs from the route table it replaces, which shadow
+// mode reports on the filter_disabled counter.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, DisablesAllowedFilter) {
+  setupTest(R"EOF(
+allowed_filter_names:
+- exact: envoy.filters.http.allowed
+shadow_mode:
+  compare_fields: [FILTER_DISABLED]
+)EOF");
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest(
+      {{"x-decision", "override"}, {"x-filter-disabled", "envoy.filters.http.allowed"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  test_server_->waitForCounter(
+      "route_specifier.dynamic_modules.test.shadow_mismatch_filter_disabled", testing::Ge(1));
+}
+
+// Route entry properties cannot be applied to a route that answers the request directly.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, OverrideOnDirectResponse) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest(
+      {{"x-decision", "select-template"}, {"x-template", "direct"}, {"x-cluster", "canary"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  test_server_->waitForCounter(
+      "route_specifier.dynamic_modules.test.failure_override_on_non_route_entry", testing::Ge(1));
+}
+
+// The route timeout a module records reaches the upstream request.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, OverridesTimeout) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "override"}, {"x-timeout-ms", "3000"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+
+  const auto upstream_headers =
+      reinterpret_cast<AutonomousUpstream*>(fake_upstreams_.front().get())->lastRequestHeaders();
+  ASSERT_NE(nullptr, upstream_headers);
+  EXPECT_EQ("3000", upstream_headers->get_("x-envoy-expected-rq-timeout-ms"));
+}
+
+// The status code a module records for a missing cluster is the one the request fails with.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, OverridesClusterNotFoundResponseCode) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest(
+      {{"x-decision", "override"}, {"x-cluster", "missing"}, {"x-not-found-code", "502"}});
+  EXPECT_EQ("502", response->headers().getStatusValue());
+}
+
+// A metadata namespace the allowlist rejects is ignored, so the metadata of the produced route
+// stays in effect.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, RejectsMetadataNamespaceOutsideAllowlist) {
+  setupTest(R"EOF(
+allowed_metadata_namespaces:
+- exact: envoy.test.allowed
+shadow_mode:
+  compare_fields: [ROUTE_METADATA]
+)EOF");
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "override"}, {"x-route-meta-string", "value"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.shadow_match", testing::Ge(1));
+  EXPECT_EQ(0, test_server_
+                   ->counter("route_specifier.dynamic_modules.test.shadow_mismatch_route_metadata")
+                   ->value());
+}
+
+// An override of a request that matching resolved no route for cannot be honored.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, OverrideWithoutRoute) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = codec_client_->makeHeaderOnlyRequest(
+      Http::TestRequestHeaderMapImpl{{":method", "GET"},
+                                     {":path", "/"},
+                                     {":scheme", "http"},
+                                     {":authority", "nomatch.example.com"},
+                                     {"x-decision", "override"},
+                                     {"x-cluster", "canary"}});
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("404", response->headers().getStatusValue());
+}
+
+// The header mutations a module records are applied to the request sent upstream and to the
+// response.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, AppliesHeaderMutations) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "override"},
+                               {"x-add-response-header", "x-added=value"},
+                               {"x-add-request-header", "x-upstream=value"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  EXPECT_EQ("value", header(response->headers(), "x-added"));
+
+  const auto upstream_headers =
+      reinterpret_cast<AutonomousUpstream*>(fake_upstreams_.front().get())->lastRequestHeaders();
+  ASSERT_NE(nullptr, upstream_headers);
+  EXPECT_EQ("value", upstream_headers->get_("x-upstream"));
+}
+
+// A recorded path and authority replace those of the request sent upstream.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, RewritesPathAndHost) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest(
+      {{"x-decision", "override"}, {"x-set-path", "/rewritten"}, {"x-set-host", "upstream.local"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+
+  const auto upstream_headers =
+      reinterpret_cast<AutonomousUpstream*>(fake_upstreams_.front().get())->lastRequestHeaders();
+  ASSERT_NE(nullptr, upstream_headers);
+  EXPECT_EQ("/rewritten", upstream_headers->getPathValue());
+  EXPECT_EQ("upstream.local", upstream_headers->getHostValue());
+}
+
+// A module reads the request, the stream info and the route through the context, which is how it
+// reaches a decision.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, ReadsRequestAndRouteState) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  struct TestCase {
+    std::string accessor;
+    std::string expected;
+  };
+  const TestCase test_cases[] = {
+      {"header-count", ""},
+      {"header-value", "first"},
+      {"header-value-index", "second"},
+      {"header-value-total", "2"},
+      {"header-bulk", "first"},
+      {"attribute-string", "HTTP/1.1"},
+      {"attribute-bool", "false"},
+      {"route-kind", "RouteEntry"},
+      {"virtual-host-name", "integration"},
+      {"route-cluster-name", "cluster_0"},
+      {"cluster-host-count", "1/1/0"},
+      {"template-ids", "canary,direct,redirect,unmatched,hedged,redirect_found,direct_body"},
+      {"shadow-mode", "false"},
+  };
+  for (const auto& test_case : test_cases) {
+    auto response = sendRequest({{"x-decision", "override"},
+                                 {"x-echo", test_case.accessor},
+                                 {"x-query-cluster", "cluster_0"},
+                                 {"x-multi", "first"},
+                                 {"x-multi", "second"}});
+    EXPECT_EQ("200", response->headers().getStatusValue());
+    if (!test_case.expected.empty()) {
+      EXPECT_EQ(test_case.expected, header(response->headers(), "x-echo-result"))
+          << test_case.accessor;
+    } else {
+      EXPECT_FALSE(header(response->headers(), "x-echo-result").empty()) << test_case.accessor;
+    }
+  }
+}
+
+// A request outside the runtime fraction is passed through untouched.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, RuntimeFractionSkips) {
+  setupTest(R"EOF(
+runtime_fraction:
+  default_value:
+    numerator: 0
+    denominator: HUNDRED
+)EOF");
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "no-route"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.runtime_skipped",
+                               testing::Ge(1));
+}
+
+// In shadow mode the routing of a request never changes, and the comparison of the two routes is
+// reported to the module and counted.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, ShadowModeReportsMismatch) {
+  setupTest(R"EOF(
+shadow_mode:
+  compare_fields: [ROUTE_KIND, CLUSTER_NAME, TIMEOUT]
+)EOF");
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "select-template"}, {"x-template", "canary"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.shadow_mismatch",
+                               testing::Ge(1));
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.shadow_mismatch_cluster_name",
+                               testing::Ge(1));
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.shadow_mismatch_timeout",
+                               testing::Ge(1));
+  test_server_->waitForCounter("dynamicmodulescustom.shadow_results.outcome.mismatch",
+                               testing::Ge(1));
+}
+
+// Every compared property is reported on its own counter, so an operator can tell which part of
+// the route the module got wrong.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, ShadowModeReportsEachComparedField) {
+  setupTest(R"EOF(
+shadow_mode: {}
+)EOF");
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  struct TestCase {
+    std::string field;
+    std::vector<std::pair<std::string, std::string>> headers;
+  };
+  const TestCase test_cases[] = {
+      {"route_kind", {{"x-decision", "select-template"}, {"x-template", "direct"}}},
+      {"cluster_name", {{"x-decision", "override"}, {"x-cluster", "canary"}}},
+      {"timeout", {{"x-decision", "override"}, {"x-timeout-ms", "9000"}}},
+      {"idle_timeout", {{"x-decision", "override"}, {"x-idle-timeout-ms", "9000"}}},
+      {"max_stream_duration", {{"x-decision", "override"}, {"x-max-stream-duration-ms", "9000"}}},
+      {"priority", {{"x-decision", "override"}, {"x-priority", "high"}}},
+      {"request_body_buffer_limit", {{"x-decision", "override"}, {"x-buffer-limit", "9999"}}},
+      {"cluster_not_found_response_code",
+       {{"x-decision", "override"}, {"x-not-found-code", "502"}}},
+      {"retry_policy", {{"x-decision", "override"}, {"x-override", "slow"}}},
+      {"metadata_match", {{"x-decision", "override"}, {"x-override", "matched"}}},
+      {"hash_policy", {{"x-decision", "override"}, {"x-override", "hashed"}, {"x-hash", "a"}}},
+      {"request_mirror_policies", {{"x-decision", "override"}, {"x-override", "mirrored"}}},
+      {"request_path", {{"x-decision", "override"}, {"x-set-path", "/rewritten"}}},
+      {"request_authority", {{"x-decision", "override"}, {"x-set-host", "upstream.local"}}},
+      {"request_headers", {{"x-decision", "override"}, {"x-add-request-header", "x-shadow=value"}}},
+      {"response_headers",
+       {{"x-decision", "override"}, {"x-add-response-header", "x-shadow=value"}}},
+      {"route_metadata", {{"x-decision", "override"}, {"x-route-meta-string", "value"}}},
+      {"hedge_policy", {{"x-decision", "select-template"}, {"x-template", "hedged"}}},
+  };
+  for (const auto& test_case : test_cases) {
+    const std::string counter =
+        absl::StrCat("route_specifier.dynamic_modules.test.shadow_mismatch_", test_case.field);
+    const uint64_t before = test_server_->counter(counter)->value();
+    auto response = sendRequest(test_case.headers);
+    EXPECT_EQ("200", response->headers().getStatusValue()) << test_case.field;
+    test_server_->waitForCounter(counter, testing::Gt(before));
+  }
+}
+
+// The properties only a route that answers the request directly has are compared against a
+// matched route of the same kind.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, ShadowModeComparesDirectResponseFields) {
+  setupTest(R"EOF(
+shadow_mode:
+  compare_fields:
+  - RESPONSE_CODE
+  - REDIRECT_LOCATION
+  - DIRECT_RESPONSE_BODY
+  - ROUTE_NAME
+)EOF");
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  // The matched route redirects to another host with the default status, the template uses a
+  // different host and status.
+  auto response =
+      codec_client_->makeHeaderOnlyRequest(requestHeaders({{":path", "/redirect"},
+                                                           {"x-decision", "select-template"},
+                                                           {"x-template", "redirect_found"}}));
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("301", response->headers().getStatusValue());
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.shadow_mismatch_response_code",
+                               testing::Ge(1));
+  test_server_->waitForCounter(
+      "route_specifier.dynamic_modules.test.shadow_mismatch_redirect_location", testing::Ge(1));
+
+  // The matched route and the template answer with different bodies under different names.
+  response = codec_client_->makeHeaderOnlyRequest(requestHeaders(
+      {{":path", "/direct"}, {"x-decision", "select-template"}, {"x-template", "direct_body"}}));
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_EQ("204", response->headers().getStatusValue());
+  test_server_->waitForCounter(
+      "route_specifier.dynamic_modules.test.shadow_mismatch_direct_response_body", testing::Ge(1));
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.shadow_mismatch_route_name",
+                               testing::Ge(1));
+}
+
+// A shadowed decision that produces an equivalent route is counted as a match.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, ShadowModeReportsMatch) {
+  setupTest(R"EOF(
+shadow_mode:
+  compare_fields: [ROUTE_KIND, CLUSTER_NAME]
+)EOF");
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "override"}, {"x-cluster", "cluster_0"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.shadow_match", testing::Ge(1));
+  test_server_->waitForCounter("dynamicmodulescustom.shadow_results.outcome.match", testing::Ge(1));
+}
+
+// A shadowed pass through has nothing to compare, and is counted separately so that it does not
+// look like a match.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, ShadowModeReportsPassThrough) {
+  setupTest(R"EOF(
+shadow_mode: {}
+)EOF");
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.shadow_pass_through",
+                               testing::Ge(1));
+}
+
+// A shadowed decision that cannot be honored is reported as a failure rather than as a mismatch.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, ShadowModeReportsFailure) {
+  setupTest(R"EOF(
+shadow_mode: {}
+)EOF");
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "error"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  test_server_->waitForCounter("route_specifier.dynamic_modules.test.shadow_failure",
+                               testing::Ge(1));
+  EXPECT_EQ(0, test_server_->counter("route_specifier.dynamic_modules.test.shadow_match")->value());
+  test_server_->waitForCounter("dynamicmodulescustom.shadow_results.outcome.failure",
+                               testing::Ge(1));
+}
+
+// A decision that stops the chain skips the specifiers configured after it, which the second
+// specifier of the chain reports through its own statistics.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, StopsChain) {
+  setupTest("", /*chain_second_specifier=*/true);
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "override"}, {"x-cluster", "canary"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  test_server_->waitForCounter("route_specifier.dynamic_modules.second.decision_override",
+                               testing::Ge(1));
+
+  response =
+      sendRequest({{"x-decision", "override"}, {"x-cluster", "canary"}, {"x-stop-chain", "true"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  // The second specifier did not run again, so its counter did not move.
+  EXPECT_EQ(
+      1,
+      test_server_->counter("route_specifier.dynamic_modules.second.decision_override")->value());
+}
+
+// Each append action combines an added header with one of the same name in its own way.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, AppliesEachHeaderAppendAction) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  struct TestCase {
+    std::string action;
+    std::string expected;
+  };
+  const TestCase test_cases[] = {
+      {"append", "original,added"},
+      {"add-if-absent", "original"},
+      {"overwrite", "added"},
+      {"overwrite-if-exists", "added"},
+  };
+  for (const auto& test_case : test_cases) {
+    auto response = sendRequest({{"x-decision", "override"},
+                                 {"x-append-action", test_case.action},
+                                 {"x-existing", "original"},
+                                 {"x-add-request-header", "x-existing=added"}});
+    EXPECT_EQ("200", response->headers().getStatusValue());
+    const auto upstream_headers =
+        reinterpret_cast<AutonomousUpstream*>(fake_upstreams_.front().get())->lastRequestHeaders();
+    ASSERT_NE(nullptr, upstream_headers);
+    EXPECT_EQ(test_case.expected, upstream_headers->get_("x-existing")) << test_case.action;
+  }
+
+  // Without a header of the same name every action adds the header.
+  auto response = sendRequest({{"x-decision", "override"},
+                               {"x-append-action", "overwrite-if-exists"},
+                               {"x-add-request-header", "x-absent=added"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  const auto upstream_headers =
+      reinterpret_cast<AutonomousUpstream*>(fake_upstreams_.front().get())->lastRequestHeaders();
+  ASSERT_NE(nullptr, upstream_headers);
+  EXPECT_EQ("", upstream_headers->get_("x-absent"));
+}
+
+// The header removals a module records are applied to the request sent upstream and to the
+// response.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, RemovesHeaders) {
+  setupTest();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({{"x-decision", "override"},
+                               {"x-drop-me", "value"},
+                               {"x-remove-request-header", "x-drop-me"},
+                               {"x-add-response-header", "x-drop-response=value"},
+                               {"x-remove-response-header", "x-drop-response"}});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  EXPECT_EQ("", header(response->headers(), "x-drop-response"));
+
+  const auto upstream_headers =
+      reinterpret_cast<AutonomousUpstream*>(fake_upstreams_.front().get())->lastRequestHeaders();
+  ASSERT_NE(nullptr, upstream_headers);
+  EXPECT_EQ("", upstream_headers->get_("x-drop-me"));
+}
+
+} // namespace
+} // namespace DynamicModules
+} // namespace RouteSpecifiers
+} // namespace Extensions
+} // namespace Envoy
