@@ -430,8 +430,10 @@ message Bootstrap {
   // Optional gRPC async client manager config.
   GrpcAsyncClientManagerConfig grpc_async_client_manager_config = 40;
 
-  // Optional configuration for memory allocation manager.
-  // Memory releasing is only supported for `tcmalloc allocator <https://github.com/google/tcmalloc>`_.
+  // Optional configuration for the memory allocation manager. Background memory release is
+  // supported with `Google's tcmalloc <https://github.com/google/tcmalloc>`_ and
+  // `gperftools <https://github.com/gperftools/gperftools>`_ tcmalloc. With any other allocator the
+  // background release fields have no effect and a non-zero ``bytes_to_release`` logs a warning.
   MemoryAllocatorManager memory_allocator_manager = 41;
 
   // When enabled, Envoy pins each worker thread to a distinct CPU from the process affinity mask,
@@ -790,13 +792,23 @@ message CustomInlineHeader {
 
 // [#next-free-field: 6]
 message MemoryAllocatorManager {
-  // Configures tcmalloc to perform background release of free memory in amount of bytes per ``memory_release_interval`` interval.
-  // If equals to ``0``, no memory release will occur. Defaults to ``0``.
+  // Amount of free memory in bytes that Envoy attempts to release back to the OS each
+  // :ref:`memory_release_interval <envoy_v3_api_field_config.bootstrap.v3.MemoryAllocatorManager.memory_release_interval>`.
+  // If set to ``0``, no background memory release is configured. Defaults to ``0``.
+  //
+  // .. note::
+  //     With Google's tcmalloc this value is converted into a bytes-per-second rate for tcmalloc's
+  //     native background release. With ``gperftools`` tcmalloc a dedicated thread releases whole
+  //     page-heap spans, so a given interval may release more, less or no memory. Builds using
+  //     neither allocator ignore this field and log a warning when it is non-zero.
+  //
   uint64 bytes_to_release = 1;
 
-  // Interval in milliseconds for memory releasing. If specified, during every
-  // interval Envoy will try to release ``bytes_to_release`` of free memory back to operating system for reuse.
-  // Defaults to ``1000`` milliseconds.
+  // Interval at which Envoy releases
+  // :ref:`bytes_to_release <envoy_v3_api_field_config.bootstrap.v3.MemoryAllocatorManager.bytes_to_release>`
+  // of free memory back to the OS. With Google's tcmalloc it is used only to compute the
+  // bytes-per-second release rate. Defaults to ``1000`` milliseconds. An interval of ``0``, or
+  // shorter than one millisecond, disables background memory release.
   google.protobuf.Duration memory_release_interval = 2;
 
   // Sets the soft memory limit for tcmalloc. When the total memory used by tcmalloc exceeds this

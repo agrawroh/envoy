@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
+#include "envoy/event/dispatcher.h"
 
 #include "source/common/common/thread.h"
 #include "source/common/protobuf/utility.h"
@@ -11,6 +12,9 @@ namespace Envoy {
 namespace Memory {
 
 constexpr absl::string_view TCMALLOC_ROUTINE_THREAD_ID = "TcmallocProcessBackgroundActions";
+// Name of the `gperftools` background release thread and its dispatcher. Kept within the 15
+// character limit of `pthread_setname_np`.
+constexpr absl::string_view GPERFTOOLS_RELEASE_THREAD_ID = "gperf_release";
 constexpr uint64_t DEFAULT_MAX_UNFREED_MEMORY_BYTES = 100 * 1024 * 1024;
 
 /**
@@ -72,12 +76,10 @@ public:
 };
 
 /**
- * Manages tcmalloc background memory release using the native ProcessBackgroundActions API.
- * When configured with a non-zero release rate, a dedicated thread is started that runs
- * tcmalloc's ProcessBackgroundActions, which handles per-CPU cache reclamation, cache shuffling,
- * size class resizing, transfer cache plundering, and memory release to the OS at the configured
- * rate. Also supports configuring a soft memory limit, per-CPU cache size, and the threshold
- * for tryShrinkHeap.
+ * Manages background memory release for the process allocator. With Google's tcmalloc a dedicated
+ * thread runs the native ProcessBackgroundActions loop. With `gperftools` tcmalloc, which has no
+ * native loop, a dedicated dispatcher thread periodically releases the configured number of bytes.
+ * Also configures the soft memory limit, per-CPU cache size, and the tryShrinkHeap threshold.
  */
 class AllocatorManager {
 public:
@@ -92,6 +94,10 @@ private:
   const size_t background_release_rate_bytes_per_second_;
   Api::Api& api_;
   Thread::ThreadPtr tcmalloc_thread_;
+  // Used only by the `gperftools` path. The timer is declared after the dispatcher so it is
+  // destroyed first, while the dispatcher that owns its event is still alive.
+  Event::DispatcherPtr tcmalloc_routine_dispatcher_;
+  Event::TimerPtr memory_release_timer_;
   void configureBackgroundMemoryRelease();
   void configureTcmallocOptions(const envoy::config::bootstrap::v3::MemoryAllocatorManager& config);
   // Used for testing.
