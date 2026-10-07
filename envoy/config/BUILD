@@ -214,6 +214,7 @@ envoy_cc_library(
         ":grpc_mux_interface",
         ":subscription_factory_interface",
         ":subscription_interface",
+        ":xds_config_tracker_interface",
         "//envoy/common:optref_lib",
         "//envoy/common:pure_lib",
         "//envoy/stats:scope_interface",

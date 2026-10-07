@@ -35,7 +35,10 @@ const int UpstreamIndex2 = 2;
   COUNTER(on_config_accepted)                                                                      \
   COUNTER(on_config_rejected)                                                                      \
   COUNTER(on_config_metadata_read)                                                                 \
-  COUNTER(on_resource_unsubscribed)
+  COUNTER(on_resource_unsubscribed)                                                                \
+  COUNTER(on_resources_applied)                                                                    \
+  COUNTER(resource_applied)                                                                        \
+  COUNTER(resource_failed)
 
 /**
  * Struct definition for stats. @see stats_macros.h
@@ -87,6 +90,24 @@ public:
           }
           stats_.on_config_metadata_read_.inc();
         }
+      }
+    }
+  }
+
+  void onResourcesApplied(const absl::string_view,
+                          absl::Span<const Config::ResourceApplyResult> results) override {
+    stats_.on_resources_applied_.inc();
+    for (const auto& result : results) {
+      switch (result.status) {
+      case Config::ResourceApplyStatus::Applied:
+        stats_.resource_applied_.inc();
+        break;
+      case Config::ResourceApplyStatus::Failed:
+        stats_.resource_failed_.inc();
+        break;
+      case Config::ResourceApplyStatus::Skipped:
+      case Config::ResourceApplyStatus::Removed:
+        break;
       }
     }
   }
@@ -296,6 +317,41 @@ TEST_P(XdsConfigTrackerIntegrationTest, XdsConfigTrackerPartialUpdate) {
   EXPECT_EQ(1, test_server_->counter("test_xds_tracker.on_config_rejected")->value());
 
   // onConfigAccepted is called only when all the resources in a response are successfully ingested.
+  EXPECT_EQ(0, test_server_->counter("test_xds_tracker.on_config_accepted")->value());
+}
+
+// Envoy applies the resources of an update one by one, so an update carrying both valid and invalid
+// clusters applies the valid ones and rejects the rest. The tracker is given the outcome of every
+// resource, which is what lets a management server tell which resources Envoy is running.
+TEST_P(XdsConfigTrackerIntegrationTest, XdsConfigTrackerResourceApplyOutcomes) {
+  TestXdsConfigTrackerFactory factory;
+  Registry::InjectFactory<Config::XdsConfigTrackerFactory> registered(factory);
+
+  initialize();
+  EXPECT_TRUE(compareDiscoveryRequest(Config::TestTypeUrl::get().Cluster, "", {}, {}, {}, true));
+
+  // An ORIGINAL_DST cluster is only valid with the CLUSTER_PROVIDED load balancing policy, so this
+  // cluster passes proto validation but fails when the cluster manager builds it.
+  envoy::config::cluster::v3::Cluster invalid_cluster;
+  invalid_cluster.set_name("invalid_cluster");
+  invalid_cluster.set_type(envoy::config::cluster::v3::Cluster::ORIGINAL_DST);
+  invalid_cluster.set_lb_policy(envoy::config::cluster::v3::Cluster::ROUND_ROBIN);
+
+  sendDiscoveryResponse<envoy::config::cluster::v3::Cluster>(
+      Config::TestTypeUrl::get().Cluster, {cluster1_, invalid_cluster, cluster2_},
+      {cluster1_, invalid_cluster, cluster2_}, {}, "1");
+
+  // The update is NACKed because one of its resources was rejected. It is the last thing the
+  // tracker is told about this update, so waiting for it makes the outcome counters below stable.
+  test_server_->waitForCounter("test_xds_tracker.on_config_rejected", Eq(1));
+
+  EXPECT_EQ(1, test_server_->counter("test_xds_tracker.on_resources_applied")->value());
+  EXPECT_EQ(2, test_server_->counter("test_xds_tracker.resource_applied")->value());
+  EXPECT_EQ(1, test_server_->counter("test_xds_tracker.resource_failed")->value());
+
+  // The two valid clusters are serving even though the update as a whole was NACKed. 3 because the
+  // statically specified CDS server itself counts as a cluster.
+  test_server_->waitForGauge("cluster_manager.active_clusters", Eq(3));
   EXPECT_EQ(0, test_server_->counter("test_xds_tracker.on_config_accepted")->value());
 }
 

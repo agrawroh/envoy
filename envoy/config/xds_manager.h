@@ -11,6 +11,7 @@
 #include "envoy/config/grpc_mux.h"
 #include "envoy/config/subscription.h"
 #include "envoy/config/subscription_factory.h"
+#include "envoy/config/xds_config_tracker.h"
 #include "envoy/stats/scope.h"
 #include "envoy/upstream/cluster_manager.h"
 
@@ -146,6 +147,15 @@ public:
    * @return Config::SubscriptionFactory& the subscription factory.
    */
   virtual SubscriptionFactory& subscriptionFactory() PURE;
+
+  /**
+   * Obtain the xDS config tracker extension, so that the components that apply xDS resources can
+   * report the outcome of an update to it.
+   *
+   * @return XdsConfigTrackerOptRef the tracker configured in the bootstrap, or an empty reference
+   * if none is configured.
+   */
+  virtual XdsConfigTrackerOptRef xdsConfigTracker() PURE;
 };
 
 using XdsManagerPtr = std::unique_ptr<XdsManager>;

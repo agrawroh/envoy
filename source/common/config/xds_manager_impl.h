@@ -38,6 +38,9 @@ public:
 
   Config::GrpcMuxSharedPtr adsMux() override { return ads_mux_; }
   SubscriptionFactory& subscriptionFactory() override { return *subscription_factory_; }
+  XdsConfigTrackerOptRef xdsConfigTracker() override {
+    return makeOptRefFromPtr<XdsConfigTracker>(xds_config_tracker_.get());
+  }
 
 private:
   class AuthorityData {

@@ -189,6 +189,111 @@ TEST_F(LdsApiTest, ListenerCreationContinuesEvenAfterException) {
             "wrong\ninvalid-listener-2: something else is wrong\n");
 }
 
+// The xDS config tracker is handed the outcome of every listener in an update, including the ones
+// that could not be applied.
+TEST_F(LdsApiTest, ConfigUpdateReportsResourceOutcomes) {
+  NiceMock<Config::MockXdsConfigTracker> xds_config_tracker;
+  ON_CALL(xds_manager_, xdsConfigTracker())
+      .WillByDefault(Return(Config::XdsConfigTrackerOptRef(xds_config_tracker)));
+
+  setup();
+
+  Protobuf::RepeatedPtrField<envoy::service::discovery::v3::Resource> resources;
+  const auto add_resource = [this, &resources](const std::string& name,
+                                               const std::string& version) {
+    auto* resource = resources.Add();
+    std::ignore = resource->mutable_resource()->PackFrom(buildListener(name));
+    resource->set_name(name);
+    resource->set_version(version);
+  };
+  add_resource("applied-listener", "v1");
+  add_resource("skipped-listener", "v2");
+  add_resource("rejected-listener", "v3");
+  add_resource("thrown-listener", "v4");
+  // A second copy of a listener already in this update is rejected without reaching the listener
+  // manager.
+  add_resource("applied-listener", "v5");
+
+  Protobuf::RepeatedPtrField<std::string> removed;
+  *removed.Add() = "removed-listener";
+  *removed.Add() = "protected-listener";
+
+  EXPECT_CALL(listener_manager_, beginListenerUpdate());
+  EXPECT_CALL(listener_manager_, removeListener("removed-listener")).WillOnce(Return(true));
+  // Envoy refuses this removal, and a removal that changed nothing is not reported.
+  EXPECT_CALL(listener_manager_, removeListener("protected-listener")).WillOnce(Return(false));
+  EXPECT_CALL(listener_manager_, addOrUpdateListener(_, "v1", true)).WillOnce(Return(true));
+  EXPECT_CALL(listener_manager_, addOrUpdateListener(_, "v2", true)).WillOnce(Return(false));
+  EXPECT_CALL(listener_manager_, addOrUpdateListener(_, "v3", true))
+      .WillOnce(Return(absl::InvalidArgumentError("listener manager said no")));
+  EXPECT_CALL(listener_manager_, addOrUpdateListener(_, "v4", true))
+      .WillOnce(Throw(EnvoyException("something is wrong")));
+  EXPECT_CALL(listener_manager_, endListenerUpdate(_));
+
+  const auto expect_outcomes = [](absl::string_view type_url,
+                                  absl::Span<const Config::ResourceApplyResult> results) {
+    EXPECT_EQ("type.googleapis.com/envoy.config.listener.v3.Listener", type_url);
+    // The removals are applied before the additions, so they are reported first.
+    ASSERT_EQ(6, results.size());
+
+    EXPECT_EQ("removed-listener", results[0].name);
+    EXPECT_EQ("", results[0].version);
+    EXPECT_EQ(Config::ResourceApplyStatus::Removed, results[0].status);
+
+    EXPECT_EQ("applied-listener", results[1].name);
+    EXPECT_EQ("v1", results[1].version);
+    EXPECT_EQ(Config::ResourceApplyStatus::Applied, results[1].status);
+    EXPECT_EQ("", results[1].details);
+
+    EXPECT_EQ("skipped-listener", results[2].name);
+    EXPECT_EQ("v2", results[2].version);
+    EXPECT_EQ(Config::ResourceApplyStatus::Skipped, results[2].status);
+
+    EXPECT_EQ("rejected-listener", results[3].name);
+    EXPECT_EQ("v3", results[3].version);
+    EXPECT_EQ(Config::ResourceApplyStatus::Failed, results[3].status);
+    EXPECT_EQ("listener manager said no", results[3].details);
+
+    EXPECT_EQ("thrown-listener", results[4].name);
+    EXPECT_EQ("v4", results[4].version);
+    EXPECT_EQ(Config::ResourceApplyStatus::Failed, results[4].status);
+    EXPECT_EQ("something is wrong", results[4].details);
+
+    EXPECT_EQ("applied-listener", results[5].name);
+    EXPECT_EQ("v5", results[5].version);
+    EXPECT_EQ(Config::ResourceApplyStatus::Failed, results[5].status);
+    EXPECT_EQ("duplicate listener applied-listener found", results[5].details);
+  };
+  EXPECT_CALL(xds_config_tracker, onResourcesApplied(_, _)).WillOnce(Invoke(expect_outcomes));
+  EXPECT_CALL(init_watcher_, ready());
+
+  const auto decoded_resources =
+      TestUtility::decodeResources<envoy::config::listener::v3::Listener>(resources);
+  EXPECT_EQ(lds_callbacks_->onConfigUpdate(decoded_resources.refvec_, removed, "v6").message(),
+            "Error adding/updating listener(s) rejected-listener: listener manager said no\n"
+            "thrown-listener: something is wrong\n"
+            "applied-listener: duplicate listener applied-listener found\n");
+}
+
+// An update that did not act on any listener, such as a delta heartbeat, is not reported to the
+// xDS config tracker.
+TEST_F(LdsApiTest, ConfigUpdateWithNoOutcomesDoesNotReportToTracker) {
+  NiceMock<Config::MockXdsConfigTracker> xds_config_tracker;
+  ON_CALL(xds_manager_, xdsConfigTracker())
+      .WillByDefault(Return(Config::XdsConfigTrackerOptRef(xds_config_tracker)));
+
+  InSequence s;
+
+  setup();
+
+  EXPECT_CALL(listener_manager_, beginListenerUpdate());
+  EXPECT_CALL(listener_manager_, endListenerUpdate(_));
+  EXPECT_CALL(xds_config_tracker, onResourcesApplied(_, _)).Times(0);
+  EXPECT_CALL(init_watcher_, ready());
+
+  EXPECT_OK(lds_callbacks_->onConfigUpdate({}, {}, "v1"));
+}
+
 // Validate onConfigUpdate throws EnvoyException with duplicate listeners.
 // The first of the duplicates will be successfully applied, with the rest adding to
 // the exception message.

@@ -61,6 +61,7 @@ envoy_cc_test(
         "//source/common/config:utility_lib",
         "//source/common/protobuf:utility_lib",
         "//source/common/upstream:cds_api_lib",
+        "//test/mocks/config:config_mocks",
         "//test/mocks/protobuf:protobuf_mocks",
         "//test/mocks/server:server_factory_context_mocks",
         "//test/mocks/upstream:cluster_manager_mocks",
@@ -857,6 +858,33 @@ envoy_cc_fuzz_test(
         ":health_check_fuzz_proto_cc_proto",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
     ],
+)
+
+envoy_cc_benchmark_binary(
+    name = "cds_speed_test",
+    srcs = ["cds_speed_test.cc"],
+    rbe_pool = "6gig",
+    deps = [
+        ":cluster_manager_impl_test_common",
+        "//envoy/config:xds_config_tracker_interface",
+        "//source/common/config:null_grpc_mux_lib",
+        "//source/common/upstream:cds_api_helper_lib",
+        "//source/extensions/clusters/static:static_cluster_lib",
+        "//source/extensions/load_balancing_policies/round_robin:config",
+        "//source/extensions/transport_sockets/raw_buffer:config",
+        "//test/mocks/config:xds_manager_mocks",
+        "//test/mocks/upstream:cluster_manager_mocks",
+        "//test/test_common:utility_lib",
+        "@benchmark",
+        "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
+        "@envoy_api//envoy/config/cluster/v3:pkg_cc_proto",
+        "@envoy_api//envoy/service/discovery/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_benchmark_test(
+    name = "cds_speed_test_benchmark_test",
+    benchmark_binary = "cds_speed_test",
 )
 
 envoy_cc_benchmark_binary(

@@ -176,6 +176,7 @@ envoy_cc_library(
     deps = [
         "//envoy/config:subscription_factory_interface",
         "//envoy/config:subscription_interface",
+        "//envoy/config:xds_config_tracker_interface",
         "//envoy/init:manager_interface",
         "//envoy/server:listener_manager_interface",
         "//source/common/common:cleanup_lib",

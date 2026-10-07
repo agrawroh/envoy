@@ -1,10 +1,13 @@
 #include "source/common/listener_manager/lds_api.h"
 
+#include <deque>
+
 #include "envoy/admin/v3/config_dump.pb.h"
 #include "envoy/config/core/v3/config_source.pb.h"
 #include "envoy/config/listener/v3/listener.pb.h"
 #include "envoy/config/route/v3/route.pb.h"
 #include "envoy/config/route/v3/scoped_route.pb.h"
+#include "envoy/config/xds_config_tracker.h"
 #include "envoy/service/discovery/v3/discovery.pb.h"
 #include "envoy/stats/scope.h"
 
@@ -60,12 +63,21 @@ LdsApiImpl::onConfigUpdate(const std::vector<Config::DecodedResourceRef>& added_
   bool any_applied = false;
   listener_manager_.beginListenerUpdate();
 
+  // Backs the failure details handed to the xDS config tracker. A deque is used because it does
+  // not invalidate references to the elements it already holds when it grows, so `apply_results`
+  // can hold views into it.
+  std::deque<std::string> failure_details;
+  std::vector<Config::ResourceApplyResult> apply_results;
+  apply_results.reserve(added_resources.size() + removed_resources.size());
+
   // We do all listener removals before adding the new listeners. This allows adding a new
   // listener with the same address as a listener that is to be removed. Do not change the order.
   for (const auto& removed_listener : removed_resources) {
     if (listener_manager_.removeListener(removed_listener)) {
       ENVOY_LOG(info, "lds: remove listener '{}'", removed_listener);
       any_applied = true;
+      apply_results.push_back(
+          {.name = removed_listener, .status = Config::ResourceApplyStatus::Removed});
     }
   }
 
@@ -87,6 +99,11 @@ LdsApiImpl::onConfigUpdate(const std::vector<Config::DecodedResourceRef>& added_
 #endif
       absl::StrAppend(&message, listener_name, ": ", error_message, "\n");
       ENVOY_LOG(warn, "lds: listener '{}' config rejected: {}", listener_name, error_message);
+      failure_details.push_back(std::move(error_message));
+      apply_results.push_back({.name = listener_name,
+                               .version = resource.get().version(),
+                               .status = Config::ResourceApplyStatus::Failed,
+                               .details = failure_details.back()});
     };
 
     TRY_ASSERT_MAIN_THREAD {
@@ -109,14 +126,26 @@ LdsApiImpl::onConfigUpdate(const std::vector<Config::DecodedResourceRef>& added_
       if (update_or_error.value()) {
         ENVOY_LOG(info, "lds: add/update listener '{}'", listener_name);
         any_applied = true;
+        apply_results.push_back({.name = listener_name,
+                                 .version = resource.get().version(),
+                                 .status = Config::ResourceApplyStatus::Applied});
       } else {
         ENVOY_LOG(debug, "lds: add/update listener '{}' skipped", listener_name);
+        apply_results.push_back({.name = listener_name,
+                                 .version = resource.get().version(),
+                                 .status = Config::ResourceApplyStatus::Skipped});
       }
     }
     END_TRY
     CATCH(EnvoyException & e, { onError(e.what()); })
   }
   listener_manager_.endListenerUpdate(std::move(failure_state));
+
+  if (Config::XdsConfigTrackerOptRef xds_config_tracker = xds_manager_.xdsConfigTracker();
+      !apply_results.empty() && xds_config_tracker.has_value()) {
+    xds_config_tracker->onResourcesApplied(
+        Config::getTypeUrl<envoy::config::listener::v3::Listener>(), apply_results);
+  }
 
   if (any_applied) {
     system_version_info_ = system_version_info;

@@ -50,6 +50,9 @@ public:
                absl::Span<const envoy::service::discovery::v3::Resource* const> added_resources,
                const Protobuf::RepeatedPtrField<std::string>& removed_resources),
               (override));
+  MOCK_METHOD(void, onResourcesApplied,
+              (const absl::string_view type_url, absl::Span<const ResourceApplyResult> results),
+              (override));
   MOCK_METHOD(void, onConfigRejected,
               (const envoy::service::discovery::v3::DiscoveryResponse& message,
                const absl::string_view error_detail),

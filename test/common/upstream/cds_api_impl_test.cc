@@ -13,6 +13,7 @@
 #include "source/common/upstream/cds_api_impl.h"
 
 #include "test/common/upstream/utility.h"
+#include "test/mocks/config/mocks.h"
 #include "test/mocks/protobuf/mocks.h"
 #include "test/mocks/server/server_factory_context.h"
 #include "test/mocks/upstream/cluster_manager.h"
@@ -27,6 +28,7 @@
 using ::Envoy::StatusHelpers::IsOk;
 using testing::_;
 using testing::InSequence;
+using testing::Invoke;
 using ::testing::Not;
 using testing::Return;
 using testing::StrEq;
@@ -127,6 +129,110 @@ resources:
       TestUtility::decodeResources<envoy::config::cluster::v3::Cluster>(response2);
   EXPECT_OK(cds_callbacks_->onConfigUpdate(decoded_resources_2.refvec_, response2.version_info()));
   EXPECT_EQ("1", cds_->versionInfo());
+}
+
+// The xDS config tracker is handed the outcome of every cluster in an update, including the ones
+// that could not be applied.
+TEST_F(CdsApiImplTest, ConfigUpdateReportsResourceOutcomes) {
+  NiceMock<Config::MockXdsConfigTracker> xds_config_tracker;
+  ON_CALL(server_factory_context_.xds_manager_, xdsConfigTracker())
+      .WillByDefault(Return(Config::XdsConfigTrackerOptRef(xds_config_tracker)));
+  {
+    InSequence s;
+    setup();
+  }
+
+  Protobuf::RepeatedPtrField<envoy::service::discovery::v3::Resource> resources;
+  const auto add_resource = [&resources](const std::string& name, const std::string& version) {
+    envoy::config::cluster::v3::Cluster cluster;
+    cluster.set_name(name);
+    auto* resource = resources.Add();
+    std::ignore = resource->mutable_resource()->PackFrom(cluster);
+    resource->set_name(name);
+    resource->set_version(version);
+  };
+  add_resource("applied_cluster", "v1");
+  add_resource("skipped_cluster", "v2");
+  add_resource("rejected_cluster", "v3");
+  add_resource("thrown_cluster", "v4");
+  // A second copy of a cluster already in this update is rejected without reaching the cluster
+  // manager.
+  add_resource("applied_cluster", "v5");
+
+  EXPECT_CALL(cm_, addOrUpdateCluster(WithName("applied_cluster"), "v1", false))
+      .WillOnce(Return(true));
+  EXPECT_CALL(cm_, addOrUpdateCluster(WithName("skipped_cluster"), "v2", false))
+      .WillOnce(Return(false));
+  EXPECT_CALL(cm_, addOrUpdateCluster(WithName("rejected_cluster"), "v3", false))
+      .WillOnce(Return(absl::InvalidArgumentError("cluster manager said no")));
+  expectAddToThrow("thrown_cluster", "bad cluster");
+
+  Protobuf::RepeatedPtrField<std::string> removed;
+  *removed.Add() = "removed_cluster";
+  *removed.Add() = "protected_cluster";
+  EXPECT_CALL(cm_, removeCluster(StrEq("removed_cluster"), false)).WillOnce(Return(true));
+  // Envoy refuses this removal, and a removal that changed nothing is not reported.
+  EXPECT_CALL(cm_, removeCluster(StrEq("protected_cluster"), false)).WillOnce(Return(false));
+
+  const auto expect_outcomes = [](absl::string_view type_url,
+                                  absl::Span<const Config::ResourceApplyResult> results) {
+    EXPECT_EQ("type.googleapis.com/envoy.config.cluster.v3.Cluster", type_url);
+    // The added clusters are reported in the order they were applied, followed by the removals.
+    ASSERT_EQ(6, results.size());
+
+    EXPECT_EQ("applied_cluster", results[0].name);
+    EXPECT_EQ("v1", results[0].version);
+    EXPECT_EQ(Config::ResourceApplyStatus::Applied, results[0].status);
+    EXPECT_EQ("", results[0].details);
+
+    EXPECT_EQ("skipped_cluster", results[1].name);
+    EXPECT_EQ("v2", results[1].version);
+    EXPECT_EQ(Config::ResourceApplyStatus::Skipped, results[1].status);
+
+    EXPECT_EQ("rejected_cluster", results[2].name);
+    EXPECT_EQ("v3", results[2].version);
+    EXPECT_EQ(Config::ResourceApplyStatus::Failed, results[2].status);
+    EXPECT_EQ("cluster manager said no", results[2].details);
+
+    EXPECT_EQ("thrown_cluster", results[3].name);
+    EXPECT_EQ("v4", results[3].version);
+    EXPECT_EQ(Config::ResourceApplyStatus::Failed, results[3].status);
+    EXPECT_EQ("bad cluster", results[3].details);
+
+    EXPECT_EQ("applied_cluster", results[4].name);
+    EXPECT_EQ("v5", results[4].version);
+    EXPECT_EQ(Config::ResourceApplyStatus::Failed, results[4].status);
+    EXPECT_EQ("duplicate cluster applied_cluster found", results[4].details);
+
+    EXPECT_EQ("removed_cluster", results[5].name);
+    EXPECT_EQ("", results[5].version);
+    EXPECT_EQ(Config::ResourceApplyStatus::Removed, results[5].status);
+  };
+  EXPECT_CALL(xds_config_tracker, onResourcesApplied(_, _)).WillOnce(Invoke(expect_outcomes));
+  EXPECT_CALL(initialized_, ready());
+
+  const auto decoded_resources =
+      TestUtility::decodeResources<envoy::config::cluster::v3::Cluster>(resources);
+  EXPECT_EQ(cds_callbacks_->onConfigUpdate(decoded_resources.refvec_, removed, "v6").message(),
+            "Error adding/updating cluster(s) rejected_cluster: cluster manager said no, "
+            "thrown_cluster: bad cluster, applied_cluster: duplicate cluster applied_cluster "
+            "found");
+}
+
+// An update that did not act on any resource, such as a delta heartbeat, is not reported to the
+// xDS config tracker.
+TEST_F(CdsApiImplTest, ConfigUpdateWithNoOutcomesDoesNotReportToTracker) {
+  NiceMock<Config::MockXdsConfigTracker> xds_config_tracker;
+  ON_CALL(server_factory_context_.xds_manager_, xdsConfigTracker())
+      .WillByDefault(Return(Config::XdsConfigTrackerOptRef(xds_config_tracker)));
+  {
+    InSequence s;
+    setup();
+  }
+
+  EXPECT_CALL(xds_config_tracker, onResourcesApplied(_, _)).Times(0);
+  EXPECT_CALL(initialized_, ready());
+  EXPECT_OK(cds_callbacks_->onConfigUpdate({}, {}, "v1"));
 }
 
 // Validate onConfigUpdate throws EnvoyException with duplicate clusters.

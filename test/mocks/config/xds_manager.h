@@ -33,6 +33,7 @@ public:
               (const envoy::config::bootstrap::v3::Bootstrap& bootstrap));
   MOCK_METHOD(GrpcMuxSharedPtr, adsMux, ());
   MOCK_METHOD(SubscriptionFactory&, subscriptionFactory, ());
+  MOCK_METHOD(XdsConfigTrackerOptRef, xdsConfigTracker, ());
 
   testing::NiceMock<MockSubscriptionFactory> subscription_factory_;
   std::shared_ptr<testing::NiceMock<MockGrpcMux>> ads_mux_;
