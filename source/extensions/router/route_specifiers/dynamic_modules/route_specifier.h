@@ -67,6 +67,7 @@ constexpr absl::string_view DefaultMetricsNamespace = "dynamicmodulescustom";
   COUNTER(failure_route_metadata)                                                                  \
   COUNTER(reuse_previous_rejected)                                                                 \
   COUNTER(route_destroy)                                                                           \
+  COUNTER(rewrite_not_applied)                                                                     \
   HISTOGRAM(on_route_duration, Microseconds)                                                       \
   HISTOGRAM(specifier_duration, Microseconds)
 
@@ -105,6 +106,23 @@ struct RouteOverride {
 
 using RouteOverrideMap = absl::flat_hash_map<std::string, RouteOverride>;
 
+// A prefix rewrite a module recorded as a rule. It is applied to the path the request carries when
+// the request headers are finalized, the same way the prefix_rewrite of a configured route is, so a
+// route that carries it is not specific to the request it was built for.
+struct PrefixRewriteRule {
+  // The literal the rule replaces. Empty when the rule replaces the whole path without its query
+  // string.
+  std::string matched;
+  std::string replacement;
+  bool whole_path{false};
+
+  // The path the rule produces for a request path, or nullopt when the rule does not apply to it or
+  // the result would exceed max_bytes.
+  std::optional<std::string> apply(absl::string_view path, size_t max_bytes) const;
+
+  bool operator==(const PrefixRewriteRule& other) const = default;
+};
+
 // A header mutation a module recorded for a request.
 struct HeaderMutation {
   Http::LowerCaseString key;
@@ -133,6 +151,8 @@ struct RouteOverrides {
   // Name the module recorded for the route it produces. Unset when the module set none.
   std::optional<std::string> route_name;
   std::optional<std::string> path;
+  // Applied when the request headers are finalized. A recorded path takes precedence over it.
+  std::optional<PrefixRewriteRule> prefix_rewrite_rule;
   std::optional<std::string> host;
   std::vector<HeaderMutation> request_headers_to_add;
   std::vector<Http::LowerCaseString> request_headers_to_remove;
@@ -410,6 +430,14 @@ public:
                                                   bool do_formatting = true) const override;
 
 private:
+  // Whether a rewrite is applied to the path the request carries when it is finalized, which is the
+  // prefix rewrite rule the module recorded or the regex rewrite of the selected route override.
+  bool hasFinalizationRewrite() const;
+  // The path the finalization rewrite produces for a request path, or nullopt when it does not
+  // apply. A recorded prefix rewrite rule owns the rewrite, so the regex rewrite of the route
+  // override is not tried when a rule is recorded.
+  std::optional<std::string> finalizationRewrite(absl::string_view path) const;
+
   const DynamicModuleRouteSpecifierConfigSharedPtr config_;
   const RouteOverrides overrides_;
   const Envoy::Config::MetadataPackPtr<Envoy::Router::HttpRouteTypedMetadataFactory> metadata_pack_;

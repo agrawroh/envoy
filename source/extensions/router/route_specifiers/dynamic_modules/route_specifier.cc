@@ -11,6 +11,7 @@
 #include "source/common/config/well_known_names.h"
 #include "source/common/http/hash_policy.h"
 #include "source/common/http/header_utility.h"
+#include "source/common/http/path_utility.h"
 #include "source/common/http/utility.h"
 #include "source/common/protobuf/utility.h"
 #include "source/common/router/config_impl.h"
@@ -171,25 +172,15 @@ void applyHeaderMutations(Http::HeaderMap& headers,
   }
 }
 
-// Applies what the selected route override carries onto the recorded overrides before the route
-// is built. Deferred to resolution so that unset_route_override can revert the selection cleanly,
-// and defined so that the values the module records itself win whatever the call order: the
-// override's regex rewrite applies only when the module recorded no path, and its metadata sits
-// under the metadata the module recorded.
+// Applies the metadata the selected route override carries onto the recorded overrides before the
+// route is built. Deferred to resolution so that unset_route_override can revert the selection
+// cleanly, and defined so that the metadata the module records itself wins whatever the call order.
+// The regex rewrite of the override is not applied here but when the request headers are
+// finalized, to the path the request carries then, so the route stays valid for another request.
 void applySelectedRouteOverride(RouteSpecifierContext& context) {
   const RouteOverride* entry = context.overrides.route_override;
   if (entry == nullptr) {
     return;
-  }
-  if (entry->regex_rewrite != nullptr && !context.overrides.path.has_value()) {
-    // A result over the bound or an empty rewrite leaves the path alone, the same way
-    // set_prefix_rewrite does.
-    std::optional<std::string> rewritten = Envoy::Router::rewritePathByPrefixOrRegex(
-        context.headers.getPathValue(), "", "", entry->regex_rewrite.get(),
-        entry->regex_rewrite_substitution, context.config.maxRewrittenPathBytes());
-    if (rewritten.has_value()) {
-      context.overrides.path = std::move(*rewritten);
-    }
   }
   for (const auto& [name, fields] : entry->metadata.filter_metadata()) {
     auto& slot = (*context.overrides.route_metadata.mutable_filter_metadata())[name];
@@ -228,14 +219,23 @@ void appendHeaderTransforms(Http::HeaderTransforms& transforms,
 
 } // namespace
 
+std::optional<std::string> PrefixRewriteRule::apply(absl::string_view path,
+                                                    size_t max_bytes) const {
+  // A rule over the whole path replaces the part a regex route matches, which is the path without
+  // its query string and fragment.
+  const absl::string_view span =
+      whole_path ? Http::PathUtil::removeQueryAndFragment(path) : absl::string_view(matched);
+  return Envoy::Router::rewritePathByPrefixOrRegex(path, span, replacement, nullptr, "", max_bytes);
+}
+
 bool RouteOverrides::hasRouteEntryOverrides() const {
   return !cluster_name.empty() || timeout.has_value() || idle_timeout.has_value() ||
          max_stream_duration.has_value() || request_body_buffer_limit.has_value() ||
          priority.has_value() || cluster_not_found_response_code.has_value() ||
          (route_override != nullptr && route_override->hasRouteEntryProperties()) ||
-         path.has_value() || host.has_value() || !request_headers_to_add.empty() ||
-         !request_headers_to_remove.empty() || !response_headers_to_add.empty() ||
-         !response_headers_to_remove.empty();
+         path.has_value() || prefix_rewrite_rule.has_value() || host.has_value() ||
+         !request_headers_to_add.empty() || !request_headers_to_remove.empty() ||
+         !response_headers_to_add.empty() || !response_headers_to_remove.empty();
 }
 
 bool RouteOverrides::hasRouteOverrides() const {
@@ -611,17 +611,77 @@ const Envoy::Router::CorsPolicy* DynamicModuleRouteEntry::corsPolicy() const {
                                                            : DelegatingRouteEntry::corsPolicy();
 }
 
+bool DynamicModuleRouteEntry::hasFinalizationRewrite() const {
+  return overrides_.prefix_rewrite_rule.has_value() ||
+         (overrides_.route_override != nullptr &&
+          overrides_.route_override->regex_rewrite != nullptr);
+}
+
+std::optional<std::string>
+DynamicModuleRouteEntry::finalizationRewrite(absl::string_view path) const {
+  if (overrides_.prefix_rewrite_rule.has_value()) {
+    return overrides_.prefix_rewrite_rule->apply(path, config_->maxRewrittenPathBytes());
+  }
+  const RouteOverride* entry = overrides_.route_override;
+  if (entry != nullptr && entry->regex_rewrite != nullptr) {
+    return Envoy::Router::rewritePathByPrefixOrRegex(path, "", "", entry->regex_rewrite.get(),
+                                                     entry->regex_rewrite_substitution,
+                                                     config_->maxRewrittenPathBytes());
+  }
+  return std::nullopt;
+}
+
 std::string DynamicModuleRouteEntry::currentUrlPathAfterRewrite(
     const Http::RequestHeaderMap& headers, const Formatter::Context& context,
     const StreamInfo::StreamInfo& stream_info) const {
-  return overrides_.path.value_or(
-      DelegatingRouteEntry::currentUrlPathAfterRewrite(headers, context, stream_info));
+  if (overrides_.path.has_value()) {
+    return *overrides_.path;
+  }
+  // A recorded rule owns the rewrite, so a rule that does not apply leaves the path unchanged,
+  // which the empty result reports the same way a configured route without a rewrite reports it.
+  if (overrides_.prefix_rewrite_rule.has_value()) {
+    return overrides_.prefix_rewrite_rule
+        ->apply(headers.getPathValue(), config_->maxRewrittenPathBytes())
+        .value_or(std::string{});
+  }
+  // A route override regex rewrite that yields nothing leaves the rewrite of the route in effect,
+  // which is what finalizeRequestHeaders applies too.
+  std::optional<std::string> rewritten = finalizationRewrite(headers.getPathValue());
+  return rewritten.has_value()
+             ? std::move(*rewritten)
+             : DelegatingRouteEntry::currentUrlPathAfterRewrite(headers, context, stream_info);
 }
 
 void DynamicModuleRouteEntry::finalizeRequestHeaders(Http::RequestHeaderMap& headers,
                                                      const Formatter::Context& context,
                                                      const StreamInfo::StreamInfo& stream_info,
                                                      bool insert_envoy_original_path) const {
+  // A finalization rewrite rewrites the path the request carries when it is finalized, the same
+  // path a configured route rewrites, so it is computed before the route below finalizes the
+  // headers and possibly rewrites the path itself. A recorded path takes precedence over it.
+  //
+  // A recorded rule owns the rewrite, so when it does not apply the path the route below rewrote is
+  // restored, together with the x-envoy-original-path it recorded, and the path is left unchanged.
+  const bool rule_owns_path =
+      !overrides_.path.has_value() && overrides_.prefix_rewrite_rule.has_value();
+  std::optional<std::string> rewritten;
+  std::string original_path;
+  std::optional<std::string> original_envoy_original_path;
+  if (!overrides_.path.has_value() && hasFinalizationRewrite()) {
+    rewritten = finalizationRewrite(headers.getPathValue());
+    if (!rewritten.has_value()) {
+      // The path is left unchanged, which is what a configured route does when its rewrite yields
+      // nothing.
+      config_->stats().rewrite_not_applied_.inc();
+    }
+    if ((rewritten.has_value() && insert_envoy_original_path) ||
+        (!rewritten.has_value() && rule_owns_path)) {
+      original_path = std::string(headers.getPathValue());
+    }
+    if (!rewritten.has_value() && rule_owns_path && headers.EnvoyOriginalPath() != nullptr) {
+      original_envoy_original_path = std::string(headers.getEnvoyOriginalPathValue());
+    }
+  }
   DelegatingRouteEntry::finalizeRequestHeaders(headers, context, stream_info,
                                                insert_envoy_original_path);
   applyHeaderMutations(headers, overrides_.request_headers_to_add,
@@ -637,6 +697,19 @@ void DynamicModuleRouteEntry::finalizeRequestHeaders(Http::RequestHeaderMap& hea
       headers.setEnvoyOriginalPath(headers.getPathValue());
     }
     headers.setPath(*overrides_.path);
+  } else if (rewritten.has_value()) {
+    // The original path is recorded the way finalizePathHeader of a configured route records it.
+    if (insert_envoy_original_path) {
+      headers.setEnvoyOriginalPath(original_path);
+    }
+    headers.setPath(*rewritten);
+  } else if (rule_owns_path) {
+    headers.setPath(original_path);
+    if (original_envoy_original_path.has_value()) {
+      headers.setEnvoyOriginalPath(*original_envoy_original_path);
+    } else {
+      headers.removeEnvoyOriginalPath();
+    }
   }
 }
 

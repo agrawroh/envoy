@@ -22,6 +22,7 @@ envoy_extension_cc_dyn_module_test(
         "//test/extensions/dynamic_modules/test_data/c:route_specifier_missing_on_route",
         "//test/extensions/dynamic_modules/test_data/c:route_specifier_no_op",
         "//test/extensions/dynamic_modules/test_data/c:route_specifier_override",
+        "//test/extensions/dynamic_modules/test_data/c:route_specifier_rewrite_rule",
         "//test/extensions/dynamic_modules/test_data/c:route_specifier_select_template",
         "//test/extensions/dynamic_modules/test_data/c:route_specifier_unknown_decision",
         "//test/extensions/dynamic_modules/test_data/c:route_specifier_unknown_status",

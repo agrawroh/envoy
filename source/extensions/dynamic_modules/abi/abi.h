@@ -17385,6 +17385,25 @@ typedef enum envoy_dynamic_module_type_route_specifier_header_append_action {
 } envoy_dynamic_module_type_route_specifier_header_append_action;
 
 /**
+ * envoy_dynamic_module_type_route_specifier_rewrite_span selects the part of the request path that
+ * a rule recorded with envoy_dynamic_module_callback_route_specifier_set_prefix_rewrite_rule
+ * replaces.
+ */
+typedef enum envoy_dynamic_module_type_route_specifier_rewrite_span {
+  // A literal the route matched, its prefix or its exact path, is replaced. This is the part a
+  // prefix or a path route replaces with its prefix_rewrite.
+  envoy_dynamic_module_type_route_specifier_rewrite_span_Literal = 0,
+  // The whole path without its query string and fragment is replaced. This is the part a regex
+  // route replaces with its prefix_rewrite, since the part of the path it matched is the whole
+  // path.
+  envoy_dynamic_module_type_route_specifier_rewrite_span_WholePath = 1,
+  // Not a span. Pins the type to a stable 32 bit size and widens its value range, so that a span a
+  // newer ABI defines can be held and rejected by an Envoy that does not know it without undefined
+  // behavior.
+  envoy_dynamic_module_type_route_specifier_rewrite_span_Sentinel = 0x7FFFFFFF,
+} envoy_dynamic_module_type_route_specifier_rewrite_span;
+
+/**
  * envoy_dynamic_module_type_route_specifier_input_route holds the properties of the route the
  * module is resolving that are free to read, so that a module can take all of them in one call
  * instead of one call each. After a template is selected with
@@ -18226,7 +18245,9 @@ void envoy_dynamic_module_callback_route_specifier_set_route_user_data(
  * request path sent upstream. matched must be a case insensitive prefix of the current path without
  * its query string, which is replaced by replacement while the query string is preserved. Envoy
  * computes the rewritten path once, so it takes precedence over the rewrites of the route the same
- * way set_path does.
+ * way set_path does. The recorded path is specific to the current request, so a module that reuses
+ * the routes it builds across requests records
+ * envoy_dynamic_module_callback_route_specifier_set_prefix_rewrite_rule instead.
  *
  * @param context_envoy_ptr is the pointer to the route decision context.
  * @param matched is the prefix of the path to replace. The buffer is owned by the module.
@@ -18240,14 +18261,52 @@ bool envoy_dynamic_module_callback_route_specifier_set_prefix_rewrite(
     envoy_dynamic_module_type_module_buffer replacement);
 
 /**
+ * envoy_dynamic_module_callback_route_specifier_set_prefix_rewrite_rule records a prefix rewrite of
+ * the request path sent upstream as a rule. Unlike
+ * envoy_dynamic_module_callback_route_specifier_set_prefix_rewrite, which records the path the
+ * rewrite produces for the current request, the rule is applied when the request headers are
+ * finalized, to the path the request carries then, the same way the prefix_rewrite of a configured
+ * route is applied. A route that carries a rule is therefore not specific to the request it was
+ * built for.
+ *
+ * With the Literal span, matched must be a case insensitive prefix of the current path, and it is
+ * replaced by replacement while the rest of the path and the query string are preserved. With the
+ * WholePath span, matched must be empty, and the whole path without its query string is replaced by
+ * replacement while the query string is preserved. The rule is checked against the current request
+ * when it is recorded. When it does not apply to the path at finalization, the path is left
+ * unchanged and rewrite_not_applied is counted, the same way a configured route leaves the path
+ * unchanged when its rewrite yields nothing.
+ *
+ * A path recorded with set_path or set_prefix_rewrite takes precedence over the rule. Otherwise the
+ * rule owns the rewrite, so neither the regex rewrite of a selected route override nor the rewrites
+ * of the route apply once a rule is recorded, whether or not the rule applies, and whatever the
+ * call order. A later call replaces the rule of an earlier one.
+ *
+ * @param context_envoy_ptr is the pointer to the route decision context.
+ * @param span selects the part of the path that is replaced.
+ * @param matched is the literal to replace for the Literal span, and must be empty for the
+ * WholePath span. The buffer is owned by the module.
+ * @param replacement is the replacement. The buffer is owned by the module.
+ * @return true when the span is known, the rule applies to the current path, the replacement is a
+ * valid header value and the rewritten path is within the configured maximum, false otherwise, in
+ * which case nothing is recorded.
+ */
+bool envoy_dynamic_module_callback_route_specifier_set_prefix_rewrite_rule(
+    envoy_dynamic_module_type_route_specifier_context_envoy_ptr context_envoy_ptr,
+    envoy_dynamic_module_type_route_specifier_rewrite_span span,
+    envoy_dynamic_module_type_module_buffer matched,
+    envoy_dynamic_module_type_module_buffer replacement);
+
+/**
  * envoy_dynamic_module_callback_route_specifier_set_route_override selects a route override
  * declared in the route specifier configuration by override_id. It replaces the retry policy,
  * metadata match criteria, request mirroring policies, hash policy, hedge policy, rate limits and
  * CORS policy of the route with the ones the override builds, for the properties that it sets.
- * The path rewrite and the metadata the override carries are applied when the decision resolves,
- * and the values the module records itself win whatever the call order: the override's regex
- * rewrite applies only when the module recorded no path, and its metadata sits under the metadata
- * the module recorded.
+ * The metadata the override carries is applied when the decision resolves, and its regex rewrite is
+ * applied when the request headers are finalized, to the path the request carries then. The values
+ * the module records itself win whatever the call order. The override's regex rewrite applies only
+ * when the module recorded no path and no prefix rewrite rule, and its metadata sits under the
+ * metadata the module recorded.
  *
  * @param context_envoy_ptr is the pointer to the route decision context.
  * @param override_id is the identifier of the entry in route_overrides. The buffer is owned by

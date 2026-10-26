@@ -120,9 +120,10 @@ message RouteOverride {
   // CORS is not configured through per filter configuration.
   config.route.v3.CorsPolicy cors = 8;
 
-  // Regex rewrite of the request path, replacing the path the produced route sends upstream,
-  // unless the module records a path of its own, which wins. The
-  // pattern is compiled once when the specifier is configured. It applies to the path without the
+  // Regex rewrite of the request path, replacing the path the produced route sends upstream, unless
+  // the module records a path or a prefix rewrite rule of its own, which wins. The pattern is
+  // compiled once when the specifier is configured, and the rewrite is applied when the request
+  // headers are finalized, to the path the request carries then. It applies to the path without the
   // query string, which is preserved, and the result is capped at
   // :ref:`max_rewritten_path_bytes
   // <envoy_v3_api_field_extensions.router.route_specifiers.dynamic_modules.v3.DynamicModuleRouteSpecifier.max_rewritten_path_bytes>`.

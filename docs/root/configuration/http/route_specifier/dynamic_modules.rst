@@ -85,6 +85,28 @@ owner may retain the route, so a module must treat it as a lease release only. T
 <envoy_v3_api_field_extensions.router.route_specifiers.dynamic_modules.v3.DynamicModuleRouteSpecifier.specifier_instance_id>`
 lets two specifier instances sharing one module tell their routes apart.
 
+Rewriting the path
+------------------
+
+A module rewrites the path sent upstream with ``set_path``, which records the whole path, or with
+``set_prefix_rewrite_rule``, which records a prefix rewrite as a rule. A rule is applied when the
+request headers are finalized, to the path the request carries then, the same way the
+:ref:`prefix_rewrite <envoy_v3_api_field_config.route.v3.RouteAction.prefix_rewrite>` of a configured
+route is applied. Its span is either a literal the route matched, which is what a prefix or a path
+route replaces, or the whole path without its query string, which is what a regex route replaces. A
+rule is checked against the request the decision is taken for. When it does not apply to the path at
+finalization, for example because a filter changed the path without clearing the route cache, the
+path is left unchanged and ``rewrite_not_applied`` is counted, which is what a configured route does
+when its rewrite yields nothing. The original path is recorded in ``x-envoy-original-path`` the way
+a configured route records it.
+
+The regex rewrite of a selected route override is applied at finalization as well. A recorded path
+takes precedence over a rule. Otherwise a recorded rule owns the rewrite, so neither the regex
+rewrite of a route override nor the rewrites of the route apply, whether or not the rule does, and
+whatever the call order. ``set_prefix_rewrite`` records the path
+the rewrite produces for the current request and is kept for existing modules, but a route that
+carries it is specific to that request, so a module that reuses its routes records a rule instead.
+
 Shadowing a routing change
 --------------------------
 
@@ -168,6 +190,7 @@ of the specifier, sharing the ``metrics_namespace`` of the module-defined metric
   failure_route_metadata, Counter, Decisions not honored because a typed metadata factory rejected the recorded metadata.
   reuse_previous_rejected, Counter, ReusePrevious decisions rejected because the stream had no previous route.
   route_destroy, Counter, Routes built with user data that were destroyed and fired the route destroy hook.
+  rewrite_not_applied, Counter, Requests whose recorded prefix rewrite rule or route override regex rewrite did not apply to the path at finalization.
   on_route_duration, Histogram, Time in microseconds the module spent deciding.
   specifier_duration, Histogram, Time in microseconds the specifier spent on a request.
 

@@ -867,9 +867,10 @@ bool envoy_dynamic_module_callback_route_specifier_set_route_override(
                    toStringView(override_id));
     return false;
   }
-  // Only the selection is recorded here. The path rewrite and the metadata the override carries
-  // are applied when the decision resolves, so unset_route_override can revert the selection
-  // cleanly and the values the module records itself win whatever the call order.
+  // Only the selection is recorded here. The metadata the override carries is applied when the
+  // decision resolves and its regex rewrite when the request headers are finalized, so
+  // unset_route_override can revert the selection cleanly and the values the module records itself
+  // win whatever the call order.
   context->overrides.route_override = entry;
   return true;
 }
@@ -900,6 +901,46 @@ bool envoy_dynamic_module_callback_route_specifier_set_prefix_rewrite(
     return false;
   }
   context->overrides.path = std::move(*rewritten);
+  return true;
+}
+
+bool envoy_dynamic_module_callback_route_specifier_set_prefix_rewrite_rule(
+    envoy_dynamic_module_type_route_specifier_context_envoy_ptr context_envoy_ptr,
+    envoy_dynamic_module_type_route_specifier_rewrite_span span,
+    envoy_dynamic_module_type_module_buffer matched,
+    envoy_dynamic_module_type_module_buffer replacement) {
+  auto* context = routeSpecifierContext(context_envoy_ptr);
+  const absl::string_view matched_view = toStringView(matched);
+  const absl::string_view replacement_view = toStringView(replacement);
+  PrefixRewriteRule rule;
+  switch (span) {
+  case envoy_dynamic_module_type_route_specifier_rewrite_span_Literal:
+    rule.matched = std::string(matched_view);
+    break;
+  case envoy_dynamic_module_type_route_specifier_rewrite_span_WholePath:
+    // The whole path is the part a regex route matches, so there is no literal to name.
+    if (!matched_view.empty()) {
+      return false;
+    }
+    rule.whole_path = true;
+    break;
+  default:
+    // A span a newer ABI defines, or the Sentinel, which is not a span.
+    return false;
+  }
+  // The replacement becomes part of the :path header, so it must be a valid header value, the rule
+  // a configured prefix_rewrite is held to. Like that field, it need not start with '/'.
+  if (!Http::HeaderUtility::headerValueIsValid(replacement_view)) {
+    return false;
+  }
+  rule.replacement = std::string(replacement_view);
+  // The rule is checked against the current request so that a rule that cannot apply to the request
+  // the decision is taken for is rejected here rather than counted at finalization.
+  if (!rule.apply(context->headers.getPathValue(), context->config.maxRewrittenPathBytes())
+           .has_value()) {
+    return false;
+  }
+  context->overrides.prefix_rewrite_rule = std::move(rule);
   return true;
 }
 

@@ -144,6 +144,27 @@ impl HeaderAppendAction {
   }
 }
 
+/// The part of the request path a rule recorded with
+/// [`RouteSpecifierContext::set_prefix_rewrite_rule`] replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteSpan {
+  /// A literal the route matched, its prefix or its exact path, is replaced. This is the part a
+  /// prefix or a path route replaces with its `prefix_rewrite`.
+  Literal,
+  /// The whole path without its query string and fragment is replaced. This is the part a regex
+  /// route replaces with its `prefix_rewrite`.
+  WholePath,
+}
+
+impl RewriteSpan {
+  fn to_abi(self) -> abi::envoy_dynamic_module_type_route_specifier_rewrite_span {
+    match self {
+      Self::Literal => abi::envoy_dynamic_module_type_route_specifier_rewrite_span::Literal,
+      Self::WholePath => abi::envoy_dynamic_module_type_route_specifier_rewrite_span::WholePath,
+    }
+  }
+}
+
 /// Convert a duration to the millisecond count the ABI takes, saturating instead of wrapping.
 fn duration_to_millis(duration: Duration) -> u64 {
   u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
@@ -828,6 +849,38 @@ impl RouteSpecifierContext {
     unsafe {
       abi::envoy_dynamic_module_callback_route_specifier_set_prefix_rewrite(
         self.envoy_ptr,
+        crate::str_to_module_buffer(matched),
+        crate::str_to_module_buffer(replacement),
+      )
+    }
+  }
+
+  /// Record a prefix rewrite of the request path sent upstream as a rule.
+  ///
+  /// Unlike [`RouteSpecifierContext::set_prefix_rewrite`], which records the path the rewrite
+  /// produces for the current request, the rule is applied when the request headers are
+  /// finalized, to the path the request carries then, the way the `prefix_rewrite` of a configured
+  /// route is applied. A route that carries a rule is therefore not specific to the request it was
+  /// built for.
+  ///
+  /// With [`RewriteSpan::Literal`], `matched` must be a case insensitive prefix of the current
+  /// path. With [`RewriteSpan::WholePath`], `matched` must be empty. A path recorded with
+  /// [`RouteSpecifierContext::set_path`] or [`RouteSpecifierContext::set_prefix_rewrite`] takes
+  /// precedence over the rule. Otherwise the rule owns the rewrite, so neither the regex rewrite of
+  /// a selected route override nor the rewrites of the route apply, whether or not the rule does.
+  /// Returns `false`, recording nothing, when the rule does not apply to the
+  /// current path, the replacement is not a valid header value, or the rewritten path exceeds the
+  /// configured maximum.
+  pub fn set_prefix_rewrite_rule(
+    &mut self,
+    span: RewriteSpan,
+    matched: &str,
+    replacement: &str,
+  ) -> bool {
+    unsafe {
+      abi::envoy_dynamic_module_callback_route_specifier_set_prefix_rewrite_rule(
+        self.envoy_ptr,
+        span.to_abi(),
         crate::str_to_module_buffer(matched),
         crate::str_to_module_buffer(replacement),
       )
