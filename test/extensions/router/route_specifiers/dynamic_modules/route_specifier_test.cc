@@ -919,6 +919,31 @@ std::string ruleAccepted(const Envoy::Router::Route& route) {
       .string_value();
 }
 
+// A route configuration whose one route, matching every path, is a template whose action is
+// `action`, under the rewrite rule module in `mode`.
+std::string templateRouteYaml(absl::string_view action, absl::string_view mode,
+                              absl::string_view extra = "") {
+  return fmt::format(R"EOF(
+name: test_route_config
+virtual_hosts:
+- name: test_vhost
+  domains: ["*"]
+  routes:
+  - match: {{prefix: "/"}}
+{}
+  route_specifiers:
+  - name: envoy.router.route_specifiers.dynamic_modules
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.router.route_specifiers.dynamic_modules.v3.DynamicModuleRouteSpecifier
+{}
+)EOF",
+                     action, rewriteRuleYaml(mode, extra));
+}
+
+// A template that rewrites the path itself.
+constexpr absl::string_view RewritingTemplate =
+    "    route: {cluster: matched_cluster, prefix_rewrite: \"/route/\"}";
+
 // A prefix rewrite rule is applied to the path the request carries when it is finalized, so a route
 // built for one request rewrites another request the way a configured route would.
 TEST_F(DynamicModuleRouteSpecifierTest, PrefixRewriteRuleAppliesToTheFinalizedPath) {
@@ -1077,21 +1102,7 @@ TEST_F(DynamicModuleRouteSpecifierTest, LaterRuleReplacesEarlierRule) {
 // A recorded rule owns the rewrite, so when a filter changed the path and the rule no longer
 // applies, the path stays as the filter left it rather than taking the rewrite of the route.
 TEST_F(DynamicModuleRouteSpecifierTest, RuleThatDoesNotApplyKeepsTheRouteRewriteOut) {
-  const auto config = loadRaw(fmt::format(R"EOF(
-name: test_route_config
-virtual_hosts:
-- name: test_vhost
-  domains: ["*"]
-  routes:
-  - match: {{prefix: "/"}}
-    route: {{cluster: matched_cluster, prefix_rewrite: "/route/"}}
-  route_specifiers:
-  - name: envoy.router.route_specifiers.dynamic_modules
-    typed_config:
-      "@type": type.googleapis.com/envoy.extensions.router.route_specifiers.dynamic_modules.v3.DynamicModuleRouteSpecifier
-{}
-)EOF",
-                                          rewriteRuleYaml("literal")));
+  const auto config = loadRaw(templateRouteYaml(RewritingTemplate, "literal"));
   ASSERT_TRUE(config.ok());
   const auto route = config.value()->route(requestHeaders("/api/v1"), stream_info_, 0);
   ASSERT_NE(nullptr, route.route);
@@ -1130,21 +1141,7 @@ virtual_hosts:
 // x-envoy-original-path the module records survives, as one a configured route that does not
 // rewrite leaves alone.
 TEST_F(DynamicModuleRouteSpecifierTest, RuleThatDoesNotApplyKeepsAnOriginalPathTheModuleRecords) {
-  const auto config = loadRaw(fmt::format(R"EOF(
-name: test_route_config
-virtual_hosts:
-- name: test_vhost
-  domains: ["*"]
-  routes:
-  - match: {{prefix: "/"}}
-    route: {{cluster: matched_cluster, prefix_rewrite: "/route/"}}
-  route_specifiers:
-  - name: envoy.router.route_specifiers.dynamic_modules
-    typed_config:
-      "@type": type.googleapis.com/envoy.extensions.router.route_specifiers.dynamic_modules.v3.DynamicModuleRouteSpecifier
-{}
-)EOF",
-                                          rewriteRuleYaml("records-original-path")));
+  const auto config = loadRaw(templateRouteYaml(RewritingTemplate, "records-original-path"));
   ASSERT_TRUE(config.ok());
   const auto route = config.value()->route(requestHeaders("/api/v1"), stream_info_, 0);
   ASSERT_NE(nullptr, route.route);
@@ -1164,6 +1161,111 @@ virtual_hosts:
   entry->finalizeRequestHeaders(applies, formatter_context, stream_info_, true);
   EXPECT_EQ("/internal/v2", applies.getPathValue());
   EXPECT_EQ("/api/v2", applies.getEnvoyOriginalPathValue());
+}
+
+// The route records x-envoy-original-path only when its own rewrite applies, so a rule that does
+// not apply keeps a value the route's header mutations set when the route does not rewrite, as a
+// configured route does. When the route rewrites, its rewrite already overwrote that value, so the
+// value the request carried is restored instead.
+TEST_F(DynamicModuleRouteSpecifierTest, RuleThatDoesNotApplyKeepsAnOriginalPathTheRouteHeadersSet) {
+  constexpr absl::string_view headers_to_add = R"EOF(
+    request_headers_to_add:
+    - header: {key: x-envoy-original-path, value: /configured})EOF";
+  {
+    const auto config = loadRaw(templateRouteYaml(
+        absl::StrCat("    route: {cluster: matched_cluster}", headers_to_add), "literal"));
+    ASSERT_TRUE(config.ok());
+    const auto route = config.value()->route(requestHeaders("/api/v1"), stream_info_, 0);
+    ASSERT_NE(nullptr, route.route);
+    const auto* entry = route.route->routeEntry();
+    ASSERT_NE(nullptr, entry);
+    auto headers = requestHeaders("/other/x");
+    Formatter::Context formatter_context(&headers);
+    entry->finalizeRequestHeaders(headers, formatter_context, stream_info_, true);
+    EXPECT_EQ("/other/x", headers.getPathValue());
+    EXPECT_EQ("/configured", headers.getEnvoyOriginalPathValue());
+  }
+  {
+    const auto config =
+        loadRaw(templateRouteYaml(absl::StrCat(RewritingTemplate, headers_to_add), "literal"));
+    ASSERT_TRUE(config.ok());
+    const auto route = config.value()->route(requestHeaders("/api/v1"), stream_info_, 0);
+    ASSERT_NE(nullptr, route.route);
+    const auto* entry = route.route->routeEntry();
+    ASSERT_NE(nullptr, entry);
+    auto headers = requestHeaders("/other/x");
+    Formatter::Context formatter_context(&headers);
+    entry->finalizeRequestHeaders(headers, formatter_context, stream_info_, true);
+    EXPECT_EQ("/other/x", headers.getPathValue());
+    EXPECT_EQ(nullptr, headers.EnvoyOriginalPath());
+    auto carried = requestHeaders("/other/y");
+    carried.setEnvoyOriginalPath("/carried");
+    entry->finalizeRequestHeaders(carried, formatter_context, stream_info_, true);
+    EXPECT_EQ("/carried", carried.getEnvoyOriginalPathValue());
+  }
+}
+
+// The module's header mutations follow the restore, so a module that removes x-envoy-original-path
+// removes a value the request carried rather than having the restore put it back.
+TEST_F(DynamicModuleRouteSpecifierTest, RuleThatDoesNotApplyLetsTheModuleRemoveTheOriginalPath) {
+  const auto config = loadRaw(templateRouteYaml(RewritingTemplate, "removes-original-path"));
+  ASSERT_TRUE(config.ok());
+  const auto route = config.value()->route(requestHeaders("/api/v1"), stream_info_, 0);
+  ASSERT_NE(nullptr, route.route);
+  EXPECT_EQ("true", ruleAccepted(*route.route));
+  const auto* entry = route.route->routeEntry();
+  ASSERT_NE(nullptr, entry);
+  auto headers = requestHeaders("/other/x");
+  headers.setEnvoyOriginalPath("/carried");
+  Formatter::Context formatter_context(&headers);
+  entry->finalizeRequestHeaders(headers, formatter_context, stream_info_, true);
+  EXPECT_EQ("/other/x", headers.getPathValue());
+  EXPECT_EQ(nullptr, headers.EnvoyOriginalPath());
+}
+
+// When the original path is not kept, the route records no x-envoy-original-path, so a rule that
+// does not apply restores only the path.
+TEST_F(DynamicModuleRouteSpecifierTest, RuleThatDoesNotApplyRestoresOnlyThePathWhenNotKept) {
+  const auto config = loadRaw(templateRouteYaml(RewritingTemplate, "literal"));
+  ASSERT_TRUE(config.ok());
+  const auto route = config.value()->route(requestHeaders("/api/v1"), stream_info_, 0);
+  ASSERT_NE(nullptr, route.route);
+  const auto* entry = route.route->routeEntry();
+  ASSERT_NE(nullptr, entry);
+  auto headers = requestHeaders("/other/x");
+  headers.setEnvoyOriginalPath("/carried");
+  Formatter::Context formatter_context(&headers);
+  entry->finalizeRequestHeaders(headers, formatter_context, stream_info_, false);
+  EXPECT_EQ("/other/x", headers.getPathValue());
+  EXPECT_EQ("/carried", headers.getEnvoyOriginalPathValue());
+  auto plain = requestHeaders("/other/y");
+  entry->finalizeRequestHeaders(plain, formatter_context, stream_info_, false);
+  EXPECT_EQ("/other/y", plain.getPathValue());
+  EXPECT_EQ(nullptr, plain.EnvoyOriginalPath());
+}
+
+// A route override regex rewrite that yields nothing, here one longer than the bound, is counted
+// and leaves the rewrite of the route in effect, which currentUrlPathAfterRewrite reports the same
+// way.
+TEST_F(DynamicModuleRouteSpecifierTest, RouteOverrideRegexThatYieldsNothingKeepsTheRouteRewrite) {
+  const auto config = loadRaw(templateRouteYaml(RewritingTemplate, "override-only",
+                                                "      max_rewritten_path_bytes: 16\n"));
+  ASSERT_TRUE(config.ok());
+  const auto route = config.value()->route(requestHeaders("/api/v1"), stream_info_, 0);
+  ASSERT_NE(nullptr, route.route);
+  EXPECT_EQ("true", ruleAccepted(*route.route));
+  const auto* entry = route.route->routeEntry();
+  ASSERT_NE(nullptr, entry);
+  auto headers = requestHeaders("/api/a-path-past-the-bound");
+  Formatter::Context formatter_context(&headers);
+  EXPECT_EQ("/route/api/a-path-past-the-bound",
+            entry->currentUrlPathAfterRewrite(headers, formatter_context, stream_info_));
+  entry->finalizeRequestHeaders(headers, formatter_context, stream_info_, true);
+  EXPECT_EQ("/route/api/a-path-past-the-bound", headers.getPathValue());
+  EXPECT_EQ("/api/a-path-past-the-bound", headers.getEnvoyOriginalPathValue());
+  EXPECT_EQ(1,
+            context_.store_.counter("dynamicmodulescustom.route_specifier.test.rewrite_not_applied")
+                .value());
 }
 
 // The result codes set_route_cache_key returns, as the route cache module reports them.

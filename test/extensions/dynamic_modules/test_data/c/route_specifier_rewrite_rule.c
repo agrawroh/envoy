@@ -25,6 +25,7 @@ enum mode {
   OVERRIDE_ONLY,
   REPLACED,
   RECORDS_ORIGINAL_PATH,
+  REMOVES_ORIGINAL_PATH,
   MODE_COUNT,
 };
 
@@ -32,7 +33,7 @@ static const char* const mode_names[MODE_COUNT] = {
     "literal",           "whole-path",          "not-prefix",    "whole-path-with-matched",
     "empty-replacement", "invalid-replacement", "unknown-span",  "too-long",
     "path-wins",         "rule-over-override",  "override-only", "replaced",
-    "records-original-path",
+    "records-original-path", "removes-original-path",
 };
 
 // Distinct addresses used as the config handle that selects the mode.
@@ -124,6 +125,11 @@ envoy_dynamic_module_on_route_specifier_on_route(
     envoy_dynamic_module_callback_route_specifier_add_request_header(
         context_envoy_ptr, buffer("x-envoy-original-path"), buffer("/module"),
         envoy_dynamic_module_type_route_specifier_header_append_action_OverwriteIfExistsOrAdd);
+    accepted = rule(context_envoy_ptr, literal, "/api", "/internal");
+    break;
+  case REMOVES_ORIGINAL_PATH:
+    envoy_dynamic_module_callback_route_specifier_remove_request_header(
+        context_envoy_ptr, buffer("x-envoy-original-path"));
     accepted = rule(context_envoy_ptr, literal, "/api", "/internal");
     break;
   case MODE_COUNT:
