@@ -822,8 +822,10 @@ void DynamicModuleRouteEntry::finalizeRequestHeaders(Http::RequestHeaderMap& hea
   // only then is the value it overwrote restored, and a value the route's header mutations set is
   // otherwise kept, as on a configured route that does not rewrite. Whether its rewrite applied is
   // computed once the path is restored, when the headers are those its rewrite read, its header
-  // mutations included. The restore runs before the header mutations of the module, so a header the
-  // module records is kept the same way.
+  // mutations included, for a configured route or a weighted cluster below. Two cases stay inexact,
+  // a rewrite that reads the x-envoy-original-path it writes, and a nested specifier below whose
+  // module mutations change a header the rewrite reads. The restore runs before the header
+  // mutations of the module, so a header the module records is kept the same way.
   const bool rule_owns_path =
       !overrides_.path.has_value() && overrides_.prefix_rewrite_rule.has_value();
   std::optional<std::string> rewritten;
