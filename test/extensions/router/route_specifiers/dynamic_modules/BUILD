@@ -35,6 +35,7 @@ envoy_extension_cc_dyn_module_test(
     ],
     rbe_pool = "linux_x64_small",
     deps = [
+        "//source/common/formatter:formatter_extension_lib",
         "//source/common/router:config_lib",
         "//source/extensions/dynamic_modules:dynamic_modules_lib",
         "//source/extensions/router/cluster_specifiers/dynamic_modules:config",

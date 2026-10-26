@@ -103,7 +103,9 @@ a configured route records it.
 The regex rewrite of a selected route override is applied at finalization as well. A recorded path
 takes precedence over a rule. Otherwise a recorded rule owns the rewrite, so neither the regex
 rewrite of a route override nor the rewrites of the route apply, whether or not the rule does, and
-whatever the call order. ``set_prefix_rewrite`` records the path
+whatever the call order. When a rule does not apply on a route that rewrites the path itself and keeps
+the original path, the ``x-envoy-original-path`` the request carried is restored, and a value the
+route's own header mutations set is lost, because the route's rewrite overwrote it. ``set_prefix_rewrite`` records the path
 the rewrite produces for the current request and is kept for existing modules, but a route that
 carries it is specific to that request, so a module that reuses its routes records a rule instead.
 
