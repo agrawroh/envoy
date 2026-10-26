@@ -747,6 +747,11 @@ public:
                   const StreamInfo::StreamInfo& stream_info, uint64_t random_value) const;
   absl::Status validateClusters(const Upstream::ClusterManager& cluster_manager) const;
   RouteSpecifierSpan routeSpecifiers() const { return route_specifiers_; }
+  // The plugin that resolves the cluster per request, weighted clusters included, or nullptr when
+  // the route names its cluster or answers the request directly.
+  const ClusterSpecifierPlugin* clusterSpecifierPlugin() const {
+    return cluster_specifier_plugin_.get();
+  }
   // Resolves the route of a request that matched this entry, which is the entry itself unless a
   // cluster specifier plugin is configured.
   RouteConstSharedPtr clusterEntry(const Http::RequestHeaderMap& headers,

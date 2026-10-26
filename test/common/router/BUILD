@@ -634,6 +634,21 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "route_builder_test",
+    srcs = ["route_builder_test.cc"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/common/router:config_lib",
+        "//test/mocks/init:init_mocks",
+        "//test/mocks/server:server_factory_context_mocks",
+        "//test/mocks/stream_info:stream_info_mocks",
+        "//test/test_common:registry_lib",
+        "//test/test_common:utility_lib",
+        "@envoy_api//envoy/config/route/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_test(
     name = "route_specifier_impl_test",
     srcs = ["route_specifier_impl_test.cc"],
     rbe_pool = "linux_x64_small",

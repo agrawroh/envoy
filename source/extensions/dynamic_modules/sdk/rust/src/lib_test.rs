@@ -13278,6 +13278,20 @@ pub extern "C" fn envoy_dynamic_module_callback_route_specifier_set_path(
   true
 }
 
+// Maps the key onto every result, so a test can observe each arm of the SDK conversion.
+#[no_mangle]
+pub extern "C" fn envoy_dynamic_module_callback_route_specifier_set_route_cache_key(
+  _context_envoy_ptr: abi::envoy_dynamic_module_type_route_specifier_context_envoy_ptr,
+  key: u64,
+) -> abi::envoy_dynamic_module_type_route_specifier_route_cache_result {
+  match key {
+    1 => abi::envoy_dynamic_module_type_route_specifier_route_cache_result::Miss,
+    2 => abi::envoy_dynamic_module_type_route_specifier_route_cache_result::Hit,
+    3 => abi::envoy_dynamic_module_type_route_specifier_route_cache_result::HitVerify,
+    _ => abi::envoy_dynamic_module_type_route_specifier_route_cache_result::Disabled,
+  }
+}
+
 #[no_mangle]
 pub extern "C" fn envoy_dynamic_module_callback_route_specifier_set_prefix_rewrite_rule(
   _context_envoy_ptr: abi::envoy_dynamic_module_type_route_specifier_context_envoy_ptr,
@@ -13883,6 +13897,22 @@ fn test_route_specifier_context_records_decision() {
   assert!(!ctx.set_filter_disabled("", true));
   assert!(ctx.set_path("/rewritten"));
   assert!(!ctx.set_path("rewritten"));
+  assert_eq!(
+    route_specifier::RouteCacheResult::Disabled,
+    ctx.set_route_cache_key(0)
+  );
+  assert_eq!(
+    route_specifier::RouteCacheResult::Miss,
+    ctx.set_route_cache_key(1)
+  );
+  assert_eq!(
+    route_specifier::RouteCacheResult::Hit,
+    ctx.set_route_cache_key(2)
+  );
+  assert_eq!(
+    route_specifier::RouteCacheResult::HitVerify,
+    ctx.set_route_cache_key(3)
+  );
   assert!(ctx.set_prefix_rewrite_rule(
     route_specifier::RewriteSpan::WholePath,
     "",

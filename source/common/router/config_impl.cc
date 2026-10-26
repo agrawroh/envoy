@@ -150,6 +150,11 @@ public:
     }
     return route_->clusterEntry(headers, stream_info, random);
   }
+  // clusterEntry() returns the route itself unless a cluster specifier plugin, weighted clusters
+  // included, resolves the cluster per request.
+  const Route* stableRoute() const override {
+    return route_->clusterSpecifierPlugin() == nullptr ? route_.get() : nullptr;
+  }
 
 private:
   const RouteEntryImplBaseConstSharedPtr route_;

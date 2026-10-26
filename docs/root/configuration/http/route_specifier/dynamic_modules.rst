@@ -107,6 +107,39 @@ whatever the call order. ``set_prefix_rewrite`` records the path
 the rewrite produces for the current request and is kept for existing modules, but a route that
 carries it is specific to that request, so a module that reuses its routes records a rule instead.
 
+Caching built routes
+--------------------
+
+A module that builds the same route for many requests can let Envoy cache it. With
+:ref:`built_route_cache <envoy_v3_api_field_extensions.router.route_specifiers.dynamic_modules.v3.DynamicModuleRouteSpecifier.built_route_cache>`
+set, the module calls ``set_route_cache_key`` after selecting a template. Each worker keeps the
+routes it built in a cache keyed by the key and the template. On a hit Envoy produces the cached
+route and the module records nothing more, so the route is built once per worker rather than once
+per request. On a miss the module records the route as usual, and Envoy caches it when the decision
+resolves without a failure.
+
+The route a module builds for a key must be a function of the key, since it serves later requests.
+A module that records a path for the current request with ``set_path`` or ``set_prefix_rewrite``
+does not set a key for it, while a rule recorded with ``set_prefix_rewrite_rule`` is applied to each
+request's own path. A template with weighted clusters or a cluster specifier plugin resolves its
+cluster per request, so the cache is not in effect for it and ``set_route_cache_key`` reports
+``Disabled``.
+
+A cached route that carries user data takes the lease it stands for once, when it is built, and the
+destroy hook fires once the cache has evicted it and no stream holds it. User data recorded before a
+hit is dropped with the rest of the recording, so a module looks the key up before it takes a lease. ``route_build`` counts the
+routes built with user data, so ``route_build`` equals ``route_destroy`` once every route has been
+released. The cache is owned by the specifier rather than by its configuration, so replacing the
+route configuration releases every cached route. A worker evicts the least recently used route,
+approximated by CLOCK, when it is full, and sweeps the routes idle for longer than
+``max_entry_age``, so an idle worker releases its routes too. One in ``verify_one_in`` hits is
+verified. The module records the route as on a miss, and Envoy compares the recording with what the
+cached route was built from. On a difference Envoy counts ``route_cache_verify_mismatch`` and
+removes the entry, so the next request builds the route again, while the verified request still uses
+the cached route. A route that ``set_prefix_rewrite`` recorded a path for is never cached, and a
+specifier configured on a route configuration, which cannot declare templates, rejects
+``built_route_cache``.
+
 Shadowing a routing change
 --------------------------
 
@@ -191,6 +224,13 @@ of the specifier, sharing the ``metrics_namespace`` of the module-defined metric
   reuse_previous_rejected, Counter, ReusePrevious decisions rejected because the stream had no previous route.
   route_destroy, Counter, Routes built with user data that were destroyed and fired the route destroy hook.
   rewrite_not_applied, Counter, Requests whose recorded prefix rewrite rule or route override regex rewrite did not apply to the path at finalization.
+  route_build, Counter, Routes built with user data whose destroy hook fires when they are destroyed.
+  route_cache_hit, Counter, Cache lookups that found a route built for the key.
+  route_cache_miss, Counter, Cache lookups that found no route for the key.
+  route_cache_verify, Counter, Cache hits verified against what the module recorded.
+  route_cache_verify_mismatch, Counter, Verified cache hits whose recording differed from what the cached route was built from.
+  route_cache_evict, Counter, Cached routes evicted because a worker was full or the route was idle for longer than the entry age.
+  route_cache_entries, Gauge, Routes cached across all workers.
   on_route_duration, Histogram, Time in microseconds the module spent deciding.
   specifier_duration, Histogram, Time in microseconds the specifier spent on a request.
 

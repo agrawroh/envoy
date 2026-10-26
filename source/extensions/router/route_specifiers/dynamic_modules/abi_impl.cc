@@ -752,6 +752,8 @@ bool envoy_dynamic_module_callback_route_specifier_set_route_template(
     return false;
   }
   context->selected_template = route_template;
+  // A cache lookup was made for the route the previous selection produced.
+  context->built_route_cache_lookup.reset();
   // Evaluate the template now so that the getters reflect the route being produced and the decision
   // reuses it rather than matching a second time. A null result means the match did not hold, which
   // resolve() turns into a template match failure.
@@ -770,7 +772,35 @@ bool envoy_dynamic_module_callback_route_specifier_unset_route_template(
   }
   context->selected_template = nullptr;
   context->selected_route = nullptr;
+  context->built_route_cache_lookup.reset();
   return true;
+}
+
+envoy_dynamic_module_type_route_specifier_route_cache_result
+envoy_dynamic_module_callback_route_specifier_set_route_cache_key(
+    envoy_dynamic_module_type_route_specifier_context_envoy_ptr context_envoy_ptr, uint64_t key) {
+  auto* context = routeSpecifierContext(context_envoy_ptr);
+  context->built_route_cache_lookup.reset();
+  // The cache holds routes built from a template whose match holds and resolves no cluster per
+  // request. A template with weighted clusters or a cluster specifier plugin produces a route built
+  // for the request, which carries state of its stream and must never serve another one.
+  if (context->built_route_cache == nullptr || context->selected_route == nullptr ||
+      context->selected_template->route->stableRoute() != context->selected_route.get()) {
+    return envoy_dynamic_module_type_route_specifier_route_cache_result_Disabled;
+  }
+  BuiltRouteCacheLookup& lookup = context->built_route_cache_lookup.emplace();
+  lookup.key = key;
+  const BuiltRouteCache::Entry* entry =
+      context->built_route_cache->lookup(key, context->selected_route.get());
+  if (entry == nullptr) {
+    return envoy_dynamic_module_type_route_specifier_route_cache_result_Miss;
+  }
+  lookup.cached = entry->route;
+  lookup.recorded = entry->recorded;
+  lookup.user_data = entry->user_data;
+  lookup.verify = context->built_route_cache->sampleVerification();
+  return lookup.verify ? envoy_dynamic_module_type_route_specifier_route_cache_result_HitVerify
+                       : envoy_dynamic_module_type_route_specifier_route_cache_result_Hit;
 }
 
 void envoy_dynamic_module_callback_route_specifier_set_route_user_data(
@@ -901,6 +931,7 @@ bool envoy_dynamic_module_callback_route_specifier_set_prefix_rewrite(
     return false;
   }
   context->overrides.path = std::move(*rewritten);
+  context->overrides.path_specific_to_request = true;
   return true;
 }
 
@@ -1004,7 +1035,10 @@ bool envoy_dynamic_module_callback_route_specifier_set_path(
   if (!absl::StartsWith(value, "/") || !Http::HeaderUtility::headerValueIsValid(value)) {
     return false;
   }
-  routeSpecifierContext(context_envoy_ptr)->overrides.path = std::string(value);
+  auto* context = routeSpecifierContext(context_envoy_ptr);
+  context->overrides.path = std::string(value);
+  // A literal path is the same for every request, unlike the one set_prefix_rewrite computes.
+  context->overrides.path_specific_to_request = false;
   return true;
 }
 

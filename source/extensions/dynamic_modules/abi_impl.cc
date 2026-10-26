@@ -2143,6 +2143,11 @@ WEAK_STUB(bool, envoy_dynamic_module_callback_route_specifier_set_prefix_rewrite
           envoy_dynamic_module_type_route_specifier_context_envoy_ptr,
           envoy_dynamic_module_type_module_buffer, envoy_dynamic_module_type_module_buffer)
 
+WEAK_STUB(envoy_dynamic_module_type_route_specifier_route_cache_result,
+          envoy_dynamic_module_callback_route_specifier_set_route_cache_key,
+          envoy_dynamic_module_type_route_specifier_route_cache_result_Disabled,
+          envoy_dynamic_module_type_route_specifier_context_envoy_ptr, uint64_t)
+
 WEAK_STUB(bool, envoy_dynamic_module_callback_route_specifier_set_prefix_rewrite_rule, false,
           envoy_dynamic_module_type_route_specifier_context_envoy_ptr,
           envoy_dynamic_module_type_route_specifier_rewrite_span,

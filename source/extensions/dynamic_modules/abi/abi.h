@@ -17404,6 +17404,33 @@ typedef enum envoy_dynamic_module_type_route_specifier_rewrite_span {
 } envoy_dynamic_module_type_route_specifier_rewrite_span;
 
 /**
+ * envoy_dynamic_module_type_route_specifier_route_cache_result is what
+ * envoy_dynamic_module_callback_route_specifier_set_route_cache_key found for a request.
+ */
+typedef enum envoy_dynamic_module_type_route_specifier_route_cache_result {
+  // The cache is not in effect for the request, because the specifier configures no
+  // built_route_cache,
+  // no template is selected, the match of the selected template did not hold, or the template
+  // resolves its cluster per request, as one with weighted clusters or a cluster specifier plugin
+  // does. The module records the route as usual and Envoy builds it for this request alone.
+  envoy_dynamic_module_type_route_specifier_route_cache_result_Disabled = 0,
+  // No route is cached for the key. The module records the route as usual, and Envoy caches the
+  // route it builds when the decision is left Unspecified and resolves without a failure.
+  envoy_dynamic_module_type_route_specifier_route_cache_result_Miss = 1,
+  // A route is cached for the key. When the decision is left Unspecified Envoy produces it and
+  // ignores what is recorded for the request, user data included, so the module records nothing
+  // more and takes no lease for the request.
+  envoy_dynamic_module_type_route_specifier_route_cache_result_Hit = 2,
+  // A route is cached for the key and this request verifies it. The module records the route as on
+  // a miss. Envoy still produces the cached route and builds nothing. When what was recorded
+  // differs
+  // from what the cached route was built from, Envoy counts route_cache_verify_mismatch and removes
+  // the entry, so the next request builds the route again. Since no route is built, user data
+  // recorded for the request is never passed to the route destroy hook.
+  envoy_dynamic_module_type_route_specifier_route_cache_result_HitVerify = 3,
+} envoy_dynamic_module_type_route_specifier_route_cache_result;
+
+/**
  * envoy_dynamic_module_type_route_specifier_input_route holds the properties of the route the
  * module is resolving that are free to read, so that a module can take all of them in one call
  * instead of one call each. After a template is selected with
@@ -18230,7 +18257,9 @@ bool envoy_dynamic_module_callback_route_specifier_unset_route_template(
  * envoy_dynamic_module_callback_route_specifier_set_route_user_data records a u64 on the route this
  * decision produces. It forces the produced route to be wrapped even when no other override was
  * recorded, so that envoy_dynamic_module_on_route_specifier_route_destroy fires for it with this
- * value. It is effective when the decision is left Unspecified.
+ * value. It is effective when the decision is left Unspecified. User data recorded before
+ * envoy_dynamic_module_callback_route_specifier_set_route_cache_key returns Hit is dropped with the
+ * rest of the recording, so a module that takes a lease for its user data looks the key up first.
  *
  * @param context_envoy_ptr is the pointer to the route decision context.
  * @param user_data is the value passed to on_route_specifier_route_destroy when the route is
@@ -18296,6 +18325,31 @@ bool envoy_dynamic_module_callback_route_specifier_set_prefix_rewrite_rule(
     envoy_dynamic_module_type_route_specifier_rewrite_span span,
     envoy_dynamic_module_type_module_buffer matched,
     envoy_dynamic_module_type_module_buffer replacement);
+
+/**
+ * envoy_dynamic_module_callback_route_specifier_set_route_cache_key looks up the route a previous
+ * request on this worker built for the key and the selected route template, so that the route is
+ * built once per worker rather than once per request. It is called after a successful
+ * envoy_dynamic_module_callback_route_specifier_set_route_template, and the cache is keyed by the
+ * key and by the selected template. A template that resolves its cluster per request, as one with
+ * weighted clusters or a cluster specifier plugin does, produces a route specific to the request,
+ * so the cache is not in effect for it. A later set_route_template or unset_route_template call
+ * that changes the selection discards the lookup, and a later call to this callback replaces it.
+ *
+ * The route built for a key must be a function of the key, since it serves every later request on
+ * the worker that looks the key up. A route that records a path for the current request with
+ * set_path or set_prefix_rewrite is therefore not a candidate, while one that records
+ * set_prefix_rewrite_rule is. A route that carries user data takes the lease it stands for once,
+ * when it is built, and the destroy hook fires once the cache evicts it and no stream holds it.
+ * The cache is configured with the built_route_cache field of the specifier.
+ *
+ * @param context_envoy_ptr is the pointer to the route decision context.
+ * @param key is the key the module identifies the route with.
+ * @return what the cache found for the request.
+ */
+envoy_dynamic_module_type_route_specifier_route_cache_result
+envoy_dynamic_module_callback_route_specifier_set_route_cache_key(
+    envoy_dynamic_module_type_route_specifier_context_envoy_ptr context_envoy_ptr, uint64_t key);
 
 /**
  * envoy_dynamic_module_callback_route_specifier_set_route_override selects a route override

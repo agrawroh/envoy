@@ -616,6 +616,32 @@ TEST_P(DynamicModuleRouteSpecifierIntegrationTest, PrefixRewriteRuleRewritesUpst
   EXPECT_EQ("/api/foo?q=1", upstream_headers->getEnvoyOriginalPathValue());
 }
 
+// A route built for a cache key serves the later requests on the worker, and the prefix rewrite
+// rule it carries rewrites each request's own path.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, RouteCacheServesLaterRequests) {
+  setupTest(R"EOF(
+built_route_cache:
+  max_entries_per_worker: 16
+)EOF");
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  for (const std::string path : {"/api/one", "/api/two"}) {
+    auto response = sendRequest({{":path", path},
+                                 {"x-template", "canary"},
+                                 {"x-cache-key", "7"},
+                                 {"x-prefix-rewrite-rule", "/api=/internal"},
+                                 {"x-stop-chain", "true"}});
+    EXPECT_EQ("200", response->headers().getStatusValue());
+  }
+  test_server_->waitForCounter("cluster.canary.upstream_rq_200", testing::Ge(2));
+  EXPECT_EQ(1, counterValue("dynamicmodulescustom.route_specifier.test.route_cache_miss"));
+  EXPECT_EQ(1, counterValue("dynamicmodulescustom.route_specifier.test.route_cache_hit"));
+  const auto upstream_headers =
+      reinterpret_cast<AutonomousUpstream*>(fake_upstreams_.back().get())->lastRequestHeaders();
+  ASSERT_NE(nullptr, upstream_headers);
+  EXPECT_EQ("/internal/two", upstream_headers->getPathValue());
+}
+
 // A prefix rewrite rule over the whole path replaces the path without its query string, which is
 // what the prefix_rewrite of a regex route does.
 TEST_P(DynamicModuleRouteSpecifierIntegrationTest, WholePathRewriteRuleRewritesUpstreamPath) {

@@ -156,6 +156,14 @@ public:
   virtual RouteConstSharedPtr match(const Http::RequestHeaderMap& headers,
                                     const StreamInfo::StreamInfo& stream_info,
                                     uint64_t random) const PURE;
+
+  /**
+   * @return the route every successful match() returns, or nullptr when a match may return a route
+   *         built for the request, as one that resolves weighted clusters or a cluster specifier
+   *         plugin does. A route built on top of the returned route carries no state of the request
+   *         it was matched for, so a specifier may reuse it for another request.
+   */
+  virtual const Route* stableRoute() const { return nullptr; }
 };
 
 using MatchableRouteConstSharedPtr = std::shared_ptr<const MatchableRoute>;
