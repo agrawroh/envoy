@@ -1245,10 +1245,11 @@ TEST_F(DynamicModuleRouteSpecifierTest, RuleThatDoesNotApplyRestoresOnlyThePathW
   EXPECT_EQ("/other/y", plain.getPathValue());
   EXPECT_EQ(nullptr, plain.EnvoyOriginalPath());
 
-  // A value the route's header mutations set is kept too, because the route records nothing.
+  // A value the route's header mutations set is kept too, because the route records nothing, even
+  // one equal to the original path, which the route would have written had it been asked to.
   const auto configured = loadRaw(templateRouteYaml(absl::StrCat(RewritingTemplate, R"EOF(
     request_headers_to_add:
-    - header: {key: x-envoy-original-path, value: /configured})EOF"),
+    - header: {key: x-envoy-original-path, value: "%REQ(:path)%"})EOF"),
                                                     "literal"));
   ASSERT_TRUE(configured.ok());
   const auto configured_route =
@@ -1260,7 +1261,7 @@ TEST_F(DynamicModuleRouteSpecifierTest, RuleThatDoesNotApplyRestoresOnlyThePathW
   Formatter::Context set_context(&set);
   configured_entry->finalizeRequestHeaders(set, set_context, stream_info_, false);
   EXPECT_EQ("/other/z", set.getPathValue());
-  EXPECT_EQ("/configured", set.getEnvoyOriginalPathValue());
+  EXPECT_EQ("/other/z", set.getEnvoyOriginalPathValue());
 }
 
 // A route rewrite that reads a header the route's own mutations add is computed only after they
@@ -1289,6 +1290,85 @@ TEST_F(DynamicModuleRouteSpecifierTest, RuleThatDoesNotApplyUndoesARouteRewriteI
   entry->finalizeRequestHeaders(carried, carried_context, stream_info_, true);
   EXPECT_EQ("/other/y", carried.getPathValue());
   EXPECT_EQ("/carried", carried.getEnvoyOriginalPathValue());
+}
+
+// Without a specifier the same route rewrites the path from the header its mutations add, which is
+// what the test above undoes.
+TEST_F(DynamicModuleRouteSpecifierTest, ARouteRewriteItsHeadersEnableRewritesWithoutASpecifier) {
+  const auto config = loadRaw(R"EOF(
+name: test_route_config
+virtual_hosts:
+- name: test_vhost
+  domains: ["*"]
+  routes:
+  - match: {prefix: "/"}
+    route:
+      cluster: matched_cluster
+      path_rewrite: "%REQ(x-target)%"
+    request_headers_to_add:
+    - header: {key: x-target, value: /svc}
+)EOF");
+  ASSERT_TRUE(config.ok()) << config.status();
+  const auto route = config.value()->route(requestHeaders("/other/x"), stream_info_, 0);
+  ASSERT_NE(nullptr, route.route);
+  const auto* entry = route.route->routeEntry();
+  ASSERT_NE(nullptr, entry);
+  auto headers = requestHeaders("/other/x");
+  Formatter::Context formatter_context(&headers);
+  entry->finalizeRequestHeaders(headers, formatter_context, stream_info_, true);
+  EXPECT_EQ("/svc", headers.getPathValue());
+  EXPECT_EQ("/other/x", headers.getEnvoyOriginalPathValue());
+}
+
+// A route rewrite that leaves the path as it was still records x-envoy-original-path, so a rule
+// that does not apply undoes that record too, here a regex rewrite that does not match.
+TEST_F(DynamicModuleRouteSpecifierTest, RuleThatDoesNotApplyUndoesARouteRewriteThatKeepsThePath) {
+  const auto config = loadRaw(templateRouteYaml(R"EOF(    route:
+      cluster: matched_cluster
+      regex_rewrite:
+        pattern: {regex: "^/nomatch/(.*)$"}
+        substitution: "/x/\\1")EOF",
+                                                "literal"));
+  ASSERT_TRUE(config.ok()) << config.status();
+  const auto route = config.value()->route(requestHeaders("/api/v1"), stream_info_, 0);
+  ASSERT_NE(nullptr, route.route);
+  const auto* entry = route.route->routeEntry();
+  ASSERT_NE(nullptr, entry);
+  auto headers = requestHeaders("/other/x");
+  Formatter::Context formatter_context(&headers);
+  entry->finalizeRequestHeaders(headers, formatter_context, stream_info_, true);
+  EXPECT_EQ("/other/x", headers.getPathValue());
+  EXPECT_EQ(nullptr, headers.EnvoyOriginalPath());
+  auto carried = requestHeaders("/other/y");
+  carried.setEnvoyOriginalPath("/carried");
+  Formatter::Context carried_context(&carried);
+  entry->finalizeRequestHeaders(carried, carried_context, stream_info_, true);
+  EXPECT_EQ("/carried", carried.getEnvoyOriginalPathValue());
+}
+
+// A route whose header mutations remove the header its rewrite reads does not rewrite, so the
+// x-envoy-original-path its mutations set to the original path is kept, as on that route without a
+// specifier.
+TEST_F(DynamicModuleRouteSpecifierTest,
+       RuleThatDoesNotApplyKeepsAnOriginalPathARouteThatDidNotRewriteSet) {
+  const auto config = loadRaw(templateRouteYaml(R"EOF(    route:
+      cluster: matched_cluster
+      path_rewrite: "%REQ(x-target)%"
+    request_headers_to_remove: [x-target]
+    request_headers_to_add:
+    - header: {key: x-envoy-original-path, value: "%REQ(:path)%"})EOF",
+                                                "literal"));
+  ASSERT_TRUE(config.ok()) << config.status();
+  const auto route = config.value()->route(requestHeaders("/api/v1"), stream_info_, 0);
+  ASSERT_NE(nullptr, route.route);
+  const auto* entry = route.route->routeEntry();
+  ASSERT_NE(nullptr, entry);
+  auto headers = requestHeaders("/other/x");
+  headers.addCopy(Http::LowerCaseString("x-target"), "/svc");
+  Formatter::Context formatter_context(&headers);
+  entry->finalizeRequestHeaders(headers, formatter_context, stream_info_, true);
+  EXPECT_EQ("/other/x", headers.getPathValue());
+  EXPECT_EQ("/other/x", headers.getEnvoyOriginalPathValue());
 }
 
 // A route override regex rewrite that yields nothing, here one longer than the bound, is counted
