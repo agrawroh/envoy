@@ -1126,6 +1126,46 @@ virtual_hosts:
   EXPECT_EQ("/api/v2", applies.getEnvoyOriginalPathValue());
 }
 
+// A rule that does not apply restores the path before the header mutations of the module run, so an
+// x-envoy-original-path the module records survives, as one a configured route that does not
+// rewrite leaves alone.
+TEST_F(DynamicModuleRouteSpecifierTest, RuleThatDoesNotApplyKeepsAnOriginalPathTheModuleRecords) {
+  const auto config = loadRaw(fmt::format(R"EOF(
+name: test_route_config
+virtual_hosts:
+- name: test_vhost
+  domains: ["*"]
+  routes:
+  - match: {{prefix: "/"}}
+    route: {{cluster: matched_cluster, prefix_rewrite: "/route/"}}
+  route_specifiers:
+  - name: envoy.router.route_specifiers.dynamic_modules
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.router.route_specifiers.dynamic_modules.v3.DynamicModuleRouteSpecifier
+{}
+)EOF",
+                                          rewriteRuleYaml("records-original-path")));
+  ASSERT_TRUE(config.ok());
+  const auto route = config.value()->route(requestHeaders("/api/v1"), stream_info_, 0);
+  ASSERT_NE(nullptr, route.route);
+  EXPECT_EQ("true", ruleAccepted(*route.route));
+  const auto* entry = route.route->routeEntry();
+  ASSERT_NE(nullptr, entry);
+
+  auto headers = requestHeaders("/other/x");
+  Formatter::Context formatter_context(&headers);
+  entry->finalizeRequestHeaders(headers, formatter_context, stream_info_, true);
+  EXPECT_EQ("/other/x", headers.getPathValue());
+  EXPECT_EQ("/module", headers.getEnvoyOriginalPathValue());
+
+  // Where the rule applies, the module's header follows the original path the rewrite records, as
+  // the header mutations of a configured route are applied before its path rewrite.
+  auto applies = requestHeaders("/api/v2");
+  entry->finalizeRequestHeaders(applies, formatter_context, stream_info_, true);
+  EXPECT_EQ("/internal/v2", applies.getPathValue());
+  EXPECT_EQ("/api/v2", applies.getEnvoyOriginalPathValue());
+}
+
 // The result codes set_route_cache_key returns, as the route cache module reports them.
 constexpr int CacheDisabled = envoy_dynamic_module_type_route_specifier_route_cache_result_Disabled;
 constexpr int CacheMiss = envoy_dynamic_module_type_route_specifier_route_cache_result_Miss;

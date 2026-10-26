@@ -818,6 +818,8 @@ void DynamicModuleRouteEntry::finalizeRequestHeaders(Http::RequestHeaderMap& hea
   //
   // A recorded rule owns the rewrite, so when it does not apply the path the route below rewrote is
   // restored, together with the x-envoy-original-path it recorded, and the path is left unchanged.
+  // The restore runs before the header mutations of the module, so a header the module records is
+  // kept the way a configured route that does not rewrite keeps it.
   const bool rule_owns_path =
       !overrides_.path.has_value() && overrides_.prefix_rewrite_rule.has_value();
   std::optional<std::string> rewritten;
@@ -840,6 +842,14 @@ void DynamicModuleRouteEntry::finalizeRequestHeaders(Http::RequestHeaderMap& hea
   }
   DelegatingRouteEntry::finalizeRequestHeaders(headers, context, stream_info,
                                                insert_envoy_original_path);
+  if (rule_owns_path && !rewritten.has_value()) {
+    headers.setPath(original_path);
+    if (original_envoy_original_path.has_value()) {
+      headers.setEnvoyOriginalPath(*original_envoy_original_path);
+    } else {
+      headers.removeEnvoyOriginalPath();
+    }
+  }
   applyHeaderMutations(headers, overrides_.request_headers_to_add,
                        overrides_.request_headers_to_remove);
   if (overrides_.host.has_value()) {
@@ -859,13 +869,6 @@ void DynamicModuleRouteEntry::finalizeRequestHeaders(Http::RequestHeaderMap& hea
       headers.setEnvoyOriginalPath(original_path);
     }
     headers.setPath(*rewritten);
-  } else if (rule_owns_path) {
-    headers.setPath(original_path);
-    if (original_envoy_original_path.has_value()) {
-      headers.setEnvoyOriginalPath(*original_envoy_original_path);
-    } else {
-      headers.removeEnvoyOriginalPath();
-    }
   }
 }
 
