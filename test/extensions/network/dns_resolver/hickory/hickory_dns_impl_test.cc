@@ -1,6 +1,7 @@
 #include "envoy/extensions/network/dns_resolver/hickory/v3/hickory_dns_resolver.pb.h"
 
 #include "source/common/network/dns_resolver/dns_factory_util.h"
+#include "source/common/network/utility.h"
 #include "source/extensions/network/dns_resolver/hickory/hickory_dns_impl.h"
 
 #include "test/common/stats/stat_test_utility.h"
@@ -8,6 +9,7 @@
 #include "test/test_common/status_utility.h"
 #include "test/test_common/test_runtime.h"
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 namespace Envoy {
@@ -73,6 +75,32 @@ public:
     EXPECT_EQ(not_found, stats_store_.counter("dns.hickory.not_found").value());
     EXPECT_EQ(get_addr_failure, stats_store_.counter("dns.hickory.get_addr_failure").value());
     EXPECT_EQ(timeouts, stats_store_.counter("dns.hickory.timeouts").value());
+  }
+
+  // Resolves localhost for the family and counts the IPv4 and IPv6 addresses returned.
+  std::pair<size_t, size_t> resolveLocalhostFamilies(DnsLookupFamily family) {
+    size_t v4 = 0;
+    size_t v6 = 0;
+    bool callback_called = false;
+    auto* query = resolver_->resolve(
+        "localhost", family,
+        [this, &v4, &v6, &callback_called](DnsResolver::ResolutionStatus status, absl::string_view,
+                                           std::list<DnsResponse>&& response) {
+          callback_called = true;
+          EXPECT_EQ(status, DnsResolver::ResolutionStatus::Completed);
+          for (const auto& resp : response) {
+            if (resp.addrInfo().address_->ip()->ipv6() != nullptr) {
+              v6++;
+            } else {
+              v4++;
+            }
+          }
+          dispatcher_->exit();
+        });
+    EXPECT_NE(query, nullptr);
+    dispatcher_->run(Event::Dispatcher::RunType::RunUntilExit);
+    EXPECT_TRUE(callback_called);
+    return {v4, v6};
   }
 
   // The resolver assigns query IDs starting at 1 and increments monotonically.
@@ -156,6 +184,7 @@ TEST_F(HickoryDnsImplTest, ResolveLocalhostV4Only) {
                                                             std::list<DnsResponse>&& response) {
                                      callback_called = true;
                                      EXPECT_EQ(status, DnsResolver::ResolutionStatus::Completed);
+                                     EXPECT_FALSE(response.empty());
                                      for (const auto& resp : response) {
                                        EXPECT_NE(resp.addrInfo().address_->ip()->ipv4(), nullptr);
                                      }
@@ -177,6 +206,7 @@ TEST_F(HickoryDnsImplTest, ResolveLocalhostV6Only) {
                                                             std::list<DnsResponse>&& response) {
                                      callback_called = true;
                                      EXPECT_EQ(status, DnsResolver::ResolutionStatus::Completed);
+                                     EXPECT_FALSE(response.empty());
                                      for (const auto& resp : response) {
                                        EXPECT_NE(resp.addrInfo().address_->ip()->ipv6(), nullptr);
                                      }
@@ -188,40 +218,30 @@ TEST_F(HickoryDnsImplTest, ResolveLocalhostV6Only) {
   EXPECT_TRUE(callback_called);
 }
 
+// Hickory answers localhost with an address of each family, from the hosts file or per RFC 6761,
+// so ALL returns both families. AUTO must then return only the IPv6 one.
 TEST_F(HickoryDnsImplTest, ResolveLocalhostAuto) {
   initialize();
 
-  bool callback_called = false;
-  auto* query =
-      resolver_->resolve("localhost", DnsLookupFamily::Auto,
-                         [this, &callback_called](DnsResolver::ResolutionStatus status,
-                                                  absl::string_view, std::list<DnsResponse>&&) {
-                           callback_called = true;
-                           EXPECT_EQ(status, DnsResolver::ResolutionStatus::Completed);
-                           dispatcher_->exit();
-                         });
-
-  EXPECT_NE(query, nullptr);
-  dispatcher_->run(Event::Dispatcher::RunType::RunUntilExit);
-  EXPECT_TRUE(callback_called);
+  const auto [all_v4, all_v6] = resolveLocalhostFamilies(DnsLookupFamily::All);
+  ASSERT_GT(all_v4, 0u);
+  ASSERT_GT(all_v6, 0u);
+  const auto [v4, v6] = resolveLocalhostFamilies(DnsLookupFamily::Auto);
+  EXPECT_EQ(v6, all_v6);
+  EXPECT_EQ(v4, 0u);
 }
 
+// As above, ALL returns both loopback families for localhost, and V4_PREFERRED must return only
+// the IPv4 one.
 TEST_F(HickoryDnsImplTest, ResolveLocalhostV4Preferred) {
   initialize();
 
-  bool callback_called = false;
-  auto* query =
-      resolver_->resolve("localhost", DnsLookupFamily::V4Preferred,
-                         [this, &callback_called](DnsResolver::ResolutionStatus status,
-                                                  absl::string_view, std::list<DnsResponse>&&) {
-                           callback_called = true;
-                           EXPECT_EQ(status, DnsResolver::ResolutionStatus::Completed);
-                           dispatcher_->exit();
-                         });
-
-  EXPECT_NE(query, nullptr);
-  dispatcher_->run(Event::Dispatcher::RunType::RunUntilExit);
-  EXPECT_TRUE(callback_called);
+  const auto [all_v4, all_v6] = resolveLocalhostFamilies(DnsLookupFamily::All);
+  ASSERT_GT(all_v4, 0u);
+  ASSERT_GT(all_v6, 0u);
+  const auto [v4, v6] = resolveLocalhostFamilies(DnsLookupFamily::V4Preferred);
+  EXPECT_EQ(v4, all_v4);
+  EXPECT_EQ(v6, 0u);
 }
 
 TEST_F(HickoryDnsImplTest, ResolveNonExistentDomain) {
@@ -663,6 +683,49 @@ TEST_F(HickoryDnsImplTest, ResolverDestroyedBeforePostedCallbackRuns) {
   // exits without touching the freed resolver and the user callback is not invoked.
   dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
   EXPECT_FALSE(callback_called);
+}
+
+// A direct completion stands in for the module with two addresses of each family, interleaved. The
+// choice keeps every address of the preferred family in the order it arrived and drops the other
+// family wherever it sits.
+TEST_F(HickoryDnsImplTest, LookupFamilyKeepsPreferredAddressesInOrder) {
+  initialize();
+  auto* hickory_resolver = dynamic_cast<HickoryDnsResolver*>(resolver_.get());
+  ASSERT_NE(hickory_resolver, nullptr);
+
+  std::vector<Address::InstanceConstSharedPtr> parsed;
+  for (const char* address : {"192.0.2.1", "2001:db8::1", "192.0.2.2", "2001:db8::2"}) {
+    parsed.push_back(Utility::parseInternetAddressNoThrow(address));
+    ASSERT_NE(parsed.back(), nullptr) << address;
+  }
+
+  uint64_t query_id = kFirstQueryId;
+  const auto resolve = [&](DnsLookupFamily family) {
+    std::vector<std::string> addresses;
+    bool callback_called = false;
+    resolver_->resolve("example.invalid", family,
+                       [&](DnsResolver::ResolutionStatus status, absl::string_view,
+                           std::list<DnsResponse>&& response) {
+                         callback_called = true;
+                         EXPECT_EQ(status, DnsResolver::ResolutionStatus::Completed);
+                         for (const auto& resp : response) {
+                           addresses.push_back(resp.addrInfo().address_->ip()->addressAsString());
+                         }
+                       });
+    std::list<DnsResponse> response;
+    for (const auto& address : parsed) {
+      response.emplace_back(address, std::chrono::seconds(30));
+    }
+    hickory_resolver->onResolveComplete(query_id++,
+                                        envoy_dynamic_module_type_dns_resolution_status_Completed,
+                                        "", std::move(response));
+    EXPECT_TRUE(callback_called);
+    return addresses;
+  };
+
+  EXPECT_THAT(resolve(DnsLookupFamily::Auto), testing::ElementsAre("2001:db8::1", "2001:db8::2"));
+  EXPECT_THAT(resolve(DnsLookupFamily::V4Preferred),
+              testing::ElementsAre("192.0.2.1", "192.0.2.2"));
 }
 
 TEST_F(HickoryDnsImplTest, StatsNotFoundOnDirectCallback) {

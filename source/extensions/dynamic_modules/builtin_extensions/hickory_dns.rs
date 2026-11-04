@@ -395,7 +395,8 @@ async fn perform_lookup(
   let mut error_msg: Option<String> = None;
 
   if need_a && need_aaaa {
-    // Issue both lookups concurrently to halve dual-stack query latency.
+    // Issue both lookups concurrently to halve dual-stack query latency. Every answer goes back to
+    // Envoy, which applies the lookup family's preference to the addresses it can use.
     let (a_result, aaaa_result) = tokio::join!(
       resolver.lookup(dns_name, RecordType::A),
       resolver.lookup(dns_name, RecordType::AAAA)
@@ -414,10 +415,6 @@ async fn perform_lookup(
       &mut addresses,
       &mut error_msg,
     );
-  }
-
-  if lookup_family == DnsLookupFamily::V4Preferred {
-    addresses.sort_by_key(|a| u8::from(a.address.starts_with('[')));
   }
 
   if addresses.is_empty() {

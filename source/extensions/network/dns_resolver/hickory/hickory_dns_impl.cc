@@ -50,6 +50,33 @@ struct DnsResolverRegistry {
 
 DnsResolverRegistry& dnsResolverRegistry() { MUTABLE_CONSTRUCT_ON_FIRST_USE(DnsResolverRegistry); }
 
+bool isIpv6(const DnsResponse& response) {
+  return response.addrInfo().address_->ip()->ipv6() != nullptr;
+}
+
+// The module returns every A and AAAA answer for AUTO and V4_PREFERRED. Keeps only the preferred
+// family, or the other one when the preferred family has no address, as the API defines for these
+// families. The choice runs over the addresses Envoy could build, so a family this host cannot
+// use, such as IPv6 on a host without IPv6 support, never hides the other one.
+void selectLookupFamily(DnsLookupFamily dns_lookup_family, std::list<DnsResponse>& response) {
+  if (dns_lookup_family != DnsLookupFamily::Auto &&
+      dns_lookup_family != DnsLookupFamily::V4Preferred) {
+    return;
+  }
+  const bool prefer_v6 = dns_lookup_family == DnsLookupFamily::Auto;
+  std::list<DnsResponse> preferred;
+  for (auto it = response.begin(); it != response.end();) {
+    auto next = std::next(it);
+    if (isIpv6(*it) == prefer_v6) {
+      preferred.splice(preferred.end(), response, it);
+    }
+    it = next;
+  }
+  if (!preferred.empty()) {
+    response = std::move(preferred);
+  }
+}
+
 } // namespace
 
 uint64_t allocateDnsResolverToken() {
@@ -201,8 +228,10 @@ HickoryDnsResolverConfig::~HickoryDnsResolverConfig() {
 
 HickoryPendingResolution::HickoryPendingResolution(HickoryDnsResolver& parent,
                                                    DnsResolver::ResolveCb callback,
-                                                   uint64_t query_id, const std::string& dns_name)
-    : callback_(std::move(callback)), query_id_(query_id), dns_name_(dns_name), parent_(parent) {}
+                                                   uint64_t query_id, const std::string& dns_name,
+                                                   DnsLookupFamily dns_lookup_family)
+    : callback_(std::move(callback)), query_id_(query_id), dns_name_(dns_name),
+      dns_lookup_family_(dns_lookup_family), parent_(parent) {}
 
 void HickoryPendingResolution::cancel(CancelReason) {
   ASSERT(parent_.dispatcher_.isThreadSafe());
@@ -326,7 +355,8 @@ ActiveDnsQuery* HickoryDnsResolver::resolve(const std::string& dns_name,
   }
 
   stats_.pending_resolutions_.inc();
-  auto* pending = new HickoryPendingResolution(*this, std::move(callback), query_id, dns_name);
+  auto* pending = new HickoryPendingResolution(*this, std::move(callback), query_id, dns_name,
+                                               dns_lookup_family);
   pending->query_module_ptr_ = query_module_ptr;
   pending_queries_[query_id] = pending;
   return pending;
@@ -359,8 +389,24 @@ void HickoryDnsResolver::onResolveComplete(uint64_t query_id,
     chargeGetAddrInfoErrorStats(details);
     ENVOY_LOG(debug, "Hickory DNS resolution failed for [{}]: {}", pending->dns_name_, details);
   } else {
-    ENVOY_LOG(debug, "Hickory DNS resolution complete for [{}]: {} address(es)", pending->dns_name_,
-              response.size());
+    // Count the parsed, usable addresses of each family before the choice drops one, only when
+    // the line logs.
+    size_t usable_v4 = 0;
+    size_t usable_v6 = 0;
+    if (ENVOY_LOG_CHECK_LEVEL(debug)) {
+      for (const auto& resp : response) {
+        if (isIpv6(resp)) {
+          ++usable_v6;
+        } else {
+          ++usable_v4;
+        }
+      }
+    }
+    selectLookupFamily(pending->dns_lookup_family_, response);
+    ENVOY_LOG(debug,
+              "Hickory DNS resolution complete for [{}]: {} usable IPv4 and {} usable IPv6 "
+              "address(es), kept {}",
+              pending->dns_name_, usable_v4, usable_v6, response.size());
   }
 
   // Free the Rust-side query object now that its task has produced a result. The cancel

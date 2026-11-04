@@ -98,7 +98,8 @@ using HickoryDnsResolverConfigSharedPtr = std::shared_ptr<HickoryDnsResolverConf
 class HickoryPendingResolution : public ActiveDnsQuery {
 public:
   HickoryPendingResolution(HickoryDnsResolver& parent, DnsResolver::ResolveCb callback,
-                           uint64_t query_id, const std::string& dns_name);
+                           uint64_t query_id, const std::string& dns_name,
+                           DnsLookupFamily dns_lookup_family);
 
   // ActiveDnsQuery
   void cancel(CancelReason reason) override;
@@ -111,6 +112,7 @@ public:
   DnsResolver::ResolveCb callback_;
   const uint64_t query_id_;
   const std::string dns_name_;
+  const DnsLookupFamily dns_lookup_family_;
   HickoryDnsResolver& parent_;
 };
 
@@ -141,8 +143,8 @@ public:
   void resetNetworking() override;
 
   /**
-   * Called by the ABI callback (from any thread) to deliver resolution results.
-   * Posts to the dispatcher thread for thread safety.
+   * Runs on the dispatcher thread, where the ABI callback posts each result after parsing its
+   * addresses, and delivers the result to the query's callback.
    */
   void onResolveComplete(uint64_t query_id, envoy_dynamic_module_type_dns_resolution_status status,
                          absl::string_view details, std::list<DnsResponse>&& response);

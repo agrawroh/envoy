@@ -37,6 +37,10 @@ fails, the resolution fails even if the other family reports no records. Strict 
 retain their existing hosts on resolution failure. A successful fallback still returns its
 addresses, and lookups that both report no records return a successful empty result.
 
+The Hickory DNS resolver sends both lookups together and applies the same fallback to the addresses
+Envoy can use. It fails a resolution in which neither family returns an address and a lookup fails,
+which includes both lookups reporting no records.
+
 The c-ares-based DNS resolver emits the following statistics rooted in the ``dns.cares`` stats tree:
 
   .. csv-table::

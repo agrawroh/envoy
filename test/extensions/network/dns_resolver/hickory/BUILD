@@ -67,6 +67,28 @@ envoy_extension_cc_dyn_module_test(
 )
 
 envoy_extension_cc_dyn_module_test(
+    name = "hickory_dns_lookup_family_test",
+    srcs = ["hickory_dns_lookup_family_test.cc"],
+    extension_names = ["envoy.network.dns_resolver.hickory"],
+    rbe_pool = "linux_x64_small",
+    tags = [
+        # FakeUdpDnsServer uses POSIX-only headers (arpa/inet.h, netinet/in.h).
+        "fails_on_clang_cl",
+        # See comment on hickory_dns_impl_test above.
+        "no_tsan",
+    ],
+    deps = [
+        "//source/common/network:address_lib",
+        "//source/common/network/dns_resolver:dns_factory_util_lib",
+        "//source/extensions/network/dns_resolver/hickory:config",
+        "//test/extensions/network/dns_resolver/common:fake_udp_dns_server_lib",
+        "//test/test_common:status_utility_lib",
+        "//test/test_common:utility_lib",
+        "@envoy_api//envoy/extensions/network/dns_resolver/hickory/v3:pkg_cc_proto",
+    ] + HICKORY_ABI_IMPL_DEPS,
+)
+
+envoy_extension_cc_dyn_module_test(
     name = "hickory_dns_integration_test",
     srcs = ["hickory_dns_integration_test.cc"],
     extension_names = ["envoy.network.dns_resolver.hickory"],
