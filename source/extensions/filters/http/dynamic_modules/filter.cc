@@ -152,7 +152,6 @@ FilterTrailersStatus DynamicModuleHttpFilter::decodeTrailers(RequestTrailerMap&)
 }
 
 FilterMetadataStatus DynamicModuleHttpFilter::decodeMetadata(MetadataMap&) {
-  decode_in_continue_ = true;
   return FilterMetadataStatus::Continue;
 }
 
@@ -202,7 +201,6 @@ FilterTrailersStatus DynamicModuleHttpFilter::encodeTrailers(ResponseTrailerMap&
 };
 
 FilterMetadataStatus DynamicModuleHttpFilter::encodeMetadata(MetadataMap&) {
-  encode_in_continue_ = true;
   return FilterMetadataStatus::Continue;
 }
 

@@ -306,7 +306,8 @@ private:
 
   // True when the decode or encode direction is in the continue state. Tracked per direction to
   // avoid prohibited repeat continueDecoding() or continueEncoding() calls, and so a continue in
-  // one direction never suppresses a resume in the other.
+  // one direction never suppresses a resume in the other. The metadata hooks leave both alone,
+  // since passing a metadata frame on does not resume a direction the module stopped.
   bool decode_in_continue_ = false;
   bool encode_in_continue_ = false;
 

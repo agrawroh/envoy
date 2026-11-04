@@ -6,6 +6,7 @@
 #include "envoy/tracing/trace_driver.h"
 
 #include "source/common/common/base64.h"
+#include "source/common/common/cleanup.h"
 #include "source/common/common/logger.h"
 #include "source/common/protobuf/protobuf.h"
 
@@ -970,6 +971,78 @@ TEST_P(DynamicModulesIntegrationTest, Scheduler) {
   auto response = std::move(encoder_decoder.second);
 
   waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(default_response_headers_, true);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().Status()->value().getStringView());
+}
+
+// The add-metadata-encode-headers filter sits between the module and the router, so it adds
+// metadata before the module sees the response headers, and the filter manager hands that metadata
+// to the module once the module's headers hook returns StopIteration. The metadata must not mark
+// the response as continued, or the module's later continue_encoding is dropped and the response
+// never completes. The cpp module stops all iteration instead, so the filter manager holds the
+// metadata until the module continues, and those cases pass either way.
+TEST_P(DynamicModulesIntegrationTest, SchedulerResumesResponseAfterMetadata) {
+  config_helper_.prependFilter(R"EOF(
+name: add-metadata-encode-headers-filter
+typed_config:
+  "@type": type.googleapis.com/test.integration.filters.AddMetadataEncodeHeadersFilterConfig
+)EOF");
+  initializeFilter("http_filter_scheduler");
+  codec_client_ = makeHttpConnection(makeClientConnection((lookupPort("http"))));
+
+  auto encoder_decoder = codec_client_->startRequest(default_request_headers_, true);
+  auto response = std::move(encoder_decoder.second);
+  // Keep the decoder alive while closing a stalled stream after an assertion failure.
+  Cleanup cleanup([this]() { cleanupUpstreamAndDownstream(); });
+
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(default_response_headers_, true);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().Status()->value().getStringView());
+}
+
+// The request direction. The request-metadata filter sits in front of the module and adds metadata
+// in its decodeHeaders, and the filter manager hands that metadata to the module once the module's
+// headers hook returns StopIteration. The metadata must not mark the request as continued, or the
+// module's later continue_decoding is dropped and the request never reaches the upstream. As in
+// the response case, the cpp module's stop all keeps the metadata from it until it continues.
+TEST_P(DynamicModulesIntegrationTest, SchedulerResumesRequestAfterMetadata) {
+  // Config modifiers run when the config is finalized, after initializeFilter() prepends the
+  // module, so this puts the metadata filter in front of it.
+  config_helper_.addConfigModifier(
+      [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+             hcm) {
+        TestUtility::loadFromYaml(R"EOF(
+name: request-metadata-filter
+typed_config:
+  "@type": type.googleapis.com/test.integration.filters.RequestMetadataFilterConfig
+)EOF",
+                                  *hcm.add_http_filters());
+        for (int i = hcm.http_filters_size() - 1; i > 0; --i) {
+          hcm.mutable_http_filters()->SwapElements(i, i - 1);
+        }
+      });
+  initializeFilter("http_filter_scheduler");
+  codec_client_ = makeHttpConnection(makeClientConnection((lookupPort("http"))));
+
+  // The headers carry no end of stream. With it the filter manager would add an empty body after
+  // the metadata, and a body chunk the module continues resumes the request on its own. So only
+  // the module's continue_decoding sends these headers upstream, and a request stalled in the
+  // module fails this bounded wait.
+  auto encoder_decoder = codec_client_->startRequest(default_request_headers_);
+  auto response = std::move(encoder_decoder.second);
+  Cleanup cleanup([this]() { cleanupUpstreamAndDownstream(); });
+  ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+  ASSERT_TRUE(fake_upstream_connection_->waitForNewStream(*dispatcher_, upstream_request_));
+  ASSERT_TRUE(upstream_request_->waitForHeadersComplete());
+
+  codec_client_->sendData(encoder_decoder.first, 0, true);
+  ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
   upstream_request_->encodeHeaders(default_response_headers_, true);
 
   ASSERT_TRUE(response->waitForEndStream());

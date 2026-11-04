@@ -3417,6 +3417,158 @@ TEST(DynamicModulesTest, PerDirectionContinueEncodeDoesNotBlockDecode) {
   filter->onDestroy();
 }
 
+// The filter manager delivers a metadata frame to a filter whose headers returned StopIteration,
+// and the filter passes the frame on without resuming the stream. Each test builds the filter from
+// the no_op module, whose headers hooks a test can replace to stop a direction.
+class DynamicModuleHttpFilterMetadataTest : public testing::Test {
+public:
+  void SetUp() override {
+    auto dynamic_module = newDynamicModule(testSharedObjectPath("no_op", "c"), false);
+    ASSERT_OK(dynamic_module);
+    auto filter_config_or_status = newDynamicModuleHttpFilterConfig(
+        "filter", "", DefaultMetricsNamespace, false, std::move(dynamic_module.value()),
+        *stats_scope_, context_);
+    ASSERT_OK(filter_config_or_status);
+    filter_config_ = filter_config_or_status.value();
+  }
+
+  // Makes the module stop both directions at their headers, as a module that waits for an
+  // asynchronous result before it continues does.
+  void stopAtHeaders() {
+    filter_config_->on_http_filter_request_headers_ =
+        +[](envoy_dynamic_module_type_http_filter_envoy_ptr,
+            envoy_dynamic_module_type_http_filter_module_ptr, bool) {
+          return envoy_dynamic_module_type_on_http_filter_request_headers_status_StopIteration;
+        };
+    filter_config_->on_http_filter_response_headers_ =
+        +[](envoy_dynamic_module_type_http_filter_envoy_ptr,
+            envoy_dynamic_module_type_http_filter_module_ptr, bool) {
+          return envoy_dynamic_module_type_on_http_filter_response_headers_status_StopIteration;
+        };
+  }
+
+  DynamicModuleHttpFilterSharedPtr newFilter() {
+    auto filter =
+        std::make_shared<DynamicModuleHttpFilter>(filter_config_, stats_scope_->symbolTable(), 0);
+    filter->initializeInModuleFilter();
+    filter->setDecoderFilterCallbacks(decoder_callbacks_);
+    filter->setEncoderFilterCallbacks(encoder_callbacks_);
+    return filter;
+  }
+
+  NiceMock<Server::Configuration::MockServerFactoryContext> context_;
+  Stats::IsolatedStoreImpl stats_store_;
+  Stats::ScopeSharedPtr stats_scope_{stats_store_.createScope("")};
+  DynamicModuleHttpFilterConfigSharedPtr filter_config_;
+  NiceMock<Http::MockStreamDecoderFilterCallbacks> decoder_callbacks_;
+  NiceMock<Http::MockStreamEncoderFilterCallbacks> encoder_callbacks_;
+  MetadataMap metadata_{{"key", "value"}};
+};
+
+// A request metadata frame after the module stopped at the request headers used to mark the decode
+// direction as continued, so the module's continueDecoding() was dropped and the request hung.
+TEST_F(DynamicModuleHttpFilterMetadataTest, DecodeMetadataKeepsStoppedRequestResumable) {
+  stopAtHeaders();
+  auto filter = newFilter();
+  TestRequestHeaderMapImpl headers{{":path", "/"}};
+  EXPECT_EQ(FilterHeadersStatus::StopIteration, filter->decodeHeaders(headers, false));
+
+  // Passing the metadata on resumes neither direction, and nothing here touches the response.
+  EXPECT_CALL(decoder_callbacks_, continueDecoding()).Times(0);
+  EXPECT_CALL(encoder_callbacks_, continueEncoding()).Times(0);
+  EXPECT_EQ(FilterMetadataStatus::Continue, filter->decodeMetadata(metadata_));
+  testing::Mock::VerifyAndClearExpectations(&decoder_callbacks_);
+
+  // The module's continue resumes the request once, and a repeat stays a no-op.
+  EXPECT_CALL(decoder_callbacks_, continueDecoding());
+  filter->continueDecoding();
+  filter->continueDecoding();
+
+  filter->onDestroy();
+}
+
+// A response metadata frame after the module stopped at the response headers used to mark the
+// encode direction as continued, so the module's continueEncoding() was dropped and the response
+// hung.
+TEST_F(DynamicModuleHttpFilterMetadataTest, EncodeMetadataKeepsStoppedResponseResumable) {
+  stopAtHeaders();
+  auto filter = newFilter();
+  TestResponseHeaderMapImpl headers{{":status", "200"}};
+  EXPECT_EQ(FilterHeadersStatus::StopIteration, filter->encodeHeaders(headers, false));
+
+  // Passing the metadata on resumes neither direction, and nothing here touches the request.
+  EXPECT_CALL(decoder_callbacks_, continueDecoding()).Times(0);
+  EXPECT_CALL(encoder_callbacks_, continueEncoding()).Times(0);
+  EXPECT_EQ(FilterMetadataStatus::Continue, filter->encodeMetadata(metadata_));
+  testing::Mock::VerifyAndClearExpectations(&encoder_callbacks_);
+
+  // The module's continue resumes the response once, and a repeat stays a no-op.
+  EXPECT_CALL(encoder_callbacks_, continueEncoding());
+  filter->continueEncoding();
+  filter->continueEncoding();
+
+  filter->onDestroy();
+}
+
+// Request metadata that arrives while the module holds the response leaves the response
+// resumable, so a metadata hook never changes the other direction's state.
+TEST_F(DynamicModuleHttpFilterMetadataTest, DecodeMetadataKeepsStoppedResponseResumable) {
+  stopAtHeaders();
+  auto filter = newFilter();
+  TestRequestHeaderMapImpl request_headers{{":path", "/"}};
+  EXPECT_EQ(FilterHeadersStatus::StopIteration, filter->decodeHeaders(request_headers, false));
+  TestResponseHeaderMapImpl response_headers{{":status", "200"}};
+  EXPECT_EQ(FilterHeadersStatus::StopIteration, filter->encodeHeaders(response_headers, false));
+
+  EXPECT_CALL(encoder_callbacks_, continueEncoding()).Times(0);
+  EXPECT_EQ(FilterMetadataStatus::Continue, filter->decodeMetadata(metadata_));
+  testing::Mock::VerifyAndClearExpectations(&encoder_callbacks_);
+
+  EXPECT_CALL(encoder_callbacks_, continueEncoding());
+  filter->continueEncoding();
+
+  filter->onDestroy();
+}
+
+// The mirror case. Response metadata that arrives while the module holds the request leaves the
+// request resumable.
+TEST_F(DynamicModuleHttpFilterMetadataTest, EncodeMetadataKeepsStoppedRequestResumable) {
+  stopAtHeaders();
+  auto filter = newFilter();
+  TestRequestHeaderMapImpl request_headers{{":path", "/"}};
+  EXPECT_EQ(FilterHeadersStatus::StopIteration, filter->decodeHeaders(request_headers, false));
+  TestResponseHeaderMapImpl response_headers{{":status", "200"}};
+  EXPECT_EQ(FilterHeadersStatus::StopIteration, filter->encodeHeaders(response_headers, false));
+
+  EXPECT_CALL(decoder_callbacks_, continueDecoding()).Times(0);
+  EXPECT_EQ(FilterMetadataStatus::Continue, filter->encodeMetadata(metadata_));
+  testing::Mock::VerifyAndClearExpectations(&decoder_callbacks_);
+
+  EXPECT_CALL(decoder_callbacks_, continueDecoding());
+  filter->continueDecoding();
+
+  filter->onDestroy();
+}
+
+// After headers that returned Continue, a metadata frame keeps both directions continued, so the
+// module's continue calls stay no-ops on directions that are already iterating.
+TEST_F(DynamicModuleHttpFilterMetadataTest, MetadataKeepsContinuedStreamContinued) {
+  auto filter = newFilter();
+  TestRequestHeaderMapImpl request_headers{{":path", "/"}};
+  EXPECT_EQ(FilterHeadersStatus::Continue, filter->decodeHeaders(request_headers, false));
+  EXPECT_EQ(FilterMetadataStatus::Continue, filter->decodeMetadata(metadata_));
+  TestResponseHeaderMapImpl response_headers{{":status", "200"}};
+  EXPECT_EQ(FilterHeadersStatus::Continue, filter->encodeHeaders(response_headers, false));
+  EXPECT_EQ(FilterMetadataStatus::Continue, filter->encodeMetadata(metadata_));
+
+  EXPECT_CALL(decoder_callbacks_, continueDecoding()).Times(0);
+  EXPECT_CALL(encoder_callbacks_, continueEncoding()).Times(0);
+  filter->continueDecoding();
+  filter->continueEncoding();
+
+  filter->onDestroy();
+}
+
 } // namespace HttpFilters
 } // namespace DynamicModules
 } // namespace Extensions
