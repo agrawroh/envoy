@@ -65,6 +65,9 @@ public:
   // Plaintext bytes delivered to the upstream and to the downstream so far.
   uint64_t bytesUploaded() const { return bytes_uploaded_; }
   uint64_t bytesDownloaded() const { return bytes_downloaded_; }
+  // The upload pipe's capacity and the kTLS download buffer's size, which grow on demand.
+  size_t uploadPipeCapacity() const { return d2u_.capacity; }
+  size_t downloadBufferSize() const { return download_buf_ != nullptr ? DownloadBufferSize : 0; }
 
 private:
   struct Pipe {
@@ -72,7 +75,16 @@ private:
     int write_fd{-1};
     size_t in_pipe{0};
     size_t capacity{0};
+    // Whether the pipe asked to grow, which it does once, the first time it fills.
+    bool grown{false};
   };
+
+  // Grows a pipe to its full capacity the first time it fills, so a session that never fills the
+  // default pipe charges only that against the user's pipe page budget. Returns whether it grew.
+  static bool grow(Pipe& pipe);
+  // Bytes one recvmsg reads from a kTLS socket. TLS caps a record at 16384 bytes of plaintext, so
+  // a larger read lets the kernel return several application data records in one call.
+  static constexpr size_t DownloadBufferSize = 64 * 1024;
 
   // Outcome of one kTLS read.
   enum class ReadResult {
@@ -106,8 +118,10 @@ private:
   Pipe u2d_; // Upstream to downstream, the plaintext download. Unused for a kTLS download.
   Pipe d2u_; // Downstream to upstream, the upload.
   // The kTLS download read with recvmsg, how many bytes it holds, and how many have reached the
-  // downstream socket. A short write keeps the rest for the next pass.
-  std::vector<uint8_t> download_buf_;
+  // downstream socket. A short write keeps the rest for the next pass. It is allocated when a read
+  // starts and released once the download is drained and the socket is empty, so an idle session
+  // holds none.
+  std::unique_ptr<uint8_t[]> download_buf_;
   size_t download_len_{0};
   size_t download_offset_{0};
   Event::FileEventPtr up_file_event_;

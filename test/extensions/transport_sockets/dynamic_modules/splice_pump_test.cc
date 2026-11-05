@@ -177,6 +177,19 @@ void sendTlsRecord(int fd, uint8_t record_type, const std::string& payload) {
 }
 
 // Bytes that depend on their offset so a reordered or truncated stream does not compare equal.
+// Whether this process may give a new pipe 1 MiB, which fs.pipe-max-size and the user's pipe
+// page budget decide.
+bool canGrowPipeToOneMiB() {
+  int fds[2];
+  if (::pipe2(fds, O_CLOEXEC) != 0) {
+    return false;
+  }
+  const bool grown = ::fcntl(fds[1], F_SETPIPE_SZ, 1 << 20) >= (1 << 20);
+  ::close(fds[0]);
+  ::close(fds[1]);
+  return grown;
+}
+
 std::string pattern(size_t size, uint8_t seed = 7) {
   std::string out(size, '\0');
   for (size_t i = 0; i < size; ++i) {
@@ -390,6 +403,28 @@ TEST_F(SplicePumpTest, UpstreamHalfCloseKeepsUploadFlowing) {
   runUntil([&]() { return backend_.eof && completed_; });
   EXPECT_TRUE(samePayload(upload, backend_.received));
   EXPECT_EQ(SplicePump::Outcome::Done, outcome_);
+}
+
+// The upload pipe starts at the default size and grows only once a session fills it, so a short
+// session charges little against the user's pipe page budget.
+TEST_F(SplicePumpTest, UploadPipeGrowsOnlyOnceItFills) {
+  startPump(false);
+  const size_t initial = pump_->uploadPipeCapacity();
+  const std::string first = pattern(1024, 23);
+  send(client_, first);
+  runUntil([&]() { return backend_.received.size() >= first.size(); });
+  EXPECT_EQ(initial, pump_->uploadPipeCapacity());
+
+  stallPeer(backend_);
+  const std::string rest = pattern(8 << 20, 24);
+  send(client_, rest);
+  runWhilePathFills();
+  if (canGrowPipeToOneMiB()) {
+    EXPECT_EQ(size_t{1} << 20, pump_->uploadPipeCapacity());
+  }
+  armPeer(backend_);
+  runUntil([&]() { return backend_.received.size() >= first.size() + rest.size(); });
+  EXPECT_TRUE(samePayload(first + rest, backend_.received));
 }
 
 // A client that stops reading closes its window, so the downstream socket fills and the pump
@@ -606,6 +641,13 @@ TEST_F(KtlsSplicePumpTest, UploadIsEncryptedInKernel) {
   send(client_, upload);
   runUntil([&]() { return backend_.received.size() >= upload.size(); });
   EXPECT_TRUE(samePayload(upload, backend_.received));
+  // The download buffer exists only while a download is in flight, so an idle session holds none.
+  EXPECT_EQ(0, pump_->downloadBufferSize());
+  const std::string download = pattern(16 << 10, 25);
+  send(backend_, download);
+  runUntil([&]() { return client_.received.size() >= download.size(); });
+  EXPECT_TRUE(samePayload(download, client_.received));
+  EXPECT_EQ(0, pump_->downloadBufferSize());
 }
 
 // A NewSessionTicket between two bursts is consumed and never reaches the client.

@@ -16213,8 +16213,8 @@ void envoy_dynamic_module_callback_transport_socket_set_is_writable(
  * download is spliced. Each end of stream is forwarded as a half-close, both connections close once
  * both directions end, and an error resets them.
  *
- * Envoy's read and write buffers of both connections must be empty and the module must hold no
- * pending bytes, because the pump reads only the sockets. After this returns true, neither socket
+ * The module must hold no pending bytes, because the pump reads only the sockets. Envoy checks its
+ * own read and write buffers of both connections. After this returns true, neither socket
  * receives do_read or do_write, its readiness and flush callbacks do nothing, and the module must
  * not do I/O on either socket, including in on_close. The relayed bytes are added to the
  * connection stream info when the session ends, but they do not reset the TCP proxy idle timer, so
@@ -16222,8 +16222,9 @@ void envoy_dynamic_module_callback_transport_socket_set_is_writable(
  *
  * It returns false and leaves both connections on their buffered path in these cases.
  * - The peer is null, or both sockets are downstream or both are upstream.
- * - Either socket has no connection yet, is already spliced, or is in a read or write whose buffer
- *   still holds bytes.
+ * - Either socket has no connection yet or is already spliced.
+ * - Either connection's read or write buffer holds bytes, or either connection has not yet read
+ *   and written once, so its buffers are unknown.
  * - Either connection is connecting, closed, or on a blocking socket, which io_uring creates for
  *   upstream connections.
  * - The two connections run on different workers.

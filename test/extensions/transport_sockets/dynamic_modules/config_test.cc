@@ -297,8 +297,10 @@ public:
   }
 
   std::unique_ptr<DynamicModuleTransportSocket>
-  createStubSocket(const envoy_dynamic_module_type_transport_socket_io_result& io_result) {
+  createStubSocket(const envoy_dynamic_module_type_transport_socket_io_result& io_result,
+                   bool is_upstream = false) {
     auto config = std::make_shared<DynamicModuleTransportSocketConfig>(false, nullptr);
+    config->is_upstream_ = is_upstream;
     config->in_module_config_ = &io_result;
     config->on_new_ = newStubTransportSocket;
     config->on_destroy_ = destroyStubTransportSocket;
@@ -1023,13 +1025,67 @@ TEST_F(DynamicModuleTransportSocketTest, StartSpliceRejectsPendingBytes) {
   EXPECT_FALSE(splicing.started);
 }
 
+// A connection passes its own buffers to every read and write, so start_splice can check them from
+// either socket. A socket that has not seen them yet cannot show they are empty.
+TEST_F(DynamicModuleTransportSocketTest, StartSpliceRejectsBuffersItHasNotSeen) {
+  const envoy_dynamic_module_type_transport_socket_io_result idle = {
+      envoy_dynamic_module_type_transport_socket_post_io_action_KeepOpen, 0, false};
+  Buffer::OwnedImpl read_buffer;
+  Buffer::OwnedImpl write_buffer;
+  auto self = createStubSocket(idle);
+  auto peer = createStubSocket(idle, /*is_upstream=*/true);
+  self->setTransportSocketCallbacks(callbacks_);
+  peer->setTransportSocketCallbacks(callbacks_);
+  self->doRead(read_buffer);
+  self->doWrite(write_buffer, false);
+  peer->doRead(read_buffer);
+  EXPECT_CALL(io_handle_, fdDoNotUse()).Times(0);
+  EXPECT_FALSE(envoy_dynamic_module_callback_transport_socket_start_splice(self.get(), peer.get()));
+}
+
+// A byte another filter queued on a connection outside any read or write would stay in Envoy.
+TEST_F(DynamicModuleTransportSocketTest, StartSpliceRejectsBytesQueuedOnEitherConnection) {
+  const envoy_dynamic_module_type_transport_socket_io_result idle = {
+      envoy_dynamic_module_type_transport_socket_post_io_action_KeepOpen, 0, false};
+  Buffer::OwnedImpl self_read;
+  Buffer::OwnedImpl self_write;
+  Buffer::OwnedImpl peer_read;
+  Buffer::OwnedImpl peer_write;
+  auto self = createStubSocket(idle);
+  auto peer = createStubSocket(idle, /*is_upstream=*/true);
+  self->setTransportSocketCallbacks(callbacks_);
+  peer->setTransportSocketCallbacks(callbacks_);
+  self->doRead(self_read);
+  self->doWrite(self_write, false);
+  peer->doRead(peer_read);
+  peer->doWrite(peer_write, false);
+  EXPECT_CALL(io_handle_, fdDoNotUse()).Times(0);
+  for (Buffer::OwnedImpl* buffer : {&self_read, &self_write, &peer_read, &peer_write}) {
+    buffer->add("x");
+    EXPECT_FALSE(
+        envoy_dynamic_module_callback_transport_socket_start_splice(self.get(), peer.get()));
+    EXPECT_FALSE(
+        envoy_dynamic_module_callback_transport_socket_start_splice(peer.get(), self.get()));
+    buffer->drain(buffer->length());
+  }
+}
+
 // A pair that passes every check but cannot be prepared stays on the buffered path untouched.
 TEST_F(DynamicModuleTransportSocketTest, StartSpliceFallsBackWhenPrepareFails) {
-  auto self_socket = createSocket("passthrough");
-  auto peer_socket = createUpstreamSocket();
+  const envoy_dynamic_module_type_transport_socket_io_result idle = {
+      envoy_dynamic_module_type_transport_socket_post_io_action_KeepOpen, 0, false};
+  Buffer::OwnedImpl read_buffer;
+  Buffer::OwnedImpl write_buffer;
+  auto self_socket = createStubSocket(idle);
+  auto peer_socket = createStubSocket(idle, /*is_upstream=*/true);
+  self_socket->setTransportSocketCallbacks(callbacks_);
   peer_socket->setTransportSocketCallbacks(callbacks_);
-  auto* self = static_cast<DynamicModuleTransportSocket*>(self_socket.get());
-  auto* peer = static_cast<DynamicModuleTransportSocket*>(peer_socket.get());
+  for (DynamicModuleTransportSocket* socket : {self_socket.get(), peer_socket.get()}) {
+    socket->doRead(read_buffer);
+    socket->doWrite(write_buffer, false);
+  }
+  auto* self = self_socket.get();
+  auto* peer = peer_socket.get();
   // Both fds are read, so every guard passed, and an invalid fd then fails the non-blocking check.
   // The session asks for its teardown callback first.
   EXPECT_CALL(io_handle_, fdDoNotUse()).Times(2).WillRepeatedly(testing::Return(-1));

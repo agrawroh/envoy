@@ -47,12 +47,15 @@ void addWireBytes(StreamInfo::StreamInfo& stream_info, uint64_t bytes_received,
   }
 }
 
-// Whether a read or write running on the socket still holds bytes in its buffer.
+// Whether a byte may wait in the connection's read or write buffer. A module calls start_splice
+// from one socket's callback, where the peer's buffers are not the current ones, so this checks the
+// buffers the connection passed to the last doRead and doWrite. A socket that has not yet seen both
+// cannot show they are empty.
 bool hasPendingBytes(const DynamicModuleTransportSocket& socket) {
-  const Buffer::Instance* read_buffer = socket.currentReadBuffer();
-  const Buffer::Instance* write_buffer = socket.currentWriteBuffer();
-  return (read_buffer != nullptr && read_buffer->length() > 0) ||
-         (write_buffer != nullptr && write_buffer->length() > 0);
+  const Buffer::Instance* read_buffer = socket.connectionReadBuffer();
+  const Buffer::Instance* write_buffer = socket.connectionWriteBuffer();
+  return read_buffer == nullptr || write_buffer == nullptr || read_buffer->length() > 0 ||
+         write_buffer->length() > 0;
 }
 
 class SpliceSession;

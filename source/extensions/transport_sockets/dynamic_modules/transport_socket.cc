@@ -221,6 +221,7 @@ Network::IoResult DynamicModuleTransportSocket::doRead(Buffer::Instance& buffer)
   if (spliced_) {
     return {Network::PostIoAction::KeepOpen, 0, false};
   }
+  connection_read_buffer_ = &buffer;
   current_read_buffer_ = &buffer;
   auto result = config_->on_do_read_(this, in_module_socket_);
   current_read_buffer_ = nullptr;
@@ -234,6 +235,7 @@ Network::IoResult DynamicModuleTransportSocket::doWrite(Buffer::Instance& buffer
   if (spliced_) {
     return {Network::PostIoAction::KeepOpen, 0, false};
   }
+  connection_write_buffer_ = &buffer;
   current_write_buffer_ = &buffer;
   auto result = config_->on_do_write_(this, in_module_socket_, end_stream);
   current_write_buffer_ = nullptr;

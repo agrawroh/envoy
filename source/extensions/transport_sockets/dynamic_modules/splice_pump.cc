@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 
 #include "source/common/common/assert.h"
 #include "source/common/common/utility.h"
@@ -10,6 +11,7 @@
 #if defined(__linux__)
 #include <fcntl.h>
 #include <linux/tls.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -65,17 +67,20 @@ ControlAction classifyKtlsControlRecord(uint8_t record_type, const uint8_t* data
 
 namespace {
 constexpr uint8_t TlsRecordApplicationData = 23;
-// Requested pipe capacity. An unprivileged process cannot exceed fs.pipe-max-size, so a larger
-// request fails and the pipe keeps its default size.
+// The capacity a pipe grows to once it fills. An unprivileged process cannot exceed
+// fs.pipe-max-size, so a larger request fails and the pipe keeps its default size.
 constexpr size_t PipeCapacity = 1024 * 1024;
 // Upper bound on non-data kTLS records drained in one pass. A trusted upstream sends a handful of
 // NewSessionTickets, so a long run signals a misbehaving peer and the pump closes.
 constexpr int MaxControlRecordsPerPass = 1024;
-// Bytes read from the kTLS socket per recvmsg. TLS caps a record at 16384 bytes of plaintext, so a
-// larger read lets the kernel return several application data records in one call. Each kTLS
-// session holds this buffer for its lifetime.
-constexpr size_t DownloadReadSize = 64 * 1024;
 constexpr unsigned SpliceFlags = SPLICE_F_NONBLOCK | SPLICE_F_MOVE;
+
+// Whether a socket received bytes nobody read yet. A splice into a pipe that is full by its slots
+// fails with EAGAIN just like a splice from an empty socket, and this tells them apart.
+bool hasQueuedBytes(os_fd_t fd) {
+  int queued = 0;
+  return ::ioctl(fd, FIONREAD, &queued) == 0 && queued > 0;
+}
 
 // Counts the directions of fd with kTLS installed. Reading only the version and cipher header
 // leaves the keys in the kernel.
@@ -135,9 +140,6 @@ bool SplicePump::prepare(bool upstream_needs_ktls) {
   up_is_ktls_ = up_tls_directions == 2;
   // A kTLS download is read into download_buf_ and written straight to the downstream socket, so it
   // needs no u2d pipe.
-  if (up_is_ktls_) {
-    download_buf_.resize(DownloadReadSize);
-  }
   for (Pipe* pipe : {&u2d_, &d2u_}) {
     if (pipe == &u2d_ && up_is_ktls_) {
       continue;
@@ -153,18 +155,29 @@ bool SplicePump::prepare(bool upstream_needs_ktls) {
   return true;
 }
 
+bool SplicePump::grow(Pipe& pipe) {
+  if (pipe.grown) {
+    return false;
+  }
+  pipe.grown = true;
+  // The resize returns the page rounded size. A refusal leaves the pipe at its current size.
+  const int size = ::fcntl(pipe.write_fd, F_SETPIPE_SZ, static_cast<int>(PipeCapacity));
+  if (size <= 0 || static_cast<size_t>(size) <= pipe.capacity) {
+    return false;
+  }
+  pipe.capacity = static_cast<size_t>(size);
+  return true;
+}
+
 void SplicePump::arm() {
-  // Record the capacity the kernel actually gave each pipe. The resize returns the page rounded
-  // size on success, otherwise the pipe keeps its default size. Trusting the requested size while
-  // the real pipe is smaller would splice into a full pipe and read the EAGAIN as a drained socket.
+  // Record the capacity the kernel actually gave each pipe. Trusting a larger size than the real
+  // pipe has would splice into a full pipe and read the EAGAIN as a drained socket. A pipe starts
+  // at the default size and grows the first time it fills.
   for (Pipe* pipe : {&u2d_, &d2u_}) {
     if (pipe->write_fd < 0) {
       continue;
     }
-    int size = ::fcntl(pipe->write_fd, F_SETPIPE_SZ, static_cast<int>(PipeCapacity));
-    if (size <= 0) {
-      size = ::fcntl(pipe->write_fd, F_GETPIPE_SZ);
-    }
+    const int size = ::fcntl(pipe->write_fd, F_GETPIPE_SZ);
     RELEASE_ASSERT(size > 0, "splice pump could not read the size of a new pipe");
     pipe->capacity = static_cast<size_t>(size);
   }
@@ -250,7 +263,7 @@ void SplicePump::pump() {
     if (up_is_ktls_) {
       while (true) {
         while (down_writable && download_offset_ < download_len_) {
-          const ssize_t n = ::send(down_fd_, download_buf_.data() + download_offset_,
+          const ssize_t n = ::send(down_fd_, download_buf_.get() + download_offset_,
                                    download_len_ - download_offset_, MSG_DONTWAIT | MSG_NOSIGNAL);
           if (n > 0) {
             download_offset_ += static_cast<size_t>(n);
@@ -292,14 +305,21 @@ void SplicePump::pump() {
         if (n > 0) {
           u2d_.in_pipe += static_cast<size_t>(n);
           progress = true;
+          if (u2d_.in_pipe == u2d_.capacity) {
+            grow(u2d_);
+          }
         } else if (n == 0) {
           up_read_eof_ = true;
         } else if (errno == EINTR) {
           continue;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          // A full pipe also yields EAGAIN, so only an empty pipe proves the socket is drained.
+          // A full pipe also yields EAGAIN, so only an empty pipe proves the socket is drained. A
+          // pipe can be full by its slots before its bytes reach the capacity, so it grows when
+          // the socket still holds bytes.
           if (u2d_.in_pipe == 0) {
             up_readable_ = false;
+          } else if (hasQueuedBytes(up_fd_) && grow(u2d_)) {
+            continue;
           }
           break;
         } else {
@@ -336,14 +356,21 @@ void SplicePump::pump() {
       if (n > 0) {
         d2u_.in_pipe += static_cast<size_t>(n);
         progress = true;
+        if (d2u_.in_pipe == d2u_.capacity) {
+          grow(d2u_);
+        }
       } else if (n == 0) {
         down_read_eof_ = true;
       } else if (errno == EINTR) {
         continue;
       } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        // A full pipe also yields EAGAIN, so only an empty pipe proves the socket is drained.
+        // A full pipe also yields EAGAIN, so only an empty pipe proves the socket is drained. A
+        // pipe can be full by its slots before its bytes reach the capacity, so it grows when the
+        // socket still holds bytes.
         if (d2u_.in_pipe == 0) {
           down_readable_ = false;
+        } else if (hasQueuedBytes(down_fd_) && grow(d2u_)) {
+          continue;
         }
         break;
       } else {
@@ -358,10 +385,14 @@ void SplicePump::pump() {
 }
 
 SplicePump::ReadResult SplicePump::readUpstreamRecord() {
+  if (download_buf_ == nullptr) {
+    // Uninitialized, since recvmsg writes before anything reads it.
+    download_buf_ = std::make_unique_for_overwrite<uint8_t[]>(DownloadBufferSize);
+  }
   alignas(struct cmsghdr) char cmsg_space[CMSG_SPACE(sizeof(uint8_t))];
   struct iovec iov;
-  iov.iov_base = download_buf_.data();
-  iov.iov_len = download_buf_.size();
+  iov.iov_base = download_buf_.get();
+  iov.iov_len = DownloadBufferSize;
   struct msghdr msg;
   std::memset(&msg, 0, sizeof(msg));
   msg.msg_iov = &iov;
@@ -376,7 +407,10 @@ SplicePump::ReadResult SplicePump::readUpstreamRecord() {
 
   if (n < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      // The pump reads only once the last download is written, so nothing waits in the buffer and
+      // an idle session gives it back.
       up_readable_ = false;
+      download_buf_.reset();
       return ReadResult::Stop;
     }
     ENVOY_LOG(debug, "splice pump kTLS recvmsg error, {}", errorDetails(errno));
@@ -408,7 +442,7 @@ SplicePump::ReadResult SplicePump::readUpstreamRecord() {
     return ReadResult::Data;
   }
 
-  switch (classifyKtlsControlRecord(record_type, download_buf_.data(), static_cast<size_t>(n))) {
+  switch (classifyKtlsControlRecord(record_type, download_buf_.get(), static_cast<size_t>(n))) {
   case ControlAction::Retry:
     return ReadResult::Control;
   case ControlAction::Eof:
