@@ -1,5 +1,7 @@
 #include "source/extensions/clusters/dynamic_modules/cluster.h"
 
+#include <thread>
+
 #include "envoy/config/core/v3/base.pb.h"
 #include "envoy/config/endpoint/v3/endpoint_components.pb.h"
 #include "envoy/network/connection.h"
@@ -446,11 +448,15 @@ void DynamicModuleCluster::runOnAllWorkers(uint64_t event_id) {
 
   ensureWorkerSlot();
 
-  // weak_from_this lets workers racing cluster destruction skip safely. The lambda also filters
-  // out the main thread because Envoy's TLS engine fires runOnAllThreads on main too.
+  // weak_from_this lets workers racing cluster destruction skip safely. The thread local engine
+  // also runs the callback inline on the calling thread, which the ABI entry and cluster creation
+  // keep to the main thread, so skip the thread that matches the caller's id. A thread id compare
+  // needs no lock. isThreadSafe() cannot replace it, since it is true on every thread before the
+  // main dispatcher runs.
   auto weak_self = weak_from_this();
-  worker_slot_->runOnAllThreads([weak_self, event_id](OptRef<WorkerSlotData>) {
-    if (Thread::MainThread::isMainOrTestThread()) {
+  const std::thread::id caller_thread = std::this_thread::get_id();
+  worker_slot_->runOnAllThreads([weak_self, event_id, caller_thread](OptRef<WorkerSlotData>) {
+    if (std::this_thread::get_id() == caller_thread) {
       return;
     }
     auto self = weak_self.lock();

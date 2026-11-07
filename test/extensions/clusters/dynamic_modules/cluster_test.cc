@@ -2165,21 +2165,49 @@ TEST_F(DynamicModuleClusterTest, RunOnAllWorkersRunsOnWorkerThreads) {
 
   // Before the main loop runs, the main dispatcher reports every thread as thread safe.
   ON_CALL(server_context_.dispatcher_, isThreadSafe()).WillByDefault(testing::Return(true));
-  // The thread local mock runs callbacks on the test thread. Run them on a worker first.
+  using GetCountFn = size_t (*)();
+  using GetEventIdFn = uint64_t (*)();
+  const auto get_count = module_handle.value()->getFunctionPointer<GetCountFn>(
+      "cluster_run_on_all_workers_test_get_count");
+  ASSERT_OK(get_count);
+  // The thread local mock runs callbacks on the test thread, which started the fan-out. Run them
+  // on a worker first, so each copy is counted on its own thread.
   EXPECT_CALL(server_context_.thread_local_, runOnAllThreads(_))
-      .WillOnce([](std::function<void()> cb) {
+      .WillOnce([&get_count](std::function<void()> cb) {
         std::thread worker(cb);
         worker.join();
+        EXPECT_EQ(1, (*get_count.value())());
         cb();
+        EXPECT_EQ(1, (*get_count.value())());
       });
   envoy_dynamic_module_callback_cluster_run_on_all_workers(cluster.get(), /*event_id=*/42);
 
-  using GetCountFn = size_t (*)();
-  using GetEventIdFn = uint64_t (*)();
-  EXPECT_EQ(1, (*module_handle.value()->getFunctionPointer<GetCountFn>(
-                   "cluster_run_on_all_workers_test_get_count"))());
   EXPECT_EQ(42, (*module_handle.value()->getFunctionPointer<GetEventIdFn>(
                     "cluster_run_on_all_workers_test_get_last_event_id"))());
+}
+
+// Test that a fan-out started off the main thread is refused. The worker event skips the calling
+// thread, so a worker that started one would otherwise never see its own copy.
+TEST_F(DynamicModuleClusterTest, RunOnAllWorkersOffMainThreadFailsClosed) {
+  auto module_handle = Envoy::Extensions::DynamicModules::newDynamicModule(
+      Envoy::Extensions::DynamicModules::testSharedObjectPath("cluster_run_on_all_workers", "c"),
+      /*do_not_close=*/true);
+  ASSERT_OK(module_handle);
+  auto result = createCluster(makeYamlConfig("cluster_run_on_all_workers"));
+  ASSERT_OK(result);
+  auto cluster = std::dynamic_pointer_cast<DynamicModuleCluster>(result->first);
+  ASSERT_NE(nullptr, cluster);
+
+  EXPECT_CALL(server_context_.thread_local_, runOnAllThreads(_)).Times(0);
+  void* cluster_ptr = cluster.get();
+  EXPECT_ENVOY_BUG(
+      {
+        std::thread t([&] {
+          envoy_dynamic_module_callback_cluster_run_on_all_workers(cluster_ptr, /*event_id=*/7);
+        });
+        t.join();
+      },
+      "envoy_dynamic_module_callback_cluster_run_on_all_workers must be called on the main thread");
 }
 
 // Test that run_on_all_workers and worker_slot_set do not reach the workers once thread local

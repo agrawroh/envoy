@@ -1,12 +1,12 @@
 #include "source/extensions/bootstrap/dynamic_modules/extension_config.h"
 
 #include <algorithm>
+#include <thread>
 #include <vector>
 
 #include "envoy/server/options.h"
 
 #include "source/common/common/assert.h"
-#include "source/common/common/thread.h"
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/strings/str_cat.h"
@@ -240,10 +240,13 @@ bool DynamicModuleBootstrapExtensionConfig::runOnAllWorkers(uint64_t event_id) {
         [](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr { return nullptr; });
   }
   std::weak_ptr<DynamicModuleBootstrapExtensionConfig> weak_config = weak_from_this();
+  const std::thread::id caller_thread = std::this_thread::get_id();
   worker_slot_->runOnAllThreads(
-      [weak_config, event_id](OptRef<ThreadLocal::ThreadLocalObject>) {
-        // The thread local engine runs this on the main thread too.
-        if (Thread::MainThread::isMainOrTestThread()) {
+      [weak_config, event_id, caller_thread](OptRef<ThreadLocal::ThreadLocalObject>) {
+        // The thread local engine also runs this inline on the calling thread, which the ABI entry
+        // keeps to the main thread, so skip the thread that matches the caller's id. A thread id
+        // compare needs no lock.
+        if (std::this_thread::get_id() == caller_thread) {
           return;
         }
         DynamicModuleBootstrapExtensionConfigSharedPtr config = weak_config.lock();
