@@ -2092,6 +2092,17 @@ WEAK_STUB(envoy_dynamic_module_type_route_specifier_route_kind,
 WEAK_STUB(bool, envoy_dynamic_module_callback_route_specifier_config_has_built_route_cache, false,
           envoy_dynamic_module_type_route_specifier_config_envoy_ptr)
 
+WEAK_STUB_VOID(envoy_dynamic_module_callback_route_specifier_config_answers_virtual_clusters,
+               envoy_dynamic_module_type_route_specifier_config_envoy_ptr)
+
+WEAK_STUB(size_t,
+          envoy_dynamic_module_callback_route_specifier_virtual_cluster_get_request_headers_size, 0,
+          envoy_dynamic_module_type_route_specifier_virtual_cluster_context_envoy_ptr)
+
+WEAK_STUB(bool, envoy_dynamic_module_callback_route_specifier_virtual_cluster_get_request_headers,
+          false, envoy_dynamic_module_type_route_specifier_virtual_cluster_context_envoy_ptr,
+          envoy_dynamic_module_type_envoy_http_header*)
+
 WEAK_STUB(bool, envoy_dynamic_module_callback_route_specifier_config_has_route_override, false,
           envoy_dynamic_module_type_route_specifier_config_envoy_ptr,
           envoy_dynamic_module_type_module_buffer)

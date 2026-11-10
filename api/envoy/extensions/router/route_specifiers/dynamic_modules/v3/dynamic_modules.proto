@@ -60,6 +60,25 @@ enum FailurePolicy {
   CONTINUE_MATCHING = 3;
 }
 
+// How the router learns the virtual cluster of a request that the module answers.
+enum RouterAnswer {
+  // The module selects the virtual cluster with set_virtual_cluster when route matching resolves
+  // the route. The selection is taken from the request headers at that point, and it is the
+  // default.
+  ROUTER_ANSWER_NONE = 0;
+
+  // The router asks the module for the virtual cluster of each request, with the headers it
+  // forwards. This answers every route the route specifier builds, and set_virtual_cluster is
+  // refused. A route the specifier passes through is not answered.
+  ROUTER_ANSWER_BUILT_ROUTES = 1;
+
+  // The router asks the module for the virtual cluster of each request, with the headers it
+  // forwards, for every route entry the route specifier is handed. The module is not called when
+  // route matching resolves, and set_virtual_cluster is refused. A route without a route entry,
+  // such as a direct response or a redirect, is not answered.
+  ROUTER_ANSWER_EVERY_ROUTE_ENTRY = 2;
+}
+
 // A named route the module may select for a request.
 //
 // A template is built and validated once, when the specifier is configured, so an invalid template
@@ -179,6 +198,7 @@ message BuiltRouteCache {
 // configuration loads rather than on the request path. A selected virtual cluster uses the
 // statistics of the virtual cluster of the same name on the virtual host, with the same names and
 // tags even when the virtual host does not configure that name.
+// [#next-free-field: 6]
 message VirtualClusterOverride {
   // The :ref:`name <envoy_v3_api_field_config.route.v3.VirtualHost.name>` of the virtual host whose
   // statistics the selected virtual clusters use. The statistics of every declared name are created
@@ -206,6 +226,12 @@ message VirtualClusterOverride {
   // selected a virtual cluster for, with a chance of one in this many, so that the selection is
   // still compared with it. Zero disables the comparison. If not specified, defaults to 1024.
   google.protobuf.UInt32Value verify_one_in = 4;
+
+  // How the router obtains the virtual cluster of a request. A value other than
+  // ``ROUTER_ANSWER_NONE`` requires the module to opt in from its configuration constructor and to
+  // export the hook that answers the router. Envoy refuses the configuration otherwise. If not
+  // specified, defaults to ``ROUTER_ANSWER_NONE``.
+  RouterAnswer router_answer = 5 [(validate.rules).enum = {defined_only: true}];
 }
 
 // Configuration for the dynamic modules route specifier.

@@ -1325,6 +1325,75 @@ pub trait RouteSpecifierConfig: Send + Sync {
   fn on_user_data_discard(&self, user_data: u64) {
     let _ = user_data;
   }
+
+  /// Answers the virtual cluster of a request, which the router asks for once per request with the
+  /// request headers it forwards, before it finalizes them.
+  ///
+  /// It is called only when the `router_answer` of the virtual cluster override is not `NONE`, and
+  /// only if the module declared that it answers from
+  /// [`EnvoyRouteSpecifierConfig::config_answers_virtual_clusters`] during configuration. Return
+  /// the name of a declared virtual cluster, or `None` to select none. The name is read by Envoy
+  /// before the router calls the module again, so it may be borrowed from the configuration. It
+  /// runs on every worker thread concurrently, so it must not mutate the configuration and must
+  /// keep scratch state per thread. A panic selects none. The default selects none.
+  fn virtual_cluster<'a>(&'a self, ctx: &VirtualClusterContext) -> Option<&'a str> {
+    let _ = ctx;
+    None
+  }
+}
+
+/// Context of one router answer, which [`RouteSpecifierConfig::virtual_cluster`] reads the request
+/// headers from.
+///
+/// It is valid only for the duration of that call and must not be stored.
+pub struct VirtualClusterContext {
+  envoy_ptr: *mut c_void,
+}
+
+impl VirtualClusterContext {
+  /// Create a new VirtualClusterContext. Used internally by the SDK.
+  ///
+  /// # Safety
+  ///
+  /// `envoy_ptr` must be the router answer context Envoy passed to
+  /// [`envoy_dynamic_module_on_route_specifier_virtual_cluster`], and the value must not outlive
+  /// that call.
+  #[doc(hidden)]
+  pub unsafe fn new(envoy_ptr: *mut c_void) -> Self {
+    Self { envoy_ptr }
+  }
+
+  /// Get the number of request headers.
+  pub fn get_request_headers_count(&self) -> usize {
+    unsafe {
+      abi::envoy_dynamic_module_callback_route_specifier_virtual_cluster_get_request_headers_size(
+        self.envoy_ptr,
+      )
+    }
+  }
+
+  /// Fills the caller owned buffer with the request headers and returns a [`HeaderView`] over it.
+  ///
+  /// The buffer is reused across calls, so a module that answers many requests allocates once.
+  pub fn get_request_headers_into<'a>(
+    &'a self,
+    buf: &'a mut Vec<MaybeUninit<abi::envoy_dynamic_module_type_envoy_http_header>>,
+  ) -> Result<HeaderView<'a>, FillError> {
+    crate::utility::fill_headers(
+      buf,
+      || self.get_request_headers_count(),
+      |headers| unsafe {
+        abi::envoy_dynamic_module_callback_route_specifier_virtual_cluster_get_request_headers(
+          self.envoy_ptr,
+          headers,
+        )
+      },
+    )
+    .map(|_| ())
+    .ok_or(FillError::Unavailable)?;
+    let headers: &'a [MaybeUninit<abi::envoy_dynamic_module_type_envoy_http_header>] = buf;
+    Ok(HeaderView { headers })
+  }
 }
 
 /// Envoy-side interface for the route specifier dynamic module.
@@ -1365,6 +1434,11 @@ pub trait EnvoyRouteSpecifierConfig: Send + Sync {
   /// Whether the configuration sets `built_route_cache`, so that a module whose routes rely on the
   /// cache can reject a configuration without it.
   fn has_built_route_cache(&self) -> bool;
+
+  /// Declares that the module answers the virtual cluster of each request at the router, so that a
+  /// `router_answer` other than `NONE` is accepted. Call it from the configuration constructor
+  /// only.
+  fn config_answers_virtual_clusters(&self);
 
   /// Define a new counter with the given name and no labels.
   fn define_counter(
@@ -1570,6 +1644,12 @@ impl EnvoyRouteSpecifierConfig for EnvoyRouteSpecifierConfigImpl {
   fn has_built_route_cache(&self) -> bool {
     unsafe {
       abi::envoy_dynamic_module_callback_route_specifier_config_has_built_route_cache(self.raw)
+    }
+  }
+
+  fn config_answers_virtual_clusters(&self) {
+    unsafe {
+      abi::envoy_dynamic_module_callback_route_specifier_config_answers_virtual_clusters(self.raw)
     }
   }
 
@@ -1967,4 +2047,28 @@ ffi_export! {
     let config = &*(config_ptr as *const Box<dyn RouteSpecifierConfig>);
     config.on_user_data_discard(user_data);
   }
+}
+
+ffi_export! {
+  /// # Safety
+  ///
+  /// This is an FFI function called by Envoy. All pointer arguments must be valid as guaranteed
+  /// by the Envoy dynamic module ABI.
+  unsafe fn envoy_dynamic_module_on_route_specifier_virtual_cluster(
+    config_ptr: abi::envoy_dynamic_module_type_route_specifier_config_module_ptr,
+    context_envoy_ptr: *mut c_void,
+    virtual_cluster_name: *mut abi::envoy_dynamic_module_type_module_buffer,
+  ) -> bool {
+    let config = &*(config_ptr as *const Box<dyn RouteSpecifierConfig>);
+    let ctx = unsafe { VirtualClusterContext::new(context_envoy_ptr) };
+    match config.virtual_cluster(&ctx) {
+      Some(name) => {
+        unsafe { *virtual_cluster_name = crate::str_to_module_buffer(name) };
+        true
+      },
+      None => false,
+    }
+  }
+  // A panic must not select a virtual cluster, so it selects none.
+  on_panic = false
 }

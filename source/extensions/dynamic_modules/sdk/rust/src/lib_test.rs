@@ -760,10 +760,19 @@ static LISTENER_FILTER_GAUGES: std::sync::Mutex<Vec<ListenerFilterMetricEntry>> 
 static LISTENER_FILTER_HISTOGRAMS: std::sync::Mutex<Vec<ListenerFilterMetricEntry>> =
   std::sync::Mutex::new(Vec::new());
 
-fn reset_listener_filter_metrics() {
+// The tests of the listener filter metrics share the registries above, and the test harness runs
+// them in parallel. Each test holds this guard from its reset to its end, so one test cannot clear
+// the registries another test is reading.
+static LISTENER_FILTER_METRICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn reset_listener_filter_metrics() -> std::sync::MutexGuard<'static, ()> {
+  let guard = LISTENER_FILTER_METRICS_TEST_LOCK
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner());
   LISTENER_FILTER_COUNTERS.lock().unwrap().clear();
   LISTENER_FILTER_GAUGES.lock().unwrap().clear();
   LISTENER_FILTER_HISTOGRAMS.lock().unwrap().clear();
+  guard
 }
 
 #[no_mangle]
@@ -914,7 +923,7 @@ pub extern "C" fn envoy_dynamic_module_callback_listener_filter_record_histogram
 
 #[test]
 fn test_listener_filter_config_define_and_increment_counter() {
-  reset_listener_filter_metrics();
+  let _metrics_guard = reset_listener_filter_metrics();
   let mut config = EnvoyListenerFilterConfigImpl {
     raw: std::ptr::null_mut(),
   };
@@ -956,7 +965,7 @@ fn test_listener_filter_config_define_and_increment_counter() {
 
 #[test]
 fn test_listener_filter_config_define_multiple_counters() {
-  reset_listener_filter_metrics();
+  let _metrics_guard = reset_listener_filter_metrics();
   let mut config = EnvoyListenerFilterConfigImpl {
     raw: std::ptr::null_mut(),
   };
@@ -978,7 +987,7 @@ fn test_listener_filter_config_define_multiple_counters() {
 
 #[test]
 fn test_listener_filter_counter_invalid_id() {
-  reset_listener_filter_metrics();
+  let _metrics_guard = reset_listener_filter_metrics();
   let filter = EnvoyListenerFilterImpl {
     raw: std::ptr::null_mut(),
   };
@@ -1014,7 +1023,7 @@ fn test_listener_get_dynamic_metadata_string_none() {
 
 #[test]
 fn test_listener_filter_config_define_and_manipulate_gauge() {
-  reset_listener_filter_metrics();
+  let _metrics_guard = reset_listener_filter_metrics();
   let mut config = EnvoyListenerFilterConfigImpl {
     raw: std::ptr::null_mut(),
   };
@@ -1056,7 +1065,7 @@ fn test_listener_filter_config_define_and_manipulate_gauge() {
 
 #[test]
 fn test_listener_filter_gauge_invalid_id() {
-  reset_listener_filter_metrics();
+  let _metrics_guard = reset_listener_filter_metrics();
   let filter = EnvoyListenerFilterImpl {
     raw: std::ptr::null_mut(),
   };
@@ -1069,7 +1078,7 @@ fn test_listener_filter_gauge_invalid_id() {
 
 #[test]
 fn test_listener_filter_gauge_decrease_saturates_at_zero() {
-  reset_listener_filter_metrics();
+  let _metrics_guard = reset_listener_filter_metrics();
   let mut config = EnvoyListenerFilterConfigImpl {
     raw: std::ptr::null_mut(),
   };
@@ -1091,7 +1100,7 @@ fn test_listener_filter_gauge_decrease_saturates_at_zero() {
 
 #[test]
 fn test_listener_filter_config_define_and_record_histogram() {
-  reset_listener_filter_metrics();
+  let _metrics_guard = reset_listener_filter_metrics();
   let mut config = EnvoyListenerFilterConfigImpl {
     raw: std::ptr::null_mut(),
   };
@@ -1119,7 +1128,7 @@ fn test_listener_filter_config_define_and_record_histogram() {
 
 #[test]
 fn test_listener_filter_histogram_invalid_id() {
-  reset_listener_filter_metrics();
+  let _metrics_guard = reset_listener_filter_metrics();
   let filter = EnvoyListenerFilterImpl {
     raw: std::ptr::null_mut(),
   };
@@ -1131,7 +1140,7 @@ fn test_listener_filter_histogram_invalid_id() {
 
 #[test]
 fn test_listener_filter_define_all_metric_types() {
-  reset_listener_filter_metrics();
+  let _metrics_guard = reset_listener_filter_metrics();
   let mut config = EnvoyListenerFilterConfigImpl {
     raw: std::ptr::null_mut(),
   };
@@ -13116,6 +13125,27 @@ pub extern "C" fn envoy_dynamic_module_callback_route_specifier_config_has_built
 }
 
 #[no_mangle]
+pub extern "C" fn envoy_dynamic_module_callback_route_specifier_config_answers_virtual_clusters(
+  _config_envoy_ptr: abi::envoy_dynamic_module_type_route_specifier_config_envoy_ptr,
+) {
+}
+
+#[no_mangle]
+pub extern "C" fn envoy_dynamic_module_callback_route_specifier_virtual_cluster_get_request_headers_size(
+  _context_envoy_ptr: *mut std::ffi::c_void,
+) -> usize {
+  0
+}
+
+#[no_mangle]
+pub extern "C" fn envoy_dynamic_module_callback_route_specifier_virtual_cluster_get_request_headers(
+  _context_envoy_ptr: *mut std::ffi::c_void,
+  _result_headers: *mut abi::envoy_dynamic_module_type_envoy_http_header,
+) -> bool {
+  true
+}
+
+#[no_mangle]
 pub extern "C" fn envoy_dynamic_module_callback_route_specifier_config_register_route_template(
   _config_envoy_ptr: abi::envoy_dynamic_module_type_route_specifier_config_envoy_ptr,
   template_id: abi::envoy_dynamic_module_type_module_buffer,
@@ -14639,6 +14669,190 @@ fn test_envoy_route_specifier_config_impl() {
     .record_histogram_value_vec(histogram_vec, &["a"], 1)
     .is_ok());
 
+  unsafe {
+    route_specifier::envoy_dynamic_module_on_route_specifier_config_destroy(config_ptr);
+  }
+}
+
+#[test]
+fn test_envoy_dynamic_module_on_route_specifier_virtual_cluster() {
+  // Drives the answer hook through the FFI entry point, which writes the name it returns into the
+  // buffer Envoy passes and reports whether it selects one. The names come from the configuration,
+  // so the answer borrows from it.
+  struct AnswerConfig {
+    name: Option<&'static str>,
+  }
+  impl route_specifier::RouteSpecifierConfig for AnswerConfig {
+    fn on_route(
+      &self,
+      _ctx: &mut route_specifier::RouteSpecifierContext,
+    ) -> route_specifier::OnRouteStatus {
+      route_specifier::OnRouteStatus::Continue
+    }
+    fn virtual_cluster<'a>(
+      &'a self,
+      _ctx: &route_specifier::VirtualClusterContext,
+    ) -> Option<&'a str> {
+      self.name
+    }
+  }
+  let new_fn: NewRouteSpecifierConfigFunction = |_, _, _| {
+    Some(Box::new(AnswerConfig {
+      name: Some("rides"),
+    }))
+  };
+  let config_ptr = route_specifier::envoy_dynamic_module_on_route_specifier_config_new_impl(
+    std::ptr::null_mut(),
+    "test_route_specifier",
+    b"",
+    &new_fn,
+  );
+  assert!(!config_ptr.is_null());
+  let mut name = abi::envoy_dynamic_module_type_module_buffer {
+    ptr: std::ptr::null(),
+    length: 0,
+  };
+  let answered = unsafe {
+    route_specifier::envoy_dynamic_module_on_route_specifier_virtual_cluster(
+      config_ptr,
+      std::ptr::null_mut(),
+      &mut name,
+    )
+  };
+  assert!(answered);
+  assert_eq!(b"rides".as_slice(), unsafe {
+    std::slice::from_raw_parts(name.ptr as *const u8, name.length)
+  });
+  unsafe {
+    route_specifier::envoy_dynamic_module_on_route_specifier_config_destroy(config_ptr);
+  }
+}
+
+#[test]
+fn test_envoy_dynamic_module_on_route_specifier_virtual_cluster_panic_returns_false() {
+  // A hook that panics is caught at the boundary with on_panic = false, which returns false and
+  // leaves the name the router reads unwritten, so Envoy selects no virtual cluster.
+  struct PanicConfig;
+  impl route_specifier::RouteSpecifierConfig for PanicConfig {
+    fn on_route(
+      &self,
+      _ctx: &mut route_specifier::RouteSpecifierContext,
+    ) -> route_specifier::OnRouteStatus {
+      route_specifier::OnRouteStatus::Continue
+    }
+    fn virtual_cluster<'a>(
+      &'a self,
+      _ctx: &route_specifier::VirtualClusterContext,
+    ) -> Option<&'a str> {
+      panic!("virtual cluster hook panicked");
+    }
+  }
+  let new_fn: NewRouteSpecifierConfigFunction = |_, _, _| Some(Box::new(PanicConfig));
+  let config_ptr = route_specifier::envoy_dynamic_module_on_route_specifier_config_new_impl(
+    std::ptr::null_mut(),
+    "test_route_specifier",
+    b"",
+    &new_fn,
+  );
+  assert!(!config_ptr.is_null());
+  let mut name = abi::envoy_dynamic_module_type_module_buffer {
+    ptr: std::ptr::null(),
+    length: 0,
+  };
+  let answered = unsafe {
+    route_specifier::envoy_dynamic_module_on_route_specifier_virtual_cluster(
+      config_ptr,
+      std::ptr::null_mut(),
+      &mut name,
+    )
+  };
+  assert!(!answered);
+  assert!(name.ptr.is_null());
+  assert_eq!(0, name.length);
+  unsafe {
+    route_specifier::envoy_dynamic_module_on_route_specifier_config_destroy(config_ptr);
+  }
+}
+
+#[test]
+fn test_envoy_dynamic_module_on_route_specifier_virtual_cluster_none_returns_false() {
+  // A hook that names no virtual cluster returns false and leaves the name unwritten, which Envoy
+  // counts as none.
+  struct NoneConfig;
+  impl route_specifier::RouteSpecifierConfig for NoneConfig {
+    fn on_route(
+      &self,
+      _ctx: &mut route_specifier::RouteSpecifierContext,
+    ) -> route_specifier::OnRouteStatus {
+      route_specifier::OnRouteStatus::Continue
+    }
+    fn virtual_cluster<'a>(
+      &'a self,
+      _ctx: &route_specifier::VirtualClusterContext,
+    ) -> Option<&'a str> {
+      None
+    }
+  }
+  let new_fn: NewRouteSpecifierConfigFunction = |_, _, _| Some(Box::new(NoneConfig));
+  let config_ptr = route_specifier::envoy_dynamic_module_on_route_specifier_config_new_impl(
+    std::ptr::null_mut(),
+    "test_route_specifier",
+    b"",
+    &new_fn,
+  );
+  assert!(!config_ptr.is_null());
+  let mut name = abi::envoy_dynamic_module_type_module_buffer {
+    ptr: std::ptr::null(),
+    length: 0,
+  };
+  let answered = unsafe {
+    route_specifier::envoy_dynamic_module_on_route_specifier_virtual_cluster(
+      config_ptr,
+      std::ptr::null_mut(),
+      &mut name,
+    )
+  };
+  assert!(!answered);
+  assert!(name.ptr.is_null());
+  unsafe {
+    route_specifier::envoy_dynamic_module_on_route_specifier_config_destroy(config_ptr);
+  }
+}
+
+#[test]
+fn test_envoy_dynamic_module_on_route_specifier_virtual_cluster_default_returns_false() {
+  // A config that does not override the hook takes the trait default, which names no virtual
+  // cluster, so the export returns false and leaves the name unwritten.
+  struct DefaultConfig;
+  impl route_specifier::RouteSpecifierConfig for DefaultConfig {
+    fn on_route(
+      &self,
+      _ctx: &mut route_specifier::RouteSpecifierContext,
+    ) -> route_specifier::OnRouteStatus {
+      route_specifier::OnRouteStatus::Continue
+    }
+  }
+  let new_fn: NewRouteSpecifierConfigFunction = |_, _, _| Some(Box::new(DefaultConfig));
+  let config_ptr = route_specifier::envoy_dynamic_module_on_route_specifier_config_new_impl(
+    std::ptr::null_mut(),
+    "test_route_specifier",
+    b"",
+    &new_fn,
+  );
+  assert!(!config_ptr.is_null());
+  let mut name = abi::envoy_dynamic_module_type_module_buffer {
+    ptr: std::ptr::null(),
+    length: 0,
+  };
+  let answered = unsafe {
+    route_specifier::envoy_dynamic_module_on_route_specifier_virtual_cluster(
+      config_ptr,
+      std::ptr::null_mut(),
+      &mut name,
+    )
+  };
+  assert!(!answered);
+  assert!(name.ptr.is_null());
   unsafe {
     route_specifier::envoy_dynamic_module_on_route_specifier_config_destroy(config_ptr);
   }

@@ -452,6 +452,22 @@ envoy_cc_test_library(
 )
 
 envoy_cc_test_library(
+    name = "set_router_answer_header_filter_lib",
+    srcs = [
+        "set_router_answer_header_filter.cc",
+    ],
+    deps = [
+        ":common_lib",
+        ":test_filters_proto_cc_proto",
+        "//envoy/http:filter_interface",
+        "//envoy/registry",
+        "//envoy/server:filter_config_interface",
+        "//source/extensions/filters/http/common:pass_through_filter_lib",
+        "//test/extensions/filters/http/common:empty_http_filter_config_lib",
+    ],
+)
+
+envoy_cc_test_library(
     name = "refresh_route_cluster_filter_lib",
     srcs = [
         "refresh_route_cluster_filter.cc",

@@ -1,3 +1,4 @@
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -2366,7 +2367,8 @@ std::string virtualClusterOverrideYaml(absl::string_view fields = "",
 std::string
 virtualClusterConfigYaml(absl::string_view specifier_fields,
                          absl::string_view virtual_clusters = RidesAndTripsVirtualClusters,
-                         absl::string_view prefix = "/") {
+                         absl::string_view prefix = "/",
+                         absl::string_view module_name = "route_specifier_virtual_cluster") {
   return fmt::format(R"EOF(
 name: test_route_config
 virtual_hosts:
@@ -2380,7 +2382,7 @@ virtual_hosts:
     typed_config:
       "@type": type.googleapis.com/envoy.extensions.router.route_specifiers.dynamic_modules.v3.DynamicModuleRouteSpecifier
       dynamic_module_config:
-        name: route_specifier_virtual_cluster
+        name: {}
         do_not_close: true
       specifier_name: test_route_specifier
       stat_prefix: test
@@ -2395,7 +2397,7 @@ virtual_hosts:
           match: {{prefix: "/"}}
           route: {{cluster: rerouted_cluster}}
 {})EOF",
-                     prefix, virtual_clusters, specifier_fields);
+                     prefix, virtual_clusters, module_name, specifier_fields);
 }
 
 class DynamicModuleVirtualClusterTest : public DynamicModuleRouteSpecifierTest {
@@ -3104,7 +3106,7 @@ TEST_F(DynamicModuleRouteSpecifierTest,
                                                  std::move(module.value()), factory_context,
                                                  DefaultMetricsNamespace);
   testing::StrictMock<Envoy::Router::MockVirtualHost> base;
-  const VirtualClusterSelectingVirtualHost host(base, config, nullptr);
+  const VirtualClusterSelectingVirtualHost host(base, config, VirtualClusterAnswer{nullptr});
 
   EXPECT_CALL(base, corsPolicy()).WillOnce(testing::Return(&base.cors_policy_));
   EXPECT_EQ(&base.cors_policy_, host.corsPolicy());
@@ -3158,9 +3160,11 @@ TEST_F(DynamicModuleRouteSpecifierTest, SelectionConsultsTheVirtualHostOnlyToCom
   const Envoy::Router::VirtualCluster* matched = &base.virtual_cluster_;
   // The test printer of an unexpected lookup only prints a header map of this type.
   const Http::RequestHeaderMapPtr headers = Http::RequestHeaderMapImpl::create();
-  const VirtualClusterSelectingVirtualHost preferred(base, *configs[0], matched);
-  const VirtualClusterSelectingVirtualHost compared(base, *configs[1], matched);
-  const VirtualClusterSelectingVirtualHost none(base, *configs[0], nullptr);
+  const VirtualClusterSelectingVirtualHost preferred(base, *configs[0],
+                                                     VirtualClusterAnswer{matched});
+  const VirtualClusterSelectingVirtualHost compared(base, *configs[1],
+                                                    VirtualClusterAnswer{matched});
+  const VirtualClusterSelectingVirtualHost none(base, *configs[0], VirtualClusterAnswer{nullptr});
 
   EXPECT_CALL(context_.api_.random_, random()).WillOnce(testing::Return(1));
   EXPECT_EQ(matched, preferred.virtualCluster(*headers));
@@ -3187,17 +3191,400 @@ TEST_F(DynamicModuleRouteSpecifierTest, SelectionConsultsTheVirtualHostOnlyToCom
         .value();
   };
   const VirtualClusterSelectingVirtualHost compared_after_preferred(preferred, *configs[1],
-                                                                    matched);
+                                                                    VirtualClusterAnswer{matched});
   EXPECT_CALL(context_.api_.random_, random()).WillOnce(testing::Return(1));
   EXPECT_EQ(matched, compared_after_preferred.virtualCluster(*headers));
   EXPECT_EQ(2, counter("preferred", "virtual_cluster_selected"));
   EXPECT_EQ(2, counter("compared", "virtual_cluster_agree"));
   testing::Mock::VerifyAndClearExpectations(&context_.api_.random_);
-  const VirtualClusterSelectingVirtualHost preferred_after_compared(compared, *configs[0], matched);
+  const VirtualClusterSelectingVirtualHost preferred_after_compared(compared, *configs[0],
+                                                                    VirtualClusterAnswer{matched});
   EXPECT_CALL(context_.api_.random_, random()).WillOnce(testing::Return(1));
   EXPECT_EQ(matched, preferred_after_compared.virtualCluster(*headers));
   EXPECT_EQ(3, counter("preferred", "virtual_cluster_selected"));
   EXPECT_EQ(2, counter("compared", "virtual_cluster_agree"));
+}
+
+// A router answer is asked for each request at the router, from the headers the router forwards,
+// and the module is not called at route matching under EVERY_ROUTE_ENTRY. The module opts in and
+// names the x-router-virtual-cluster header, so each test chooses the answer with that header.
+class DynamicModuleRouterAnswerTest : public DynamicModuleRouteSpecifierTest {
+public:
+  void SetUp() override {
+    auto module = Extensions::DynamicModules::newDynamicModule(
+        Extensions::DynamicModules::testSharedObjectPath("route_specifier_router_answer", "c"),
+        /*do_not_close=*/true);
+    ASSERT_TRUE(module.ok());
+    module_ = std::move(module.value());
+    // The module keeps its counts for the whole process, so each test counts from here.
+    on_route_base_ = moduleValue("getOnRouteCount");
+    answer_base_ = moduleValue("getRouterAnswerCount");
+    // A preferred selection is compared with the virtual host only on a sample, so no sample is
+    // drawn here.
+    ON_CALL(context_.api_.random_, random()).WillByDefault(testing::Return(1));
+  }
+
+  // The calls of route matching into the module, and the calls of the router, in this test.
+  int onRouteCalls() { return moduleValue("getOnRouteCount") - on_route_base_; }
+  int routerAnswers() { return moduleValue("getRouterAnswerCount") - answer_base_; }
+
+  int moduleValue(const std::string& getter) {
+    auto function = module_->getFunctionPointer<int (*)(void)>(getter);
+    EXPECT_TRUE(function.ok());
+    return function.ok() ? function.value()() : -2;
+  }
+
+  // The configuration of a route specifier answering with the given router_answer, from the module
+  // with the given name.
+  absl::StatusOr<std::shared_ptr<Envoy::Router::ConfigImpl>>
+  loadAnswering(absl::string_view router_answer, bool prefer_selection = true,
+                absl::string_view module_name = "route_specifier_router_answer") {
+    const std::string fields = fmt::format("{}        router_answer: ROUTER_ANSWER_{}\n",
+                                           prefer_selection ? PreferSelection : "", router_answer);
+    return loadRaw(virtualClusterConfigYaml(virtualClusterOverrideYaml(fields),
+                                            RidesAndTripsVirtualClusters, "/", module_name));
+  }
+
+  // Resolves the route of a request for the path, with the request headers the module reads.
+  Envoy::Router::RouteConstSharedPtr resolveWith(const Envoy::Router::ConfigImpl& config,
+                                                 absl::string_view path,
+                                                 absl::string_view router_header = "") {
+    auto headers = requestHeaders(path);
+    if (!router_header.empty()) {
+      headers.addCopy(Http::LowerCaseString("x-router-virtual-cluster"),
+                      std::string(router_header));
+    }
+    return config.route(headers, stream_info_, 0).route;
+  }
+
+  // The virtual cluster the router counts the request in, asked with the headers it forwards.
+  static const Envoy::Router::VirtualCluster* routerLookup(const Envoy::Router::Route& route,
+                                                           absl::string_view path,
+                                                           absl::string_view router_header) {
+    auto headers = requestHeaders(path);
+    if (!router_header.empty()) {
+      headers.addCopy(Http::LowerCaseString("x-router-virtual-cluster"),
+                      std::string(router_header));
+    }
+    return route.virtualHost().virtualCluster(headers);
+  }
+
+  // A configuration whose first specifier selects with the given fields, and whose second specifier
+  // answers every route entry with the router answer module, on the same virtual host.
+  absl::StatusOr<std::shared_ptr<Envoy::Router::ConfigImpl>>
+  loadSelectingThenAnswering(absl::string_view first_fields) {
+    const std::string first = virtualClusterConfigYaml(first_fields);
+    const std::string second = R"EOF(  - name: envoy.router.route_specifiers.dynamic_modules
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.router.route_specifiers.dynamic_modules.v3.DynamicModuleRouteSpecifier
+      dynamic_module_config:
+        name: route_specifier_router_answer
+        do_not_close: true
+      specifier_name: second_route_specifier
+      stat_prefix: second
+      failure_policy: PASS_THROUGH
+)EOF" + virtualClusterOverrideYaml(absl::StrCat(
+            PreferSelection, "        router_answer: ROUTER_ANSWER_EVERY_ROUTE_ENTRY\n"));
+    return loadRaw(absl::StrCat(first, second));
+  }
+
+  Extensions::DynamicModules::DynamicModulePtr module_;
+  int on_route_base_{0};
+  int answer_base_{0};
+};
+
+// Under BUILT_ROUTES the module decides the route at resolution, and the router asks it once per
+// request with the headers it forwards, so the answer follows the header the router sees.
+TEST_F(DynamicModuleRouterAnswerTest, BuiltRoutesAnswerAtTheRouter) {
+  const auto config = loadAnswering("BUILT_ROUTES");
+  ASSERT_TRUE(config.ok()) << config.status();
+  const auto route = resolveWith(*config.value(), "/trips", "rides");
+  ASSERT_NE(nullptr, route);
+  EXPECT_EQ(1, onRouteCalls());
+  EXPECT_EQ(0, routerAnswers());
+
+  const Envoy::Router::VirtualCluster* selected = routerLookup(*route, "/trips", "rides");
+  ASSERT_NE(nullptr, selected);
+  EXPECT_EQ("rides", selected->name());
+  EXPECT_EQ(1, routerAnswers());
+  EXPECT_EQ(1, counterValue("virtual_cluster_selected"));
+  EXPECT_EQ(0, counterValue("virtual_cluster_stacked"));
+}
+
+// A route configuration with a direct response, a redirect and the catch all route, whose virtual
+// host declares the rides and trips virtual clusters and runs the router answer module.
+std::string redirectAndDirectConfigYaml(absl::string_view fields) {
+  return absl::StrCat(R"EOF(
+name: test_route_config
+virtual_hosts:
+- name: test_vhost
+  domains: ["*"]
+)EOF",
+                      RidesAndTripsVirtualClusters, R"EOF(  routes:
+  - match: {prefix: "/direct"}
+    direct_response: {status: 204}
+  - match: {prefix: "/redirect"}
+    redirect: {path_redirect: "/elsewhere"}
+  - match: {prefix: "/"}
+    route: {cluster: matched_cluster}
+  route_specifiers:
+  - name: envoy.router.route_specifiers.dynamic_modules
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.router.route_specifiers.dynamic_modules.v3.DynamicModuleRouteSpecifier
+      dynamic_module_config:
+        name: route_specifier_router_answer
+        do_not_close: true
+      specifier_name: test_route_specifier
+      stat_prefix: test
+      failure_policy: PASS_THROUGH
+)EOF",
+                      virtualClusterOverrideYaml(fields));
+}
+
+// Under BUILT_ROUTES a selection the module makes is refused, since the router answers instead. The
+// call returns false and counts nothing.
+TEST_F(DynamicModuleRouterAnswerTest, RouterAnswerRefusesSetVirtualCluster) {
+  const auto config = loadAnswering("BUILT_ROUTES");
+  ASSERT_TRUE(config.ok()) << config.status();
+  const auto route = resolveWith(*config.value(), "/trips", "rides");
+  ASSERT_NE(nullptr, route);
+  EXPECT_EQ(1, onRouteCalls());
+  EXPECT_EQ(0, moduleValue("getSetVirtualClusterResult"));
+  EXPECT_EQ(0, counterValue("virtual_cluster_selected"));
+  EXPECT_EQ(0, counterValue("virtual_cluster_stacked"));
+}
+
+// A route that an earlier specifier already selects is not answered again. The later router answer
+// is refused and counted as stacked, the router never asks the module, and the earlier selection
+// stands.
+TEST_F(DynamicModuleRouterAnswerTest, AnswerOnSelectedRouteIsRefusedAsStacked) {
+  const auto config = loadSelectingThenAnswering(virtualClusterOverrideYaml(PreferSelection));
+  ASSERT_TRUE(config.ok()) << config.status();
+  auto headers = requestHeaders("/trips");
+  headers.addCopy(Http::LowerCaseString("x-virtual-cluster"), "trips");
+  const auto route = config.value()->route(headers, stream_info_, 0).route;
+  ASSERT_NE(nullptr, route);
+  EXPECT_EQ(0, routerAnswers());
+  EXPECT_EQ(1, context_.store_
+                   .counter("dynamicmodulescustom.route_specifier.second.virtual_cluster_stacked")
+                   .value());
+  const Envoy::Router::VirtualCluster* selected = routerLookup(*route, "/trips", "");
+  ASSERT_NE(nullptr, selected);
+  EXPECT_EQ("trips", selected->name());
+  EXPECT_EQ(0, routerAnswers());
+}
+
+// A selection of none names no virtual cluster and answers nothing, so a later answer takes the
+// route rather than counting it as stacked.
+TEST_F(DynamicModuleRouterAnswerTest, NoneSelectionDoesNotBlockALaterAnswer) {
+  const auto config = loadSelectingThenAnswering(virtualClusterOverrideYaml(PreferSelection));
+  ASSERT_TRUE(config.ok()) << config.status();
+  auto headers = requestHeaders("/trips");
+  headers.addCopy(Http::LowerCaseString("x-virtual-cluster"), "");
+  const auto route = config.value()->route(headers, stream_info_, 0).route;
+  ASSERT_NE(nullptr, route);
+  EXPECT_EQ(0, context_.store_
+                   .counter("dynamicmodulescustom.route_specifier.second.virtual_cluster_stacked")
+                   .value());
+  const Envoy::Router::VirtualCluster* answered = routerLookup(*route, "/trips", "rides");
+  ASSERT_NE(nullptr, answered);
+  EXPECT_EQ("rides", answered->name());
+  EXPECT_EQ(1, routerAnswers());
+}
+
+// A name the router answer module returns as a null buffer with a length is unknown, and the router
+// counts the request in none.
+TEST_F(DynamicModuleRouterAnswerTest, NullNameIsCountedUnknown) {
+  const auto config = loadAnswering("EVERY_ROUTE_ENTRY");
+  ASSERT_TRUE(config.ok()) << config.status();
+  const auto route = resolveWith(*config.value(), "/trips");
+  ASSERT_NE(nullptr, route);
+  // The unknown name is counted, and the router falls back to the base match of the path.
+  const Envoy::Router::VirtualCluster* counted = routerLookup(*route, "/trips", "null");
+  ASSERT_NE(nullptr, counted);
+  EXPECT_EQ("trips", counted->name());
+  EXPECT_EQ(1, counterValue("virtual_cluster_unknown"));
+  EXPECT_EQ(1, routerAnswers());
+}
+
+// A direct response and a redirect have no route entry, so the router never asks for their virtual
+// cluster, and the specifier leaves them unwrapped under either router answer.
+TEST_F(DynamicModuleRouterAnswerTest, RedirectAndDirectResponseStayUnwrapped) {
+  for (const std::string& answer : {std::string("ROUTER_ANSWER_BUILT_ROUTES"),
+                                    std::string("ROUTER_ANSWER_EVERY_ROUTE_ENTRY")}) {
+    const auto config =
+        loadRaw(redirectAndDirectConfigYaml(absl::StrCat("        router_answer: ", answer, "\n")));
+    ASSERT_TRUE(config.ok()) << config.status();
+    for (const std::string& path : {std::string("/direct"), std::string("/redirect")}) {
+      const auto route = config.value()->route(requestHeaders(path), stream_info_, 0).route;
+      ASSERT_NE(nullptr, route) << path << " " << answer;
+      EXPECT_EQ(nullptr, route->routeEntry()) << path << " " << answer;
+      EXPECT_EQ(nullptr,
+                dynamic_cast<const VirtualClusterSelectingVirtualHost*>(&route->virtualHost()))
+          << path << " " << answer;
+    }
+  }
+  // The specifier runs on each matched route under BUILT_ROUTES, so the module saw both routes.
+  EXPECT_EQ(2, onRouteCalls());
+  EXPECT_EQ(0, routerAnswers());
+}
+
+// A cache hit returns the route the miss built, and the router still asks the module for each
+// request, so the answer follows the headers of the request that reaches the router.
+TEST_F(DynamicModuleRouterAnswerTest, BuiltRouteCacheHitAnswersEachRequest) {
+  const auto config = loadRaw(virtualClusterConfigYaml(
+      absl::StrCat(builtRouteCacheYaml(16),
+                   virtualClusterOverrideYaml(absl::StrCat(
+                       PreferSelection, "        router_answer: ROUTER_ANSWER_BUILT_ROUTES\n"))),
+      RidesAndTripsVirtualClusters, "/", "route_specifier_router_answer"));
+  ASSERT_TRUE(config.ok()) << config.status();
+
+  auto first_headers = requestHeaders("/trips");
+  first_headers.addCopy(Http::LowerCaseString("x-key"), "1");
+  first_headers.addCopy(Http::LowerCaseString("x-router-virtual-cluster"), "rides");
+  const auto first = config.value()->route(first_headers, stream_info_, 0).route;
+  ASSERT_NE(nullptr, first);
+  EXPECT_EQ(1, counterValue("built_route_cache_miss"));
+  const Envoy::Router::VirtualCluster* answered = routerLookup(*first, "/trips", "rides");
+  ASSERT_NE(nullptr, answered);
+  EXPECT_EQ("rides", answered->name());
+
+  auto second_headers = requestHeaders("/trips");
+  second_headers.addCopy(Http::LowerCaseString("x-key"), "1");
+  second_headers.addCopy(Http::LowerCaseString("x-router-virtual-cluster"), "bikes");
+  const auto second = config.value()->route(second_headers, stream_info_, 0).route;
+  ASSERT_NE(nullptr, second);
+  EXPECT_EQ(1, counterValue("built_route_cache_hit"));
+  EXPECT_EQ(first, second);
+  const Envoy::Router::VirtualCluster* reanswered = routerLookup(*second, "/trips", "bikes");
+  ASSERT_NE(nullptr, reanswered);
+  EXPECT_EQ("bikes", reanswered->name());
+  EXPECT_EQ(2, routerAnswers());
+}
+
+// The router asks the module from several worker threads against one configuration, so each
+// thread must get the answer of its own request, and none may be mixed up with another's.
+TEST_F(DynamicModuleRouterAnswerTest, ConcurrentAnswersEachFollowTheirOwnRequest) {
+  const auto config = loadAnswering("EVERY_ROUTE_ENTRY");
+  ASSERT_TRUE(config.ok()) << config.status();
+  const auto route = resolveWith(*config.value(), "/trips");
+  ASSERT_NE(nullptr, route);
+  std::atomic<int> mismatches{0};
+  const auto ask = [&route, &mismatches](const std::string answer) {
+    for (int i = 0; i < 20000; ++i) {
+      const Envoy::Router::VirtualCluster* selected = routerLookup(*route, "/trips", answer);
+      if (selected == nullptr || selected->name() != answer) {
+        mismatches++;
+      }
+    }
+  };
+  auto rides = Thread::threadFactoryForTest().createThread([&ask] { ask("rides"); });
+  auto bikes = Thread::threadFactoryForTest().createThread([&ask] { ask("bikes"); });
+  rides->join();
+  bikes->join();
+  EXPECT_EQ(0, mismatches.load());
+  EXPECT_EQ(40000, routerAnswers());
+}
+
+// Under EVERY_ROUTE_ENTRY the module is not called when route matching resolves. The router asks it
+// for every request, so the answer follows the headers the router sees, not the ones at resolution.
+TEST_F(DynamicModuleRouterAnswerTest, EveryRouteEntryNeverCallsTheModuleAtResolution) {
+  const auto config = loadAnswering("EVERY_ROUTE_ENTRY");
+  ASSERT_TRUE(config.ok()) << config.status();
+  const auto route = resolveWith(*config.value(), "/trips", "rides");
+  ASSERT_NE(nullptr, route);
+  EXPECT_EQ(0, onRouteCalls());
+  EXPECT_EQ(0, routerAnswers());
+
+  // A header that changed after resolution is the one the router answers on.
+  const Envoy::Router::VirtualCluster* selected = routerLookup(*route, "/trips", "bikes");
+  ASSERT_NE(nullptr, selected);
+  EXPECT_EQ("bikes", selected->name());
+  EXPECT_EQ(1, routerAnswers());
+  EXPECT_EQ(0, onRouteCalls());
+  EXPECT_EQ(0, counterValue("decision_pass_through"));
+  EXPECT_EQ(0, counterValue("decision_no_route"));
+  EXPECT_EQ(0, counterValue("failure_module_error"));
+}
+
+// A request whose headers the module answers with no name is counted as none, and the route keeps
+// the virtual host it wraps for everything else.
+TEST_F(DynamicModuleRouterAnswerTest, AbsentAnswerCountsNoneAndMatchesTheVirtualHost) {
+  const auto config = loadAnswering("EVERY_ROUTE_ENTRY");
+  ASSERT_TRUE(config.ok());
+  const auto route = resolveWith(*config.value(), "/trips");
+  ASSERT_NE(nullptr, route);
+  const Envoy::Router::VirtualCluster* matched = routerLookup(*route, "/trips", "");
+  ASSERT_NE(nullptr, matched);
+  EXPECT_EQ(1, counterValue("virtual_cluster_none"));
+  EXPECT_EQ("test_vhost", route->virtualHost().name());
+}
+
+// A name the configuration does not declare counts as unknown and selects nothing.
+TEST_F(DynamicModuleRouterAnswerTest, UnknownNameIsCountedAndSelectsNone) {
+  const auto config = loadAnswering("EVERY_ROUTE_ENTRY");
+  ASSERT_TRUE(config.ok());
+  const auto route = resolveWith(*config.value(), "/trips");
+  ASSERT_NE(nullptr, route);
+  routerLookup(*route, "/trips", "undeclared");
+  EXPECT_EQ(1, counterValue("virtual_cluster_unknown"));
+}
+
+// The router answer names a declared virtual cluster, which the router counts the request in
+// through the same statistics as a native virtual cluster of that name. Under the default
+// comparison the request is counted in the virtual host's match and compared with the answer, once.
+TEST_F(DynamicModuleRouterAnswerTest, AnswerIsComparedOnceWithTheVirtualHost) {
+  const auto config = loadAnswering("EVERY_ROUTE_ENTRY", /*prefer_selection=*/false);
+  ASSERT_TRUE(config.ok());
+  const auto route = resolveWith(*config.value(), "/trips");
+  ASSERT_NE(nullptr, route);
+  const Envoy::Router::VirtualCluster* selected = routerLookup(*route, "/trips", "rides");
+  ASSERT_NE(nullptr, selected);
+  EXPECT_EQ(1, counterValue("virtual_cluster_agree") + counterValue("virtual_cluster_disagree"));
+  EXPECT_EQ(0, counterValue("virtual_cluster_selected"));
+}
+
+// An answer whose configuration refuses it is a configuration error, not a silent fallback.
+TEST_F(DynamicModuleRouterAnswerTest, RefusedWithoutOptIn) {
+  const auto config =
+      loadAnswering("EVERY_ROUTE_ENTRY", true, "route_specifier_router_answer_no_opt_in");
+  EXPECT_THAT(config.status(), HasStatusMessage(HasSubstr("router_answer requires the module")));
+}
+
+// An answer whose module opted in but exports no hook is refused as well.
+TEST_F(DynamicModuleRouterAnswerTest, RefusedWithoutHook) {
+  const auto config = loadAnswering("BUILT_ROUTES", true, "route_specifier_router_answer_no_hook");
+  EXPECT_THAT(config.status(), HasStatusMessage(HasSubstr("router_answer requires the module")));
+}
+
+// Under NONE the opt in is ignored, so the module is called at resolution as it is for a selection.
+TEST_F(DynamicModuleRouterAnswerTest, NoneIgnoresTheOptIn) {
+  const auto config = loadAnswering("NONE");
+  ASSERT_TRUE(config.ok()) << config.status();
+  auto headers = requestHeaders("/trips");
+  headers.addCopy(Http::LowerCaseString("x-virtual-cluster"), "rides");
+  const auto route = config.value()->route(headers, stream_info_, 0).route;
+  ASSERT_NE(nullptr, route);
+  EXPECT_EQ(1, onRouteCalls());
+  // The module selects trips at resolution, which NONE accepts, and the router reads that selection
+  // rather than the header it forwards, and never asks the module.
+  const Envoy::Router::VirtualCluster* selected = routerLookup(*route, "/trips", "bikes");
+  ASSERT_NE(nullptr, selected);
+  EXPECT_EQ("trips", selected->name());
+  EXPECT_EQ(0, routerAnswers());
+}
+
+// The router answer is a call into the module, which must not touch the configuration after the
+// route configuration is released, so a route keeps its answer after that.
+TEST_F(DynamicModuleRouterAnswerTest, RouteKeepsItsAnswerAfterTheConfigurationIsReleased) {
+  auto config = loadAnswering("EVERY_ROUTE_ENTRY");
+  ASSERT_TRUE(config.ok());
+  auto route = resolveWith(*config.value(), "/trips");
+  ASSERT_NE(nullptr, route);
+  config.value().reset();
+  const Envoy::Router::VirtualCluster* selected = routerLookup(*route, "/trips", "rides");
+  ASSERT_NE(nullptr, selected);
+  EXPECT_EQ("rides", selected->name());
 }
 
 } // namespace

@@ -17915,6 +17915,19 @@ typedef const void* envoy_dynamic_module_type_route_specifier_config_module_ptr;
 typedef void* envoy_dynamic_module_type_route_specifier_context_envoy_ptr;
 
 /**
+ * envoy_dynamic_module_type_route_specifier_virtual_cluster_context_envoy_ptr is a raw pointer to
+ * the context of one router answer, which envoy_dynamic_module_on_route_specifier_virtual_cluster
+ * receives. It is valid only during that call.
+ *
+ * OWNERSHIP: Envoy owns the pointer.
+ *
+ * THREADING: The hook runs on the worker thread that routes the request, and the pointer is valid
+ * only for the duration of that call. The module must not store it or use it after the hook
+ * returns.
+ */
+typedef void* envoy_dynamic_module_type_route_specifier_virtual_cluster_context_envoy_ptr;
+
+/**
  * envoy_dynamic_module_type_route_specifier_decision is the decision a route specifier records for
  * a request with envoy_dynamic_module_callback_route_specifier_set_decision. It selects how Envoy
  * builds the route.
@@ -18171,6 +18184,38 @@ void envoy_dynamic_module_on_route_specifier_user_data_discard(
     envoy_dynamic_module_type_route_specifier_config_module_ptr config_module_ptr,
     uint64_t user_data);
 
+/**
+ * envoy_dynamic_module_on_route_specifier_virtual_cluster is called by the router to ask for the
+ * virtual cluster of a request, when the virtual_cluster_override of the route specifier sets a
+ * router_answer other than NONE. Under NONE it is not called. A module that opts in with
+ * envoy_dynamic_module_callback_route_specifier_config_answers_virtual_clusters must export it.
+ *
+ * The router calls it at most once per request, and not when the request has no cluster, with the
+ * request headers it forwards, before it finalizes them. It returns false when the module selects
+ * no virtual cluster.
+ *
+ * The name buffer is owned by the module and is valid only until the next call into the module on
+ * the same thread. Envoy does not keep it. Envoy resolves the name to a declared virtual cluster
+ * after this function returns and before it calls into the module again on that thread, so the
+ * module does not need to keep the buffer beyond the return.
+ *
+ * This may be called concurrently on multiple worker threads, and on the main thread by the router
+ * check tool, with the same in-module configuration. The module must treat the configuration as
+ * read-only, and must keep scratch state per thread, since the configuration is shared by every
+ * route the specifier produces.
+ *
+ * @param config_module_ptr is the pointer to the in-module route specifier configuration.
+ * @param context_envoy_ptr is the pointer to the router answer context, valid only during this
+ * call.
+ * @param virtual_cluster_name is filled by the module with the name of the virtual cluster. An
+ * empty name selects none.
+ * @return true when a virtual cluster is selected, false when none is.
+ */
+bool envoy_dynamic_module_on_route_specifier_virtual_cluster(
+    envoy_dynamic_module_type_route_specifier_config_module_ptr config_module_ptr,
+    envoy_dynamic_module_type_route_specifier_virtual_cluster_context_envoy_ptr context_envoy_ptr,
+    envoy_dynamic_module_type_module_buffer* virtual_cluster_name);
+
 // =============================================================================
 // Route Specifier Callbacks
 // =============================================================================
@@ -18257,6 +18302,20 @@ bool envoy_dynamic_module_callback_route_specifier_config_register_route_templat
     envoy_dynamic_module_type_route_specifier_config_envoy_ptr config_envoy_ptr,
     envoy_dynamic_module_type_module_buffer template_id,
     envoy_dynamic_module_type_module_buffer serialized_route);
+
+/**
+ * envoy_dynamic_module_callback_route_specifier_config_answers_virtual_clusters declares that the
+ * module answers the virtual cluster of each request at the router, through
+ * envoy_dynamic_module_on_route_specifier_virtual_cluster. Envoy refuses a configuration whose
+ * virtual_cluster_override sets a router_answer other than NONE unless the module called this and
+ * exports that hook. Under NONE the declaration is ignored.
+ *
+ * This may only be called from inside envoy_dynamic_module_on_route_specifier_config_new.
+ *
+ * @param config_envoy_ptr is the pointer to the route specifier configuration.
+ */
+void envoy_dynamic_module_callback_route_specifier_config_answers_virtual_clusters(
+    envoy_dynamic_module_type_route_specifier_config_envoy_ptr config_envoy_ptr);
 
 /**
  * envoy_dynamic_module_callback_route_specifier_config_get_specifier_instance_id returns the
@@ -18495,6 +18554,32 @@ size_t envoy_dynamic_module_callback_route_specifier_get_request_headers_size(
  */
 bool envoy_dynamic_module_callback_route_specifier_get_request_headers(
     envoy_dynamic_module_type_route_specifier_context_envoy_ptr context_envoy_ptr,
+    envoy_dynamic_module_type_envoy_http_header* result_headers);
+
+/**
+ * envoy_dynamic_module_callback_route_specifier_virtual_cluster_get_request_headers_size returns
+ * the number of request headers the router answer is asked with.
+ *
+ * @param context_envoy_ptr is the pointer to the router answer context.
+ * @return the number of request headers.
+ */
+size_t envoy_dynamic_module_callback_route_specifier_virtual_cluster_get_request_headers_size(
+    envoy_dynamic_module_type_route_specifier_virtual_cluster_context_envoy_ptr context_envoy_ptr);
+
+/**
+ * envoy_dynamic_module_callback_route_specifier_virtual_cluster_get_request_headers fills the
+ * module owned array with all request headers the router answer is asked with. It allocates
+ * nothing.
+ *
+ * @param context_envoy_ptr is the pointer to the router answer context.
+ * @param result_headers is the output array. The module must pre-allocate at least
+ * envoy_dynamic_module_callback_route_specifier_virtual_cluster_get_request_headers_size entries.
+ * Envoy does not bounds check the array, so passing a shorter one is undefined behavior. The
+ * buffers in the entries are owned by Envoy and are valid only until the hook returns.
+ * @return true if the operation is successful, false otherwise.
+ */
+bool envoy_dynamic_module_callback_route_specifier_virtual_cluster_get_request_headers(
+    envoy_dynamic_module_type_route_specifier_virtual_cluster_context_envoy_ptr context_envoy_ptr,
     envoy_dynamic_module_type_envoy_http_header* result_headers);
 
 /**
@@ -19085,6 +19170,10 @@ bool envoy_dynamic_module_callback_route_specifier_set_route_name(
  * @param context_envoy_ptr is the pointer to the route decision context.
  * @param virtual_cluster_name is the name of the virtual cluster, or empty to select none. The
  * buffer is owned by the module. Its pointer may be null only when its length is zero.
+ * Under a router_answer other than NONE the router asks the module instead, so this returns false
+ * and changes nothing. A selection on a route whose virtual host already selects a virtual cluster
+ * is dropped and counted as stacked.
+ *
  * @return true if the route specifier declares virtual clusters and the name is empty or one of
  * them, false otherwise, in which case the selection does not change.
  */

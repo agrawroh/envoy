@@ -1,5 +1,6 @@
 load(
     "//bazel:envoy_build_system.bzl",
+    "envoy_cc_benchmark_dyn_module_binary",
     "envoy_package",
 )
 load(
@@ -24,6 +25,9 @@ envoy_extension_cc_dyn_module_test(
         "//test/extensions/dynamic_modules/test_data/c:route_specifier_no_op",
         "//test/extensions/dynamic_modules/test_data/c:route_specifier_override",
         "//test/extensions/dynamic_modules/test_data/c:route_specifier_rewrite_rule",
+        "//test/extensions/dynamic_modules/test_data/c:route_specifier_router_answer",
+        "//test/extensions/dynamic_modules/test_data/c:route_specifier_router_answer_no_hook",
+        "//test/extensions/dynamic_modules/test_data/c:route_specifier_router_answer_no_opt_in",
         "//test/extensions/dynamic_modules/test_data/c:route_specifier_select_template",
         "//test/extensions/dynamic_modules/test_data/c:route_specifier_unknown_decision",
         "//test/extensions/dynamic_modules/test_data/c:route_specifier_unknown_status",
@@ -64,6 +68,7 @@ envoy_extension_cc_dyn_module_test(
     name = "integration_test",
     srcs = ["integration_test.cc"],
     data = [
+        "//test/extensions/dynamic_modules/test_data/c:route_specifier_router_answer",
         "//test/extensions/dynamic_modules/test_data/rust:route_specifier_integration_test",
         "//test/extensions/dynamic_modules/test_data/rust:route_specifier_shadow",
     ],
@@ -75,7 +80,35 @@ envoy_extension_cc_dyn_module_test(
         "//source/extensions/router/route_specifiers/dynamic_modules:config",
         "//test/integration:http_integration_lib",
         "//test/integration/filters:clear_route_cache_filter_lib",
+        "//test/integration/filters:set_router_answer_header_filter_lib",
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/extensions/router/route_specifiers/dynamic_modules/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_benchmark_dyn_module_binary(
+    name = "route_specifier_speed_test",
+    srcs = ["route_specifier_speed_test.cc"],
+    data = [
+        "//test/extensions/dynamic_modules/test_data/c:route_specifier_router_answer",
+        "//test/extensions/dynamic_modules/test_data/c:route_specifier_virtual_cluster",
+    ],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/common/http:header_map_lib",
+        "//source/common/router:config_lib",
+        "//source/common/stats:custom_stat_namespaces_lib",
+        "//source/common/stats:isolated_store_lib",
+        "//source/extensions/dynamic_modules:dynamic_modules_lib",
+        "//source/extensions/router/route_specifiers/dynamic_modules:config",
+        "//test/extensions/dynamic_modules:util",
+        "//test/mocks/router:router_mocks",
+        "//test/mocks/server:server_factory_context_mocks",
+        "//test/mocks/stream_info:stream_info_mocks",
+        "//test/test_common:environment_lib",
+        "//test/test_common:test_time_lib",
+        "//test/test_common:utility_lib",
+        "@benchmark",
+        "@envoy_api//envoy/config/route/v3:pkg_cc_proto",
     ],
 )

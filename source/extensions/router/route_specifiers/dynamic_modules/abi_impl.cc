@@ -35,6 +35,11 @@ routeSpecifierConfig(envoy_dynamic_module_type_route_specifier_config_envoy_ptr 
   return static_cast<DynamicModuleRouteSpecifierConfig*>(ptr);
 }
 
+VirtualClusterContext* virtualClusterContext(
+    envoy_dynamic_module_type_route_specifier_virtual_cluster_context_envoy_ptr ptr) {
+  return static_cast<VirtualClusterContext*>(ptr);
+}
+
 absl::string_view toStringView(envoy_dynamic_module_type_module_buffer buffer) {
   if (buffer.ptr == nullptr) {
     return {};
@@ -241,6 +246,11 @@ void envoy_dynamic_module_callback_route_specifier_config_get_specifier_instance
 bool envoy_dynamic_module_callback_route_specifier_config_has_built_route_cache(
     envoy_dynamic_module_type_route_specifier_config_envoy_ptr config_envoy_ptr) {
   return routeSpecifierConfig(config_envoy_ptr)->hasBuiltRouteCache();
+}
+
+void envoy_dynamic_module_callback_route_specifier_config_answers_virtual_clusters(
+    envoy_dynamic_module_type_route_specifier_config_envoy_ptr config_envoy_ptr) {
+  routeSpecifierConfig(config_envoy_ptr)->answers_virtual_clusters_ = true;
 }
 
 // ---------------------------------- Metrics ----------------------------------
@@ -456,6 +466,18 @@ bool envoy_dynamic_module_callback_route_specifier_get_request_headers(
     envoy_dynamic_module_type_route_specifier_context_envoy_ptr context_envoy_ptr,
     envoy_dynamic_module_type_envoy_http_header* result_headers) {
   return ContextAccessor::getHeaders(routeSpecifierContext(context_envoy_ptr)->headers,
+                                     result_headers);
+}
+
+size_t envoy_dynamic_module_callback_route_specifier_virtual_cluster_get_request_headers_size(
+    envoy_dynamic_module_type_route_specifier_virtual_cluster_context_envoy_ptr context_envoy_ptr) {
+  return virtualClusterContext(context_envoy_ptr)->headers.size();
+}
+
+bool envoy_dynamic_module_callback_route_specifier_virtual_cluster_get_request_headers(
+    envoy_dynamic_module_type_route_specifier_virtual_cluster_context_envoy_ptr context_envoy_ptr,
+    envoy_dynamic_module_type_envoy_http_header* result_headers) {
+  return ContextAccessor::getHeaders(virtualClusterContext(context_envoy_ptr)->headers,
                                      result_headers);
 }
 
@@ -874,6 +896,11 @@ bool envoy_dynamic_module_callback_route_specifier_set_virtual_cluster(
     envoy_dynamic_module_type_route_specifier_context_envoy_ptr context_envoy_ptr,
     envoy_dynamic_module_type_module_buffer virtual_cluster_name) {
   auto* context = routeSpecifierContext(context_envoy_ptr);
+  // Under a router answer the router asks the module, so a selection made here is refused.
+  if (context->config.routerAnswer() !=
+      envoy::extensions::router::route_specifiers::dynamic_modules::v3::ROUTER_ANSWER_NONE) {
+    return false;
+  }
   const DeclaredVirtualClusterSet* declared = context->config.virtualClusters();
   if (declared == nullptr) {
     return false;

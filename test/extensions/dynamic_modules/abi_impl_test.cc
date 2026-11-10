@@ -2510,6 +2510,14 @@ WEAK_STUB(RouteSpecifierConfigHasBuiltRouteCache,
           envoy_dynamic_module_callback_route_specifier_config_has_built_route_cache(nullptr))
 WEAK_STUB(RouteSpecifierSetVirtualCluster,
           envoy_dynamic_module_callback_route_specifier_set_virtual_cluster(nullptr, {nullptr, 0}))
+WEAK_STUB(RouteSpecifierConfigAnswersVirtualClusters,
+          envoy_dynamic_module_callback_route_specifier_config_answers_virtual_clusters(nullptr))
+WEAK_STUB(
+    RouteSpecifierVirtualClusterGetRequestHeadersSize,
+    envoy_dynamic_module_callback_route_specifier_virtual_cluster_get_request_headers_size(nullptr))
+WEAK_STUB(RouteSpecifierVirtualClusterGetRequestHeaders,
+          envoy_dynamic_module_callback_route_specifier_virtual_cluster_get_request_headers(
+              nullptr, nullptr))
 
 } // namespace
 } // namespace DynamicModules

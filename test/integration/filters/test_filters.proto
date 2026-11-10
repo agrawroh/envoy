@@ -116,3 +116,5 @@ message LocalReplyDuringHostSelectionConfig {
 }
 message StatsPrefixFilterConfig {
 }
+message SetRouterAnswerHeaderFilterConfig {
+}

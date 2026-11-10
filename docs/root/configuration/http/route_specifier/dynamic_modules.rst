@@ -187,6 +187,24 @@ requests whose route carries no selection or a selection of none, so set it back
 changing them or the selections of the module. Keep ``verify_one_in`` above zero so that
 ``virtual_cluster_agree`` keeps growing and ``virtual_cluster_disagree`` keeps showing a difference.
 
+A module can instead answer the virtual cluster at the router, which asks it once per request with
+the request headers the router forwards. Set :ref:`router_answer
+<envoy_v3_api_field_extensions.router.route_specifiers.dynamic_modules.v3.VirtualClusterOverride.router_answer>`
+to ``ROUTER_ANSWER_BUILT_ROUTES`` to answer the routes the specifier builds, or to
+``ROUTER_ANSWER_EVERY_ROUTE_ENTRY`` to answer every route entry the specifier is handed, in which case
+the module is not called when route matching resolves. Under either value ``set_virtual_cluster``
+selects nothing and is refused, and the module must opt in from its configuration constructor and
+export the answer hook, or Envoy rejects the configuration. A header a filter changes after route
+matching resolves is then the one the router answers on. Envoy times the answer in
+``virtual_cluster_duration``. A selection, or an answer, on a route whose virtual host already
+selects a virtual cluster is dropped and counted in ``virtual_cluster_stacked``. A selection of none
+answers nothing, so a later answer may still take the route.
+
+The router answer takes effect only for requests that ``runtime_fraction`` admits, so lowering
+``runtime_fraction`` also turns the answer off for the rest. Without ``prefer_selection`` the router
+compares the answer with the virtual host and keeps the match of the virtual host, so set
+``prefer_selection`` to route with the answer.
+
 Rewriting the path
 ------------------
 
@@ -305,8 +323,10 @@ of the specifier, sharing the ``metrics_namespace`` of the module-defined metric
   virtual_cluster_none, Counter, Requests for which the module selected none and that the virtual host then matched against its virtual clusters.
   virtual_cluster_agree, Counter, Compared requests whose selection agreed with the virtual cluster the virtual host matched.
   virtual_cluster_disagree, Counter, Compared requests whose selection disagreed with the virtual cluster the virtual host matched.
-  virtual_cluster_unknown, Counter, Virtual cluster selections rejected because the name is not declared or the buffer is null with a non-zero length. Nothing is counted when ``virtual_cluster_override`` is not set.
-  virtual_cluster_vhost_mismatch, Counter, Virtual cluster selections dropped because the route belongs to a virtual host other than ``virtual_host_name``.
+  virtual_cluster_unknown, Counter, Virtual cluster selections rejected because the name is not declared or the buffer is null with a non-zero length, or answers that name no declared virtual cluster. Nothing is counted when ``virtual_cluster_override`` is not set.
+  virtual_cluster_vhost_mismatch, Counter, Virtual cluster selections dropped because the route belongs to a virtual host other than ``virtual_host_name``. A router answer for such a route is not counted here.
+  virtual_cluster_stacked, Counter, Virtual cluster selections or answers dropped because the route already answers the router with a virtual cluster.
+  virtual_cluster_duration, Histogram, Time in nanoseconds the router answer spent, from the call of the module to the lookup of the virtual cluster it names.
   built_route_cache_entries, Gauge, Routes cached by the workers of the specifiers that share the stat prefix.
   on_route_duration, Histogram, Time in microseconds the module spent deciding.
   specifier_duration, Histogram, Time in microseconds the specifier spent on a request that ``runtime_fraction`` does not skip.

@@ -293,13 +293,34 @@ absl::string_view headerValue(const Http::HeaderMap& headers, const Http::LowerC
   return value.empty() ? absl::string_view() : value[0]->value().getStringView();
 }
 
-// Builds the wrapper, which answers the virtual cluster lookup of the router from the selection
-// when the module made one.
+// The answer a route carries, given the selection the module recorded and whether the router asks
+// the module. Unset when the route answers nothing.
+std::optional<VirtualClusterAnswer>
+answerOf(std::optional<const Envoy::Router::VirtualCluster*> selection, bool answered_by_router) {
+  if (answered_by_router) {
+    return VirtualClusterAnswer{nullptr, true};
+  }
+  if (selection.has_value()) {
+    return VirtualClusterAnswer{*selection, false};
+  }
+  return std::nullopt;
+}
+
+// Whether the virtual host of the route already answers the router, which a second answer would
+// stack on.
+bool answersVirtualCluster(const Envoy::Router::Route& route) {
+  const auto* selecting =
+      dynamic_cast<const VirtualClusterSelectingVirtualHost*>(&route.virtualHost());
+  return selecting != nullptr && selecting->answers();
+}
+
+// Builds the wrapper, which answers the virtual cluster lookup of the router when the route carries
+// an answer.
 template <class Wrapper, class... Args>
-std::shared_ptr<const Wrapper>
-makeWrapper(std::optional<const Envoy::Router::VirtualCluster*> virtual_cluster, Args&&... args) {
-  if (virtual_cluster.has_value()) {
-    return std::make_shared<VirtualClusterSelectingRoute<Wrapper>>(*virtual_cluster,
+std::shared_ptr<const Wrapper> makeWrapper(std::optional<VirtualClusterAnswer> answer,
+                                           Args&&... args) {
+  if (answer.has_value()) {
+    return std::make_shared<VirtualClusterSelectingRoute<Wrapper>>(*answer,
                                                                    std::forward<Args>(args)...);
   }
   return std::make_shared<Wrapper>(std::forward<Args>(args)...);
@@ -456,6 +477,7 @@ DynamicModuleRouteSpecifierConfig::DynamicModuleRouteSpecifierConfig(
       prefer_virtual_cluster_selection_(proto_config.virtual_cluster_override().prefer_selection()),
       virtual_cluster_verify_one_in_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(
           proto_config.virtual_cluster_override(), verify_one_in, 1024)),
+      router_answer_(proto_config.virtual_cluster_override().router_answer()),
       cluster_manager_(context.serverFactoryContext().clusterManager()),
       runtime_(context.serverFactoryContext().runtime()),
       time_source_(context.serverFactoryContext().timeSource()),
@@ -565,6 +587,10 @@ newDynamicModuleRouteSpecifierConfig(const DynamicModuleRouteSpecifierProto& pro
   auto on_user_data_discard =
       dynamic_module->getFunctionPointer<OnRouteSpecifierUserDataDiscardType>(
           "envoy_dynamic_module_on_route_specifier_user_data_discard");
+  // The router answer hook is optional too, and a router answer is refused below unless it exists
+  // and the module opted in.
+  auto on_virtual_cluster = dynamic_module->getFunctionPointer<OnRouteSpecifierVirtualClusterType>(
+      "envoy_dynamic_module_on_route_specifier_virtual_cluster");
 
   // Use knownAnyToBytes() to properly handle StringValue/BytesValue/Struct types.
   std::string specifier_config;
@@ -591,6 +617,7 @@ newDynamicModuleRouteSpecifierConfig(const DynamicModuleRouteSpecifierProto& pro
   config->on_route_destroy_ = on_route_destroy.ok() ? on_route_destroy.value() : nullptr;
   config->on_user_data_discard_ =
       on_user_data_discard.ok() ? on_user_data_discard.value() : nullptr;
+  config->on_virtual_cluster_ = on_virtual_cluster.ok() ? on_virtual_cluster.value() : nullptr;
 
   const bool validate_clusters =
       PROTOBUF_GET_WRAPPED_OR_DEFAULT(proto_config, validate_clusters, false);
@@ -659,6 +686,15 @@ newDynamicModuleRouteSpecifierConfig(const DynamicModuleRouteSpecifierProto& pro
 
   if (config->in_module_config_ == nullptr) {
     return absl::InvalidArgumentError("Failed to initialize dynamic module route specifier config");
+  }
+  if (config->routerAnswer() !=
+          envoy::extensions::router::route_specifiers::dynamic_modules::v3::ROUTER_ANSWER_NONE &&
+      (!config->answers_virtual_clusters_ || config->on_virtual_cluster_ == nullptr)) {
+    return absl::InvalidArgumentError(
+        "virtual_cluster_override.router_answer requires the module to call "
+        "envoy_dynamic_module_callback_route_specifier_config_answers_virtual_clusters from "
+        "envoy_dynamic_module_on_route_specifier_config_new and to export "
+        "envoy_dynamic_module_on_route_specifier_virtual_cluster");
   }
   if (proto_config.has_virtual_cluster_override()) {
     config->virtual_clusters_ = DeclaredVirtualClusterRegistry::getOrCreate(
@@ -795,44 +831,73 @@ void BuiltRouteCache::removeAt(size_t index) {
 }
 
 const Envoy::Router::VirtualCluster*
+VirtualClusterSelectingVirtualHost::answerAtRouter(const Http::HeaderMap& headers) const {
+  RouteSpecifierStats& stats = config_.stats();
+  const MonotonicTime start = config_.timeSource().monotonicTime();
+  VirtualClusterContext context{headers};
+  envoy_dynamic_module_type_module_buffer name{nullptr, 0};
+  const bool answered = (*config_.on_virtual_cluster_)(config_.in_module_config_,
+                                                       static_cast<void*>(&context), &name);
+  const Envoy::Router::VirtualCluster* cluster = nullptr;
+  // A null buffer with a length names nothing declared, so it counts as unknown, as a selection
+  // does.
+  if (answered && name.length != 0) {
+    const absl::string_view declared_name =
+        name.ptr == nullptr ? absl::string_view() : absl::string_view(name.ptr, name.length);
+    cluster = declared_name.empty() ? nullptr : config_.virtualClusters()->find(declared_name);
+    if (cluster == nullptr) {
+      stats.virtual_cluster_unknown_.inc();
+      ENVOY_LOG(debug, "dynamic module route specifier answered unknown virtual cluster '{}'",
+                declared_name);
+    }
+  }
+  const MonotonicTime end = config_.timeSource().monotonicTime();
+  stats.virtual_cluster_duration_.recordValue(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+  return cluster;
+}
+
+const Envoy::Router::VirtualCluster*
 VirtualClusterSelectingVirtualHost::virtualCluster(const Http::HeaderMap& headers) const {
   RouteSpecifierStats& stats = config_.stats();
-  if (selected_ == nullptr) {
+  const Envoy::Router::VirtualCluster* selected =
+      answered_by_router_ ? answerAtRouter(headers) : selected_;
+  if (selected == nullptr) {
     stats.virtual_cluster_none_.inc();
     return base_.virtualCluster(headers);
   }
   const bool prefer = config_.preferVirtualClusterSelection();
   if (prefer && !config_.sampleVirtualClusterComparison()) {
     stats.virtual_cluster_selected_.inc();
-    return selected_;
+    return selected;
   }
   const Envoy::Router::VirtualCluster* matched = base_.virtualCluster(headers);
   // Only a virtual host without virtual clusters matches no virtual cluster, which leaves nothing
   // to compare the selection with.
   if (matched == nullptr) {
     stats.virtual_cluster_selected_.inc();
-    return selected_;
+    return selected;
   }
   // Agreeing means counting in the same statistics, so a virtual cluster named other agrees with
   // the catch all.
-  if (selected_->statName() == matched->statName()) {
+  if (selected->statName() == matched->statName()) {
     stats.virtual_cluster_agree_.inc();
   } else {
     stats.virtual_cluster_disagree_.inc();
     ENVOY_LOG(debug,
               "dynamic module route specifier '{}' selected virtual cluster '{}' for {} '{}' "
               "while virtual host '{}' matched '{}'",
-              config_.statPrefix(), declaredName(*selected_),
+              config_.statPrefix(), declaredName(*selected),
               headerValue(headers, Http::Headers::get().Method),
               headerValue(headers, Http::Headers::get().Path), base_.name(),
               declaredName(*matched));
     ENVOY_LOG_PERIODIC(warn, std::chrono::seconds(10),
                        "dynamic module route specifier '{}' selected virtual cluster '{}' while "
                        "virtual host '{}' matched '{}'",
-                       config_.statPrefix(), declaredName(*selected_), base_.name(),
+                       config_.statPrefix(), declaredName(*selected), base_.name(),
                        declaredName(*matched));
   }
-  return prefer ? selected_ : matched;
+  return prefer ? selected : matched;
 }
 
 DynamicModuleRoute::DynamicModuleRoute(
@@ -1135,6 +1200,12 @@ DynamicModuleRouteSpecifier::onRoute(Envoy::Router::RouteConstSharedPtr route,
     config_->stats().runtime_skipped_.inc();
     return {std::move(route)};
   }
+  // Under EVERY_ROUTE_ENTRY the router asks the module for the answer, so the module is not called
+  // here and records nothing.
+  if (config_->routerAnswer() == envoy::extensions::router::route_specifiers::dynamic_modules::v3::
+                                     ROUTER_ANSWER_EVERY_ROUTE_ENTRY) {
+    return {answerEveryRouteEntry(std::move(route))};
+  }
 
   const MonotonicTime start = config_->timeSource().monotonicTime();
   const auto record_duration = [start](Stats::Histogram& histogram, MonotonicTime end) {
@@ -1324,20 +1395,28 @@ DynamicModuleRouteSpecifier::wrap(Envoy::Router::RouteConstSharedPtr route,
                                   RouteSpecifierContext& context,
                                   Envoy::Router::OnRouteStatus status) const {
   dropUnusableVirtualClusterSelection(*route, context);
+  // Under BUILT_ROUTES the router asks the module for every route entry the specifier builds, so
+  // each one carries the answer, whatever the module recorded for it.
+  const bool answered_by_router =
+      config_->routerAnswer() == envoy::extensions::router::route_specifiers::dynamic_modules::v3::
+                                     ROUTER_ANSWER_BUILT_ROUTES &&
+      route->routeEntry() != nullptr && virtualClusterAnswerable(*route);
+  const std::optional<VirtualClusterAnswer> answer =
+      answerOf(context.overrides.virtual_cluster, answered_by_router);
   const bool route_entry_overrides = context.overrides.hasRouteEntryOverrides();
   // User data forces a wrapper even with no override, so the route destroy hook fires for the
   // produced route.
   if (!route_entry_overrides && !context.overrides.hasRouteOverrides() &&
       !context.user_data.has_value()) {
-    if (!context.overrides.virtual_cluster.has_value()) {
+    if (!answer.has_value()) {
       return {std::move(route), status};
     }
-    // A selection alone builds a route without the recorded overrides, unless the built route
-    // cache needs them to compare.
+    // An answer alone builds a route without the recorded overrides, unless the built route cache
+    // needs them to compare.
     if (!context.built_route_lookup.has_value()) {
       return {.route =
                   std::make_shared<VirtualClusterSelectingRoute<DynamicModuleVirtualClusterRoute>>(
-                      *context.overrides.virtual_cluster, std::move(route), config_),
+                      *answer, std::move(route), config_),
               .status = status,
               .built = true};
     }
@@ -1357,13 +1436,13 @@ DynamicModuleRouteSpecifier::wrap(Envoy::Router::RouteConstSharedPtr route,
   Decision decision{.status = status, .built = true};
   if (route_entry_overrides) {
     auto entry = makeWrapper<DynamicModuleRouteEntry>(
-        context.overrides.virtual_cluster, std::move(route), config_, std::move(context.overrides),
+        answer, std::move(route), config_, std::move(context.overrides),
         std::move(metadata_pack.value()), context.user_data);
     decision.recorded = &entry->recordedOverrides();
     decision.route = std::move(entry);
   } else {
     auto wrapper = makeWrapper<DynamicModuleRoute>(
-        context.overrides.virtual_cluster, std::move(route), config_, std::move(context.overrides),
+        answer, std::move(route), config_, std::move(context.overrides),
         std::move(metadata_pack.value()), context.user_data);
     decision.recorded = &wrapper->recordedOverrides();
     decision.route = std::move(wrapper);
@@ -1383,16 +1462,45 @@ void DynamicModuleRouteSpecifier::dropUnusableVirtualClusterSelection(
   }
   // A selection of none names no statistics, and a selection is only recorded when the
   // configuration declares virtual clusters.
-  if (*context.overrides.virtual_cluster != nullptr &&
-      route.virtualHost().statName() != config_->virtualClusters()->virtualHostStatName()) {
-    config_->stats().virtual_cluster_vhost_mismatch_.inc();
-    ENVOY_LOG_PERIODIC(warn, std::chrono::seconds(10),
-                       "dynamic module route specifier '{}' dropped a virtual cluster selection "
-                       "for virtual host '{}', which is not the declared virtual host '{}'",
-                       config_->statPrefix(), route.virtualHost().name(),
-                       config_->virtualClusters()->virtualHostName());
+  if (*context.overrides.virtual_cluster != nullptr && !virtualClusterAnswerable(route)) {
+    // Only a selection can be for another virtual host, so only a selection counts the mismatch.
+    if (!answersVirtualCluster(route) &&
+        route.virtualHost().statName() != config_->virtualClusters()->virtualHostStatName()) {
+      config_->stats().virtual_cluster_vhost_mismatch_.inc();
+      ENVOY_LOG_PERIODIC(warn, std::chrono::seconds(10),
+                         "dynamic module route specifier '{}' dropped a virtual cluster selection "
+                         "for virtual host '{}', which is not the declared virtual host '{}'",
+                         config_->statPrefix(), route.virtualHost().name(),
+                         config_->virtualClusters()->virtualHostName());
+    }
     context.overrides.virtual_cluster.reset();
   }
+}
+
+bool DynamicModuleRouteSpecifier::virtualClusterAnswerable(
+    const Envoy::Router::Route& route) const {
+  if (answersVirtualCluster(route)) {
+    config_->stats().virtual_cluster_stacked_.inc();
+    ENVOY_LOG_PERIODIC(warn, std::chrono::seconds(10),
+                       "dynamic module route specifier '{}' dropped a virtual cluster answer for a "
+                       "route that already answers the router",
+                       config_->statPrefix());
+    return false;
+  }
+  // A route of another virtual host is not answered, and that is not an error, since a global
+  // route specifier also sees the routes of the other virtual hosts.
+  return route.virtualHost().statName() == config_->virtualClusters()->virtualHostStatName();
+}
+
+Envoy::Router::RouteConstSharedPtr
+DynamicModuleRouteSpecifier::answerEveryRouteEntry(Envoy::Router::RouteConstSharedPtr route) const {
+  // The router looks the virtual cluster up only for a route entry, so anything else is handed on
+  // unchanged.
+  if (route == nullptr || route->routeEntry() == nullptr || !virtualClusterAnswerable(*route)) {
+    return route;
+  }
+  return std::make_shared<VirtualClusterSelectingRoute<DynamicModuleVirtualClusterRoute>>(
+      VirtualClusterAnswer{nullptr, true}, std::move(route), config_);
 }
 
 bool DynamicModuleRouteSpecifier::recordsACacheableRoute(const RouteSpecifierContext& context,

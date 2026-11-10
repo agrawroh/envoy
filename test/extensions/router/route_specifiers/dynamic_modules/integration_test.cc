@@ -209,6 +209,54 @@ direct_response:
     });
   }
 
+  // Configures the virtual host with the rides virtual cluster, and the router answer module, which
+  // names the x-router-virtual-cluster header, with the given router answer and a preferred
+  // selection so that the router counts the request in the virtual cluster it answers. The module
+  // is a C module, so the search path moves from the Rust modules to the C ones before Envoy
+  // starts.
+  void setupRouterAnswerTest(absl::string_view router_answer) {
+    TestEnvironment::setEnvVar("ENVOY_DYNAMIC_MODULES_SEARCH_PATH",
+                               TestEnvironment::substitute(
+                                   "{{ test_rundir }}/test/extensions/dynamic_modules/test_data/c"),
+                               1);
+    config_helper_.addConfigModifier(
+        [router_answer = std::string(router_answer)](
+            envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+                hcm) {
+          TestUtility::loadFromYaml(
+              R"EOF(
+name: rides
+headers:
+- name: ":path"
+  string_match: {prefix: "/rides"}
+)EOF",
+              *hcm.mutable_route_config()->mutable_virtual_hosts(0)->add_virtual_clusters());
+          const std::string specifier_yaml = absl::StrCat(R"EOF(
+dynamic_module_config:
+  name: route_specifier_router_answer
+  do_not_close: true
+specifier_name: router_answer
+stat_prefix: test
+failure_policy: PASS_THROUGH
+virtual_cluster_override:
+  virtual_host_name: integration
+  names: [rides, bikes, other]
+  verify_one_in: 0
+  prefer_selection: true
+  router_answer: ROUTER_ANSWER_)EOF",
+                                                          router_answer, "\n");
+          DynamicModuleRouteSpecifierProto specifier_config;
+          TestUtility::loadFromYaml(specifier_yaml, specifier_config);
+          auto* specifier =
+              hcm.mutable_route_config()->mutable_virtual_hosts(0)->add_route_specifiers();
+          specifier->set_name("envoy.router.route_specifiers.dynamic_modules");
+          std::ignore = specifier->mutable_typed_config()->PackFrom(specifier_config);
+        });
+    Runtime::maybeSetRuntimeGuard("envoy.reloadable_features.enable_stats_explicit_tags",
+                                  useExplicitStatsTags());
+    HttpIntegrationTest::initialize();
+  }
+
   // Configures the virtual host to count requests for /rides in its rides virtual cluster, and the
   // specifier to declare rides, bikes and the catch all virtual cluster for the virtual host with
   // no sampled comparison.
@@ -1557,6 +1605,29 @@ route_overrides:
       reinterpret_cast<AutonomousUpstream*>(fake_upstreams_.front().get())->lastRequestHeaders();
   ASSERT_NE(nullptr, upstream_headers);
   EXPECT_EQ("/internal/foo?q=1", upstream_headers->getPathValue());
+}
+
+// A filter that runs after route matching resolved the route sets the header the router answer
+// reads. Under EVERY_ROUTE_ENTRY the router asks the module with the headers it forwards, so the
+// request is counted in the rides virtual cluster the filter's header names, which route matching
+// did not see.
+TEST_P(DynamicModuleRouteSpecifierIntegrationTest, RouterAnswerReadsHeadersSetAfterResolution) {
+  useAccessLog("%VIRTUAL_CLUSTER_NAME%");
+  config_helper_.prependFilter(R"EOF(
+name: set-router-answer-header
+typed_config:
+  "@type": type.googleapis.com/test.integration.filters.SetRouterAnswerHeaderFilterConfig
+)EOF");
+  setupRouterAnswerTest("EVERY_ROUTE_ENTRY");
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = sendRequest({});
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  test_server_->waitForCounter("vhost.integration.vcluster.rides.upstream_rq_200", testing::Eq(1));
+  EXPECT_NE(std::string::npos, waitForAccessLog(access_log_name_).find("rides"));
+  EXPECT_EQ(1, counterValue("dynamicmodulescustom.route_specifier.test.virtual_cluster_selected"));
+  // The module is not called at route matching under EVERY_ROUTE_ENTRY, only by the router.
+  EXPECT_EQ(0, counterValue("dynamicmodulescustom.route_specifier.test.decision_has_override"));
 }
 
 } // namespace

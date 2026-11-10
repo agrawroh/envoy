@@ -45,6 +45,8 @@ using DynamicModuleRouteSpecifierProto =
     envoy::extensions::router::route_specifiers::dynamic_modules::v3::DynamicModuleRouteSpecifier;
 using VirtualClusterOverrideProto =
     envoy::extensions::router::route_specifiers::dynamic_modules::v3::VirtualClusterOverride;
+using RouterAnswerProto =
+    envoy::extensions::router::route_specifiers::dynamic_modules::v3::RouterAnswer;
 
 // Type aliases for function pointers resolved from the module.
 using OnRouteSpecifierConfigNewType = decltype(&envoy_dynamic_module_on_route_specifier_config_new);
@@ -55,6 +57,8 @@ using OnRouteSpecifierRouteDestroyType =
     decltype(&envoy_dynamic_module_on_route_specifier_route_destroy);
 using OnRouteSpecifierUserDataDiscardType =
     decltype(&envoy_dynamic_module_on_route_specifier_user_data_discard);
+using OnRouteSpecifierVirtualClusterType =
+    decltype(&envoy_dynamic_module_on_route_specifier_virtual_cluster);
 
 // The default custom stat namespace which prepends all user-defined metrics.
 // This can be overridden via the ``metrics_namespace`` field in ``DynamicModuleConfig``.
@@ -93,7 +97,9 @@ constexpr absl::string_view DefaultMetricsNamespace = "dynamicmodulescustom";
   COUNTER(virtual_cluster_disagree)                                                                \
   COUNTER(virtual_cluster_unknown)                                                                 \
   COUNTER(virtual_cluster_vhost_mismatch)                                                          \
+  COUNTER(virtual_cluster_stacked)                                                                 \
   GAUGE(built_route_cache_entries, NeverImport)                                                    \
+  HISTOGRAM(virtual_cluster_duration, Nanoseconds)                                                 \
   HISTOGRAM(on_route_duration, Microseconds)                                                       \
   HISTOGRAM(specifier_duration, Microseconds)
 
@@ -369,6 +375,8 @@ public:
   // The virtual clusters the module may select, or nullptr when the configuration declares none.
   const DeclaredVirtualClusterSet* virtualClusters() const { return virtual_clusters_.get(); }
   bool preferVirtualClusterSelection() const { return prefer_virtual_cluster_selection_; }
+  // How the router obtains the virtual cluster of a request.
+  RouterAnswerProto routerAnswer() const { return router_answer_; }
   // Whether the router also compares a preferred selection with the virtual cluster the virtual
   // host matches, with a chance of one in verify_one_in.
   bool sampleVirtualClusterComparison() const;
@@ -388,6 +396,12 @@ public:
   // Optional hooks, null when the module does not export them, in which case Envoy skips them.
   OnRouteSpecifierRouteDestroyType on_route_destroy_{nullptr};
   OnRouteSpecifierUserDataDiscardType on_user_data_discard_{nullptr};
+  // Null unless the module exports it, which a router answer requires. Envoy calls it at the
+  // router.
+  OnRouteSpecifierVirtualClusterType on_virtual_cluster_{nullptr};
+  // Set by envoy_dynamic_module_callback_route_specifier_config_answers_virtual_clusters, which the
+  // module calls from its configuration constructor. Read only after that constructor returns.
+  bool answers_virtual_clusters_{false};
 
   // ----------------------------- Metrics Support -----------------------------
   // The shared registry holding all module-defined metrics.
@@ -431,6 +445,7 @@ private:
   const bool continue_matching_on_failure_;
   const bool prefer_virtual_cluster_selection_;
   const uint32_t virtual_cluster_verify_one_in_;
+  const RouterAnswerProto router_answer_;
   Upstream::ClusterManager& cluster_manager_;
   Runtime::Loader& runtime_;
   TimeSource& time_source_;
@@ -582,6 +597,20 @@ struct RouteSpecifierContext {
   }
 };
 
+// The context of one router answer. The bulk getter of the module reads the headers from it.
+struct VirtualClusterContext {
+  const Http::HeaderMap& headers;
+};
+
+// The virtual cluster a route answers the router with. A selection the module recorded is answered
+// as it is. A router answer is asked for each request, so the route records no selection.
+struct VirtualClusterAnswer {
+  // The selected virtual cluster, null when the module selected none.
+  const Envoy::Router::VirtualCluster* selected{nullptr};
+  // Whether the router asks the module for the answer of each request.
+  bool answered_by_router{false};
+};
+
 /**
  * Virtual host of a route that carries a virtual cluster selection. It answers the virtual cluster
  * lookup of the router from the selection and forwards everything else to the virtual host of the
@@ -592,8 +621,9 @@ class VirtualClusterSelectingVirtualHost : public Envoy::Router::VirtualHost,
 public:
   VirtualClusterSelectingVirtualHost(const Envoy::Router::VirtualHost& base,
                                      const DynamicModuleRouteSpecifierConfig& config,
-                                     const Envoy::Router::VirtualCluster* selected)
-      : base_(base), config_(config), selected_(selected) {}
+                                     VirtualClusterAnswer answer)
+      : base_(base), config_(config), selected_(answer.selected),
+        answered_by_router_(answer.answered_by_router) {}
 
   // Router::VirtualHost
   const Envoy::Router::CorsPolicy* corsPolicy() const override { return base_.corsPolicy(); }
@@ -627,11 +657,22 @@ public:
   const Envoy::Router::VirtualCluster*
   virtualCluster(const Http::HeaderMap& headers) const override;
 
+  // Whether the route answers the router, which is so for a selection that names a virtual cluster
+  // or for a router answer. A selection of none answers nothing, so a later answer may take the
+  // route.
+  bool answers() const { return answered_by_router_ || selected_ != nullptr; }
+
 private:
   const Envoy::Router::VirtualHost& base_;
   const DynamicModuleRouteSpecifierConfig& config_;
-  // Null when the module selected no virtual cluster.
+  // Null when the module selected no virtual cluster, or when the router asks the module.
   const Envoy::Router::VirtualCluster* const selected_;
+  const bool answered_by_router_;
+
+  // Asks the module for the virtual cluster of the request, from the headers the router forwards,
+  // and returns the declared virtual cluster it names, or null when it names none or an unknown
+  // one. Times the call and the lookup.
+  const Envoy::Router::VirtualCluster* answerAtRouter(const Http::HeaderMap& headers) const;
 };
 
 /**
@@ -755,9 +796,9 @@ template <class Wrapper> class VirtualClusterSelectingRoute final : public Wrapp
 public:
   // The selected virtual cluster must be one the configuration of the wrapper declares.
   template <class... Args>
-  VirtualClusterSelectingRoute(const Envoy::Router::VirtualCluster* selected, Args&&... args)
+  VirtualClusterSelectingRoute(VirtualClusterAnswer answer, Args&&... args)
       : Wrapper(std::forward<Args>(args)...),
-        virtual_host_(this->base_route_->virtualHost(), *this->config_, selected) {}
+        virtual_host_(this->base_route_->virtualHost(), *this->config_, answer) {}
 
   // Router::Route
   const Envoy::Router::VirtualHost& virtualHost() const override { return virtual_host_; }
@@ -834,6 +875,13 @@ private:
   // host other than the declared one, since its statistics would be named after the declared one.
   void dropUnusableVirtualClusterSelection(const Envoy::Router::Route& route,
                                            RouteSpecifierContext& context) const;
+  // Whether a virtual cluster answer may be attached to the route. Counts the reason when not: the
+  // route already answers, or its virtual host is not the declared one.
+  bool virtualClusterAnswerable(const Envoy::Router::Route& route) const;
+  // The route a route entry the module is not called for answers the router with, or the route
+  // itself when nothing can be attached to it.
+  Envoy::Router::RouteConstSharedPtr
+  answerEveryRouteEntry(Envoy::Router::RouteConstSharedPtr route) const;
   // Whether the decision recorded a route the cache can hold, which serves every later request that
   // looks the key up.
   static bool recordsACacheableRoute(const RouteSpecifierContext& context,

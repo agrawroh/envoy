@@ -249,6 +249,12 @@ test_program(name = "route_specifier_user_data")
 
 test_program(name = "route_specifier_virtual_cluster")
 
+test_program(name = "route_specifier_router_answer")
+
+test_program(name = "route_specifier_router_answer_no_opt_in")
+
+test_program(name = "route_specifier_router_answer_no_hook")
+
 test_program(name = "cluster_async_host_selection")
 
 test_program(name = "cluster_no_op")
