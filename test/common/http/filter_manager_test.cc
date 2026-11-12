@@ -1,3 +1,4 @@
+#include <array>
 #include <memory>
 #include <optional>
 
@@ -7,6 +8,8 @@
 #include "envoy/matcher/matcher.h"
 #include "envoy/stream_info/filter_state.h"
 
+#include "source/common/filter/config_discovery_impl.h"
+#include "source/common/http/filter_chain_helper.h"
 #include "source/common/http/filter_manager.h"
 #include "source/common/http/matching/inputs.h"
 #include "source/common/matcher/exact_map_matcher.h"
@@ -30,6 +33,22 @@ using testing::Return;
 
 namespace Envoy {
 namespace Http {
+
+// Reads the sizes and capacities of the filter vectors that a filter chain creation fills, in the
+// order filters_, the decoder vector and the encoder vector. The tests assert exact capacities,
+// which are those of libc++ and libstdc++, the standard libraries CI builds.
+class FilterManagerTestPeer {
+public:
+  static std::array<size_t, 3> sizes(const FilterManager& manager) {
+    return {manager.filters_.size(), manager.decoder_filters_.entries_.size(),
+            manager.encoder_filters_.entries_.size()};
+  }
+  static std::array<size_t, 3> capacities(const FilterManager& manager) {
+    return {manager.filters_.capacity(), manager.decoder_filters_.entries_.capacity(),
+            manager.encoder_filters_.entries_.capacity()};
+  }
+};
+
 namespace {
 using Protobuf::util::MessageDifferencer;
 
@@ -59,6 +78,20 @@ public:
     return [handler](FilterChainFactoryCallbacks& callbacks) {
       callbacks.addAccessLogHandler(handler);
     };
+  }
+  // Creates the stream's chain through the helper the HTTP connection manager uses.
+  void createChainFromFactories(const FilterChainUtility::FilterFactoriesList& filter_factories) {
+    EXPECT_CALL(filter_factory_, createFilterChain(_))
+        .WillOnce([&filter_factories](FilterChainFactoryCallbacks& callbacks) -> bool {
+          FilterChainUtility::createFilterChainForFactories(callbacks, filter_factories);
+          return true;
+        });
+    EXPECT_TRUE(filter_manager_->createDownstreamFilterChain().created());
+  }
+  // Expects the sizes and capacities of filters_, the decoder vector and the encoder vector.
+  void expectFilterVectors(std::array<size_t, 3> sizes, std::array<size_t, 3> capacities) {
+    EXPECT_EQ(sizes, FilterManagerTestPeer::sizes(*filter_manager_));
+    EXPECT_EQ(capacities, FilterManagerTestPeer::capacities(*filter_manager_));
   }
 
   void validateFilterStateData(const std::string& expected_name) {
@@ -553,6 +586,296 @@ TEST_F(FilterManagerTest, SetAndGetUpstreamOverrideHost) {
 
   filter_manager_->destroyFilters();
 };
+
+// Builds the factory list that the HTTP connection manager builds from its filter config, with
+// one static provider per factory.
+FilterChainUtility::FilterFactoriesList
+makeFilterFactories(std::vector<std::pair<std::string, FilterFactoryCb>> factories,
+                    bool disabled = false) {
+  FilterChainUtility::FilterFactoriesList filter_factories;
+  for (auto& [name, factory] : factories) {
+    filter_factories.push_back(
+        {std::make_unique<Filter::StaticFilterConfigProviderImpl<Filter::HttpFilterFactoryCb>>(
+             std::move(factory), name),
+         disabled});
+  }
+  return filter_factories;
+}
+
+RequestHeaderMapPtr makeRequestHeaders() {
+  return RequestHeaderMapPtr{
+      new TestRequestHeaderMapImpl{{":authority", "host"}, {":path", "/"}, {":method", "GET"}}};
+}
+
+TEST_F(FilterManagerTest, CreateFilterChainReservesFactoryCount) {
+  initialize();
+
+  auto decoder_filter_0 = std::make_shared<NiceMock<MockStreamDecoderFilter>>();
+  auto encoder_filter_1 = std::make_shared<NiceMock<MockStreamEncoderFilter>>();
+  auto stream_filter_2 = std::make_shared<NiceMock<MockStreamFilter>>();
+  auto stream_filter_3 = std::make_shared<NiceMock<MockStreamFilter>>();
+  auto decoder_filter_4 = std::make_shared<NiceMock<MockStreamDecoderFilter>>();
+  const auto filter_factories = makeFilterFactories({
+      {"decoder_filter_0", createDecoderFilterFactoryCb(decoder_filter_0)},
+      {"encoder_filter_1", createEncoderFilterFactoryCb(encoder_filter_1)},
+      {"stream_filter_2", createStreamFilterFactoryCb(stream_filter_2)},
+      {"stream_filter_3", createStreamFilterFactoryCb(stream_filter_3)},
+      {"decoder_filter_4", createDecoderFilterFactoryCb(decoder_filter_4)},
+  });
+  createChainFromFactories(filter_factories);
+
+  // Five factories add five filters, four of them decoders and three encoders. Each vector takes
+  // five slots on its first filter, where growing one filter at a time would leave capacities of
+  // 8, 4 and 4.
+  expectFilterVectors({5, 4, 3}, {5, 5, 5});
+
+  auto request_headers = makeRequestHeaders();
+  {
+    InSequence s;
+    EXPECT_CALL(*decoder_filter_0, decodeHeaders(_, true))
+        .WillOnce(Return(FilterHeadersStatus::Continue));
+    EXPECT_CALL(*stream_filter_2, decodeHeaders(_, true))
+        .WillOnce(Return(FilterHeadersStatus::Continue));
+    EXPECT_CALL(*stream_filter_3, decodeHeaders(_, true))
+        .WillOnce(Return(FilterHeadersStatus::Continue));
+    EXPECT_CALL(*decoder_filter_4, decodeHeaders(_, true))
+        .WillOnce(Return(FilterHeadersStatus::StopIteration));
+  }
+  filter_manager_->decodeHeaders(*request_headers, true);
+
+  {
+    InSequence s;
+    EXPECT_CALL(*stream_filter_3, encodeHeaders(_, true))
+        .WillOnce(Return(FilterHeadersStatus::Continue));
+    EXPECT_CALL(*stream_filter_2, encodeHeaders(_, true))
+        .WillOnce(Return(FilterHeadersStatus::Continue));
+    EXPECT_CALL(*encoder_filter_1, encodeHeaders(_, true))
+        .WillOnce(Return(FilterHeadersStatus::Continue));
+    EXPECT_CALL(filter_manager_callbacks_, encodeHeaders(_, true));
+  }
+  decoder_filter_4->callbacks_->encodeHeaders(
+      std::make_unique<TestResponseHeaderMapImpl>(TestResponseHeaderMapImpl{{":status", "200"}}),
+      true, "details");
+
+  filter_manager_->destroyFilters();
+  // The providers own the filter config names the filter wrappers view.
+  filter_manager_.reset();
+}
+
+// An encoder filter that comes first reserves filters_ and the encoder vector, and the stream
+// filter after it reserves the decoder vector.
+TEST_F(FilterManagerTest, CreateFilterChainEncoderFirstReservesFactoryCount) {
+  initialize();
+
+  auto encoder_filter = std::make_shared<NiceMock<MockStreamEncoderFilter>>();
+  auto stream_filter = std::make_shared<NiceMock<MockStreamFilter>>();
+  auto decoder_filter = std::make_shared<NiceMock<MockStreamDecoderFilter>>();
+  const auto filter_factories = makeFilterFactories({
+      {"encoder_filter", createEncoderFilterFactoryCb(encoder_filter)},
+      {"stream_filter", createStreamFilterFactoryCb(stream_filter)},
+      {"decoder_filter", createDecoderFilterFactoryCb(decoder_filter)},
+  });
+  createChainFromFactories(filter_factories);
+
+  // Growing one filter at a time would leave capacities of 4, 2 and 2.
+  expectFilterVectors({3, 2, 2}, {3, 3, 3});
+
+  filter_manager_->destroyFilters();
+  // The providers own the filter config names the filter wrappers view.
+  filter_manager_.reset();
+}
+
+// The factory count is a hint, so a chain whose factories each add two filters outgrows it and
+// still runs every filter in configured order.
+TEST_F(FilterManagerTest, CreateFilterChainWithTwoFiltersPerFactory) {
+  initialize();
+
+  std::vector<std::shared_ptr<NiceMock<MockStreamFilter>>> stream_filters;
+  for (int i = 0; i < 6; ++i) {
+    stream_filters.push_back(std::make_shared<NiceMock<MockStreamFilter>>());
+  }
+  auto add_two_filters = [&stream_filters](size_t first) -> FilterFactoryCb {
+    return [&stream_filters, first](FilterChainFactoryCallbacks& callbacks) {
+      callbacks.addStreamFilter(stream_filters[first]);
+      callbacks.addStreamFilter(stream_filters[first + 1]);
+    };
+  };
+  const auto filter_factories = makeFilterFactories({
+      {"filters_0_1", add_two_filters(0)},
+      {"filters_2_3", add_two_filters(2)},
+      {"filters_4_5", add_two_filters(4)},
+  });
+  createChainFromFactories(filter_factories);
+
+  // Each vector takes the three hinted slots on its first filter and doubles them on the fourth.
+  expectFilterVectors({6, 6, 6}, {6, 6, 6});
+
+  auto request_headers = makeRequestHeaders();
+  {
+    InSequence s;
+    for (size_t i = 0; i < 5; ++i) {
+      EXPECT_CALL(*stream_filters[i], decodeHeaders(_, true))
+          .WillOnce(Return(FilterHeadersStatus::Continue));
+    }
+    EXPECT_CALL(*stream_filters[5], decodeHeaders(_, true))
+        .WillOnce(Return(FilterHeadersStatus::StopIteration));
+  }
+  filter_manager_->decodeHeaders(*request_headers, true);
+
+  {
+    InSequence s;
+    for (size_t i = 6; i > 0; --i) {
+      EXPECT_CALL(*stream_filters[i - 1], encodeHeaders(_, true))
+          .WillOnce(Return(FilterHeadersStatus::Continue));
+    }
+    EXPECT_CALL(filter_manager_callbacks_, encodeHeaders(_, true));
+  }
+  stream_filters[5]->decoder_callbacks_->encodeHeaders(
+      std::make_unique<TestResponseHeaderMapImpl>(TestResponseHeaderMapImpl{{":status", "200"}}),
+      true, "details");
+
+  filter_manager_->destroyFilters();
+  // The providers own the filter config names the filter wrappers view.
+  filter_manager_.reset();
+}
+
+// A router-only chain adds one decoder filter, so the encoder vector stays unallocated.
+TEST_F(FilterManagerTest, CreateFilterChainRouterOnlyLeavesEncoderVectorUnallocated) {
+  initialize();
+
+  auto router_filter = std::make_shared<NiceMock<MockStreamDecoderFilter>>();
+  const auto filter_factories =
+      makeFilterFactories({{"router", createDecoderFilterFactoryCb(router_filter)}});
+  createChainFromFactories(filter_factories);
+
+  expectFilterVectors({1, 1, 0}, {1, 1, 0});
+
+  auto request_headers = makeRequestHeaders();
+  EXPECT_CALL(*router_filter, decodeHeaders(_, true))
+      .WillOnce(Return(FilterHeadersStatus::StopIteration));
+  filter_manager_->decodeHeaders(*request_headers, true);
+
+  filter_manager_->destroyFilters();
+  // The providers own the filter config names the filter wrappers view.
+  filter_manager_.reset();
+}
+
+// A dynamic filter config provider before its first config arrives, which the helper replaces with
+// a filter that answers every request with a local reply.
+class MissingConfigProvider : public Filter::FilterConfigProvider<Filter::HttpFilterFactoryCb> {
+public:
+  const std::string& name() override { return name_; }
+  OptRef<Filter::HttpFilterFactoryCb> config() override { return {}; }
+
+private:
+  const std::string name_{"missing_config"};
+};
+
+// The hint counts only the factories enabled by default, a missing config included, so a factory
+// disabled by default adds no slot.
+TEST_F(FilterManagerTest, CreateFilterChainHintSkipsDefaultDisabledFactories) {
+  initialize();
+
+  std::vector<std::shared_ptr<NiceMock<MockStreamFilter>>> stream_filters;
+  FilterChainUtility::FilterFactoriesList filter_factories;
+  for (size_t i = 0; i < 36; ++i) {
+    // Factories 0, 11, 22 and 33 are enabled, and the other 32 are disabled by default.
+    const bool enabled = i % 11 == 0;
+    stream_filters.push_back(std::make_shared<NiceMock<MockStreamFilter>>());
+    auto factory = makeFilterFactories(
+        {{"filter_" + std::to_string(i), createStreamFilterFactoryCb(stream_filters.back())}},
+        /*disabled=*/!enabled);
+    filter_factories.push_back(std::move(factory.front()));
+  }
+  filter_factories.push_back({std::make_unique<MissingConfigProvider>(), false});
+  createChainFromFactories(filter_factories);
+
+  // The 32 factories disabled by default add no slot, so four stream filters and the decoder
+  // filter for the missing config take five, where counting them would take 37. Leaving the missing
+  // config out of the count would grow filters_ and the decoder vector from 4 to 8.
+  expectFilterVectors({5, 5, 4}, {5, 5, 5});
+
+  filter_manager_->destroyFilters();
+  // The providers own the filter config names the filter wrappers view.
+  filter_manager_.reset();
+}
+
+// A route that enables factories disabled by default can add more filters than the hint, and a
+// vector that takes more filters than the hint grows from it. A route that disables a factory
+// enabled by default leaves its slot unused.
+TEST_F(FilterManagerTest, CreateFilterChainRouteOverridesGrowFromHint) {
+  initialize();
+
+  auto route = std::make_shared<NiceMock<Router::MockRoute>>();
+  ON_CALL(*route, filterDisabled(_)).WillByDefault(Return(std::nullopt));
+  ON_CALL(*route, filterDisabled(testing::Eq("disabled_by_route")))
+      .WillByDefault(Return(std::make_optional(true)));
+  ON_CALL(*route, filterDisabled(testing::Eq("enabled_by_route_0")))
+      .WillByDefault(Return(std::make_optional(false)));
+  ON_CALL(*route, filterDisabled(testing::Eq("enabled_by_route_1")))
+      .WillByDefault(Return(std::make_optional(false)));
+  filter_manager_->streamInfo().route_ = route;
+
+  std::vector<std::shared_ptr<NiceMock<MockStreamFilter>>> stream_filters;
+  for (int i = 0; i < 5; ++i) {
+    stream_filters.push_back(std::make_shared<NiceMock<MockStreamFilter>>());
+  }
+  auto filter_factories = makeFilterFactories({
+      {"enabled_0", createStreamFilterFactoryCb(stream_filters[0])},
+      {"enabled_1", createStreamFilterFactoryCb(stream_filters[1])},
+      {"disabled_by_route", createStreamFilterFactoryCb(stream_filters[2])},
+  });
+  auto disabled_by_default = makeFilterFactories(
+      {
+          {"enabled_by_route_0", createStreamFilterFactoryCb(stream_filters[3])},
+          {"enabled_by_route_1", createStreamFilterFactoryCb(stream_filters[4])},
+      },
+      /*disabled=*/true);
+  for (auto& filter_factory : disabled_by_default) {
+    filter_factories.push_back(std::move(filter_factory));
+  }
+  createChainFromFactories(filter_factories);
+
+  // Three factories enabled by default give a hint of 3, and the route runs four, so each vector
+  // takes three slots on its first filter and doubles them on the fourth, where growing one filter
+  // at a time would take 4.
+  expectFilterVectors({4, 4, 4}, {6, 6, 6});
+
+  filter_manager_->destroyFilters();
+  // The providers own the filter config names the filter wrappers view.
+  filter_manager_.reset();
+}
+
+// A factory enabled by default may add no filter, so the hint is 1 while no vector takes a filter.
+// Each vector reserves only when it takes its first filter, so none is allocated.
+TEST_F(FilterManagerTest, CreateFilterChainFactoryAddingNoFilterAllocatesNoVector) {
+  initialize();
+
+  const auto filter_factories =
+      makeFilterFactories({{"adds_no_filter", [](FilterChainFactoryCallbacks&) {}}});
+  createChainFromFactories(filter_factories);
+
+  expectFilterVectors({0, 0, 0}, {0, 0, 0});
+
+  filter_manager_->destroyFilters();
+  filter_manager_.reset();
+}
+
+TEST_F(FilterManagerTest, CreateFilterChainWithNoFactories) {
+  initialize();
+
+  const FilterChainUtility::FilterFactoriesList filter_factories;
+  createChainFromFactories(filter_factories);
+
+  expectFilterVectors({0, 0, 0}, {0, 0, 0});
+
+  // A header-only request walks the empty chain to its end.
+  auto request_headers = makeRequestHeaders();
+  EXPECT_CALL(filter_manager_callbacks_, disarmRequestTimeout());
+  filter_manager_->decodeHeaders(*request_headers, true);
+
+  filter_manager_->destroyFilters();
+}
 
 TEST_F(FilterManagerTest, GetRouteLevelFilterConfig) {
   initialize();

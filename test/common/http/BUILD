@@ -153,6 +153,8 @@ envoy_cc_test(
     srcs = ["filter_manager_test.cc"],
     rbe_pool = {"build": "linux_x64_small"},
     deps = [
+        "//source/common/filter:config_discovery_lib",
+        "//source/common/http:filter_chain_helper_lib",
         "//source/common/http:filter_manager_lib",
         "//test/mocks/event:event_mocks",
         "//test/mocks/http:http_mocks",
@@ -226,7 +228,10 @@ envoy_cc_benchmark_binary(
     srcs = ["filter_manager_benchmark.cc"],
     rbe_pool = {"build": "linux_x64_small"},
     deps = [
+        "//source/common/filter:config_discovery_lib",
+        "//source/common/http:filter_chain_helper_lib",
         "//source/common/http:filter_manager_lib",
+        "//source/extensions/filters/http/common:pass_through_filter_lib",
         "//test/mocks/event:event_mocks",
         "//test/mocks/http:http_mocks",
         "//test/mocks/local_reply:local_reply_mocks",

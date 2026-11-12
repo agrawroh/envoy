@@ -1,5 +1,6 @@
 #include "source/common/http/filter_chain_helper.h"
 
+#include <algorithm>
 #include <memory>
 #include <string>
 
@@ -17,6 +18,11 @@ namespace Http {
 
 void FilterChainUtility::createFilterChainForFactories(
     Http::FilterChainFactoryCallbacks& callbacks, const FilterFactoriesList& filter_factories) {
+  // Counting the factories disabled by default would hold a slot per stream for every one that a
+  // route never enables. Any vector that takes more filters than the hint grows from it.
+  callbacks.reserveFilters(static_cast<uint32_t>(
+      std::count_if(filter_factories.begin(), filter_factories.end(),
+                    [](const FilterFactoryProvider& provider) { return !provider.disabled; })));
   bool added_missing_config_filter = false;
 
   for (const auto& filter_config_provider : filter_factories) {

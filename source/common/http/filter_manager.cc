@@ -1856,8 +1856,6 @@ FilterManager::createFilterChain(const FilterChainFactory& filter_chain_factory)
     }
   });
 
-  // TODO(wbpcode): reserve memory for filters to avoid frequent reallocation.
-
   OptRef<DownstreamStreamFilterCallbacks> downstream_callbacks =
       filter_manager_callbacks_.downstreamCallbacks();
 

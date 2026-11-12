@@ -1420,6 +1420,17 @@ public:
   virtual void addStreamFilter(Http::StreamFilterSharedPtr filter) PURE;
 
   /**
+   * Hints how many filter factories the chain about to be created runs, so the implementation can
+   * reserve storage for the filters they add. FilterChainUtility::createFilterChainForFactories()
+   * calls this once before it runs the factories, and a filter factory should not call it. The
+   * count is the factories enabled by default, those whose config is missing included. A route may
+   * enable or disable factories, and a factory may add no filter or several, so the count is a hint
+   * and never a limit. The default implementation does nothing.
+   * @param filter_count supplies the number of filter factories enabled by default.
+   */
+  virtual void reserveFilters(uint32_t /* filter_count */) {}
+
+  /**
    * Add an access log handler that is called when the stream is destroyed.
    * @param handler supplies the handler to add.
    */

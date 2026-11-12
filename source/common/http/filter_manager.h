@@ -28,6 +28,8 @@
 #include "source/common/runtime/runtime_features.h"
 #include "source/common/stream_info/stream_info_impl.h"
 
+#include "absl/base/attributes.h"
+
 namespace Envoy {
 namespace Http {
 
@@ -1027,33 +1029,39 @@ protected:
 
 private:
   friend class DownstreamFilterManager;
+  friend class FilterManagerTestPeer;
   class FilterChainFactoryCallbacksImpl : public Http::FilterChainFactoryCallbacks {
   public:
     FilterChainFactoryCallbacksImpl(FilterManager& manager)
         : manager_(manager), route_(manager_.streamInfo().route()) {}
 
     void addStreamDecoderFilter(Http::StreamDecoderFilterSharedPtr filter) override {
-      manager_.filters_.push_back(filter.get());
+      appendFilter(manager_.filters_, filter.get());
 
-      manager_.decoder_filters_.entries_.emplace_back(std::make_unique<ActiveStreamDecoderFilter>(
-          manager_, std::move(filter), filter_config_name_));
+      appendFilter(manager_.decoder_filters_.entries_,
+                   std::make_unique<ActiveStreamDecoderFilter>(manager_, std::move(filter),
+                                                               filter_config_name_));
     }
 
     void addStreamEncoderFilter(Http::StreamEncoderFilterSharedPtr filter) override {
-      manager_.filters_.push_back(filter.get());
+      appendFilter(manager_.filters_, filter.get());
 
-      manager_.encoder_filters_.entries_.emplace_back(std::make_unique<ActiveStreamEncoderFilter>(
-          manager_, std::move(filter), filter_config_name_));
+      appendFilter(manager_.encoder_filters_.entries_,
+                   std::make_unique<ActiveStreamEncoderFilter>(manager_, std::move(filter),
+                                                               filter_config_name_));
     }
 
     void addStreamFilter(Http::StreamFilterSharedPtr filter) override {
-      manager_.filters_.push_back(filter.get());
+      appendFilter(manager_.filters_, filter.get());
 
-      manager_.decoder_filters_.entries_.emplace_back(
-          std::make_unique<ActiveStreamDecoderFilter>(manager_, filter, filter_config_name_));
-      manager_.encoder_filters_.entries_.emplace_back(std::make_unique<ActiveStreamEncoderFilter>(
-          manager_, std::move(filter), filter_config_name_));
+      appendFilter(manager_.decoder_filters_.entries_, std::make_unique<ActiveStreamDecoderFilter>(
+                                                           manager_, filter, filter_config_name_));
+      appendFilter(manager_.encoder_filters_.entries_,
+                   std::make_unique<ActiveStreamEncoderFilter>(manager_, std::move(filter),
+                                                               filter_config_name_));
     }
+
+    void reserveFilters(uint32_t filter_count) override { filter_count_hint_ = filter_count; }
 
     void addAccessLogHandler(AccessLog::InstanceSharedPtr handler) override {
       manager_.access_log_handlers_.push_back(std::move(handler));
@@ -1078,11 +1086,26 @@ private:
     }
 
   private:
+    // Reserves the hinted count when a vector takes its first filter, so a chain never allocates a
+    // vector it leaves empty, such as the encoder vector of a router-only chain. A vector that
+    // takes fewer filters than the hint keeps the unused slots for the stream's life. A
+    // decoder-heavy chain's encoder vector does, and so does every vector when a route disables
+    // most factories. Clang emits this template out of line otherwise, so it is forced inline, and
+    // the hint costs one capacity compare per vector append.
+    template <class T, class U>
+    ABSL_ATTRIBUTE_ALWAYS_INLINE void appendFilter(std::vector<T>& filters, U&& filter) {
+      if (filters.capacity() == 0) {
+        filters.reserve(filter_count_hint_);
+      }
+      filters.emplace_back(std::forward<U>(filter));
+    }
+
     FilterManager& manager_;
     absl::string_view filter_config_name_;
     // Reference here is safe because the callbacks are only used during filter chain creation,
     // at which point the route cannot change.
     OptRef<const Router::Route> route_;
+    uint32_t filter_count_hint_{0};
   };
 
   // Indicates which filter to start the iteration with.
