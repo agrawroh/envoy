@@ -1,6 +1,8 @@
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -13,9 +15,13 @@
 
 #include "source/common/network/address_impl.h"
 #include "source/common/router/string_accessor_impl.h"
+#include "source/common/stats/allocator.h"
+#include "source/common/stats/thread_local_store.h"
+#include "source/common/thread_local/thread_local_impl.h"
 #include "source/extensions/filters/http/dynamic_modules/filter.h"
 #include "source/extensions/filters/http/dynamic_modules/filter_config.h"
 
+#include "test/common/memory/memory_test_utility.h"
 #include "test/common/stats/stat_test_utility.h"
 #include "test/extensions/dynamic_modules/util.h"
 #include "test/mocks/event/mocks.h"
@@ -31,10 +37,16 @@
 #include "test/mocks/upstream/host_set.h"
 #include "test/mocks/upstream/priority_set.h"
 #include "test/mocks/upstream/thread_local_cluster.h"
+#include "test/test_common/logging.h"
 #include "test/test_common/status_utility.h"
 #include "test/test_common/struct_matchers.h"
 #include "test/test_common/utility.h"
 
+#include "absl/cleanup/cleanup.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
+#include "absl/synchronization/notification.h"
 #include "gmock/gmock.h"
 
 using testing::_;
@@ -4355,6 +4367,774 @@ TEST(ABIImpl, ConfigStats) {
       envoy_dynamic_module_callback_http_filter_config_record_histogram_value(
           filter_config.get(), histogram_vec_id, invalid_labels.data(), invalid_labels.size(), 10),
       envoy_dynamic_module_type_metrics_result_InvalidLabels);
+}
+
+namespace {
+
+using DefineMetricFn = decltype(&envoy_dynamic_module_callback_http_filter_config_define_counter);
+using RecordFilterMetricFn = decltype(&envoy_dynamic_module_callback_http_filter_increment_counter);
+using RecordConfigMetricFn =
+    decltype(&envoy_dynamic_module_callback_http_filter_config_increment_counter);
+
+// Builds module buffers that point into `values`, which must outlive them.
+std::vector<envoy_dynamic_module_type_module_buffer>
+moduleBuffers(const std::vector<std::string>& values) {
+  std::vector<envoy_dynamic_module_type_module_buffer> buffers;
+  buffers.reserve(values.size());
+  for (const std::string& value : values) {
+    buffers.push_back(moduleBuffer(value));
+  }
+  return buffers;
+}
+
+size_t defineMetric(DefineMetricFn define, DynamicModuleHttpFilterConfig& config,
+                    const std::string& name, const std::vector<std::string>& label_names) {
+  auto names = moduleBuffers(label_names);
+  size_t id = 0;
+  EXPECT_EQ(define(&config, {name.data(), name.size()}, names.data(), names.size(), &id),
+            envoy_dynamic_module_type_metrics_result_Success);
+  return id;
+}
+
+envoy_dynamic_module_type_metrics_result
+recordOnFilter(RecordFilterMetricFn record, DynamicModuleHttpFilter& filter, size_t id,
+               const std::vector<std::string>& label_values, uint64_t value) {
+  auto values = moduleBuffers(label_values);
+  return record(&filter, id, values.data(), values.size(), value);
+}
+
+envoy_dynamic_module_type_metrics_result
+recordOnConfig(RecordConfigMetricFn record, DynamicModuleHttpFilterConfig& config, size_t id,
+               const std::vector<std::string>& label_values, uint64_t value) {
+  auto values = moduleBuffers(label_values);
+  return record(&config, id, values.data(), values.size(), value);
+}
+
+uint64_t counterValue(const Stats::TestUtil::TestStore& store, const std::string& name) {
+  Stats::CounterOptConstRef counter = store.findCounterByString(name);
+  EXPECT_TRUE(counter.has_value()) << name;
+  return counter.has_value() ? counter->value() : 0;
+}
+
+// The key the cache stores for metric `id` and `label_values`.
+std::string cacheKey(size_t id, const std::vector<std::string>& label_values) {
+  auto values = moduleBuffers(label_values);
+  char buffer[ThreadLocalMetricVecCache::MaxKeyLength];
+  return std::string(ThreadLocalMetricVecCache::makeKey(id, values.data(), values.size(), buffer));
+}
+
+// Reads a histogram's recorded values, and fails the test rather than the binary when there are
+// none.
+std::vector<uint64_t> histogramValuesIfRecorded(Stats::TestUtil::TestStore& store,
+                                                const std::string& name) {
+  const bool recorded = store.histogramRecordedValues(name);
+  EXPECT_TRUE(recorded) << name;
+  return recorded ? store.histogramValues(name, false) : std::vector<uint64_t>{};
+}
+
+uint64_t gaugeValue(const Stats::TestUtil::TestStore& store, const std::string& name) {
+  Stats::GaugeOptConstRef gauge = store.findGaugeByString(name);
+  EXPECT_TRUE(gauge.has_value()) << name;
+  return gauge.has_value() ? gauge->value() : 0;
+}
+
+// A thread local instance that registers the test thread as the main thread, as a server does.
+class TestThreadLocal {
+public:
+  TestThreadLocal()
+      : api_(Api::createApiForTest()), dispatcher_(api_->allocateDispatcher("test_thread")) {
+    tls_.registerThread(*dispatcher_, true);
+  }
+  ~TestThreadLocal() {
+    tls_.shutdownGlobalThreading();
+    tls_.shutdownThread();
+  }
+  ThreadLocal::InstanceImpl& tls() { return tls_; }
+
+private:
+  Api::ApiPtr api_;
+  Event::DispatcherPtr dispatcher_;
+  ThreadLocal::InstanceImpl tls_;
+};
+
+} // namespace
+
+// The filter path, which caches each child per thread, records the same values as the config
+// path, which resolves every child through the stats store, for every metric type with and without
+// labels. The tuples include two that a key without length prefixes would confuse, two with an
+// empty value, one given once as an empty string and once as a null buffer, and one tuple recorded
+// on two metrics with the same label names.
+TEST(ABIImpl, CachedLabeledMetricsMatchStoreResolvedMetrics) {
+  Stats::TestUtil::TestStore stats_store;
+  Stats::TestUtil::TestScope stats_scope{"", stats_store};
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  auto cached = std::make_shared<DynamicModuleHttpFilterConfig>(
+      "some_name", "some_config", "cached", nullptr, stats_scope, context);
+  auto reference = std::make_shared<DynamicModuleHttpFilterConfig>(
+      "some_name", "some_config", "reference", nullptr, stats_scope, context);
+
+  const DefineMetricFn counter = envoy_dynamic_module_callback_http_filter_config_define_counter;
+  const DefineMetricFn gauge = envoy_dynamic_module_callback_http_filter_config_define_gauge;
+  const DefineMetricFn histogram =
+      envoy_dynamic_module_callback_http_filter_config_define_histogram;
+  struct Metric {
+    DefineMetricFn define;
+    std::string name;
+    std::vector<std::string> label_names;
+  };
+  const std::vector<Metric> metrics = {
+      {counter, "c0", {}},
+      {counter, "c1", {"k1"}},
+      {counter, "c1b", {"k1"}},
+      {counter, "c2", {"k1", "k2"}},
+      {counter, "c3", {"k1", "k2", "k3"}},
+      {gauge, "g0", {}},
+      {gauge, "g2", {"k1", "k2"}},
+      {histogram, "h0", {}},
+      {histogram, "h2", {"k1", "k2"}},
+  };
+  std::vector<size_t> ids;
+  for (const Metric& metric : metrics) {
+    ids.push_back(defineMetric(metric.define, *cached, metric.name, metric.label_names));
+    EXPECT_EQ(defineMetric(metric.define, *reference, metric.name, metric.label_names), ids.back());
+  }
+
+  const RecordFilterMetricFn add = envoy_dynamic_module_callback_http_filter_increment_counter;
+  const RecordConfigMetricFn config_add =
+      envoy_dynamic_module_callback_http_filter_config_increment_counter;
+  const RecordFilterMetricFn inc = envoy_dynamic_module_callback_http_filter_increment_gauge;
+  const RecordConfigMetricFn config_inc =
+      envoy_dynamic_module_callback_http_filter_config_increment_gauge;
+  const RecordFilterMetricFn dec = envoy_dynamic_module_callback_http_filter_decrement_gauge;
+  const RecordConfigMetricFn config_dec =
+      envoy_dynamic_module_callback_http_filter_config_decrement_gauge;
+  const RecordFilterMetricFn set = envoy_dynamic_module_callback_http_filter_set_gauge;
+  const RecordConfigMetricFn config_set =
+      envoy_dynamic_module_callback_http_filter_config_set_gauge;
+  const RecordFilterMetricFn record =
+      envoy_dynamic_module_callback_http_filter_record_histogram_value;
+  const RecordConfigMetricFn config_record =
+      envoy_dynamic_module_callback_http_filter_config_record_histogram_value;
+  struct Record {
+    RecordFilterMetricFn on_filter;
+    RecordConfigMetricFn on_config;
+    size_t metric;
+    std::vector<std::string> label_values;
+    uint64_t value;
+  };
+  const std::vector<Record> records = {
+      {add, config_add, 0, {}, 3},
+      {add, config_add, 1, {"x"}, 1},
+      {add, config_add, 2, {"x"}, 5},
+      {add, config_add, 1, {"x"}, 2},
+      {add, config_add, 3, {"a", "bc"}, 1},
+      {add, config_add, 3, {"ab", "c"}, 10},
+      {add, config_add, 3, {"a", "bc"}, 100},
+      {add, config_add, 3, {"x", ""}, 4},
+      {add, config_add, 4, {"p", "q", "r"}, 7},
+      {add, config_add, 4, {"p", "q", "s"}, 8},
+      {add, config_add, 4, {"p", "q", "r"}, 9},
+      {inc, config_inc, 5, {}, 4},
+      {inc, config_inc, 6, {"a", "bc"}, 10},
+      {dec, config_dec, 6, {"a", "bc"}, 3},
+      {inc, config_inc, 6, {"ab", "c"}, 5},
+      {set, config_set, 6, {"ab", "c"}, 42},
+      {dec, config_dec, 6, {"ab", "c"}, 2},
+      {inc, config_inc, 6, {"a", "bc"}, 1},
+      {record, config_record, 7, {}, 11},
+      {record, config_record, 8, {"a", "bc"}, 10},
+      {record, config_record, 8, {"ab", "c"}, 20},
+      {record, config_record, 8, {"a", "bc"}, 30},
+  };
+  // Two streams take turns, so a child that one stream cached serves the other.
+  DynamicModuleHttpFilter first{cached, stats_scope.symbolTable(), 0};
+  DynamicModuleHttpFilter second{cached, stats_scope.symbolTable(), 0};
+  for (size_t i = 0; i < records.size(); i++) {
+    const Record& r = records[i];
+    EXPECT_EQ(recordOnFilter(r.on_filter, i % 2 == 0 ? first : second, ids[r.metric],
+                             r.label_values, r.value),
+              envoy_dynamic_module_type_metrics_result_Success);
+    EXPECT_EQ(recordOnConfig(r.on_config, *reference, ids[r.metric], r.label_values, r.value),
+              envoy_dynamic_module_type_metrics_result_Success);
+  }
+  ASSERT_NE(cached->metricVecCache(), nullptr);
+  // One entry per distinct labeled tuple so far. Unlabeled metrics never reach the cache.
+  EXPECT_EQ(cached->metricVecCache()->sizeForTest(), 11);
+  // A module may pass a null buffer for an empty value. Recorded first, the tuple takes a new
+  // entry, and the same tuple given as an empty string then hits that entry.
+  envoy_dynamic_module_type_module_buffer null_first[] = {{nullptr, 0}, {"x", 1}};
+  EXPECT_EQ(envoy_dynamic_module_callback_http_filter_increment_counter(&second, ids[3], null_first,
+                                                                        2, 2),
+            envoy_dynamic_module_type_metrics_result_Success);
+  EXPECT_EQ(envoy_dynamic_module_callback_http_filter_config_increment_counter(
+                reference.get(), ids[3], null_first, 2, 2),
+            envoy_dynamic_module_type_metrics_result_Success);
+  EXPECT_EQ(cached->metricVecCache()->sizeForTest(), 12);
+  EXPECT_EQ(recordOnFilter(add, first, ids[3], {"", "x"}, 1),
+            envoy_dynamic_module_type_metrics_result_Success);
+  EXPECT_EQ(recordOnConfig(config_add, *reference, ids[3], {"", "x"}, 1),
+            envoy_dynamic_module_type_metrics_result_Success);
+  EXPECT_EQ(cached->metricVecCache()->sizeForTest(), 12);
+  // Every counter and gauge of one config has a twin with the same value in the other.
+  absl::flat_hash_map<std::string, uint64_t> cached_values;
+  absl::flat_hash_map<std::string, uint64_t> reference_values;
+  std::vector<uint64_t> c2_values;
+  for (const Stats::CounterSharedPtr& counter : stats_store.counters()) {
+    const std::string name = counter->name();
+    if (absl::StartsWith(name, "cached.")) {
+      cached_values[name.substr(strlen("cached."))] = counter->value();
+      if (absl::StartsWith(name, "cached.c2.")) {
+        c2_values.push_back(counter->value());
+      }
+    } else if (absl::StartsWith(name, "reference.")) {
+      reference_values[name.substr(strlen("reference."))] = counter->value();
+    }
+  }
+  for (const Stats::GaugeSharedPtr& gauge : stats_store.gauges()) {
+    const std::string name = gauge->name();
+    if (absl::StartsWith(name, "cached.")) {
+      cached_values[name.substr(strlen("cached."))] = gauge->value();
+    } else if (absl::StartsWith(name, "reference.")) {
+      reference_values[name.substr(strlen("reference."))] = gauge->value();
+    }
+  }
+  EXPECT_EQ(cached_values.size(), 12);
+  EXPECT_EQ(cached_values, reference_values);
+  // The four tuples of `c2`, with the null-buffer record counted in the empty-first one.
+  std::sort(c2_values.begin(), c2_values.end());
+  EXPECT_EQ(c2_values, (std::vector<uint64_t>{3, 4, 10, 101}));
+  for (const char* name : {"c0", "c1.k1.x", "c1b.k1.x", "c2.k1.a.k2.bc", "c2.k1.ab.k2.c",
+                           "c3.k1.p.k2.q.k3.r", "c3.k1.p.k2.q.k3.s"}) {
+    EXPECT_EQ(counterValue(stats_store, absl::StrCat("cached.", name)),
+              counterValue(stats_store, absl::StrCat("reference.", name)))
+        << name;
+  }
+  EXPECT_EQ(counterValue(stats_store, "cached.c1.k1.x"), 3);
+  EXPECT_EQ(counterValue(stats_store, "cached.c1b.k1.x"), 5);
+  EXPECT_EQ(counterValue(stats_store, "cached.c2.k1.a.k2.bc"), 101);
+  EXPECT_EQ(counterValue(stats_store, "cached.c2.k1.ab.k2.c"), 10);
+  for (const char* name : {"g0", "g2.k1.a.k2.bc", "g2.k1.ab.k2.c"}) {
+    EXPECT_EQ(gaugeValue(stats_store, absl::StrCat("cached.", name)),
+              gaugeValue(stats_store, absl::StrCat("reference.", name)))
+        << name;
+  }
+  EXPECT_EQ(gaugeValue(stats_store, "cached.g2.k1.a.k2.bc"), 8);
+  EXPECT_EQ(gaugeValue(stats_store, "cached.g2.k1.ab.k2.c"), 40);
+  for (const char* name : {"h0", "h2.k1.a.k2.bc", "h2.k1.ab.k2.c"}) {
+    EXPECT_EQ(histogramValuesIfRecorded(stats_store, absl::StrCat("cached.", name)),
+              histogramValuesIfRecorded(stats_store, absl::StrCat("reference.", name)))
+        << name;
+  }
+  EXPECT_EQ(histogramValuesIfRecorded(stats_store, "cached.h2.k1.a.k2.bc"),
+            (std::vector<uint64_t>{10, 30}));
+}
+
+// After the first record of a tuple, later records of it on any stream of the thread reuse the
+// cached child and retain no heap bytes, where the uncached path interns every label value into the
+// stream's pool on every call. `EXPECT_MEMORY_EQ` reads the allocator's heap counter, so a build
+// without allocator stats, such as a sanitizer build, compares nothing.
+TEST(ABIImpl, RepeatedLabelTupleReusesOneCachedChild) {
+  Stats::TestUtil::TestStore stats_store;
+  Stats::TestUtil::TestScope stats_scope{"", stats_store};
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  auto config = std::make_shared<DynamicModuleHttpFilterConfig>(
+      "some_name", "some_config", DefaultMetricsNamespace, nullptr, stats_scope, context);
+  const size_t counter_id =
+      defineMetric(envoy_dynamic_module_callback_http_filter_config_define_counter, *config,
+                   "result", {"result", "reason"});
+  const size_t gauge_id =
+      defineMetric(envoy_dynamic_module_callback_http_filter_config_define_gauge, *config,
+                   "inflight", {"result", "reason"});
+  const std::vector<std::string> tuple = {"allow", "residual"};
+  auto values = moduleBuffers(tuple);
+
+  DynamicModuleHttpFilter first{config, stats_scope.symbolTable(), 0};
+  DynamicModuleHttpFilter second{config, stats_scope.symbolTable(), 0};
+  EXPECT_EQ(recordOnFilter(envoy_dynamic_module_callback_http_filter_increment_counter, first,
+                           counter_id, tuple, 1),
+            envoy_dynamic_module_type_metrics_result_Success);
+  EXPECT_EQ(recordOnFilter(envoy_dynamic_module_callback_http_filter_increment_counter, second,
+                           counter_id, tuple, 1),
+            envoy_dynamic_module_type_metrics_result_Success);
+  EXPECT_EQ(recordOnFilter(envoy_dynamic_module_callback_http_filter_set_gauge, second, gauge_id,
+                           tuple, 1),
+            envoy_dynamic_module_type_metrics_result_Success);
+  ASSERT_NE(config->metricVecCache(), nullptr);
+  EXPECT_EQ(config->metricVecCache()->sizeForTest(), 2);
+
+  // The loop calls the ABI with buffers built above, so only the records themselves can hold heap
+  // bytes after it.
+  size_t failures = 0;
+  Memory::TestUtil::MemoryTest memory_test;
+  for (uint64_t i = 0; i < 100; i++) {
+    DynamicModuleHttpFilter& filter = i % 2 == 0 ? first : second;
+    if (envoy_dynamic_module_callback_http_filter_increment_counter(
+            &filter, counter_id, values.data(), values.size(), 1) !=
+        envoy_dynamic_module_type_metrics_result_Success) {
+      failures++;
+    }
+    if (envoy_dynamic_module_callback_http_filter_set_gauge(&filter, gauge_id, values.data(),
+                                                            values.size(), i) !=
+        envoy_dynamic_module_type_metrics_result_Success) {
+      failures++;
+    }
+  }
+  EXPECT_MEMORY_EQ(memory_test.consumedBytes(), 0);
+  EXPECT_EQ(failures, 0);
+  EXPECT_EQ(config->metricVecCache()->sizeForTest(), 2);
+  EXPECT_EQ(counterValue(stats_store, "dynamicmodulescustom.result.result.allow.reason.residual"),
+            102);
+  EXPECT_EQ(gaugeValue(stats_store, "dynamicmodulescustom.inflight.result.allow.reason.residual"),
+            99);
+}
+
+// The cache object a labeled config creates on every registered thread up front, with the
+// `std::make_shared` block the slot initializer allocates it in, stays within 128 bytes, since its
+// maps hold no table until the first insert. A cache full of the longest keys stays within the
+// bound the cap sets. The figures need tcmalloc and are skipped without it.
+TEST(ABIImpl, LabeledMetricCacheMemory) {
+  Stats::TestUtil::TestStore stats_store;
+  Stats::Counter& counter = stats_store.counterFromString("planted");
+  std::string value(ThreadLocalMetricVecCache::MaxLabelValueLength, 'v');
+  char buffer[ThreadLocalMetricVecCache::MaxKeyLength];
+
+  Memory::TestUtil::MemoryTest object_memory;
+  auto cache = std::make_shared<ThreadLocalMetricVecCache>();
+  const size_t object_bytes = object_memory.consumedBytes();
+  EXPECT_MEMORY_LE(object_bytes, 128);
+
+  Memory::TestUtil::MemoryTest full_memory;
+  for (size_t i = 0; i < ThreadLocalMetricVecCache::MaxEntries; i++) {
+    const std::string index = absl::StrCat(i);
+    value.replace(0, index.size(), index);
+    envoy_dynamic_module_type_module_buffer label{value.data(), value.size()};
+    cache->insert(ThreadLocalMetricVecCache::makeKey(1, &label, 1, buffer), counter);
+  }
+  const size_t full_bytes = full_memory.consumedBytes();
+  EXPECT_EQ(cache->sizeForTest(), ThreadLocalMetricVecCache::MaxEntries);
+  EXPECT_MEMORY_LE(full_bytes, 400 * 1024);
+}
+
+// A cached entry serves the record. A counter of another store, planted under a tuple's key, takes
+// the record, and the config's own store never creates the tuple's counter. This needs no heap
+// counter, unlike `RepeatedLabelTupleReusesOneCachedChild`.
+TEST(ABIImpl, LabeledMetricCacheServesTheCachedChild) {
+  Stats::TestUtil::TestStore stats_store;
+  Stats::TestUtil::TestScope stats_scope{"", stats_store};
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  auto config = std::make_shared<DynamicModuleHttpFilterConfig>(
+      "some_name", "some_config", DefaultMetricsNamespace, nullptr, stats_scope, context);
+  const size_t id = defineMetric(envoy_dynamic_module_callback_http_filter_config_define_counter,
+                                 *config, "requests", {"result"});
+  DynamicModuleHttpFilter filter{config, stats_scope.symbolTable(), 0};
+  Stats::TestUtil::TestStore other_store;
+  Stats::Counter& planted = other_store.counterFromString("planted");
+  ASSERT_NE(config->metricVecCache(), nullptr);
+  config->metricVecCache()->insert(cacheKey(id, {"sentinel"}), planted);
+
+  EXPECT_EQ(recordOnFilter(envoy_dynamic_module_callback_http_filter_increment_counter, filter, id,
+                           {"sentinel"}, 3),
+            envoy_dynamic_module_type_metrics_result_Success);
+  EXPECT_EQ(planted.value(), 3);
+  EXPECT_FALSE(
+      stats_store.findCounterByString("dynamicmodulescustom.requests.result.sentinel").has_value());
+}
+
+// The key refuses an ID past four bytes and a label length past the room left, even SIZE_MAX,
+// keeps apart two tuples whose values join to the same bytes, and names a null buffer and an empty
+// string as the same empty value.
+TEST(ABIImpl, LabeledMetricCacheKey) {
+  char buffer[ThreadLocalMetricVecCache::MaxKeyLength];
+  envoy_dynamic_module_type_module_buffer x{"x", 1};
+  const size_t widest_id = std::numeric_limits<uint32_t>::max();
+  EXPECT_TRUE(ThreadLocalMetricVecCache::makeKey(widest_id + 1, &x, 1, buffer).empty());
+  EXPECT_EQ(ThreadLocalMetricVecCache::makeKey(widest_id, &x, 1, buffer).size(), 6);
+  envoy_dynamic_module_type_module_buffer widest_length{"x", std::numeric_limits<size_t>::max()};
+  EXPECT_TRUE(ThreadLocalMetricVecCache::makeKey(1, &widest_length, 1, buffer).empty());
+  EXPECT_NE(cacheKey(1, {"x"}), cacheKey(2, {"x"}));
+  EXPECT_NE(cacheKey(1, {"a", "bc"}), cacheKey(1, {"ab", "c"}));
+
+  envoy_dynamic_module_type_module_buffer null_value{nullptr, 0};
+  envoy_dynamic_module_type_module_buffer empty_value{"", 0};
+  const std::string null_key(ThreadLocalMetricVecCache::makeKey(1, &null_value, 1, buffer));
+  const std::string empty_key(ThreadLocalMetricVecCache::makeKey(1, &empty_value, 1, buffer));
+  EXPECT_EQ(null_key.size(), 5);
+  EXPECT_EQ(null_key, empty_key);
+}
+
+// Once the cache is full, a tuple it does not hold is resolved through the stats store on every
+// call and still counts, while the cached tuples keep their entries.
+TEST(ABIImpl, LabeledMetricCacheStopsGrowingAtItsCap) {
+  Stats::TestUtil::TestStore stats_store;
+  Stats::TestUtil::TestScope stats_scope{"", stats_store};
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  auto config = std::make_shared<DynamicModuleHttpFilterConfig>(
+      "some_name", "some_config", DefaultMetricsNamespace, nullptr, stats_scope, context);
+  const size_t id = defineMetric(envoy_dynamic_module_callback_http_filter_config_define_counter,
+                                 *config, "requests", {"peer"});
+  const size_t gauge_id = defineMetric(
+      envoy_dynamic_module_callback_http_filter_config_define_gauge, *config, "inflight", {"peer"});
+  const size_t histogram_id =
+      defineMetric(envoy_dynamic_module_callback_http_filter_config_define_histogram, *config,
+                   "latency", {"peer"});
+  DynamicModuleHttpFilter filter{config, stats_scope.symbolTable(), 0};
+  const RecordFilterMetricFn add = envoy_dynamic_module_callback_http_filter_increment_counter;
+
+  // Filling the cache logs once, naming the filter, and no record past the cap logs again, whether
+  // it misses, hits or misses on another metric type.
+  EXPECT_LOG_CONTAINS_N_TIMES("debug", "cache of filter some_name on this thread is full", 1, {
+    for (size_t i = 0; i < ThreadLocalMetricVecCache::MaxEntries; i++) {
+      EXPECT_EQ(recordOnFilter(add, filter, id, {absl::StrCat("p", i)}, 1),
+                envoy_dynamic_module_type_metrics_result_Success);
+    }
+    EXPECT_EQ(recordOnFilter(add, filter, id, {"overflow"}, 1),
+              envoy_dynamic_module_type_metrics_result_Success);
+    EXPECT_EQ(recordOnFilter(add, filter, id, {"overflow"}, 1),
+              envoy_dynamic_module_type_metrics_result_Success);
+    EXPECT_EQ(recordOnFilter(add, filter, id, {"p0"}, 1),
+              envoy_dynamic_module_type_metrics_result_Success);
+    // The cap spans every metric type of the config.
+    EXPECT_EQ(recordOnFilter(envoy_dynamic_module_callback_http_filter_set_gauge, filter, gauge_id,
+                             {"p0"}, 7),
+              envoy_dynamic_module_type_metrics_result_Success);
+    EXPECT_EQ(recordOnFilter(envoy_dynamic_module_callback_http_filter_record_histogram_value,
+                             filter, histogram_id, {"p0"}, 9),
+              envoy_dynamic_module_type_metrics_result_Success);
+  });
+  ASSERT_NE(config->metricVecCache(), nullptr);
+  ThreadLocalMetricVecCache& cache = *config->metricVecCache();
+  EXPECT_EQ(cache.sizeForTest(), ThreadLocalMetricVecCache::MaxEntries);
+  EXPECT_EQ(cache.find<Stats::Counter>(cacheKey(id, {"overflow"})), nullptr);
+  EXPECT_NE(cache.find<Stats::Counter>(cacheKey(id, {"p0"})), nullptr);
+  EXPECT_EQ(cache.find<Stats::Gauge>(cacheKey(gauge_id, {"p0"})), nullptr);
+  EXPECT_EQ(cache.find<Stats::Histogram>(cacheKey(histogram_id, {"p0"})), nullptr);
+  EXPECT_EQ(counterValue(stats_store, "dynamicmodulescustom.requests.peer.overflow"), 2);
+  EXPECT_EQ(counterValue(stats_store, "dynamicmodulescustom.requests.peer.p0"), 2);
+  EXPECT_EQ(gaugeValue(stats_store, "dynamicmodulescustom.inflight.peer.p0"), 7);
+  EXPECT_EQ(histogramValuesIfRecorded(stats_store, "dynamicmodulescustom.latency.peer.p0"),
+            (std::vector<uint64_t>{9}));
+}
+
+// A tuple whose key would exceed `MaxKeyLength`, such as one that carries a long request header,
+// is resolved through the stats store on every call and still counts. A tuple at the limit is
+// cached. The bound applies to the whole key, so two labels that each fit can still be too long.
+TEST(ABIImpl, LabeledMetricCacheSkipsTuplesWithLongKeys) {
+  Stats::TestUtil::TestStore stats_store;
+  Stats::TestUtil::TestScope stats_scope{"", stats_store};
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  auto config = std::make_shared<DynamicModuleHttpFilterConfig>(
+      "some_name", "some_config", DefaultMetricsNamespace, nullptr, stats_scope, context);
+  const size_t id = defineMetric(envoy_dynamic_module_callback_http_filter_config_define_counter,
+                                 *config, "requests", {"agent"});
+  const size_t pair_id =
+      defineMetric(envoy_dynamic_module_callback_http_filter_config_define_counter, *config,
+                   "pairs", {"first", "second"});
+  DynamicModuleHttpFilter filter{config, stats_scope.symbolTable(), 0};
+  const RecordFilterMetricFn add = envoy_dynamic_module_callback_http_filter_increment_counter;
+  const size_t longest_value = ThreadLocalMetricVecCache::MaxLabelValueLength;
+  // Two-label keys of 258 and 250 bytes, after the four-byte ID and the two length bytes.
+  const std::vector<std::string> too_long_pair = {std::string(126, 'c'), std::string(126, 'd')};
+  const std::vector<std::string> fitting_pair = {std::string(122, 'e'), std::string(122, 'f')};
+  const std::string at_limit(longest_value, 'a');
+  const std::string past_limit(longest_value + 1, 'b');
+
+  for (int i = 0; i < 2; i++) {
+    EXPECT_EQ(recordOnFilter(add, filter, id, {at_limit}, 1),
+              envoy_dynamic_module_type_metrics_result_Success);
+    EXPECT_EQ(recordOnFilter(add, filter, id, {past_limit}, 1),
+              envoy_dynamic_module_type_metrics_result_Success);
+    EXPECT_EQ(recordOnFilter(add, filter, pair_id, too_long_pair, 1),
+              envoy_dynamic_module_type_metrics_result_Success);
+    EXPECT_EQ(recordOnFilter(add, filter, pair_id, fitting_pair, 1),
+              envoy_dynamic_module_type_metrics_result_Success);
+  }
+  ASSERT_NE(config->metricVecCache(), nullptr);
+  EXPECT_EQ(config->metricVecCache()->sizeForTest(), 2);
+  EXPECT_EQ(cacheKey(pair_id, too_long_pair), "");
+  EXPECT_EQ(cacheKey(pair_id, fitting_pair).size(), 250);
+  EXPECT_NE(config->metricVecCache()->find<Stats::Counter>(cacheKey(pair_id, fitting_pair)),
+            nullptr);
+  EXPECT_EQ(counterValue(stats_store, absl::StrCat("dynamicmodulescustom.pairs.first.",
+                                                   too_long_pair[0], ".second.", too_long_pair[1])),
+            2);
+  EXPECT_EQ(counterValue(stats_store, absl::StrCat("dynamicmodulescustom.pairs.first.",
+                                                   fitting_pair[0], ".second.", fitting_pair[1])),
+            2);
+  EXPECT_EQ(
+      counterValue(stats_store, absl::StrCat("dynamicmodulescustom.requests.agent.", at_limit)), 2);
+  EXPECT_EQ(
+      counterValue(stats_store, absl::StrCat("dynamicmodulescustom.requests.agent.", past_limit)),
+      2);
+}
+
+// Two filter configs that define the same metric get the same ID, and each config's records still
+// land in its own scope, since each config holds its own cache.
+TEST(ABIImpl, LabeledMetricCacheIsPerFilterConfig) {
+  Stats::TestUtil::TestStore stats_store;
+  Stats::TestUtil::TestScope stats_scope{"", stats_store};
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  auto first = std::make_shared<DynamicModuleHttpFilterConfig>("some_name", "some_config", "first",
+                                                               nullptr, stats_scope, context);
+  auto second = std::make_shared<DynamicModuleHttpFilterConfig>(
+      "some_name", "some_config", "second", nullptr, stats_scope, context);
+  const DefineMetricFn define = envoy_dynamic_module_callback_http_filter_config_define_counter;
+  const size_t id = defineMetric(define, *first, "requests", {"result"});
+  ASSERT_EQ(defineMetric(define, *second, "requests", {"result"}), id);
+
+  DynamicModuleHttpFilter first_filter{first, stats_scope.symbolTable(), 0};
+  DynamicModuleHttpFilter second_filter{second, stats_scope.symbolTable(), 0};
+  const RecordFilterMetricFn add = envoy_dynamic_module_callback_http_filter_increment_counter;
+  EXPECT_EQ(recordOnFilter(add, first_filter, id, {"allow"}, 1),
+            envoy_dynamic_module_type_metrics_result_Success);
+  EXPECT_EQ(recordOnFilter(add, second_filter, id, {"allow"}, 10),
+            envoy_dynamic_module_type_metrics_result_Success);
+  EXPECT_EQ(recordOnFilter(add, first_filter, id, {"allow"}, 1),
+            envoy_dynamic_module_type_metrics_result_Success);
+
+  EXPECT_EQ(counterValue(stats_store, "first.requests.result.allow"), 2);
+  EXPECT_EQ(counterValue(stats_store, "second.requests.result.allow"), 10);
+  ASSERT_NE(first->metricVecCache(), nullptr);
+  ASSERT_NE(second->metricVecCache(), nullptr);
+  EXPECT_EQ(first->metricVecCache()->sizeForTest(), 1);
+  EXPECT_EQ(second->metricVecCache()->sizeForTest(), 1);
+}
+
+// Each registered thread keeps its own module cache for a config. The two threads record
+// overlapping tuples, and each thread's cache holds only the tuples that thread recorded.
+TEST(ABIImpl, LabeledMetricCacheIsPerThread) {
+  TestThreadLocal thread_local_instance;
+  Api::ApiPtr api = Api::createApiForTest();
+  Event::DispatcherPtr worker_dispatcher = api->allocateDispatcher("worker_0");
+  thread_local_instance.tls().registerThread(*worker_dispatcher, false);
+  std::thread worker(
+      [&worker_dispatcher]() { worker_dispatcher->run(Event::Dispatcher::RunType::RunUntilExit); });
+  // Stops and joins the worker even when an assertion below returns early.
+  absl::Cleanup stop_worker = [&worker_dispatcher, &worker]() {
+    worker_dispatcher->post([&worker_dispatcher]() { worker_dispatcher->exit(); });
+    worker.join();
+  };
+  // Runs `fn` on the worker and waits for it to return.
+  auto on_worker = [&worker_dispatcher](std::function<void()> fn) {
+    absl::Notification done;
+    worker_dispatcher->post([&fn, &done]() {
+      fn();
+      done.Notify();
+    });
+    done.WaitForNotification();
+  };
+
+  Stats::TestUtil::TestStore stats_store;
+  Stats::TestUtil::TestScope stats_scope{"", stats_store};
+  {
+    NiceMock<Server::Configuration::MockServerFactoryContext> context;
+    ON_CALL(context, threadLocal()).WillByDefault(testing::ReturnRef(thread_local_instance.tls()));
+    auto config = std::make_shared<DynamicModuleHttpFilterConfig>(
+        "some_name", "some_config", DefaultMetricsNamespace, nullptr, stats_scope, context);
+    const size_t id = defineMetric(envoy_dynamic_module_callback_http_filter_config_define_counter,
+                                   *config, "requests", {"result"});
+    const RecordFilterMetricFn add = envoy_dynamic_module_callback_http_filter_increment_counter;
+    DynamicModuleHttpFilter main_filter{config, stats_scope.symbolTable(), 0};
+    auto worker_filter =
+        std::make_unique<DynamicModuleHttpFilter>(config, stats_scope.symbolTable(), 1);
+    // The results whose tuple a thread's cache holds.
+    auto cached_results = [id](ThreadLocalMetricVecCache& cache) {
+      std::vector<std::string> results;
+      for (const char* result : {"allow", "deny", "error"}) {
+        if (cache.find<Stats::Counter>(cacheKey(id, {result})) != nullptr) {
+          results.push_back(result);
+        }
+      }
+      return results;
+    };
+
+    size_t failures = 0;
+    for (const char* result : {"allow", "allow", "deny"}) {
+      if (recordOnFilter(add, main_filter, id, {result}, 1) !=
+          envoy_dynamic_module_type_metrics_result_Success) {
+        failures++;
+      }
+    }
+    size_t worker_failures = 0;
+    size_t worker_size = 0;
+    bool worker_has_cache = false;
+    std::vector<std::string> worker_results;
+    on_worker([&]() {
+      for (const char* result : {"allow", "error", "error"}) {
+        if (recordOnFilter(add, *worker_filter, id, {result}, 10) !=
+            envoy_dynamic_module_type_metrics_result_Success) {
+          worker_failures++;
+        }
+      }
+      ThreadLocalMetricVecCache* cache = config->metricVecCache();
+      worker_has_cache = cache != nullptr;
+      if (worker_has_cache) {
+        worker_size = cache->sizeForTest();
+        worker_results = cached_results(*cache);
+      }
+      worker_filter.reset();
+    });
+
+    EXPECT_EQ(failures, 0);
+    EXPECT_EQ(worker_failures, 0);
+    EXPECT_TRUE(worker_has_cache);
+    EXPECT_EQ(worker_size, 2);
+    EXPECT_EQ(worker_results, (std::vector<std::string>{"allow", "error"}));
+    ASSERT_NE(config->metricVecCache(), nullptr);
+    EXPECT_EQ(config->metricVecCache()->sizeForTest(), 2);
+    EXPECT_EQ(cached_results(*config->metricVecCache()),
+              (std::vector<std::string>{"allow", "deny"}));
+    EXPECT_EQ(counterValue(stats_store, "dynamicmodulescustom.requests.result.allow"), 12);
+    EXPECT_EQ(counterValue(stats_store, "dynamicmodulescustom.requests.result.deny"), 1);
+    EXPECT_EQ(counterValue(stats_store, "dynamicmodulescustom.requests.result.error"), 20);
+  }
+}
+
+// A thread's slot entry that holds no cache, as during the thread's thread local teardown, sends
+// the record through the stats store, and the cache serves records again once the entry holds it.
+TEST(ABIImpl, LabeledMetricCacheIgnoresAnEmptySlotEntry) {
+  Stats::TestUtil::TestStore stats_store;
+  Stats::TestUtil::TestScope stats_scope{"", stats_store};
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  ThreadLocal::MockInstance& tls = context.thread_local_;
+  auto config = std::make_shared<DynamicModuleHttpFilterConfig>(
+      "some_name", "some_config", DefaultMetricsNamespace, nullptr, stats_scope, context);
+  const size_t id = defineMetric(envoy_dynamic_module_callback_http_filter_config_define_counter,
+                                 *config, "requests", {"result"});
+  const uint32_t slot = tls.current_slot_ - 1;
+  ASSERT_NE(config->metricVecCache(), nullptr);
+  const ThreadLocal::ThreadLocalObjectSharedPtr cache = tls.data_[slot];
+  DynamicModuleHttpFilter filter{config, stats_scope.symbolTable(), 0};
+  const RecordFilterMetricFn add = envoy_dynamic_module_callback_http_filter_increment_counter;
+
+  tls.data_[slot].reset();
+  EXPECT_EQ(config->metricVecCache(), nullptr);
+  EXPECT_EQ(recordOnFilter(add, filter, id, {"allow"}, 100),
+            envoy_dynamic_module_type_metrics_result_Success);
+
+  tls.data_[slot] = cache;
+  ASSERT_NE(config->metricVecCache(), nullptr);
+  EXPECT_EQ(config->metricVecCache()->sizeForTest(), 0);
+  EXPECT_EQ(recordOnFilter(add, filter, id, {"allow"}, 1),
+            envoy_dynamic_module_type_metrics_result_Success);
+  EXPECT_EQ(config->metricVecCache()->sizeForTest(), 1);
+  EXPECT_EQ(counterValue(stats_store, "dynamicmodulescustom.requests.result.allow"), 101);
+}
+
+// The module's scope is not evictable, so a store eviction pass never frees a child the cache
+// holds, and a record after it reaches the same counter.
+TEST(ABIImpl, LabeledMetricCacheSurvivesStoreEviction) {
+  Stats::SymbolTableImpl symbol_table;
+  Stats::Allocator alloc(symbol_table);
+  Api::ApiPtr api = Api::createApiForTest();
+  Event::DispatcherPtr dispatcher = api->allocateDispatcher("test_thread");
+  ThreadLocal::InstanceImpl tls;
+  Stats::ThreadLocalStoreImpl store(alloc);
+  tls.registerThread(*dispatcher, true);
+  store.initializeThreading(*dispatcher, tls);
+  // Shuts threading down even when an assertion below returns early.
+  absl::Cleanup shutdown = [&]() {
+    tls.shutdownGlobalThreading();
+    store.shutdownThreading();
+    tls.shutdownThread();
+    dispatcher->run(Event::Dispatcher::RunType::NonBlock);
+  };
+  {
+    NiceMock<Server::Configuration::MockServerFactoryContext> context;
+    ON_CALL(context, threadLocal()).WillByDefault(testing::ReturnRef(tls));
+    auto config = std::make_shared<DynamicModuleHttpFilterConfig>(
+        "some_name", "some_config", DefaultMetricsNamespace, nullptr, *store.rootScope(), context);
+    const size_t id = defineMetric(envoy_dynamic_module_callback_http_filter_config_define_counter,
+                                   *config, "requests", {"result"});
+    DynamicModuleHttpFilter filter{config, symbol_table, 0};
+    const RecordFilterMetricFn add = envoy_dynamic_module_callback_http_filter_increment_counter;
+    EXPECT_EQ(recordOnFilter(add, filter, id, {"allow"}, 1),
+              envoy_dynamic_module_type_metrics_result_Success);
+    ASSERT_NE(config->metricVecCache(), nullptr);
+    EXPECT_EQ(config->metricVecCache()->sizeForTest(), 1);
+
+    // An evictable scope marks an unused stat on the first pass and frees it on the second.
+    for (int i = 0; i < 2; i++) {
+      store.evictUnused();
+      dispatcher->run(Event::Dispatcher::RunType::NonBlock);
+    }
+    EXPECT_EQ(recordOnFilter(add, filter, id, {"allow"}, 1),
+              envoy_dynamic_module_type_metrics_result_Success);
+    Stats::CounterSharedPtr counter =
+        TestUtility::findCounter(store, "dynamicmodulescustom.requests.result.allow");
+    ASSERT_NE(counter, nullptr);
+    EXPECT_EQ(counter->value(), 2);
+  }
+}
+
+// A thread without thread local storage, such as one a module starts, records a labeled metric
+// through the stats store and leaves the cache alone. The store here is an isolated test store,
+// which keeps no thread local state of its own.
+TEST(ABIImpl, LabeledMetricOnThreadWithoutThreadLocalStorageIsNotCached) {
+  TestThreadLocal thread_local_instance;
+  Stats::TestUtil::TestStore stats_store;
+  Stats::TestUtil::TestScope stats_scope{"", stats_store};
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  ON_CALL(context, threadLocal()).WillByDefault(testing::ReturnRef(thread_local_instance.tls()));
+  auto config = std::make_shared<DynamicModuleHttpFilterConfig>(
+      "some_name", "some_config", DefaultMetricsNamespace, nullptr, stats_scope, context);
+  const size_t id = defineMetric(envoy_dynamic_module_callback_http_filter_config_define_counter,
+                                 *config, "requests", {"result"});
+  DynamicModuleHttpFilter filter{config, stats_scope.symbolTable(), 0};
+
+  envoy_dynamic_module_type_metrics_result result = envoy_dynamic_module_type_metrics_result_Frozen;
+  std::thread module_thread([&]() {
+    result = recordOnFilter(envoy_dynamic_module_callback_http_filter_increment_counter, filter, id,
+                            {"allow"}, 1);
+  });
+  module_thread.join();
+
+  EXPECT_EQ(result, envoy_dynamic_module_type_metrics_result_Success);
+  EXPECT_EQ(counterValue(stats_store, "dynamicmodulescustom.requests.result.allow"), 1);
+  ASSERT_NE(config->metricVecCache(), nullptr);
+  EXPECT_EQ(config->metricVecCache()->sizeForTest(), 0);
+}
+
+// The cache takes one thread local slot per config, once the module defines a labeled metric of any
+// type, and only on the main thread, since allocating a slot anywhere else is unsafe.
+TEST(ABIImpl, LabeledMetricCacheSlotAllocation) {
+  Stats::TestUtil::TestStore stats_store;
+  Stats::TestUtil::TestScope stats_scope{"", stats_store};
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  const DefineMetricFn counter = envoy_dynamic_module_callback_http_filter_config_define_counter;
+  const DefineMetricFn gauge = envoy_dynamic_module_callback_http_filter_config_define_gauge;
+  const DefineMetricFn histogram =
+      envoy_dynamic_module_callback_http_filter_config_define_histogram;
+  auto make_config = [&](absl::string_view metrics_namespace) {
+    return std::make_shared<DynamicModuleHttpFilterConfig>(
+        "some_name", "some_config", metrics_namespace, nullptr, stats_scope, context);
+  };
+
+  EXPECT_CALL(context.thread_local_, allocateSlot()).Times(0);
+  auto unlabeled = make_config("unlabeled");
+  defineMetric(counter, *unlabeled, "c", {});
+  defineMetric(gauge, *unlabeled, "g", {});
+  defineMetric(histogram, *unlabeled, "h", {});
+  EXPECT_EQ(unlabeled->metricVecCache(), nullptr);
+
+  auto off_main = make_config("off_main");
+  std::thread module_thread([&]() { defineMetric(counter, *off_main, "c", {"k"}); });
+  module_thread.join();
+  EXPECT_EQ(off_main->metricVecCache(), nullptr);
+  testing::Mock::VerifyAndClearExpectations(&context.thread_local_);
+
+  EXPECT_CALL(context.thread_local_, allocateSlot()).Times(3);
+  auto every_type = make_config("every_type");
+  defineMetric(counter, *every_type, "c", {"k"});
+  defineMetric(gauge, *every_type, "g", {"k"});
+  defineMetric(histogram, *every_type, "h", {"k"});
+  auto gauge_only = make_config("gauge_only");
+  defineMetric(gauge, *gauge_only, "g", {"k"});
+  auto histogram_only = make_config("histogram_only");
+  defineMetric(histogram, *histogram_only, "h", {"k"});
+  for (const auto& config : {every_type, gauge_only, histogram_only}) {
+    ASSERT_NE(config->metricVecCache(), nullptr);
+    EXPECT_EQ(config->metricVecCache()->sizeForTest(), 0);
+  }
 }
 
 TEST_F(DynamicModuleHttpFilterTest, GetConcurrency) {

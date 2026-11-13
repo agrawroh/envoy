@@ -1,6 +1,8 @@
 #include "source/extensions/filters/http/dynamic_modules/filter_config.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 
 #include "envoy/common/exception.h"
 #include "envoy/config/core/v3/config_source.pb.h"
@@ -17,6 +19,38 @@ namespace Extensions {
 namespace DynamicModules {
 namespace HttpFilters {
 
+absl::string_view
+ThreadLocalMetricVecCache::makeKey(size_t id,
+                                   const envoy_dynamic_module_type_module_buffer* label_values,
+                                   size_t label_values_length, char (&buffer)[MaxKeyLength]) {
+  // MetricRegistry::byId bounds an ID by the number of metrics the config defined, so this guard
+  // only keeps two IDs from sharing a key for a caller that passes an unchecked ID.
+  if (id > std::numeric_limits<uint32_t>::max()) {
+    return {};
+  }
+  const uint32_t key_id = static_cast<uint32_t>(id);
+  std::copy_n(reinterpret_cast<const char*>(&key_id), sizeof(key_id), buffer);
+  size_t offset = sizeof(key_id);
+  for (size_t i = 0; i < label_values_length; i++) {
+    // The module owns the buffers, so each length is read once and checked against the room left
+    // before the copy. Comparing it with the room, rather than adding it to the offset, keeps a
+    // length near SIZE_MAX from wrapping past the check. A key that fits holds no label value
+    // longer than MaxLabelValueLength. The single read only bounds the copy. The tags come from a
+    // second read, so a module that rewrites a buffer during the call can bind this tuple's key to
+    // another of its own tuples, and this thread then counts the tuple there for the config's life.
+    const size_t length = label_values[i].length;
+    if (length >= MaxKeyLength - offset) {
+      return {};
+    }
+    buffer[offset++] = static_cast<char>(static_cast<uint8_t>(length));
+    if (length > 0) {
+      std::copy_n(label_values[i].ptr, length, buffer + offset);
+      offset += length;
+    }
+  }
+  return {buffer, offset};
+}
+
 DynamicModuleHttpFilterConfig::DynamicModuleHttpFilterConfig(
     const absl::string_view filter_name, const absl::string_view filter_config,
     const absl::string_view metrics_namespace,
@@ -25,7 +59,10 @@ DynamicModuleHttpFilterConfig::DynamicModuleHttpFilterConfig(
     OptRef<Server::LoadShedPointProvider> load_shed_point_provider)
     : cluster_manager_(context.clusterManager()),
       main_thread_dispatcher_(context.mainThreadDispatcher()),
-      stats_scope_(stats_scope.createScope(absl::StrCat(metrics_namespace, "."))),
+      // ThreadLocalMetricVecCache keeps raw pointers to this scope's children, so the scope must
+      // never evict a stat.
+      stats_scope_(
+          stats_scope.createScope(absl::StrCat(metrics_namespace, "."), /*evictable=*/false)),
       metrics_(*stats_scope_), init_manager_(init_manager),
       load_shed_point_provider_(load_shed_point_provider), server_context_(context),
       filter_name_(filter_name), filter_config_(filter_config),
@@ -110,6 +147,19 @@ size_t DynamicModuleHttpFilterConfig::subscribeGenericSecret(absl::string_view n
   generic_secrets_.push_back(std::move(thread_local_provider.value()));
   // IDs are 1-based so that 0 can signal failure to the module.
   return generic_secrets_.size();
+}
+
+void DynamicModuleHttpFilterConfig::createMetricVecCache() {
+  // Allocating a thread local slot is main-thread-only. A module that defines a labeled metric from
+  // a thread of its own inside ``config_new`` gets no cache, so every labeled record resolves its
+  // child through the stats store, as it does without the cache.
+  if (!Thread::MainThread::isMainOrTestThread() || metric_vec_cache_ != nullptr) {
+    return;
+  }
+  metric_vec_cache_ =
+      ThreadLocal::TypedSlot<ThreadLocalMetricVecCache>::makeUnique(server_context_.threadLocal());
+  metric_vec_cache_->set(
+      [](Event::Dispatcher&) { return std::make_shared<ThreadLocalMetricVecCache>(); });
 }
 
 DynamicModuleHttpFilterConfig::~DynamicModuleHttpFilterConfig() {

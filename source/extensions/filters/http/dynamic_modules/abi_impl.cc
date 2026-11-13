@@ -17,6 +17,8 @@
 #include "source/extensions/dynamic_modules/abi_conversions.h"
 #include "source/extensions/filters/http/dynamic_modules/filter.h"
 
+#include "absl/base/attributes.h"
+
 namespace Envoy {
 namespace Extensions {
 namespace DynamicModules {
@@ -50,6 +52,41 @@ static Stats::StatNameTagVector buildTagsForModuleMetric(
     tags.push_back(Stats::StatNameTag(label_names[i], label_value));
   }
   return tags;
+}
+
+// Returns the child of a labeled metric for one label value tuple. A tuple the calling thread has
+// resolved before comes from the config's cache, which skips interning the label values into the
+// stream's pool and building the tagged name that the stats store looks up. It stays out of line,
+// so the unlabeled path of each metric callback keeps its size.
+template <class MetricType, class VecHandle>
+ABSL_ATTRIBUTE_NOINLINE MetricType&
+resolveLabeledMetric(DynamicModuleHttpFilter& filter, size_t id, const VecHandle& vec,
+                     envoy_dynamic_module_type_module_buffer* label_values,
+                     size_t label_values_length) {
+  DynamicModuleHttpFilterConfig& config = *filter.getFilterConfigSharedPtr();
+  ThreadLocalMetricVecCache* cache = config.metricVecCache();
+  char key_buffer[ThreadLocalMetricVecCache::MaxKeyLength];
+  absl::string_view key;
+  if (cache != nullptr) {
+    key = ThreadLocalMetricVecCache::makeKey(id, label_values, label_values_length, key_buffer);
+    if (key.empty()) {
+      // The tuple is too long to cache, or the metric ID is out of the key's range.
+      cache = nullptr;
+    } else if (MetricType* cached = cache->find<MetricType>(key); cached != nullptr) {
+      return *cached;
+    }
+  }
+  auto tags = buildTagsForModuleMetric(filter.getStatNamePool(), vec.labelNames(), label_values,
+                                       label_values_length);
+  MetricType& metric = vec.resolve(config.metrics().scope(), tags);
+  if (cache != nullptr && cache->insert(key, metric)) {
+    ENVOY_LOG_TO_LOGGER(Envoy::Logger::Registry::getLog(Envoy::Logger::Id::dynamic_modules), debug,
+                        "the labeled metric cache of filter {} on this thread is full at {} "
+                        "entries, so a label value tuple it does not hold is resolved on every "
+                        "record",
+                        config.filterName(), ThreadLocalMetricVecCache::MaxEntries);
+  }
+  return metric;
 }
 
 // Converts a module owned buffer to a string view, tolerating the null buffer that a module passes
@@ -584,6 +621,7 @@ envoy_dynamic_module_callback_http_filter_config_define_counter(
   }
   *counter_id_ptr = filter_config->metrics().addCounterVec(
       MetricRegistry::CounterVecHandle(main_stat_name, std::move(label_names_vec)));
+  filter_config->createMetricVecCache();
   return envoy_dynamic_module_type_metrics_result_Success;
 }
 
@@ -611,9 +649,8 @@ envoy_dynamic_module_callback_http_filter_increment_counter(
   if (label_values_length != counter->labelNames().size()) {
     return envoy_dynamic_module_type_metrics_result_InvalidLabels;
   }
-  auto tags = buildTagsForModuleMetric(filter->getStatNamePool(), counter->labelNames(),
-                                       label_values, label_values_length);
-  counter->add(filter->getFilterConfigSharedPtr()->metrics().scope(), tags, value);
+  resolveLabeledMetric<Stats::Counter>(*filter, id, *counter, label_values, label_values_length)
+      .add(value);
   return envoy_dynamic_module_type_metrics_result_Success;
 }
 
@@ -649,6 +686,7 @@ envoy_dynamic_module_callback_http_filter_config_define_gauge(
   }
   *gauge_id_ptr = filter_config->metrics().addGaugeVec(
       MetricRegistry::GaugeVecHandle(main_stat_name, std::move(label_names_vec), import_mode));
+  filter_config->createMetricVecCache();
   return envoy_dynamic_module_type_metrics_result_Success;
 }
 
@@ -673,9 +711,8 @@ envoy_dynamic_module_type_metrics_result envoy_dynamic_module_callback_http_filt
   if (label_values_length != gauge->labelNames().size()) {
     return envoy_dynamic_module_type_metrics_result_InvalidLabels;
   }
-  auto tags = buildTagsForModuleMetric(filter->getStatNamePool(), gauge->labelNames(), label_values,
-                                       label_values_length);
-  gauge->increase(filter->getFilterConfigSharedPtr()->metrics().scope(), tags, value);
+  resolveLabeledMetric<Stats::Gauge>(*filter, id, *gauge, label_values, label_values_length)
+      .add(value);
   return envoy_dynamic_module_type_metrics_result_Success;
 }
 
@@ -700,9 +737,8 @@ envoy_dynamic_module_type_metrics_result envoy_dynamic_module_callback_http_filt
   if (label_values_length != gauge->labelNames().size()) {
     return envoy_dynamic_module_type_metrics_result_InvalidLabels;
   }
-  auto tags = buildTagsForModuleMetric(filter->getStatNamePool(), gauge->labelNames(), label_values,
-                                       label_values_length);
-  gauge->decrease(filter->getFilterConfigSharedPtr()->metrics().scope(), tags, value);
+  resolveLabeledMetric<Stats::Gauge>(*filter, id, *gauge, label_values, label_values_length)
+      .sub(value);
   return envoy_dynamic_module_type_metrics_result_Success;
 }
 
@@ -727,9 +763,8 @@ envoy_dynamic_module_type_metrics_result envoy_dynamic_module_callback_http_filt
   if (label_values_length != gauge->labelNames().size()) {
     return envoy_dynamic_module_type_metrics_result_InvalidLabels;
   }
-  auto tags = buildTagsForModuleMetric(filter->getStatNamePool(), gauge->labelNames(), label_values,
-                                       label_values_length);
-  gauge->set(filter->getFilterConfigSharedPtr()->metrics().scope(), tags, value);
+  resolveLabeledMetric<Stats::Gauge>(*filter, id, *gauge, label_values, label_values_length)
+      .set(value);
   return envoy_dynamic_module_type_metrics_result_Success;
 }
 
@@ -765,6 +800,7 @@ envoy_dynamic_module_callback_http_filter_config_define_histogram(
   }
   *histogram_id_ptr = filter_config->metrics().addHistogramVec(
       MetricRegistry::HistogramVecHandle(main_stat_name, std::move(label_names_vec), unit));
+  filter_config->createMetricVecCache();
   return envoy_dynamic_module_type_metrics_result_Success;
 }
 
@@ -790,9 +826,8 @@ envoy_dynamic_module_callback_http_filter_record_histogram_value(
   if (label_values_length != hist->labelNames().size()) {
     return envoy_dynamic_module_type_metrics_result_InvalidLabels;
   }
-  auto tags = buildTagsForModuleMetric(filter->getStatNamePool(), hist->labelNames(), label_values,
-                                       label_values_length);
-  hist->recordValue(filter->getFilterConfigSharedPtr()->metrics().scope(), tags, value);
+  resolveLabeledMetric<Stats::Histogram>(*filter, id, *hist, label_values, label_values_length)
+      .recordValue(value);
   return envoy_dynamic_module_type_metrics_result_Success;
 }
 

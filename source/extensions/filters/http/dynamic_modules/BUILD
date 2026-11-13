@@ -17,6 +17,7 @@ envoy_cc_library(
         "//envoy/secret:secret_manager_interface",
         "//envoy/secret:secret_provider_interface",
         "//envoy/server/overload:load_shed_point_interface",
+        "//envoy/thread_local:thread_local_interface",
         "//source/common/common:minimal_logger_lib",
         "//source/common/common:thread_lib",
         "//source/common/protobuf:utility_lib",
@@ -24,6 +25,7 @@ envoy_cc_library(
         "//source/extensions/dynamic_modules:dynamic_modules_lib",
         "//source/extensions/dynamic_modules:metric_registry",
         "//source/extensions/filters/http/common:pass_through_filter_lib",
+        "@abseil-cpp//absl/container:flat_hash_map",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
     ],
 )
@@ -81,6 +83,7 @@ envoy_cc_library(
         "//source/extensions/dynamic_modules:abi_impl",
         "//source/extensions/dynamic_modules:dynamic_modules_lib",
         "//source/extensions/filters/http/common:pass_through_filter_lib",
+        "@abseil-cpp//absl/base:core_headers",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
     ],
     alwayslink = True,

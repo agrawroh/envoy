@@ -1,17 +1,24 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <tuple>
 
 #include "envoy/init/manager.h"
 #include "envoy/secret/secret_provider.h"
 #include "envoy/server/factory_context.h"
 #include "envoy/server/overload/load_shed_point.h"
+#include "envoy/thread_local/thread_local.h"
 #include "envoy/upstream/cluster_manager.h"
 
 #include "source/common/secret/secret_provider_impl.h"
 #include "source/extensions/dynamic_modules/abi/abi.h"
 #include "source/extensions/dynamic_modules/dynamic_modules.h"
 #include "source/extensions/dynamic_modules/metric_registry.h"
+
+#include "absl/container/flat_hash_map.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -72,6 +79,84 @@ using OnHttpFilterConfigHttpStreamCompleteType =
     decltype(&envoy_dynamic_module_on_http_filter_config_http_stream_complete);
 using OnHttpFilterConfigHttpStreamResetType =
     decltype(&envoy_dynamic_module_on_http_filter_config_http_stream_reset);
+
+/**
+ * The children of labeled metrics that one thread has resolved for one filter config, keyed by the
+ * metric ID and the label values. A hit returns the child without interning the label values or
+ * building the tagged stat name that the stats store needs before its own lookup.
+ *
+ * Each entry points into the stats scope of the config. That scope is not evictable, so a child
+ * lives as long as the scope, and only a filter that holds the config reads an entry. The entries
+ * are never dereferenced after the config is destroyed, even when this object outlives it.
+ */
+class ThreadLocalMetricVecCache final : public ThreadLocal::ThreadLocalObject {
+public:
+  // A label with unbounded values would otherwise grow the cache on every thread without limit.
+  // The cap spans every labeled metric of the config, and an entry stays for the config's life.
+  // Once the cache holds this many entries, a label value tuple it does not hold is resolved
+  // through the stats store on every call, after a failed lookup. Filling the cache logs one line
+  // at debug level, which appears only when debug logging is on at the fill.
+  static constexpr size_t MaxEntries = 1024;
+
+  // Bounds the bytes an entry and a caller's key buffer hold, since a label value can be as long as
+  // anything a module copies into it, such as a request header. A tuple with a longer key is
+  // resolved through the stats store on every call, after a key build that stops at the first
+  // label value that does not fit.
+  static constexpr size_t MaxKeyLength = 256;
+
+  // The longest label value a key can hold, after the four-byte ID and the value's length byte.
+  static constexpr size_t MaxLabelValueLength = MaxKeyLength - sizeof(uint32_t) - 1;
+  static_assert(MaxLabelValueLength <= std::numeric_limits<uint8_t>::max(),
+                "a cached label value's length must fit in one byte");
+
+  /**
+   * Encodes a metric ID and its label values as a lookup key in ``buffer``, so building the key
+   * allocates nothing. The key is the ID in four bytes, then each label value after a one-byte
+   * length, so two different tuples never share a key. With the short encoding, the stored key of a
+   * short tuple fits the string's inline buffer, and a key hashes fewer bytes.
+   * @return the key, which points into ``buffer``, or an empty view when the key would be longer
+   * than ``MaxKeyLength`` or the ID does not fit in four bytes, in which case the tuple is not
+   * cached.
+   */
+  static absl::string_view makeKey(size_t id,
+                                   const envoy_dynamic_module_type_module_buffer* label_values,
+                                   size_t label_values_length, char (&buffer)[MaxKeyLength]);
+
+  /**
+   * @return the cached child for a key from ``makeKey``, or nullptr.
+   */
+  template <class MetricType> MetricType* find(absl::string_view key) const {
+    const auto& children = std::get<Children<MetricType>>(children_);
+    const auto it = children.find(key);
+    return it == children.end() ? nullptr : it->second;
+  }
+
+  /**
+   * Caches a child under a key from ``makeKey``, unless the cache is full.
+   * @return true when this insert filled the cache, which happens at most once per cache.
+   */
+  template <class MetricType> bool insert(absl::string_view key, MetricType& metric) {
+    if (size_ < MaxEntries &&
+        std::get<Children<MetricType>>(children_).emplace(std::string(key), &metric).second) {
+      size_++;
+      return size_ == MaxEntries;
+    }
+    return false;
+  }
+
+  /**
+   * @return the number of cached children of every metric type.
+   */
+  size_t sizeForTest() const { return size_; }
+
+private:
+  template <class MetricType> using Children = absl::flat_hash_map<std::string, MetricType*>;
+
+  // One map per metric type, so a hit returns the child as its own type without a downcast.
+  std::tuple<Children<Stats::Counter>, Children<Stats::Gauge>, Children<Stats::Histogram>>
+      children_;
+  size_t size_ = 0;
+};
 
 /**
  * A config to create http filters based on a dynamic module. This will be owned by multiple
@@ -184,6 +269,32 @@ public:
   const Extensions::DynamicModules::MetricRegistry& metrics() const { return metrics_; }
 
   /**
+   * Creates the per-thread caches of labeled metric children, once per config. The ``define_*``
+   * callbacks call this when the module defines a labeled metric, which it does during
+   * ``envoy_dynamic_module_on_http_filter_config_new``, so a config without one pays nothing.
+   */
+  void createMetricVecCache();
+
+  /**
+   * @return the cache of labeled metric children for the calling thread, or nullptr when the module
+   * defined no labeled metric, when the calling thread holds no thread local storage for this
+   * config, such as a thread the module started itself, or when the thread's slot entry is empty.
+   */
+  ThreadLocalMetricVecCache* metricVecCache() {
+    if (metric_vec_cache_ == nullptr || !metric_vec_cache_->currentThreadRegistered()) {
+      return nullptr;
+    }
+    // During a worker's thread local teardown the entry is empty once shutdownThread() has reset
+    // it, while the thread still counts as registered.
+    return metric_vec_cache_->get().ptr();
+  }
+
+  /**
+   * @return the name of the filter this config was created for.
+   */
+  const std::string& filterName() const { return filter_name_; }
+
+  /**
    * Subscribes to a generic secret so that the module can read its value by the returned ID.
    *
    * This is only callable during ``envoy_dynamic_module_on_http_filter_config_new``: creating a
@@ -229,6 +340,11 @@ private:
   // makes the reads from worker threads safe. Each entry keeps its own thread local copy of the
   // value so that a read is a thread local lookup rather than a lock.
   std::vector<Secret::ThreadLocalGenericSecretProviderPtr> generic_secrets_;
+
+  // Set at most once, on the main thread during ``config_new``, and read-only afterwards. The
+  // config reaches a worker only through a post queued after the slot's ``set()``, so a worker runs
+  // the slot's initializer before any filter of this config, which makes its reads safe.
+  ThreadLocal::TypedSlotPtr<ThreadLocalMetricVecCache> metric_vec_cache_;
 
   // The handle for the module.
   Extensions::DynamicModules::DynamicModulePtr dynamic_module_;
