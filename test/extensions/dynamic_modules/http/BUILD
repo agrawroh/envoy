@@ -4,6 +4,8 @@ load(
 )
 load(
     "//test/extensions:extensions_build_system.bzl",
+    "envoy_extension_benchmark_test",
+    "envoy_extension_cc_benchmark_binary",
     "envoy_extension_cc_dyn_module_test",
     "envoy_extension_cc_test",
 )
@@ -160,6 +162,37 @@ envoy_extension_cc_test(
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/extensions/transport_sockets/tls/v3:pkg_cc_proto",
     ],
+)
+
+envoy_extension_cc_benchmark_binary(
+    name = "abi_impl_speed_test",
+    srcs = ["abi_impl_speed_test.cc"],
+    extension_names = ["envoy.filters.http.dynamic_modules"],
+    rbe_pool = {"build": "linux_x64_small"},
+    deps = [
+        "//source/common/event:libevent_lib",
+        "//source/common/stats:allocator_lib",
+        "//source/common/stats:symbol_table_lib",
+        "//source/common/stats:tag_producer_lib",
+        "//source/common/stats:thread_local_store_lib",
+        "//source/common/thread_local:thread_local_lib",
+        "//source/extensions/dynamic_modules:abi_impl",
+        "//source/extensions/dynamic_modules/abi",
+        "//source/extensions/filters/http/dynamic_modules:abi_impl",
+        "//source/extensions/filters/http/dynamic_modules:filter_config_lib",
+        "//source/extensions/filters/http/dynamic_modules:filter_lib",
+        "//test/mocks/server:server_factory_context_mocks",
+        "//test/test_common:utility_lib",
+        "@abseil-cpp//absl/strings",
+        "@benchmark",
+        "@envoy_api//envoy/config/metrics/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_extension_benchmark_test(
+    name = "abi_impl_speed_test_benchmark_test",
+    benchmark_binary = "abi_impl_speed_test",
+    extension_names = ["envoy.filters.http.dynamic_modules"],
 )
 
 envoy_extension_cc_dyn_module_test(
