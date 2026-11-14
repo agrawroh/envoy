@@ -18,6 +18,7 @@
 #include "source/common/http/message_impl.h"
 #include "source/common/init/target_impl.h"
 #include "source/extensions/bootstrap/dynamic_modules/cluster_writer.h"
+#include "source/extensions/bootstrap/dynamic_modules/filter_chain_writer.h"
 #include "source/extensions/bootstrap/dynamic_modules/listener_writer.h"
 #include "source/extensions/dynamic_modules/abi/abi.h"
 #include "source/extensions/dynamic_modules/dynamic_modules.h"
@@ -74,6 +75,8 @@ using OnBootstrapExtensionClusterWriterUpdateDoneType =
     decltype(&envoy_dynamic_module_on_bootstrap_extension_cluster_writer_update_done);
 using OnBootstrapExtensionListenerWriterUpdateDoneType =
     decltype(&envoy_dynamic_module_on_bootstrap_extension_listener_writer_update_done);
+using OnBootstrapExtensionFilterChainWriterUpdateDoneType =
+    decltype(&envoy_dynamic_module_on_bootstrap_extension_filter_chain_writer_update_done);
 
 class DynamicModuleBootstrapExtension;
 
@@ -175,6 +178,9 @@ public:
     if (listener_writer_ != nullptr) {
       listener_writer_->onServerInitialized(listener_manager);
     }
+    if (filter_chain_writer_ != nullptr) {
+      filter_chain_writer_->onServerInitialized(listener_manager);
+    }
   }
 
   /**
@@ -237,6 +243,13 @@ public:
   bool enableListenerWriter();
 
   /**
+   * Creates the filter chain writer, which lets the module add, update and remove filter chains.
+   * Must be called on the main thread.
+   * @return false if the filter chain writer already exists or shutdown began.
+   */
+  bool enableFilterChainWriter();
+
+  /**
    * Called on the main thread once Envoy finished initializing, right before it starts its
    * workers.
    */
@@ -293,6 +306,8 @@ public:
       on_bootstrap_extension_cluster_writer_update_done_ = nullptr;
   OnBootstrapExtensionListenerWriterUpdateDoneType
       on_bootstrap_extension_listener_writer_update_done_ = nullptr;
+  OnBootstrapExtensionFilterChainWriterUpdateDoneType
+      on_bootstrap_extension_filter_chain_writer_update_done_ = nullptr;
 
   // The name of the extension.
   const std::string extension_name_;
@@ -343,6 +358,8 @@ public:
   DynamicModuleClusterWriterPtr cluster_writer_;
   // The listener writer, or nullptr until the module enables it.
   DynamicModuleListenerWriterPtr listener_writer_;
+  // The filter chain writer, or nullptr until the module enables it.
+  DynamicModuleFilterChainWriterPtr filter_chain_writer_;
 
 private:
   /**

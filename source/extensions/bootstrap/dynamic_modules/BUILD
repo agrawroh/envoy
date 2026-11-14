@@ -29,6 +29,24 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "filter_chain_writer_lib",
+    srcs = ["filter_chain_writer.cc"],
+    hdrs = ["filter_chain_writer.h"],
+    deps = [
+        ":resource_writer_lib",
+        "//envoy/init:manager_interface",
+        "//envoy/server:factory_context_interface",
+        "//envoy/server:listener_manager_interface",
+        "//source/common/common:fmt_lib",
+        "//source/common/init:target_lib",
+        "//source/extensions/dynamic_modules/abi",
+        "@abseil-cpp//absl/status",
+        "@abseil-cpp//absl/strings",
+        "@envoy_api//envoy/config/listener/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_library(
     name = "listener_writer_lib",
     srcs = ["listener_writer.cc"],
     hdrs = ["listener_writer.h"],
@@ -56,6 +74,7 @@ envoy_cc_library(
     deps = [
         ":writer_shared_state_lib",
         "//envoy/common:exception_lib",
+        "//envoy/common:optref_lib",
         "//envoy/common:pure_lib",
         "//envoy/common:time_interface",
         "//envoy/event:schedulable_cb_interface",
@@ -99,6 +118,7 @@ envoy_cc_library(
     hdrs = ["extension_config.h"],
     deps = [
         ":cluster_writer_lib",
+        ":filter_chain_writer_lib",
         ":listener_writer_lib",
         "//envoy/common:optref_lib",
         "//envoy/event:dispatcher_interface",

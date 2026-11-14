@@ -315,6 +315,30 @@ bool DynamicModuleBootstrapExtensionConfig::enableListenerWriter() {
   return true;
 }
 
+bool DynamicModuleBootstrapExtensionConfig::enableFilterChainWriter() {
+  if (filter_chain_writer_ != nullptr || shutdown_started_) {
+    return false;
+  }
+  DynamicModuleFilterChainWriter::UpdateDoneCallback update_done;
+  if (on_bootstrap_extension_filter_chain_writer_update_done_ != nullptr) {
+    update_done =
+        [this](uint64_t update_id, absl::string_view filter_chain_name,
+               envoy_dynamic_module_type_bootstrap_filter_chain_writer_update_status status,
+               absl::string_view error_details) {
+          on_bootstrap_extension_filter_chain_writer_update_done_(
+              thisAsVoidPtr(), in_module_config_, update_id,
+              {filter_chain_name.data(), filter_chain_name.size()}, status,
+              {error_details.data(), error_details.size()});
+        };
+  }
+  filter_chain_writer_ = std::make_unique<DynamicModuleFilterChainWriter>(extension_name_, context_,
+                                                                          std::move(update_done));
+  if (listener_manager_ != nullptr) {
+    filter_chain_writer_->onServerInitialized(*listener_manager_);
+  }
+  return true;
+}
+
 void DynamicModuleBootstrapExtensionConfig::onPostInit() {
   if (listener_writer_ != nullptr) {
     listener_writer_->onPostInit();
@@ -328,6 +352,9 @@ void DynamicModuleBootstrapExtensionConfig::onShutdown() {
   }
   if (listener_writer_ != nullptr) {
     listener_writer_->onShutdown();
+  }
+  if (filter_chain_writer_ != nullptr) {
+    filter_chain_writer_->onShutdown();
   }
 }
 
@@ -617,6 +644,13 @@ newDynamicModuleBootstrapExtensionConfig(
           "envoy_dynamic_module_on_bootstrap_extension_listener_writer_update_done");
   config->on_bootstrap_extension_listener_writer_update_done_ =
       on_listener_writer_update_done.ok() ? on_listener_writer_update_done.value() : nullptr;
+  auto on_filter_chain_writer_update_done =
+      config->dynamic_module_
+          ->getFunctionPointer<OnBootstrapExtensionFilterChainWriterUpdateDoneType>(
+              "envoy_dynamic_module_on_bootstrap_extension_filter_chain_writer_update_done");
+  config->on_bootstrap_extension_filter_chain_writer_update_done_ =
+      on_filter_chain_writer_update_done.ok() ? on_filter_chain_writer_update_done.value()
+                                              : nullptr;
 
   // Always register an init target so that Envoy blocks traffic until the module signals readiness.
   // This must happen before calling the module constructor so the module can call
